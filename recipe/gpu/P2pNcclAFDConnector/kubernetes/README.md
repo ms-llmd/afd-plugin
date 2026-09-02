@@ -22,9 +22,7 @@ topology. Pick a recipe, set `TEMPLATE_GPUS` from this table, and go:
 `TEMPLATE_GPUS` is the only per-recipe value you supply. Everything else the
 pod reads out of the recipe script when it starts: which processes to wait for
 (from their `> *.log` redirects), how many GPUs the recipe indexes (from
-`CUDA_VISIBLE_DEVICES`), and which health endpoint answers on `:18305`. A
-recipe added later works with no edit here — and a wrong `TEMPLATE_GPUS` is
-rejected in seconds, before anything is loaded.
+`CUDA_VISIBLE_DEVICES`), and which health endpoint answers on `:18305`.
 
 
 ## 0. Prerequisites
@@ -40,13 +38,19 @@ into** — no step here reads a Secret or a volume out of another namespace.
   two `4a4f_*` ones, which need **8 on a single node**.
 - **The image URL, as one value.** Registry host, owner and repository stay
   together in `$IMAGE` — never split across a separate registry or namespace
-  variable. Every step below reads it:
+  variable. Every step below reads it. Any registry you can push to and the
+  cluster can pull from works; GHCR is only the example carried through this
+  document:
 
 ```bash
-export IMAGE=ghcr.io/<owner>/afd-plugin-k8s:<tag>
+export IMAGE=<registry>/<owner>/afd-plugin-k8s:<tag>
+# e.g. ghcr.io/<owner>/afd-plugin-k8s:v1
 ```
 
-- **A Secret holding a Hugging Face token**, used to download the model:
+- **Optionally, a Secret holding a Hugging Face token.** It is needed only
+  for a gated model, or to lift the anonymous download rate limit — the pod
+  starts without it and an ungated repo id downloads fine. If you do create
+  it, this name and key are what `serve-pod.yaml` looks for:
 
 ```bash
 kubectl create secret generic hf-token-secret --from-literal=token=<hf_token>
@@ -54,11 +58,12 @@ kubectl create secret generic hf-token-secret --from-literal=token=<hf_token>
 
 - **A registry push Secret**, needed only for the OpenShift path (step 1b) —
   buildx forwards your local Docker credentials instead and needs no Secret.
-  The token needs `write:packages` on GHCR, or the equivalent elsewhere:
+  The credential needs push rights on the repository in `$IMAGE`
+  (`write:packages` on GHCR, the equivalent elsewhere):
 
 ```bash
-kubectl create secret docker-registry ghcr-push \
-  --docker-server=ghcr.io --docker-username=<owner> --docker-password=<token>
+kubectl create secret docker-registry registry-push \
+  --docker-server=<registry> --docker-username=<user> --docker-password=<token>
 ```
 
 - A registry the cluster can pull from. The serving pod supplies no pull
@@ -122,7 +127,7 @@ you. That is the expected outcome under OpenShift's restricted SCC; use 1b.
 OpenShift will not run the buildx builder pod, but its own build controller
 does the same job: a **binary** `BuildConfig` uploads the repo root from your
 machine as the build context, builds it on a cluster node, and pushes the
-result to `$IMAGE` using the `ghcr-push` Secret from step 0.
+result to `$IMAGE` using the `registry-push` Secret from step 0.
 
 Create the BuildConfig once. It carries the full image URL as its output, so
 `$IMAGE` remains the single place the destination is written:
@@ -149,7 +154,7 @@ spec:
       kind: DockerImage
       name: ${IMAGE}
     pushSecret:
-      name: ghcr-push
+      name: registry-push
   resources:
     requests:
       cpu: "4"
@@ -179,7 +184,7 @@ different tag, re-export `$IMAGE` and re-apply the BuildConfig above first —
 `output.to.name` is what the push targets.
 
 If a build fails, `oc get builds` lists the attempts with their failure reason
-(`PushImageToRegistryFailed` means `ghcr-push` is missing, wrong, or lacks
+(`PushImageToRegistryFailed` means `registry-push` is missing, wrong, or lacks
 `write:packages`; `DockerBuildFailed` is the Dockerfile itself).
 
 Notes on both paths:
@@ -259,8 +264,7 @@ export TEMPLATE_MODEL=/models/DeepSeek-V2-Lite
 Use that form **only if the weights are already on the claim** — this recipe
 ships no download step, so nothing here creates that directory, and a path that
 does not exist fails at model load with the GPUs already reserved. Staging them
-takes a pod of your own that mounts `$TEMPLATE_PVC` and lands on a
-`scale: "true"` node (see the `nodeSelector` note below).
+takes a pod of your own that mounts `$TEMPLATE_PVC`.
 
 The default repo-id form needs none of that: the first cold run downloads into
 `HF_HOME` on the PVC and every later run starts warm.
@@ -319,6 +323,24 @@ kubectl delete pod afd-recipe             # keeps the model cache PVC
 kubectl delete pvc "$TEMPLATE_PVC"        # also drops the cache
 ```
 
+The build leaves resources behind too. On the buildx path the builder is a
+running pod:
+
+```bash
+docker buildx rm afd-remote
+```
+
+On the OpenShift path the BuildConfig keeps its completed builds and their
+pods; deleting it removes them with it:
+
+```bash
+oc delete bc/afd-plugin-k8s
+```
+
+Both are only needed while rebuilding — recreating either is the one command
+in step 1. The `registry-push` and `hf-token-secret` Secrets survive both and
+can be deleted separately once nothing else uses them.
+
 ## Notes
 
 - **The FFN worker never serves HTTP** in any recipe — it runs the p2p
@@ -337,8 +359,5 @@ kubectl delete pvc "$TEMPLATE_PVC"        # also drops the cache
 - **cpu/memory are not per-recipe.** No recipe states a requirement, so
   `serve-pod.yaml` uses one set of values sized for a 4-GPU run with headroom.
   Raise them in the manifest if a run is observed to need it.
-- **CSI-restricted volumes need a `nodeSelector`.** A GPU request alone does not
-  express which nodes can mount the model PVC. `serve-pod.yaml` ships
-  `scale: "true"` for IBM Spectrum Scale; adjust for your cluster.
 - **Single-node by construction** — a multi-pod topology would need the AFD p2p
   endpoint and NIXL side channels reachable across pod IPs.

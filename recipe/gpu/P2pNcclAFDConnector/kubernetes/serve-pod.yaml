@@ -16,10 +16,9 @@
 #
 # Model- and topology-agnostic: which processes to wait for, how many GPUs the
 # recipe indexes, and which health endpoint answers on :18305 are all read out
-# of the recipe script at startup (see the in-pod script). A recipe added later
-# therefore needs no change here. The one value that cannot be discovered that
-# way is the GPU count -- the scheduler needs it before the container runs --
-# so it is an explicit input, cross-checked against the recipe below.
+# of the recipe script at startup (see the in-pod script). The one value that
+# cannot be discovered that way is the GPU count -- the scheduler needs it
+# before the container runs -- so it is an explicit input.
 #
 # Not applied directly: render it with `envsubst` first, naming the five
 # variables explicitly so every other $VAR survives for the in-pod shell:
@@ -44,21 +43,11 @@ metadata:
     afd-recipe/script: "${TEMPLATE_RECIPE_SCRIPT}"
 spec:
   restartPolicy: Never
-  # The model PVC is backed by IBM Spectrum Scale, whose CSI driver is only
-  # installed on a subset of the GPU nodes. The GPU request alone does not
-  # express that, so the scheduler will happily pick a driverless node, where
-  # the volume then fails to attach with "CSINode <node> does not contain
-  # driver spectrumscale.csi.ibm.com" -- the pod sits in ContainerCreating,
-  # holding its 4-GPU reservation, until it is torn down.
-  #
-  # `scale=true` is a strict subset of the nodes carrying the driver, so it
-  # never selects a node that cannot mount the volume.
-  nodeSelector:
-    scale: "true"
-  # No imagePullSecrets: the image is published public. GHCR creates packages
-  # private, so if the visibility flip was missed the pod sits in
-  # ImagePullBackOff holding its 4-GPU reservation -- add an imagePullSecrets
-  # entry here (or make the package public) if that happens.
+  # No imagePullSecrets: the image is expected to be pullable without
+  # credentials. Some registries create new repositories private (GHCR, for
+  # one), and a missed visibility flip leaves the pod in ImagePullBackOff
+  # holding its GPU reservation -- add an imagePullSecrets entry here, or make
+  # the repository public, if that happens.
   volumes:
     # Hugging Face cache: cold on first run, warm on every run after.
     - name: model-storage
@@ -267,11 +256,15 @@ spec:
           value: "/work/uv"
         - name: VLLM_LOGGING_LEVEL
           value: "INFO"
+        # Optional: only a gated model (or the anonymous download rate limit)
+        # needs it. `optional: true` lets the pod start when the Secret is
+        # absent, rather than sitting in CreateContainerConfigError.
         - name: HF_TOKEN
           valueFrom:
             secretKeyRef:
               name: hf-token-secret
               key: token
+              optional: true
       resources:
         # Only the GPU count varies by recipe: 4 for the 2p1a1f and 2a2f
         # recipes, 8 for 4a4f. The in-pod script rejects a value smaller than
