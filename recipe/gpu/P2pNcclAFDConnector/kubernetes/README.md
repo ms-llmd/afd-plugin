@@ -29,20 +29,41 @@ rejected in seconds, before anything is loaded.
 
 ## 0. Prerequisites
 
-- `kubectl` authenticated to the namespace; `envsubst` (gettext) and the
-  `docker` CLI with `buildx` locally. No local Docker *daemon* is needed — the
-  image is built in-cluster (step 1).
+Everything below is supplied by you, in **the single namespace you deploy
+into** — no step here reads a Secret or a volume out of another namespace.
+
+- `kubectl` authenticated to that namespace, and `envsubst` (gettext) locally.
+  For the buildx path (step 1a) also the `docker` CLI with `buildx`; for the
+  OpenShift path (step 1b) also `oc`. No local Docker *daemon* is needed on
+  either path — the image is built in-cluster.
 - A node with enough free GPUs for the recipe: 4 for every recipe except the
   two `4a4f_*` ones, which need **8 on a single node**.
-- A Secret holding a Hugging Face token, used to download the model:
+- **The image URL, as one value.** Registry host, owner and repository stay
+  together in `$IMAGE` — never split across a separate registry or namespace
+  variable. Every step below reads it:
+
+```bash
+export IMAGE=ghcr.io/<owner>/afd-plugin-k8s:<tag>
+```
+
+- **A Secret holding a Hugging Face token**, used to download the model:
 
 ```bash
 kubectl create secret generic hf-token-secret --from-literal=token=<hf_token>
 ```
 
+- **A registry push Secret**, needed only for the OpenShift path (step 1b) —
+  buildx forwards your local Docker credentials instead and needs no Secret.
+  The token needs `write:packages` on GHCR, or the equivalent elsewhere:
+
+```bash
+kubectl create secret docker-registry ghcr-push \
+  --docker-server=ghcr.io --docker-username=<owner> --docker-password=<token>
+```
+
 - A registry the cluster can pull from. The serving pod supplies no pull
   credentials and carries no `imagePullSecrets`, so the image must be
-  **public** — see step 1.
+  **public** — see the end of step 1.
 
 ## 1. Build the image on the cluster
 
@@ -51,14 +72,18 @@ kubectl create secret generic hf-token-secret --from-literal=token=<hf_token>
 scripts included) into `vllm/vllm-openai:v0.26.0`. Rebuild after editing a
 recipe script.
 
-**Build on the cluster.** buildx's `kubernetes` driver runs BuildKit in a pod
-on an amd64 node of the cluster you are already pointed at, which makes the
-build a native `linux/amd64` one and needs no local Docker daemon.
+Two ways to build it in-cluster, both producing a native `linux/amd64` image
+from that one Dockerfile and pushing it to `$IMAGE`. Pick **1a** on plain
+Kubernetes, **1b** on OpenShift — where 1a is normally rejected by admission.
+
+### 1a. buildx, on plain Kubernetes
+
+buildx's `kubernetes` driver runs BuildKit in a pod on an amd64 node of the
+cluster you are already pointed at, which needs no local Docker daemon.
 
 Create the builder once:
 
 ```bash
-export IMAGE=ghcr.io/<user>/afd-plugin-k8s:<tag>
 NAMESPACE="$(kubectl config view --minify -o jsonpath='{..namespace}')"
 
 docker buildx create --name afd-remote --driver kubernetes \
@@ -88,15 +113,80 @@ The builder is a running pod — tear it down when finished:
 docker buildx rm afd-remote
 ```
 
-Notes on this build:
+**If the builder pod is rejected by cluster admission** — it asks for a
+privileged, or rootless-but-unconfined, pod — this driver is unavailable to
+you. That is the expected outcome under OpenShift's restricted SCC; use 1b.
+
+### 1b. BuildConfig, on OpenShift
+
+OpenShift will not run the buildx builder pod, but its own build controller
+does the same job: a **binary** `BuildConfig` uploads the repo root from your
+machine as the build context, builds it on a cluster node, and pushes the
+result to `$IMAGE` using the `ghcr-push` Secret from step 0.
+
+Create the BuildConfig once. It carries the full image URL as its output, so
+`$IMAGE` remains the single place the destination is written:
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: afd-plugin-k8s
+  labels:
+    app: afd-recipe
+spec:
+  completionDeadlineSeconds: 5400
+  source:
+    type: Binary
+    binary: {}
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: docker/Dockerfile.k8s-cuda
+  output:
+    to:
+      kind: DockerImage
+      name: ${IMAGE}
+    pushSecret:
+      name: ghcr-push
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+EOF
+```
+
+This is the one heredoc here that **should** expand `$IMAGE` — it is
+unquoted for that reason, and the manifest contains no other `$` reference.
+
+Then start the build from the **repo root**:
+
+```bash
+cd <repo-root>
+oc start-build afd-plugin-k8s --from-dir=. --follow
+```
+
+`--from-dir` honours the repo's `.dockerignore`, so the uploaded context stays
+small. `--follow` streams the build log; the build survives a dropped follow,
+and `oc logs -f bc/afd-plugin-k8s` re-attaches to the newest one.
+
+Rebuilding after a recipe edit is the same `oc start-build`. To publish a
+different tag, re-export `$IMAGE` and re-apply the BuildConfig above first —
+`output.to.name` is what the push targets.
+
+If a build fails, `oc get builds` lists the attempts with their failure reason
+(`PushImageToRegistryFailed` means `ghcr-push` is missing, wrong, or lacks
+`write:packages`; `DockerBuildFailed` is the Dockerfile itself).
+
+Notes on both paths:
 
 - **A cold build is slow before it looks busy.** `vllm/vllm-openai` is tens of
   GB, so several minutes pass pulling it before the first `RUN` step. Not a
   hang.
-- **If the builder pod is rejected by cluster admission** — it asks for a
-  privileged, or rootless-but-unconfined, pod — this driver is unavailable to
-  you, and the image has to be built somewhere else that can produce a native
-  `linux/amd64` image.
 
 **The image must be public**, or pullable with credentials you add to
 `serve-pod.yaml` yourself as `imagePullSecrets` — the manifest ships none. GHCR
