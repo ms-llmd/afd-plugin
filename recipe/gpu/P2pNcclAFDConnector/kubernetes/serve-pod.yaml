@@ -1,0 +1,297 @@
+# Serving pod for any recipe under recipe/gpu/P2pNcclAFDConnector.
+#
+# This pod brings the stack UP and holds it there, serving on 127.0.0.1:18305
+# until it is deleted. Drive traffic into it with `kubectl exec` or
+# `kubectl port-forward` (see README.md).
+#
+# Every process of the recipe runs inside this one Pod on 127.0.0.1, which is
+# what the recipe scripts already assume. Both families work unchanged:
+#
+#   prefill_decode_colocation (2a2f/4a4f)   attention + ffn; the ATTENTION
+#     server is the client endpoint on :18305 and answers vLLM's /health.
+#
+#   prefill_decode_disaggregation (2p1a1f)  prefill x2 + attention + ffn +
+#     proxy; the PROXY is the client endpoint on :18305 and answers
+#     /healthcheck. Only it performs the remote-prefill handshake.
+#
+# Model- and topology-agnostic: which processes to wait for, how many GPUs the
+# recipe indexes, and which health endpoint answers on :18305 are all read out
+# of the recipe script at startup (see the in-pod script). A recipe added later
+# therefore needs no change here. The one value that cannot be discovered that
+# way is the GPU count -- the scheduler needs it before the container runs --
+# so it is an explicit input, cross-checked against the recipe below.
+#
+# Not applied directly: render it with `envsubst` first, naming the five
+# variables explicitly so every other $VAR survives for the in-pod shell:
+#
+#   envsubst '${TEMPLATE_IMAGE} ${TEMPLATE_MODEL} ${TEMPLATE_RECIPE_SCRIPT} ${TEMPLATE_GPUS} ${TEMPLATE_PVC}' \
+#     < serve-pod.yaml | kubectl apply -f -
+#
+# Readiness markers written into the pod:
+#   /work/SERVER_READY   every worker up and the client endpoint answering
+#   /work/SERVER_FAILED  bring-up failed; per-worker logs already dumped
+apiVersion: v1
+kind: Pod
+metadata:
+  name: afd-recipe
+  labels:
+    app: afd-recipe
+    role: serve
+  annotations:
+    # Which recipe this instance is running -- the pod name is fixed (only one
+    # can hold the GPUs and the RWO claim at a time), so this is what tells two
+    # runs apart after the fact.
+    afd-recipe/script: "${TEMPLATE_RECIPE_SCRIPT}"
+spec:
+  restartPolicy: Never
+  # The model PVC is backed by IBM Spectrum Scale, whose CSI driver is only
+  # installed on a subset of the GPU nodes. The GPU request alone does not
+  # express that, so the scheduler will happily pick a driverless node, where
+  # the volume then fails to attach with "CSINode <node> does not contain
+  # driver spectrumscale.csi.ibm.com" -- the pod sits in ContainerCreating,
+  # holding its 4-GPU reservation, until it is torn down.
+  #
+  # `scale=true` is a strict subset of the nodes carrying the driver, so it
+  # never selects a node that cannot mount the volume.
+  nodeSelector:
+    scale: "true"
+  # No imagePullSecrets: the image is published public. GHCR creates packages
+  # private, so if the visibility flip was missed the pod sits in
+  # ImagePullBackOff holding its 4-GPU reservation -- add an imagePullSecrets
+  # entry here (or make the package public) if that happens.
+  volumes:
+    # Hugging Face cache: cold on first run, warm on every run after.
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: ${TEMPLATE_PVC}
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
+    - name: work
+      emptyDir: {}
+  containers:
+    - name: afd
+      image: ${TEMPLATE_IMAGE}
+      imagePullPolicy: Always
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          REPO=/opt/afd-plugin
+          # AFD_RECIPE_SCRIPT is a path relative to the connector root -- e.g.
+          # deepseek_v2_lite/prefill_decode_disaggregation/2p1a1f_eager_dbo.sh --
+          # so this manifest is not tied to any one model directory.
+          RECIPE_DIR="$REPO/recipe/gpu/P2pNcclAFDConnector"
+          RECIPE_SCRIPT="$RECIPE_DIR/$AFD_RECIPE_SCRIPT"
+          READY=/work/SERVER_READY
+          FAILED=/work/SERVER_FAILED
+
+          # HF_HOME points at the PVC (see env below), so on a cold volume vLLM
+          # downloads the weights on first use and every later run starts warm.
+          export MODEL_PATH="$AFD_MODEL"
+
+          # /work/home is HOME (see env below); nothing else creates it,
+          # and tools that expand ~ fail on a missing home directory.
+          mkdir -p /work/results /work/bin /work/home
+
+          # The recipe script invokes `uv run vllm` / `uv run python`, which is
+          # right for a local uv checkout but wrong here: this image installs
+          # vllm and afd-plugin into the system Python and has no uv project,
+          # so `uv run` would try to sync one and fail. Rather than editing (or
+          # forking) the recipe, shadow `uv` with a shim that drops the
+          # `run` verb -- the recipe script then stays byte-identical to what a
+          # local user runs, and the image needs no build-time rewriting.
+          cat > /work/bin/uv <<'SHIM'
+          #!/usr/bin/env bash
+          [ "${1:-}" = "run" ] && shift
+          exec "$@"
+          SHIM
+          chmod +x /work/bin/uv
+          export PATH="/work/bin:$PATH"
+
+          # The recipe script writes its per-worker logs to the CWD.
+          cd /work
+
+          # A bad relative path would otherwise surface as a bare "No such
+          # file" from bash, minutes into a run that already holds 4 GPUs.
+          if [ ! -f "$RECIPE_SCRIPT" ]; then
+            echo "ERROR: no recipe script at $RECIPE_SCRIPT"
+            echo "AFD_RECIPE_SCRIPT must be relative to $RECIPE_DIR; available:"
+            (cd "$RECIPE_DIR" && find . -name '*.sh' | sed 's|^\./|  |')
+            touch "$FAILED"
+            sleep infinity
+          fi
+
+          # ---- read the recipe's shape out of the script itself ----
+          # Each worker in every recipe redirects to its own log ('> attn.log'),
+          # so the redirects ARE the process list: colocation yields
+          # "attn.log ffn.log", disaggregation adds the two prefillers and the
+          # proxy. Nothing here enumerates topologies.
+          LOGS="$(grep -oE '>[[:space:]]*[A-Za-z0-9_]+\.log' "$RECIPE_SCRIPT" \
+                  | grep -oE '[A-Za-z0-9_]+\.log' | sort -u | tr '\n' ' ')"
+          if [ -z "$LOGS" ]; then
+            echo "ERROR: no '> <name>.log' redirects in $RECIPE_SCRIPT;"
+            echo "cannot tell which processes to wait for."
+            touch "$FAILED"
+            sleep infinity
+          fi
+
+          # Highest CUDA_VISIBLE_DEVICES index + 1 is what the recipe needs;
+          # nvidia-smi reports what the pod was actually given. Catching the
+          # mismatch here costs seconds -- letting it through costs a failed
+          # bring-up minutes deep, with the whole reservation held.
+          GPU_NEED="$(grep -oE 'CUDA_VISIBLE_DEVICES=[0-9,]+' "$RECIPE_SCRIPT" \
+                      | sed 's/.*=//' | tr ',' '\n' | sort -n | tail -1)"
+          GPU_NEED=$(( ${GPU_NEED:--1} + 1 ))
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            GPU_HAVE="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || echo 0)"
+            if [ "$GPU_NEED" -gt 0 ] && [ "$GPU_HAVE" -lt "$GPU_NEED" ]; then
+              echo "ERROR: $AFD_RECIPE_SCRIPT indexes $GPU_NEED GPUs but this pod has $GPU_HAVE."
+              echo "Re-render serve-pod.yaml with TEMPLATE_GPUS=$GPU_NEED."
+              touch "$FAILED"
+              sleep infinity
+            fi
+          fi
+
+          echo "=== recipe $AFD_RECIPE_SCRIPT: $GPU_NEED GPU(s), workers: $LOGS ==="
+          echo "=== launch (model: $MODEL_PATH) ==="
+          bash "$RECIPE_SCRIPT" &
+          RECIPE_PID=$!
+
+          # Dump diagnostics and park rather than hanging silently: the pod
+          # stays inspectable and /work/SERVER_FAILED marks the outcome.
+          fail() {
+            echo "ERROR: $*"
+            for log in $LOGS; do
+              echo "----- tail $log -----"
+              tail -n 100 "/work/$log" 2>/dev/null || echo "(missing)"
+            done
+            touch "$FAILED"
+            sleep infinity
+          }
+
+          echo "=== wait for every worker to report startup ==="
+          # Graph capture is slow and a cold HF cache adds a one-time model
+          # download; allow 40 minutes per instance.
+          #
+          # The FFN worker needs a DIFFERENT marker in every recipe, colocated
+          # or disaggregated. It is driven purely through the AFD
+          # attention<->FFN p2p connector and never serves HTTP, so it does not
+          # run the API-server startup path and never logs "Application startup
+          # complete". Waiting for that string would hang until the timeout
+          # even though the stack is fully working.
+          #
+          # proxy.log is skipped here: the proxy prints no startup banner, and
+          # the HTTP probe below is its readiness check.
+          ready_marker() {
+            case "$1" in
+              ffn.log) echo "AFD FFN EngineCore started" ;;
+              *)       echo "Application startup complete" ;;
+            esac
+          }
+          for log in $LOGS; do
+            [ "$log" = "proxy.log" ] && continue
+            marker="$(ready_marker "$log")"
+            echo "--- waiting on $log (marker: $marker) ---"
+            ready=0
+            for i in $(seq 1 240); do
+              if [ -f "/work/$log" ] && grep -q "$marker" "/work/$log"; then
+                echo "$log: ready"
+                ready=1
+                break
+              fi
+              if ! kill -0 "$RECIPE_PID" 2>/dev/null; then
+                fail "recipe process exited before $log came up"
+              fi
+              sleep 10
+            done
+            [ "$ready" = "1" ] || fail "timed out waiting for $log"
+          done
+
+          # :18305 is the client endpoint in every recipe, but what answers
+          # there differs, and the two do not share a path: the
+          # disaggregation proxy serves /healthcheck (not /health), while a
+          # colocation attention server serves vLLM's /health (not
+          # /healthcheck). Probing the wrong one would hang until the timeout
+          # with the stack already up.
+          case " $LOGS " in
+            *" proxy.log "*) HEALTH_PATH=/healthcheck; ENDPOINT="proxy" ;;
+            *)               HEALTH_PATH=/health;      ENDPOINT="attention server" ;;
+          esac
+
+          echo "--- waiting on $ENDPOINT $HEALTH_PATH (127.0.0.1:18305) ---"
+          proxy_ready=0
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:18305$HEALTH_PATH" >/dev/null 2>&1; then
+              echo "$ENDPOINT: ready"
+              proxy_ready=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$proxy_ready" = "1" ] || fail "$ENDPOINT did not answer $HEALTH_PATH"
+
+          touch "$READY"
+          echo "=== stack READY; drive load at 127.0.0.1:18305 ==="
+          sleep infinity
+      env:
+        # Substituted by envsubst before apply (see the header). AFD_MODEL is
+        # whatever `vllm serve` accepts: a Hub repo id, or a path under /models
+        # if the weights are already staged on the claim.
+        - name: AFD_MODEL
+          value: "${TEMPLATE_MODEL}"
+        - name: AFD_RECIPE_SCRIPT
+          value: "${TEMPLATE_RECIPE_SCRIPT}"
+        - name: USER
+          value: "vllm"
+        - name: HOME
+          value: "/work/home"
+        - name: HF_HOME
+          value: "/models/.hf_home"
+        # Keep the Xet chunk cache on the PVC too; it defaults under HOME,
+        # which is an emptyDir here and would be thrown away with the pod.
+        - name: HF_XET_CACHE
+          value: "/models/.hf_xet"
+        - name: XDG_CACHE_HOME
+          value: "/work/xdg"
+        - name: TORCHINDUCTOR_CACHE_DIR
+          value: "/work/inductor"
+        - name: TRITON_CACHE_DIR
+          value: "/work/triton"
+        - name: VLLM_CACHE_ROOT
+          value: "/work/vllm"
+        - name: UV_CACHE_DIR
+          value: "/work/uv"
+        - name: VLLM_LOGGING_LEVEL
+          value: "INFO"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+      resources:
+        # Only the GPU count varies by recipe: 4 for the 2p1a1f and 2a2f
+        # recipes, 8 for 4a4f. The in-pod script rejects a value smaller than
+        # the recipe indexes before anything is loaded.
+        #
+        # cpu/memory are deliberately NOT templated: no recipe states a
+        # requirement, and these values were sized for a 4-GPU run with plenty
+        # of headroom. Raise them if a run is actually observed to need it.
+        requests:
+          nvidia.com/gpu: "${TEMPLATE_GPUS}"
+          cpu: "16"
+          memory: 128Gi
+        limits:
+          nvidia.com/gpu: "${TEMPLATE_GPUS}"
+          cpu: "32"
+          memory: 200Gi
+      volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        - name: dshm
+          mountPath: /dev/shm
+        - name: work
+          mountPath: /work

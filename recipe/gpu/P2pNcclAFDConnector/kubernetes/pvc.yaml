@@ -1,0 +1,26 @@
+# Hugging Face cache volume for the recipes under recipe/gpu/P2pNcclAFDConnector.
+# The serving pod points HF_HOME here, so vLLM downloads the model on the first
+# cold run and every later run reuses it -- there is no separate download step.
+#
+# The claim name is a placeholder rather than a fixed string so the manifest
+# carries no model name, and so a namespace that already has a warm claim can
+# point at it instead of re-downloading. Render it the same way as
+# serve-pod.yaml, with the SAME ${TEMPLATE_PVC}:
+#
+#   envsubst '${TEMPLATE_PVC}' < pvc.yaml | kubectl apply -f -
+#
+# Sizing: 100Gi holds a ~30 GB checkpoint plus the Xet chunk cache with room to
+# share the claim across models. Raise it for anything larger -- a bound PVC's
+# spec is immutable, so growing it later means a new claim.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${TEMPLATE_PVC}
+  labels:
+    app: afd-recipe
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
