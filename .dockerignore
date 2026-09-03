@@ -13,3 +13,5 @@ _omni_bk
 _omni_bk_clean
 agent-transcripts
 **/.DS_Store
+.env
+.envrc
