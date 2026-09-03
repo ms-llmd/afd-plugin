@@ -9,7 +9,7 @@ and [`serve-pod.yaml`](serve-pod.yaml) (the stack). Neither names a model or a
 topology. Pick a recipe, set `TEMPLATE_GPUS` from this table, and go:
 
 | Recipe (`TEMPLATE_RECIPE_SCRIPT`) | `TEMPLATE_GPUS` | Processes | `:18305` served by |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | [`…/prefill_decode_colocation/2a2f_eager_dbo_dp1tp2.sh`](../deepseek_v2_lite/prefill_decode_colocation/2a2f_eager_dbo_dp1tp2.sh) | 4 | attn, ffn | attention server |
 | [`…/prefill_decode_colocation/2a2f_eager_dbo_dp2tp1.sh`](../deepseek_v2_lite/prefill_decode_colocation/2a2f_eager_dbo_dp2tp1.sh) | 4 | attn, ffn | attention server |
 | [`…/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh`](../deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh) | 4 | attn, ffn | attention server |
