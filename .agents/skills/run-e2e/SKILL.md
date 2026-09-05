@@ -30,6 +30,15 @@ DP4/TP1/EP4. The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`,
 
 ## Workflow
 
+### 0. Select the run target
+
+Everything below assumes a local host with the devices attached. When the e2e
+test should run on Kubernetes or OpenShift cluster, read
+[`references/running-in-k8s.md`](references/running-in-k8s.md) first and apply
+it on top of this workflow: it adds the Pod and Job shape, image build, weight
+staging, resource sizing, and cluster-specific failure modes, and changes
+nothing about scenarios, device order, or pass criteria.
+
 ### 1. Select the backend
 
 Honor an explicit backend. Otherwise inspect nvidia-smi -L and npu-smi info.
