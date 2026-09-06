@@ -20,7 +20,12 @@ LARGE_MODEL_OPT_IN_ENV = "AFD_E2E_LARGE_MODEL"
 MODEL_PATH_ENV = "AFD_GPU_E2E_FP8_MODEL"
 DEVICE_COUNT = 4
 ROLE_DEVICE_COUNT = 2
-SCENARIOS = (BASELINE_EAGER_SCENARIO, AFD_EAGER_2A2F_SCENARIO)
+AFD_GRAPH_2A2F_SCENARIO = "afd-graph-2a2f"
+SCENARIOS = (
+    BASELINE_EAGER_SCENARIO,
+    AFD_EAGER_2A2F_SCENARIO,
+    AFD_GRAPH_2A2F_SCENARIO,
+)
 # The FP8 checkpoint carries a block-wise (128x128) quantization_config, so vLLM
 # selects the FP8 weight loader from the checkpoint itself. --dtype stays the
 # activation dtype and must remain bfloat16; --quantization must not be passed.
@@ -101,7 +106,7 @@ def build_runner_command(scenario: str, gsm8k_output_path: Path) -> list[str]:
         ",".join(attention_devices),
     ]
     command.extend(f"--common-vllm-arg={arg}" for arg in COMMON_VLLM_ARGS)
-    if scenario == AFD_EAGER_2A2F_SCENARIO:
+    if scenario != BASELINE_EAGER_SCENARIO:
         command.extend(
             ["--ffn-devices", ",".join(devices[ROLE_DEVICE_COUNT:])],
         )

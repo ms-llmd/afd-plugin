@@ -14,126 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROC_ROOT = Path("/proc")
-# Offsets into ``/proc/<pid>/stat`` counted from the ``state`` field, which is
-# the first field after the parenthesised command name (see proc(5)).
-STAT_STATE_OFFSET = 0
-STAT_PARENT_PID_OFFSET = 1
-STAT_PROCESS_GROUP_OFFSET = 2
-STAT_THREAD_COUNT_OFFSET = 17
-UNKNOWN_PROC_FIELD = "?"
-# A process in uninterruptible sleep cannot be reaped by SIGKILL until it
-# leaves the kernel call it is blocked in; a zombie is already dead but still
-# occupies the process table. Both keep ``killpg(pgid, 0)`` succeeding.
-UNINTERRUPTIBLE_STATE = "D"
-ZOMBIE_STATE = "Z"
-
-
-@dataclass(frozen=True)
-class ProcessGroupMember:
-    """One ``/proc`` entry still attached to a process group during teardown."""
-
-    pid: int
-    parent_pid: int
-    process_group: int
-    state: str
-    command: str
-    wait_channel: str
-    thread_count: int
-
-
-def read_process_group_member(
-    pid: int,
-    *,
-    proc_root: Path = PROC_ROOT,
-) -> ProcessGroupMember | None:
-    """Read one process's teardown-relevant ``/proc`` fields, or None if gone."""
-    process_root = proc_root / str(pid)
-    try:
-        stat_text = (process_root / "stat").read_text()
-    except OSError:
-        return None
-    command_start = stat_text.find("(")
-    command_end = stat_text.rfind(")")
-    if command_start < 0 or command_end < command_start:
-        return None
-    fields = stat_text[command_end + 2 :].split()
-    if len(fields) <= STAT_THREAD_COUNT_OFFSET:
-        return None
-    # wchan names the kernel function a blocked process is waiting in, which is
-    # what distinguishes a driver hang from an ordinary slow exit.
-    try:
-        wait_channel = (process_root / "wchan").read_text().strip()
-    except OSError:
-        wait_channel = ""
-    return ProcessGroupMember(
-        pid=pid,
-        parent_pid=int(fields[STAT_PARENT_PID_OFFSET]),
-        process_group=int(fields[STAT_PROCESS_GROUP_OFFSET]),
-        state=fields[STAT_STATE_OFFSET],
-        command=stat_text[command_start + 1 : command_end],
-        wait_channel=wait_channel or UNKNOWN_PROC_FIELD,
-        thread_count=int(fields[STAT_THREAD_COUNT_OFFSET]),
-    )
-
-
-def describe_process(
-    pid: int,
-    *,
-    proc_root: Path = PROC_ROOT,
-) -> str:
-    """Summarise one surviving process for a teardown failure message."""
-    member = read_process_group_member(pid, proc_root=proc_root)
-    if member is None:
-        return "no longer present at description time"
-    return (
-        f"pgid={member.process_group} ppid={member.parent_pid} "
-        f"state={member.state} threads={member.thread_count} "
-        f"wchan={member.wait_channel} comm={member.command}"
-    )
-
-
-def describe_process_group(
-    pgid: int,
-    *,
-    proc_root: Path = PROC_ROOT,
-) -> str:
-    """Summarise the surviving members of ``pgid`` for a teardown failure.
-
-    Cleanup failures report only that a group is still alive, which cannot
-    distinguish a real driver hang from a process that merely exited slowly.
-    This renders each surviving member with the state letter and wait channel
-    needed to tell those apart from the failure message alone.
-    """
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError as exc:
-        return f"could not scan {proc_root}: {exc}"
-
-    members: list[ProcessGroupMember] = []
-    for entry in entries:
-        if not entry.name.isdecimal():
-            continue
-        member = read_process_group_member(int(entry.name), proc_root=proc_root)
-        if member is not None and member.process_group == pgid:
-            members.append(member)
-
-    if not members:
-        # The group emptied between the liveness check and this description,
-        # which is itself worth recording rather than reporting nothing.
-        return "no surviving members found at description time"
-
-    descriptions = [
-        f"pid={member.pid} ppid={member.parent_pid} state={member.state} "
-        f"threads={member.thread_count} wchan={member.wait_channel} "
-        f"comm={member.command}"
-        for member in sorted(members, key=lambda member: member.pid)
-    ]
-    stuck = sum(1 for member in members if member.state == UNINTERRUPTIBLE_STATE)
-    dead = sum(1 for member in members if member.state == ZOMBIE_STATE)
-    header = (
-        f"{len(members)} surviving member(s), {stuck} uninterruptible, {dead} zombie"
-    )
-    return f"{header}: [{'; '.join(descriptions)}]"
 
 
 @dataclass(frozen=True)
@@ -160,7 +40,6 @@ def terminate_process_groups(
     reap_timeout_s: float,
     process_name: str = "",
     deferred_sigkill_pgids: Collection[int] = (),
-    proc_root: Path = PROC_ROOT,
 ) -> list[str]:
     """Terminate process groups with one deadline and reap their leaders.
 
@@ -238,8 +117,7 @@ def terminate_process_groups(
             if pgid not in deferred_sigkill_pgids:
                 failures.append(
                     f"forced SIGKILL for {group_description} {pgid} after "
-                    f"{termination_timeout_s}s timeout "
-                    f"({describe_process_group(pgid, proc_root=proc_root)})",
+                    f"{termination_timeout_s}s timeout",
                 )
             forced_pgids.append(pgid)
 
@@ -275,8 +153,7 @@ def terminate_process_groups(
 
     for pgid in surviving_pgids:
         failures.append(
-            f"{group_description} {pgid} still alive after SIGKILL "
-            f"({describe_process_group(pgid, proc_root=proc_root)})",
+            f"{group_description} {pgid} still alive after SIGKILL",
         )
 
     return failures
@@ -374,8 +251,7 @@ def kill_processes_matching_environment(
     )
     try:
         failures.extend(
-            f"{process_name} process {process.pid} still alive after SIGKILL "
-            f"({describe_process(process.pid, proc_root=proc_root)})"
+            f"{process_name} process {process.pid} still alive after SIGKILL"
             for process in surviving_processes
         )
     finally:
