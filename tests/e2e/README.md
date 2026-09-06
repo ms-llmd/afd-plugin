@@ -115,9 +115,50 @@ routing, GSM8K-7 with eight-shot prompting, and a 4096-token model length.
 The profile removes benchmark-only forced-routing variables from child server
 environments. It also disables the optional FlashInfer sampler because vLLM
 0.26.0 rejects Blackwell SM12 during that sampler's capability check; greedy
-GSM8K does not require it. Graph, DBO, asynchronous, multi-node, quantized,
-and multimodal coverage are out of scope; graph coverage remains excluded
-while #261 is unresolved.
+GSM8K does not require it. Graph, DBO, asynchronous, multi-node, and
+multimodal coverage are out of scope; graph coverage remains excluded while
+issue #261 is unresolved. Quantized coverage is provided by the FP8 profile
+below.
+
+### Qwen3.5-122B FP8 four-device CUDA profile
+
+`Qwen/Qwen3.5-122B-A10B-FP8` is the block-wise FP8 sibling of the profile
+above. Halving the weights to roughly 119 GiB lets the same two topologies run
+on **four** devices instead of eight, which is what makes 122B-class coverage
+reachable on a single 4x80 GB node. It is likewise manual, never downloads the
+checkpoint, and requires an explicit opt-in, an existing model path, and
+exactly four unique CUDA device IDs:
+
+```bash
+export AFD_E2E_BACKEND=gpu
+export AFD_E2E_LARGE_MODEL=1
+export AFD_GPU_E2E_FP8_MODEL=/path/to/Qwen3.5-122B-A10B-FP8
+# First two: AFD Attention. Last two: AFD FFN. All four: native baseline.
+export AFD_E2E_DEVICES=0,1,2,3
+python -m pytest -q -s \
+  tests/e2e/models/qwen3_5/test_qwen3_5_122b_fp8.py
+```
+
+The two sequential cases are `baseline-eager` (native DP4/TP1/EP4 across all
+four devices) and `afd-eager-2a2f` (Attention DP2/TP1 on the first two, FFN
+DP2/TP1/EP2 on the last two). Note the asymmetry: the baseline owns the whole
+device list, while the AFD case splits it in half.
+
+The checkpoint's `quantization_config` declares `[128, 128]` block FP8 with
+dynamic activation scaling, so vLLM selects the FP8 loader from the checkpoint
+and the profile does **not** pass `--quantization`. `--dtype=bfloat16` stays
+correct: it is the activation dtype, not the weight dtype. Everything else
+matches the BF16 profile — text-only vLLM V1, natural routing, GSM8K-7 with
+eight-shot prompting, a 4096-token model length, cleared forced-routing
+variables, and the FlashInfer sampler disabled for the same SM12 reason.
+
+Two caveats when reading results. Block FP8 GEMM and grouped-GEMM take
+SM90/SM100 kernel paths; elsewhere vLLM falls back to Triton, so treat this
+profile as correctness coverage and do not compare its latency against the
+BF16 profile. And a 7-sample GSM8K gate has 14-point resolution, so a run that
+lands below the BF16 profile's score by one sample is expected quantization
+drift, not a topology regression. Graph, DBO, asynchronous, multi-node,
+per-tensor FP8, and multimodal coverage are out of scope.
 
 ### Local 2A1F cases
 
@@ -185,8 +226,8 @@ Use run-e2e to run the Qwen3 MoE GPU E2E tests with HF_HOME
 
 Provide `HF_HOME` and `AFD_E2E_BACKEND`. For default suites,
 `AFD_E2E_DEVICES` is optional and the model path is optional when Hugging Face
-download is available. The Qwen3.5-122B profile instead requires the explicit
-large-model variables documented above. The skill checks prerequisites, runs
+download is available. The two Qwen3.5-122B profiles instead require the
+explicit large-model variables documented above. The skill checks prerequisites, runs
 the selected cases, and reports failures and process cleanup.
 
 ## NPU async CAM smoke test

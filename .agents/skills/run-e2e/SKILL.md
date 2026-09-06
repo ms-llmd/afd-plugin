@@ -1,6 +1,6 @@
 ---
 name: run-e2e
-description: Use when the user asks to run, validate, or diagnose the AFD plugin's DeepSeek-V2-Lite GPU/NPU, Qwen3 MoE GPU, Qwen3.6 MoE CUDA, or opt-in Qwen3.5-122B CUDA end-to-end tests, including PR-gate E2E, GSM8K accuracy, graph, eager, DBO, or AFD topology scenarios.
+description: Use when the user asks to run, validate, or diagnose the AFD plugin's DeepSeek-V2-Lite GPU/NPU, Qwen3 MoE GPU, Qwen3.6 MoE CUDA, or the opt-in Qwen3.5-122B BF16/FP8 CUDA end-to-end tests, including PR-gate E2E, GSM8K accuracy, graph, eager, DBO, or AFD topology scenarios.
 ---
 
 # Run AFD E2E Tests
@@ -15,6 +15,8 @@ Run one of the model suites:
   evidence for the Qwen3.5/3.6 adapter family)
 - `tests/e2e/models/qwen3_5/test_qwen3_5_122b.py` on eight CUDA devices
   (manual, eager-only large-model profile)
+- `tests/e2e/models/qwen3_5/test_qwen3_5_122b_fp8.py` on four CUDA devices
+  (manual, eager-only block-FP8 large-model profile)
 
 Each suite contains four gate scenarios:
 
@@ -63,8 +65,8 @@ or uv.lock.
 Fail before pytest when a prerequisite is missing; never turn it into a skip.
 
 Set HF_HOME before every run. Default pytest entrypoints download/cache GSM8K
-and the model when the backend model env var is unset. The Qwen3.5-122B
-profile only caches GSM8K and never downloads its checkpoint.
+and the model when the backend model env var is unset. Both Qwen3.5-122B
+profiles only cache GSM8K and never download their checkpoints.
 
 ### 3. Configure the run
 
@@ -152,6 +154,29 @@ because vLLM 0.26.0 rejects Blackwell SM12 during its capability check. Report
 `baseline-eager` and `afd-eager-4a4f` separately, including cleanup and
 released GPU memory.
 
+For the Qwen3.5-122B FP8 four-device profile, run:
+
+~~~bash
+export AFD_E2E_BACKEND=gpu
+export AFD_E2E_LARGE_MODEL=1
+export AFD_GPU_E2E_FP8_MODEL=/path/to/Qwen3.5-122B-A10B-FP8
+export AFD_E2E_DEVICES=0,1,2,3
+python -m pytest -q -s \
+  tests/e2e/models/qwen3_5/test_qwen3_5_122b_fp8.py
+~~~
+
+Verify the model path and four unique devices before pytest. Device order is
+part of the contract, and the two cases use the list differently: the first two
+devices run AFD Attention DP2 and the last two run AFD FFN DP2/EP2, while
+`baseline-eager` runs native DP4 across all four. Do not pass `--quantization`
+and do not change `--dtype`; the checkpoint's `[128, 128]` block-FP8
+`quantization_config` selects the FP8 loader, and bfloat16 is the activation
+dtype. The eager, natural-routing, and FlashInfer restrictions above apply
+unchanged. Block FP8 falls back to Triton kernels off SM90/SM100, so report
+this profile as correctness only and make no latency claim. Report
+`baseline-eager` and `afd-eager-2a2f` separately, including cleanup and
+released GPU memory.
+
 Do not add backend markers or run scenarios in parallel; they share devices.
 
 For the local DeepSeek-V2-Lite 2A1F cases, run the same pytest entrypoint with
@@ -161,8 +186,8 @@ On cancellation, forward SIGTERM and allow over 90 seconds for cleanup.
 
 ### 5. Report
 
-Success means a default suite reports 4 passed and 0 skipped; the Qwen3.5-122B
-profile reports 2 passed and 0 skipped. Report the failed scenario, first
+Success means a default suite reports 4 passed and 0 skipped; each
+Qwen3.5-122B profile reports 2 passed and 0 skipped. Report the failed scenario, first
 actionable error, and cleanup status. Any skip is a gate failure.
 
 ## Environment reference
@@ -170,9 +195,10 @@ actionable error, and cleanup status. Any skip is a gate failure.
 | Variable | Backend | Required |
 |---|---|---|
 | AFD_E2E_BACKEND | both | yes: gpu or npu |
-| AFD_E2E_DEVICES | both | yes: four unique IDs for the default suite |
-| AFD_E2E_LARGE_MODEL | GPU | Qwen3.5-122B only: must equal 1 |
-| AFD_GPU_E2E_MODEL | GPU | Qwen3.5-122B: yes; default suites download when unset |
+| AFD_E2E_DEVICES | both | yes: four unique IDs; eight for the 122B BF16 profile |
+| AFD_E2E_LARGE_MODEL | GPU | Qwen3.5-122B profiles only: must equal 1 |
+| AFD_GPU_E2E_MODEL | GPU | Qwen3.5-122B BF16: yes; default suites download when unset |
+| AFD_GPU_E2E_FP8_MODEL | GPU | Qwen3.5-122B FP8 only: yes, an existing directory |
 | AFD_GPU_E2E_VLLM_BIN | GPU | no; defaults to vllm |
 | AFD_NPU_E2E_MODEL | NPU | no; downloads the selected suite's model when unset |
 | AFD_NPU_E2E_VLLM_BIN | NPU | no; defaults to vllm |

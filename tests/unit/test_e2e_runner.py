@@ -23,6 +23,9 @@ from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
 from tests.e2e.models.qwen3_5 import test_qwen3_5_122b as qwen3_5_122b_e2e
+from tests.e2e.models.qwen3_5 import (
+    test_qwen3_5_122b_fp8 as qwen3_5_122b_fp8_e2e,
+)
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
 
@@ -282,6 +285,164 @@ def test_qwen3_5_122b_correctness_clears_controlled_routing(monkeypatch):
     for name in qwen3_5_122b_e2e.CONTROLLED_ROUTING_ENV_VARS:
         assert name not in env
     assert env[qwen3_5_122b_e2e.FLASHINFER_SAMPLER_ENV] == "0"
+
+
+@pytest.mark.parametrize("scenario", qwen3_5_122b_fp8_e2e.SCENARIOS)
+def test_qwen3_5_122b_fp8_entrypoint_builds_four_device_topologies(
+    monkeypatch,
+    tmp_path,
+    scenario,
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_DEVICES", "0,1,2,3")
+    monkeypatch.setenv("AFD_GPU_E2E_FP8_MODEL", "/models/qwen3.5-122b-fp8")
+
+    command = qwen3_5_122b_fp8_e2e.build_runner_command(scenario, tmp_path)
+
+    assert command[command.index("--model") + 1] == "/models/qwen3.5-122b-fp8"
+    assert (
+        command[command.index("--served-model-name-prefix") + 1]
+        == "qwen3-5-122b-fp8-afd"
+    )
+    for arg in qwen3_5_122b_fp8_e2e.COMMON_VLLM_ARGS:
+        assert f"--common-vllm-arg={arg}" in command
+    # The baseline owns all four devices as native DP4; 2A2F splits them 2+2.
+    if scenario == runner.AFD_EAGER_2A2F_SCENARIO:
+        assert command[command.index("--attention-devices") + 1] == "0,1"
+        assert command[command.index("--ffn-devices") + 1] == "2,3"
+    else:
+        assert command[command.index("--attention-devices") + 1] == "0,1,2,3"
+        assert "--ffn-devices" not in command
+
+
+@pytest.mark.parametrize("scenario", qwen3_5_122b_fp8_e2e.SCENARIOS)
+def test_qwen3_5_122b_fp8_entrypoint_defers_quantization_to_the_checkpoint(
+    monkeypatch,
+    tmp_path,
+    scenario,
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_DEVICES", "0,1,2,3")
+    monkeypatch.setenv("AFD_GPU_E2E_FP8_MODEL", "/models/qwen3.5-122b-fp8")
+
+    command = qwen3_5_122b_fp8_e2e.build_runner_command(scenario, tmp_path)
+
+    joined = " ".join(command)
+    assert "--quantization" not in joined
+    assert "--common-vllm-arg=--dtype=bfloat16" in command
+    assert "--compilation-config" not in joined
+    assert "--enable-dbo" not in joined
+    assert "--additional-config" not in joined
+
+
+def test_qwen3_5_122b_fp8_entrypoint_rejects_unsupported_scenarios(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_DEVICES", "0,1,2,3")
+    monkeypatch.setenv("AFD_GPU_E2E_FP8_MODEL", "/models/qwen3.5-122b-fp8")
+
+    with pytest.raises(ValueError, match="unsupported Qwen3.5-122B-FP8 scenario"):
+        qwen3_5_122b_fp8_e2e.build_runner_command(
+            runner.AFD_EAGER_4A4F_SCENARIO,
+            tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "error_message"),
+    [
+        ("AFD_E2E_LARGE_MODEL", None, "AFD_E2E_LARGE_MODEL must be set"),
+        ("AFD_E2E_LARGE_MODEL", "0", "AFD_E2E_LARGE_MODEL must be set to 1"),
+        ("AFD_GPU_E2E_FP8_MODEL", None, "AFD_GPU_E2E_FP8_MODEL must be set"),
+        ("AFD_E2E_DEVICES", None, "AFD_E2E_DEVICES must be set"),
+        (
+            "AFD_E2E_DEVICES",
+            "0,1,2,3,4,5,6,7",
+            "AFD_E2E_DEVICES must contain exactly 4 devices",
+        ),
+        (
+            "AFD_E2E_DEVICES",
+            "0,1,2,2",
+            "AFD_E2E_DEVICES must contain unique devices",
+        ),
+    ],
+)
+def test_qwen3_5_122b_fp8_preflight_fails_before_dataset_download(
+    monkeypatch,
+    tmp_path,
+    env_name,
+    env_value,
+    error_message,
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_LARGE_MODEL", "1")
+    monkeypatch.setenv("AFD_GPU_E2E_FP8_MODEL", str(tmp_path))
+    monkeypatch.setenv("AFD_E2E_DEVICES", "0,1,2,3")
+    if env_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, env_value)
+    downloaded = False
+
+    def record_download(*_args):
+        nonlocal downloaded
+        downloaded = True
+
+    monkeypatch.setattr(qwen3_5_122b_fp8_e2e, "download_dataset", record_download)
+
+    with pytest.raises(RuntimeError, match=error_message):
+        qwen3_5_122b_fp8_e2e.prepare_e2e_assets()
+
+    assert downloaded is False
+
+
+def test_qwen3_5_122b_fp8_preflight_requires_existing_model_directory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_LARGE_MODEL", "1")
+    monkeypatch.setenv("AFD_GPU_E2E_FP8_MODEL", str(tmp_path / "missing"))
+    monkeypatch.setenv("AFD_E2E_DEVICES", "0,1,2,3")
+    monkeypatch.setattr(
+        qwen3_5_122b_fp8_e2e,
+        "download_dataset",
+        lambda *_args: pytest.fail("dataset download must not run"),
+    )
+
+    with pytest.raises(RuntimeError, match="must be an existing directory"):
+        qwen3_5_122b_fp8_e2e.prepare_e2e_assets()
+
+
+def test_qwen3_5_122b_fp8_preflight_rejects_non_gpu_before_download(
+    monkeypatch,
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+    downloaded = False
+
+    def record_download(*_args):
+        nonlocal downloaded
+        downloaded = True
+
+    monkeypatch.setattr(qwen3_5_122b_fp8_e2e, "download_dataset", record_download)
+
+    with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
+        qwen3_5_122b_fp8_e2e.prepare_e2e_assets()
+
+    assert downloaded is False
+
+
+def test_qwen3_5_122b_fp8_correctness_clears_controlled_routing(monkeypatch):
+    for name in qwen3_5_122b_fp8_e2e.CONTROLLED_ROUTING_ENV_VARS:
+        monkeypatch.setenv(name, "benchmark-value")
+
+    env = qwen3_5_122b_fp8_e2e.natural_routing_env()
+
+    for name in qwen3_5_122b_fp8_e2e.CONTROLLED_ROUTING_ENV_VARS:
+        assert name not in env
+    assert env[qwen3_5_122b_fp8_e2e.FLASHINFER_SAMPLER_ENV] == "0"
 
 
 @pytest.mark.parametrize(
