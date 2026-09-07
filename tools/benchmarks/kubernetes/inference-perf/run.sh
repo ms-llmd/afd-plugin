@@ -28,12 +28,12 @@
 #
 # recipe-script-path is the AFD recipe script to run inside the serve pod,
 # given as a path relative to the afd-plugin repo root baked into the image
-# (/opt/afd-plugin). Defaults to the 2P1A1F graph+DBO recipe; can also be set
-# via the RECIPE_SCRIPT_PATH env var. Example:
-#   ./run.sh recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_disaggregation/baseline.sh
+# (/opt/afd-plugin). Defaults to the 2A2F colocation graph+DBO recipe; can
+# also be set via the RECIPE_SCRIPT_PATH env var. Example:
+#   ./run.sh recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_disaggregation/2p1a1f_graph_dbo.sh
 #
 # GPU_COUNT sets the pod's nvidia.com/gpu request/limit (default 4, matching
-# the 2 prefill + 1 attention + 1 FFN workers the default recipe launches).
+# the 2 attention + 2 FFN workers the default recipe launches).
 #
 # MODEL_ID sets the HF repo id served by the pod (default
 # deepseek-ai/DeepSeek-V2-Lite).
