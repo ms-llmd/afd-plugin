@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/DeepSeek-V2-Lite}
 export VLLM_USE_V2_MODEL_RUNNER=0
 
