@@ -25,7 +25,7 @@ End-to-end launch scripts for running Qwen3.5-122B-A10B-FP8 with the AFD
 
 ## Directory layout
 
-```
+```text
 .
 └── prefill_decode_colocation/             # prefill_decode_colocation, 2A2F topology
     ├── 2a2f_graph_dp2tp1.sh
@@ -109,7 +109,7 @@ Both scripts run graph mode (`FULL_DECODE_ONLY`) with a capture size of 32
 (matches `--max-num-seqs`, which must stay `>=` the benchmark's max
 concurrency of 32):
 
-```
+```text
 --max-cudagraph-capture-size 32
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY",
                        "cudagraph_capture_sizes":[32]}'

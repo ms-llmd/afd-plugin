@@ -22,7 +22,7 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 
 ## Directory layout
 
-```
+```text
 .
 ├── prefill_decode_disaggregation/        # prefill_decode_disaggregation, 2P1A1F topology
 │   ├── 2p1a1f_eager_dbo.sh
@@ -152,7 +152,7 @@ and deployment configuration.
 
 Graph mode replaces `--enforce-eager` with:
 
-```
+```text
 --max-cudagraph-capture-size 64
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY",
                        "cudagraph_capture_sizes":[64]}'
