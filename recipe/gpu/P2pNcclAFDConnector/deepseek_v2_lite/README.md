@@ -34,6 +34,7 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
     ├── 2a2f_graph_dbo_dp1tp2.sh
     └── 2a2f_graph_dbo_dp2tp1.sh
 ```
+
 ### 1. Prefill/Decode Disaggregation — `1a1f`
 
 5 processes, 4 GPU workers + 1 proxy server:
@@ -83,6 +84,7 @@ Wait for `attn.log` (and `afd_prefill0.log`, `afd_prefill1.log` in disaggregatio
 before sending traffic.
 
 ### prefill_decode_colocation
+
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
 export VLLM_USE_V2_MODEL_RUNNER=0
