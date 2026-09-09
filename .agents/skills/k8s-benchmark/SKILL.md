@@ -1,6 +1,6 @@
 ---
 name: k8s-benchmark
-description: Use when the user asks to benchmark an AFD GPU recipe against its non-AFD baseline on Kubernetes/OpenShift, wants AFD-vs-native throughput/latency numbers, or needs a baseline recipe script created for an existing AFD colocation/disaggregation recipe. Do not use for local (non-k8s) benchmarking, NPU recipes, or E2E correctness testing (see run-e2e).
+description: Use when the user asks to benchmark an AFD GPU recipe against its non-AFD baseline on Kubernetes/OpenShift, wants AFD-vs-native throughput/latency numbers, or needs a baseline recipe script created for an existing AFD colocation recipe. Do not use for local (non-k8s) benchmarking, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e).
 ---
 
 # Benchmark an AFD GPU recipe vs. its baseline
@@ -13,11 +13,12 @@ for its GPU-equivalent non-AFD baseline, and compare the resulting reports.
 ## Scope
 
 - Recipes under `recipe/gpu/P2pNcclAFDConnector/**` only (GPU). Not NPU.
-- Both recipe topologies:
-  - `prefill_decode_colocation` -- attention + FFN workers only, no prefill
-    split (e.g. `2a2f_graph_dbo_dp2tp1.sh`, `4a4f_eager_dbo_dp2tp2.sh`).
-  - `prefill_decode_disaggregation` -- N prefill producers plus a decode side
-    split into attention + FFN workers (e.g. `2p1a1f_graph_dbo.sh`).
+- Only the `prefill_decode_colocation` topology -- attention + FFN workers
+  only, no prefill split (e.g. `2a2f_graph_dbo_dp2tp1.sh`,
+  `4a4f_eager_dbo_dp2tp2.sh`). `prefill_decode_disaggregation` recipes (e.g.
+  `2p1a1f_graph_dbo.sh`) are out of scope -- they require a NIXL-enabled
+  image and a proxy in front of the prefill/decode split; ask the user to
+  use a different workflow for those.
 - Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s) or
   correctness E2E -- use `run-e2e` for the latter.
 - Requires:
@@ -26,17 +27,18 @@ for its GPU-equivalent non-AFD baseline, and compare the resulting reports.
     namespace.
   - `envsubst` (part of `gettext`) installed locally.
   - A benchmark image built from
-    [docker/Dockerfile.k8s-cuda](../../../docker/Dockerfile.k8s-cuda) (base
+    [docker/Dockerfile.ci](../../../docker/Dockerfile.ci) (base
     `vllm/vllm-openai:v0.26.0` with an editable `afd-plugin` install, repo
     sources baked in at `/opt/afd-plugin`) and pushed somewhere the cluster
-    can pull it from. The image only needs to provide `tools/` (e.g.
-    `tools/proxy_server.py`) and the `afd-plugin` install itself -- the AFD
-    recipe script is supplied fresh from local disk via a ConfigMap on every
-    run (step 5b), so editing/adding a recipe script never requires
-    rebuilding or repushing the image:
+    can pull it from. Colocation recipes need no NIXL install, so the plain
+    CI image is sufficient. The image only needs to provide the
+    `afd-plugin` install itself -- the AFD recipe script is supplied fresh
+    from local disk via a ConfigMap on every run (step 5b), so
+    editing/adding a recipe script never requires rebuilding or repushing
+    the image:
     ```bash
     IMAGE=<registry>/<repo>:<tag>
-    docker build -f docker/Dockerfile.k8s-cuda -t "$IMAGE" .
+    docker build -f docker/Dockerfile.ci -t "$IMAGE" .
     docker push "$IMAGE"
     ```
   - An `hf-token-secret` Secret in the namespace with a `token` key:
@@ -109,9 +111,8 @@ attention+FFN into one non-disaggregated worker whose
 `--data-parallel-size` is the *sum* of the attention and FFN DPs, keep
 everything else) plus fully worked before/after diffs for both topologies.
 Save the new script beside the source recipe using the existing naming
-convention (`baseline_<mode>_dp<N>tp<T>.sh` for colocation,
-`baseline_<mode>_<P>p<D>d.sh` for disaggregation) and add it to the
-topology's `README.md` table if one documents baseline scripts there.
+convention (`baseline_<mode>_dp<N>tp<T>.sh`) and add it to the topology's
+`README.md` table if one documents baseline scripts there.
 
 Before using any newly created baseline script:
 
@@ -196,19 +197,12 @@ rebinding the client-facing port off loopback: the recipe binds `:18305` to
 `127.0.0.1` (since it's normally run and benchmarked from within the same
 pod/host), but the pod needs it on `0.0.0.0` so the Service can reach it.
 Every internal worker port stays on `127.0.0.1` -- only the client-facing
-endpoint (a proxy in disaggregation recipes, the attention server itself in
-colocation recipes) needs to be reachable off-pod. The recipe ConfigMap is
-mounted read-only at `/recipe/recipe.sh`; the container writes a patched
-copy to `/work` with two textual rewrites applied: the host rebind above,
-and any `$SCRIPT_DIR/../.../tools` reference rewritten to the image's
-baked-in absolute `$REPO/tools` path (disaggregation recipes' proxy launch
-line depends on `tools/proxy_server.py` being reachable, but since the
-recipe script itself no longer lives inside the image at a known relative
-depth, its own relative lookup can't resolve on its own -- rewriting it to
-an absolute path sidesteps that instead of trying to reproduce the script's
-original directory depth). The script also strips `uv run` at execution
-time via a `uv` shim on `PATH` -- the image's base Python environment is
-already correct, so `uv run` is unnecessary there:
+endpoint (the attention server itself, since colocation recipes have no
+proxy) needs to be reachable off-pod. The recipe ConfigMap is mounted
+read-only at `/recipe/recipe.sh`; the container writes a patched copy to
+`/work` with that host rebind applied. The script also strips `uv run` at
+execution time via a `uv` shim on `PATH` -- the image's base Python
+environment is already correct, so `uv run` is unnecessary there:
 
 ```bash
 kubectl delete pod vllm-pod --ignore-not-found
@@ -247,7 +241,6 @@ spec:
         - -c
         - |
           set -euo pipefail
-          REPO=/opt/afd-plugin
           RECIPE_SCRIPT=/recipe/recipe.sh
           REAL_UV="$(command -v uv)"
           mkdir -p /work/bin
@@ -260,7 +253,7 @@ spec:
 
           RECIPE_BASENAME="$(basename "$RECIPE_SCRIPT" .sh)"
           PATCHED_SCRIPT="/work/${RECIPE_BASENAME}.patched.sh"
-          awk -v repo="$REPO" '
+          awk '
             { line[NR] = $0 }
             END {
               for (i = 1; i <= NR; i++) {
@@ -268,7 +261,6 @@ spec:
                 if (l ~ /--host 127\.0\.0\.1/ && i < NR && line[i+1] ~ /--port 18305/) {
                   gsub(/127\.0\.0\.1/, "0.0.0.0", l)
                 }
-                gsub(/\$SCRIPT_DIR(\/\.\.)*\/tools/, repo "/tools", l)
                 print l
               }
             }' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
@@ -301,7 +293,6 @@ spec:
             esac
           }
           for log in $LOGS; do
-            [ "$log" = "proxy.log" ] && continue
             marker="$(ready_marker "$log")"
             echo "--- waiting on $log (marker: $marker) ---"
             ready=0
@@ -319,22 +310,20 @@ spec:
             [ "$ready" = "1" ] || fail "timed out waiting for $log"
           done
 
-          case " $LOGS " in
-            *" proxy.log "*) HEALTH_PATH=/healthcheck; ENDPOINT="proxy" ;;
-            *)               HEALTH_PATH=/health;      ENDPOINT="attention server" ;;
-          esac
+          HEALTH_PATH=/health
+          ENDPOINT="attention server"
 
           echo "--- waiting on $ENDPOINT $HEALTH_PATH (127.0.0.1:18305) ---"
-          proxy_ready=0
+          endpoint_ready=0
           for i in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:18305$HEALTH_PATH" >/dev/null 2>&1; then
               echo "$ENDPOINT: ready"
-              proxy_ready=1
+              endpoint_ready=1
               break
             fi
             sleep 5
           done
-          [ "$proxy_ready" = "1" ] || fail "$ENDPOINT did not answer $HEALTH_PATH"
+          [ "$endpoint_ready" = "1" ] || fail "$ENDPOINT did not answer $HEALTH_PATH"
 
           echo "=== stack READY; drive load at 127.0.0.1:18305 ==="
           sleep infinity
@@ -391,7 +380,7 @@ for `AFD_PLUGIN_IMAGE`/`MODEL_ID`; export them under those names (or adjust
 the export line) before running the block: `TEMPLATE_IMAGE="$AFD_PLUGIN_IMAGE"
 TEMPLATE_MODEL="$MODEL_ID"`.
 
-**5d. Apply the Service in front of the proxy** (idempotent, apply on every
+**5d. Apply the Service in front of the attention server** (idempotent, apply on every
 run):
 
 ```bash
