@@ -1,0 +1,4 @@
+interface:
+  display_name: "AFD Kubernetes Benchmark"
+  short_description: "Benchmark an AFD GPU recipe against its non-AFD baseline on k8s"
+  default_prompt: "Use $k8s-benchmark to benchmark an AFD GPU recipe against its equivalent non-AFD baseline on Kubernetes."
