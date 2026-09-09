@@ -74,6 +74,16 @@ read the script's `MODEL_PATH` default and the model directory name
 `deepseek-ai/DeepSeek-V2-Lite`. If the mapping isn't obvious for a model
 family you haven't seen before, ask the user rather than guessing.
 
+If the model isn't published on HF Hub -- e.g. weights staged directly on
+the PVC at a fixed local path, matching the recipe script's own
+`MODEL_PATH` default (`MODEL_PATH=${MODEL_PATH:-/path/model_weights/...}`)
+-- `MODEL_ID` may instead be that literal in-container path (e.g.
+`/models/Qwen3.5-122B-A10B-FP8`) rather than a HF repo id. This works
+transparently for the serve pod (step 5c passes `MODEL_ID` straight through
+as the `MODEL_PATH` env var, and the recipe script already expects either
+form), but step 6b's inference-perf pod needs an extra volume mount in this
+case -- see the note there.
+
 ### 2. Compute GPU_COUNT
 
 `GPU_COUNT` = the number of distinct GPU indices across every
@@ -443,8 +453,9 @@ The serve pod is now reachable in-namespace at `http://vllm-service:18305`.
 **6a. Apply the inference-perf config** as a ConfigMap. This is the default
 `shared_prefix` load profile (250 prompt groups x 5 prompts/group, 7000-token
 shared system prompt, 256-token questions, 256-token outputs, Poisson
-arrivals ramping 5 -> 40 req/s in 60s stages) targeting `vllm-service:18305`
-with the model resolved in step 1:
+arrivals ramping 5 -> 40 req/s in 60s stages -- 4 stages total, matching the
+`stage_0` .. `stage_3` reports read back in step 8) targeting
+`vllm-service:18305` with the model resolved in step 1:
 
 ```bash
 envsubst '${MODEL_ID}' <<'EOF' | kubectl apply -f -
@@ -463,15 +474,7 @@ data:
           duration: 60
         - rate: 10
           duration: 60
-        - rate: 15
-          duration: 60
         - rate: 20
-          duration: 60
-        - rate: 25
-          duration: 60
-        - rate: 30
-          duration: 60
-        - rate: 35
           duration: 60
         - rate: 40
           duration: 60
@@ -576,6 +579,49 @@ spec:
 EOF
 ```
 
+**If `MODEL_ID` is a local filesystem path** (per the step 1 note, rather than
+a HF Hub repo id): `inference-perf` loads its own tokenizer via
+`transformers.AutoTokenizer.from_pretrained(tokenizer.pretrained_model_name_or_path)`,
+which fails with `HFValidationError: Repo id must be in the form ...` if
+that value is a local path not present in *this* container -- mounting the
+reports PVC doesn't help, since it's a different PVC than the model
+weights. Add a read-only mount of the same `${PVC_NAME}` used by `vllm-pod`
+at the same path, and pin this pod to the same node as `vllm-pod` (its PVC
+is `ReadWriteOnce`, so a second pod can only attach it from that node --
+otherwise you get a `Multi-Attach error for volume ... Volume is already
+exclusively attached`):
+
+```bash
+VLLM_NODE="$(kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}')"
+```
+
+then add to the `inference-perf` container's `volumeMounts`:
+
+```yaml
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+```
+
+to `spec.volumes`:
+
+```yaml
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: ${PVC_NAME}
+        readOnly: true
+```
+
+and to the Pod's top-level `spec`:
+
+```yaml
+  nodeName: ${VLLM_NODE}
+```
+
+(substitute `${PVC_NAME}` and `${VLLM_NODE}` via `envsubst` alongside the
+rest of the manifest, same as step 5c). Skip all of this when `MODEL_ID` is
+a real HF Hub repo id -- the default spec above already handles that case.
+
 **6c. Wait for the pod to leave `Pending`, then stream its logs until the
 load test completes** (the default load profile takes ~8 minutes of load
 plus model-download/graph-capture startup time already spent in step 5):
@@ -668,8 +714,8 @@ can't run on the same pod at once).
 
 Both `reports_afd/` and `reports_baseline/` contain
 `summary_lifecycle_metrics.json` (pooled across all load stages) and
-`stage_0_lifecycle_metrics.json` .. `stage_7_lifecycle_metrics.json` (one per
-fixed-rate stage: 5, 10, 15, ..., 40 req/s, for the default load profile --
+`stage_0_lifecycle_metrics.json` .. `stage_N_lifecycle_metrics.json` (one per
+fixed-rate stage: 5, 10, 20, 40 req/s for the default 4-stage load profile --
 see `config.yaml` in either report dir for the exact stage schedule actually
 used, especially if a custom inference-perf config was used in step 6a).
 
