@@ -42,6 +42,7 @@ ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
 V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
 BASELINE_EAGER_SCENARIO = "baseline-eager"
+AFD_EAGER_2A2F_SCENARIO = "afd-eager-2a2f"
 AFD_EAGER_4A4F_SCENARIO = "afd-eager-4a4f"
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
@@ -59,7 +60,7 @@ V2_TENSOR_PARALLEL_SCENARIOS = frozenset(
 )
 E2E_RUN_ID_ENV = "AFD_E2E_RUN_ID"
 E2E_PROCESS_ROLE_ENV = "AFD_E2E_PROCESS_ROLE"
-PROCESS_TERMINATION_TIMEOUT_S = 20
+PROCESS_TERMINATION_TIMEOUT_S = 60
 PROCESS_POLL_INTERVAL_S = 0.2
 PROCESS_REAP_TIMEOUT_S = 5
 # NPU async teardown: workers blocked in uninterruptible driver/HCCL teardown
@@ -257,7 +258,7 @@ def parse_args() -> argparse.Namespace:
             "afd-eager-2a1f",
             "afd-graph-2a1f",
             "afd-graph-dbo-2a1f",
-            "afd-eager-2a2f",
+            AFD_EAGER_2A2F_SCENARIO,
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
             ASYNC_CAM_SCENARIO,
@@ -372,7 +373,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-eager-2a1f": (False, False, False, 2, 1),
         "afd-graph-2a1f": (False, True, False, 2, 1),
         "afd-graph-dbo-2a1f": (False, True, True, 2, 1),
-        "afd-eager-2a2f": (False, False, False, 2, 2),
+        AFD_EAGER_2A2F_SCENARIO: (False, False, False, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
         ASYNC_CAM_SCENARIO: (

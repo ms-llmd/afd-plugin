@@ -28,6 +28,7 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
   - "tests/e2e/models/qwen3_5/test_qwen3_5_122b.py"
+  - "tests/e2e/models/qwen3_5/test_qwen3_5_122b_fp8.py"
 upstream_refs:
   - "vLLM 0.26.0 serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
@@ -38,6 +39,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
   - "CUDA Qwen3.5-122B-A10B"
+  - "CUDA Qwen3.5-122B-A10B-FP8"
 related_issues: []
 last_reviewed: 2026-08-27
 ---
@@ -143,8 +145,8 @@ The Qwen3.5/3.6 adapter family has text-only CUDA E2E evidence through
 `baseline-graph`, and
 synchronous AFD 2A1F for `afd-eager`, `afd-graph`, and `afd-graph-dbo`.
 Multimodal, NPU, `compute_gate_on_attention=true`, pipeline-parallel,
-asynchronous, and multi-node execution are outside this case; quantization is
-unverified.
+asynchronous, and multi-node execution are outside this case; block-wise FP8 is
+covered only by the opt-in 122B-FP8 profile below.
 
 The opt-in Qwen3.5-122B-A10B profile covers a checkpoint size and 256-expert
 configuration that the default family case does not. It adds two eager-only
@@ -153,6 +155,20 @@ FFN DP4/TP1/EP4. The profile requires eight explicit devices,
 `AFD_E2E_LARGE_MODEL=1`, and an existing `AFD_GPU_E2E_MODEL`; it never
 downloads the checkpoint. It is manual hardware coverage, not a default PR or
 merge gate. Graph and DBO are outside this profile.
+
+The opt-in Qwen3.5-122B-A10B-FP8 profile is the block-wise FP8 sibling of that
+profile and the only E2E evidence for quantized weights crossing the AFD experts
+boundary. The checkpoint carries a `[128, 128]` block FP8 `quantization_config`,
+so vLLM selects the FP8 loader from the checkpoint itself and the profile never
+passes `--quantization`; `--dtype` remains the bfloat16 activation dtype. It adds
+two eager-only cases: native DP4/TP1/EP4 and synchronous AFD 2A2F, with Attention
+DP2/TP1 and FFN DP2/TP1/EP2. Halving the weights lets both cases fit four
+devices, so this profile satisfies `E2E-INV-002` as written and needs no
+exemption. It requires four explicit devices, `AFD_E2E_LARGE_MODEL=1`, and an
+existing `AFD_GPU_E2E_FP8_MODEL`; it never downloads the checkpoint. Block FP8
+GEMM and grouped-GEMM fall back to Triton off SM90/SM100, so the profile is
+correctness coverage and carries no performance claim. Graph, DBO, and
+per-tensor FP8 are outside this profile.
 
 ## Accuracy gate
 
