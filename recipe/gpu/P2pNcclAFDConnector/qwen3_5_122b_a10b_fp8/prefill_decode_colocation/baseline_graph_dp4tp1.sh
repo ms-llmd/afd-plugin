@@ -10,7 +10,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve "$MODEL_PATH" \
     --enable-expert-parallel \
     --dtype bfloat16 \
     --language-model-only \
-    --max-model-len 4096 \
+    --max-model-len 114688 \
     --mamba-cache-mode align \
     --all2all-backend allgather_reducescatter \
     --seed 0 \

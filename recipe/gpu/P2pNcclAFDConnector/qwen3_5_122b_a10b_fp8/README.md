@@ -97,7 +97,7 @@ shape; `role` differs between attention and FFN:
 
 ### Model-specific flags kept fixed across both scripts
 
-`--dtype bfloat16 --language-model-only --max-model-len 4096
+`--dtype bfloat16 --language-model-only --max-model-len 114688
 --mamba-cache-mode align --all2all-backend allgather_reducescatter --seed 0`
 are part of this model's serving contract and must not be changed between
 the AFD and baseline scripts -- only the AFD role split, DP size, and
