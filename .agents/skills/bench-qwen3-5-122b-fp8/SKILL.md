@@ -55,6 +55,16 @@ export SCENARIO=afd-eager-2a2f
 export RESULT_DIR=/tmp/results/$SCENARIO
 ~~~
 
+`--model-loader-extra-config '{"enable_multithread_load": true, "num_threads":
+96}'` parallelizes safetensors shard reads. It is the other half of the startup
+cost the K2a cache PVC does not touch: the cache skips recompilation, this skips
+serialized weight reads of the ~122 GB checkpoint. The threads are I/O-bound on
+the model PVC, so 96 is deliberately above the pod's CPU limit (K1 caps at 32);
+lower it only if the container is CPU-throttled during load or the storage
+backend degrades under the concurrency. Like the cache, it changes startup time
+and nothing that is measured - keep it identical across all four scenarios
+anyway, so bring-up logs stay comparable.
+
 The FP8 checkpoint carries a block-wise (128x128) `quantization_config`, so
 vLLM selects the FP8 weight loader itself. Keep `--dtype=bfloat16` (that is the
 activation dtype) and never pass `--quantization`.
@@ -70,7 +80,8 @@ export VLLM_ENGINE_READY_TIMEOUT_S=18000
 export PYTHONPATH=$REPO
 COMMON=(--dtype=bfloat16 --language-model-only --max-model-len=4096
         --mamba-cache-mode=align --all2all-backend=allgather_reducescatter
-        --seed=0 --max-num-seqs=64 --max-num-batched-tokens=8192)
+        --seed=0 --max-num-seqs=64 --max-num-batched-tokens=8192
+        --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 96}')
 GRAPH=(--max-num-seqs=32 --max-cudagraph-capture-size=32
        --cudagraph-capture-sizes=32
        --compilation-config='{"cudagraph_mode":"FULL_DECODE_ONLY"}')
@@ -222,10 +233,13 @@ spec:
     - {name: LOGNAME,                 value: afd}   # required, see K2
     - {name: TMPDIR,                  value: /work/tmp}
     - {name: XDG_CACHE_HOME,          value: /work/xdg}
-    - {name: TORCHINDUCTOR_CACHE_DIR, value: /work/inductor}
-    - {name: TRITON_CACHE_DIR,        value: /work/triton}
-    - {name: VLLM_CACHE_ROOT,         value: /work/vllm}
     - {name: UV_CACHE_DIR,            value: /work/uv}
+    # compile / JIT caches live on the cache PVC so they survive the pod - see K2a
+    - {name: VLLM_CACHE_ROOT,         value: /var/cache/vllm/vllm}
+    - {name: CUDA_CACHE_PATH,         value: /var/cache/vllm/cuda}
+    - {name: CUDA_CACHE_MAXSIZE,      value: "4294967296"}
+    - {name: TRITON_CACHE_DIR,        value: /var/cache/vllm/triton}
+    - {name: TORCHINDUCTOR_CACHE_DIR, value: /var/cache/vllm/inductor}
     - {name: UV_LINK_MODE,            value: copy}
     - {name: UV_PROJECT_ENVIRONMENT,  value: /work/venv}   # required, see K3
     - {name: UV_NO_SYNC,              value: "1"}          # required, see K3
@@ -237,10 +251,13 @@ spec:
     - {name: work,   mountPath: /work}
     - {name: dshm,   mountPath: /dev/shm}
     - {name: models, mountPath: /models, readOnly: true}
+    # read-WRITE, and keyed by runtime so a version bump cannot read a stale cache
+    - {name: cache,  mountPath: /var/cache/vllm, subPath: vllm-0.26.0-cu129-sm100}
   volumes:
   - {name: work,   emptyDir: {}}
   - {name: dshm,   emptyDir: {medium: Memory, sizeLimit: 32Gi}}
   - {name: models, persistentVolumeClaim: {claimName: <model-pvc>}}
+  - {name: cache,  persistentVolumeClaim: {claimName: <cache-pvc>}}   # see K2a
 ```
 
 ```bash
@@ -288,6 +305,75 @@ locality; splitting them across pods breaks the connector.
    (`spec is immutable after creation`) - create only when absent.
 5. **Request all four GPUs on one pod.** That guarantees one node. Do not spread
    roles across pods to "save" GPUs.
+
+### K2a. Persist the compile caches on a PVC
+
+Every pod in K1 is fresh, so with `emptyDir` caches each scenario re-pays the
+same one-time compilation before it can serve a token: Triton autotuning, the
+`torch.compile`/Inductor artifacts vLLM keeps under `VLLM_CACHE_ROOT`, and the
+CUDA driver's PTX JIT. Pointing those caches at a PVC instead makes the first
+scenario populate them and every later pod on the same node reuse them.
+
+```yaml
+- {name: VLLM_CACHE_ROOT,         value: /var/cache/vllm/vllm}
+- {name: CUDA_CACHE_PATH,         value: /var/cache/vllm/cuda}
+- {name: TRITON_CACHE_DIR,        value: /var/cache/vllm/triton}
+- {name: TORCHINDUCTOR_CACHE_DIR, value: /var/cache/vllm/inductor}
+- {name: CUDA_CACHE_MAXSIZE,      value: "4294967296"}
+```
+
+`TORCHINDUCTOR_CACHE_DIR` belongs on the PVC with the other three - leaving it
+on `emptyDir` while moving the rest keeps the largest recompile. Keep
+`UV_CACHE_DIR`, `XDG_CACHE_HOME`, `TMPDIR`, and `HOME` on `emptyDir`: they hold
+per-pod state, not reusable compilation output. `CUDA_CACHE_MAXSIZE` is set
+because the JIT cache defaults to a few hundred MiB and silently evicts.
+
+What this does **not** speed up is weight loading. The ~122 GB FP8 checkpoint is
+read from the model PVC every time; only the node's page cache helps there.
+Expect the saving in compile and capture time, largest for the `*-graph`
+scenarios, not in time-to-first-weight.
+
+**Provisioning the cache PVC.**
+
+1. **Mount it read-write.** Unlike `/models`, this one is written. A stray
+   `readOnly: true` does not fail the pod - Triton and Inductor fall back or
+   raise mid-startup, after you have already taken four GPUs.
+2. **Make it writable by an arbitrary UID.** Under the restricted SCC the
+   container runs as a per-namespace UID with GID 0. An RWO PVC on a CSI driver
+   that honours `fsGroup` is relabelled automatically; NFS-style RWX volumes
+   usually are not. Seed it once from a throwaway pod
+   (`mkdir -p /var/cache/vllm && chmod -R g+rwXs /var/cache/vllm`) and verify
+   with a `touch` before trusting it.
+3. **Key the mount by runtime, not by scenario.** The `subPath` in K1 encodes
+   the vLLM version, CUDA version, and GPU arch. A cache written by a different
+   vLLM or a different arch is not merely useless, it is a source of confusing
+   startup failures; a new `subPath` value is the purge. Size it at 20-50 GiB.
+4. **Share it across scenarios, one pod at a time.** All four scenarios in the
+   matrix want the same compiled artifacts, and K5 already deletes each pod
+   before the next is created. Do not run two pods against one `subPath`
+   concurrently - Triton and Inductor tolerate it through atomic renames, but
+   the CUDA JIT cache does not, and a corrupted entry costs more than it saves.
+5. **Sizes are node-affine in practice.** The cache is keyed by GPU arch, and
+   K1 already pins every scenario to one node, so this adds no new constraint -
+   but if you re-pin after a teardown hang (K5), use a fresh `subPath` unless
+   the new node carries the same GPU product.
+
+**Verify the cache is actually being used**, once, before reading anything into
+the startup times:
+
+```bash
+kubectl exec afd-bench-$SCENARIO -- bash -c \
+  'touch /var/cache/vllm/.w && rm /var/cache/vllm/.w && du -sh /var/cache/vllm/*'
+```
+
+On the first scenario those directories are empty and grow during startup; on
+every later one they are already populated. If they stay empty across two
+scenarios, the env vars are not reaching the server process - check them in the
+detached script from K4, not just in the pod spec.
+
+A warm cache changes startup time only. It does not touch steady-state
+throughput or latency, so it cannot make scenarios incomparable - but never
+report a startup or bring-up duration without saying whether the cache was warm.
 
 ### K3. Ship the local tree and install it
 
@@ -394,7 +480,8 @@ kubectl delete pod afd-bench-$SCENARIO         # frees four GPUs; do it promptly
 ```
 
 Delete before provisioning the next scenario's pod, so the two never contend
-for the pinned node's GPUs. Then summarize locally:
+for the pinned node's GPUs. Delete the pod only - leave the cache PVC alone;
+it is what makes the next scenario's startup cheap (K2a). Then summarize locally:
 
 ```bash
 python .agents/skills/bench-qwen3-5-122b-fp8/scripts/summarize.py \
@@ -430,6 +517,11 @@ BuildConfig path rather than buildx, which the restricted SCC blocks.
 | `ModuleNotFoundError: afd_plugin` | ran bare `python3`/`vllm` instead of the `/work/venv` one (K3) |
 | `ENTRY_POINTS` missing `afd`; AFD run looks like native | shipped via `PYTHONPATH` instead of an editable install (K3) |
 | `uv run` re-downloading torch at benchmark time | `UV_PROJECT_ENVIRONMENT`/`UV_NO_SYNC` unset (K1, K3) |
+| Every scenario re-pays Triton/Inductor compilation | caches left on `emptyDir` instead of the cache PVC (K2a) |
+| Weight load takes many minutes despite a warm cache PVC | `--model-loader-extra-config` multithread load not passed (§3) |
+| `Permission denied` under `/var/cache/vllm` at startup | cache PVC mounted `readOnly`, or not writable by the arbitrary UID (K2a) |
+| Cache directories stay empty across scenarios | cache env vars set in the pod spec but not exported into the K4 script (K2a) |
+| Odd compile or JIT errors right after a vLLM/image bump | stale cache; bump the mount `subPath` (K2a) |
 | `setuptools-scm was unable to detect version` | `SETUPTOOLS_SCM_PRETEND_VERSION` unset and no `git` in the image (K3) |
 | `cmake` or CANN errors during install | `AFD_BUILD_ASCEND_OPS` not forced to `0` (K3) |
 | `tar: <path>: Cannot stat` | tracked file deleted locally but not staged (K3) |
@@ -469,6 +561,7 @@ deviation; call that parity.
 | `--max-num-batched-tokens` | 8192 | lets 1024-token prefills batch |
 | graph capture size | 32 | must be >= max concurrency or decode falls back to eager |
 | `--max-model-len` | 4096 | covers ISL 1024 + OSL 128 with headroom |
+| `--model-loader-extra-config` | `{"enable_multithread_load": true, "num_threads": 96}` | parallel safetensors load; startup only, must match across scenarios |
 
 A configuration tuned for deterministic single-request accuracy is not a
 benchmark configuration. If you inherit server flags from elsewhere, check
@@ -504,3 +597,5 @@ verify the GPUs are free before the next pod is scheduled.
 | `VLLM_USE_V2_MODEL_RUNNER` | server | `0` |
 | `VLLM_USE_FLASHINFER_SAMPLER` | server | `0` |
 | `CUDA_VISIBLE_DEVICES` | server | yes; per role |
+| `VLLM_CACHE_ROOT`, `CUDA_CACHE_PATH`, `TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR` | server | on Kubernetes yes: point at the cache PVC under `/var/cache/vllm` (K2a) |
+| `CUDA_CACHE_MAXSIZE` | server | recommended with a cache PVC: `4294967296` (K2a) |
