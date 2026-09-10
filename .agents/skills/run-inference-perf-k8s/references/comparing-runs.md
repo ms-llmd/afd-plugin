@@ -17,6 +17,10 @@ for d in ./reports/*/; do
 done
 ```
 
+If a run you want is missing locally -- it was never copied out, or predates
+the current session -- fetch it from the reports PVC first, per
+[fetching-past-reports.md](fetching-past-reports.md).
+
 Refuse to produce a delta if the profiles differ -- rerun instead. Two runs
 at different offered rates or prompt shapes are not a comparison, and a
 percentage between them is worse than no number at all. If the images or

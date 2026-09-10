@@ -295,61 +295,10 @@ reason the pod holds. `kubectl cp` shells out to `tar` inside the target
 container; this image provides `/bin/tar`, `/bin/sh` and `/bin/sleep`, which
 is what makes both the hold and the copy work.
 
-**Fallback -- reports whose pod is already gone.** Reports live on the
-`inference-perf-reports` PVC, so any earlier `RUN_ID` is still retrievable
-after its pod is deleted or evicted. Mount the PVC from a short-lived
-busybox helper, pinned to the serving node for the same `ReadWriteOnce`
-reason as above:
-
-```bash
-HELPER=inference-perf-reports-copy
-VLLM_NODE="$(kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}')"
-
-kubectl delete pod "${HELPER}" --ignore-not-found
-envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${HELPER}
-  labels:
-    app: inference-perf
-    role: reports-copy
-spec:
-  restartPolicy: Never
-  nodeName: ${VLLM_NODE}
-  containers:
-    - name: copy
-      image: busybox:1.36
-      command: ["sleep", "3600"]
-      volumeMounts:
-        - name: reports
-          mountPath: /reports
-          readOnly: true
-  volumes:
-    - name: reports
-      persistentVolumeClaim:
-        claimName: inference-perf-reports
-        readOnly: true
-EOF
-
-deadline=$(( $(date +%s) + 300 ))
-until [ "$(kubectl get pod "${HELPER}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; do
-  phase="$(kubectl get pod "${HELPER}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-  if [ "$phase" = "Failed" ] || [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "helper pod not Running (phase=${phase:-<none>})"
-    kubectl describe pod "${HELPER}" | tail -30
-    kubectl delete pod "${HELPER}" --ignore-not-found
-    exit 1
-  fi
-  sleep 5
-done
-
-kubectl exec "${HELPER}" -- ls /reports          # which RUN_IDs are on the PVC
-mkdir -p "${LOCAL_DIR}"
-kubectl cp "${HELPER}:/reports/${RUN_ID}/." "${LOCAL_DIR}"
-kubectl delete pod "${HELPER}" --ignore-not-found
-```
-
+**If that pod is already gone** -- an interrupted run, or an earlier
+`RUN_ID` you want to fetch later -- reports remain on the
+`inference-perf-reports` PVC independently of any pod. See
+[references/fetching-past-reports.md](references/fetching-past-reports.md).
 
 ### 7. Record the run manifest
 
