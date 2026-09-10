@@ -1,8 +1,8 @@
 # Fetching reports whose pod is already gone
 
-Shared by `run-inference-perf-k8s` and `run-vllm-bench-k8s` -- both hold
-their load-generator pod open and copy reports straight out of it. Use this
-instead when that pod no longer exists:
+The main skill's step 5 copies reports straight out of the `vllm-bench`
+pod, which holds open until the copy is done. Use this instead when that pod
+no longer exists:
 
 - the run was interrupted, or the pod was deleted, evicted, or hit
   `activeDeadlineSeconds`
@@ -17,32 +17,25 @@ a second pod can only attach it from the node where it is already mounted,
 otherwise `Multi-Attach error for volume ...` leaves the helper `Pending`
 indefinitely.
 
-Set `REPORTS_PVC` to the calling skill's PVC, `RUN_ID` to the run you want,
-and `LOCAL_DIR` to where it should land:
-
-| Calling skill | `REPORTS_PVC` |
-|---|---|
-| `run-inference-perf-k8s` | `inference-perf-reports` |
-| `run-vllm-bench-k8s` | `vllm-bench-reports` |
+Set `RUN_ID` to the run you want and `LOCAL_DIR` to where it should land:
 
 ```bash
-REPORTS_PVC=<pvc-name>
 RUN_ID=<run-id>
 LOCAL_DIR="./reports/${RUN_ID}"
 ```
 
 ```bash
-HELPER=inference-perf-reports-copy
+HELPER=vllm-bench-reports-copy
 VLLM_NODE="$(kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}')"
 
 kubectl delete pod "${HELPER}" --ignore-not-found
-envsubst '${HELPER} ${VLLM_NODE} ${REPORTS_PVC}' <<'EOF' | kubectl apply -f -
+envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
   name: ${HELPER}
   labels:
-    app: inference-perf
+    app: vllm-bench
     role: reports-copy
 spec:
   restartPolicy: Never
@@ -58,7 +51,7 @@ spec:
   volumes:
     - name: reports
       persistentVolumeClaim:
-        claimName: ${REPORTS_PVC}
+        claimName: vllm-bench-reports
         readOnly: true
 EOF
 

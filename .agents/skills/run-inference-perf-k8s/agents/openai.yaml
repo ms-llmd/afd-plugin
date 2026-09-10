@@ -1,4 +1,0 @@
-interface:
-  display_name: "Benchmark AFD with inference-perf"
-  short_description: "Run an inference-perf benchmark against an AFD recipe on k8s"
-  default_prompt: "Use $run-inference-perf-k8s to benchmark an AFD GPU recipe on Kubernetes with inference-perf and report the results."

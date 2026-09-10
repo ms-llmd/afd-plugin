@@ -1,6 +1,6 @@
 ---
 name: run-vllm-bench-k8s
-description: Use when the user asks to benchmark an AFD GPU recipe on Kubernetes/OpenShift with vllm bench serve (or the repo's tools/benchmarks/request_generator.sh) - measuring throughput, TTFT, TPOT, or ITL for a deployed recipe and producing a report for that run. Deploys via deploy-afd-k8s. This is the vLLM-native alternative to run-inference-perf-k8s; pick this one when the user names vllm bench, request_generator.sh, or wants parity with local decode_bench runs. Do not use for local (non-k8s) benchmarking, NPU recipes, or E2E correctness testing (see run-e2e).
+description: Use when the user asks to benchmark an AFD GPU recipe on Kubernetes/OpenShift with vllm bench serve (or the repo's tools/benchmarks/request_generator.sh) - measuring throughput, TTFT, TPOT, or ITL for a deployed recipe and producing a report for that run. Deploys via deploy-afd-k8s. Do not use for local (non-k8s) benchmarking, NPU recipes, or E2E correctness testing (see run-e2e).
 ---
 
 # Benchmark an AFD recipe with `vllm bench serve`
@@ -11,29 +11,6 @@ Deploy a recipe, drive load against it with the repo's
 report for **that one run**.
 
 One invocation = one run = one `RUN_ID` = one report.
-
-## Choosing between this and `run-inference-perf-k8s`
-
-Both deploy through `deploy-afd-k8s` and report the same metrics. They
-differ in the load generator:
-
-| | `run-vllm-bench-k8s` (this) | `run-inference-perf-k8s` |
-|---|---|---|
-| Driver | `vllm bench serve` via the repo's wrapper | `inference-perf` |
-| Image | the same AFD image the recipe runs on | `quay.io/inference-perf/inference-perf` |
-| Stages | **none** -- single-shot per invocation, so a ramp is a sweep of invocations (step 3) | native multi-stage in one config |
-| Workloads | `random`, `sonnet`, `sharegpt`, ... (vLLM datasets) | `shared_prefix`, `random`, ... |
-| Parity | matches local `decode_bench_server.sh` runs | none locally |
-
-Prefer this skill when the user names `vllm bench`, `request_generator.sh`,
-or wants numbers comparable to a local decode-bench run. Prefer
-`run-inference-perf-k8s` for prefix-cache workloads or when a single config
-should sweep several rates on its own.
-
-**Never compare a run from one skill against a run from the other.** The two
-harnesses differ in arrival process, tokenizer handling, and how they count
-output tokens; a cross-harness delta measures the harness. Comparisons must
-be vllm-bench-vs-vllm-bench.
 
 ## Scope
 
@@ -50,14 +27,13 @@ be vllm-bench-vs-vllm-bench.
 
 ```bash
 RECIPE_SCRIPT_PATH=<local-recipe-script-path>
-RUN_ID="$(basename "${RECIPE_SCRIPT_PATH}" .sh)-vllmbench-$(date +%Y%m%d-%H%M%S)"
+RUN_ID="$(basename "${RECIPE_SCRIPT_PATH}" .sh)-$(date +%Y%m%d-%H%M%S)"
 LOCAL_DIR="./reports/${RUN_ID}"
 echo "RUN_ID=${RUN_ID}"
 ```
 
-The `-vllmbench-` infix keeps these runs visibly distinct from
-`run-inference-perf-k8s` runs sharing a `./reports/` tree -- they must never
-be compared against each other.
+Every artifact is keyed on `RUN_ID`, which is what keeps one run's numbers
+from being confused with another's.
 
 ### 2. Deploy the recipe
 
@@ -70,34 +46,75 @@ Follow **`deploy-afd-k8s`** with `RECIPE_SCRIPT_PATH`. It returns
 pod serves, since the model id is sent in each request and used to load the
 tokenizer.
 
-### 3. Choose the sweep
+### 3. Choose the workload
 
-`vllm bench serve` is **single-shot**: one request rate and one concurrency
-per invocation. There is no stage schedule, so a ramp is a *sweep* -- the
-bench pod invokes the wrapper once per point and writes one result JSON per
-point. That is deliberate: per-point files give a clean per-rate table,
-whereas the native `--ramp-up-strategy` pools the whole ramp into a single
-result and cannot show where the knee is.
+**If the user did not say what to run, ask before deploying anything.** Put
+the question as a choice between the named workloads below, and say which
+one you will use if they have no preference. Do not silently pick one -- the
+workload *is* the result: a throughput number without its prompt shape and
+offered load is not quotable.
 
-State the profile and its rationale before running. Match offered load to
-the recipe's `--max-num-batched-tokens` from step 2: a recipe pinned at 64
-absorbs a 1024-token prompt in ~16 chunked-prefill steps, so a high rate
-puts it in permanent backpressure and the report measures queueing.
+Ask in this form:
 
-| Profile | ISL/OSL | `NUM_PROMPTS` | Sweep (`rate:concurrency`) | Use for |
-|---|---|---|---|---|
-| `smoke` | 256/128 | 64 | `inf:8` | Wiring check, ~1 min. Never a published number. |
-| `throughput-ramp` | 1024/256 | 512 | `2:64 4:64 8:64 16:64` | Default. Poisson arrivals at fixed rates; finds the knee. |
-| `max-throughput` | 1024/256 | 512 | `inf:16 inf:32 inf:64 inf:128` | Closed-loop ceiling. `inf` sends everything at t=0, so concurrency is the only limiter. |
+> Which workload should I benchmark `<recipe>` with?
+>   1. **balanced** (default) -- random 1024-token prompts, 256-token
+>      outputs, Poisson arrivals swept 2 -> 16 req/s. General serving
+>      behaviour and where latency starts to climb.
+>   2. **max-throughput** -- same prompts, all requests issued at once,
+>      concurrency swept 16 -> 128. The peak tokens/s this recipe can reach.
+>   3. **prefix-heavy** -- 10 shared 256-token prefixes reused across
+>      requests. Prefix-cache behaviour.
+>   4. **long-context** -- 8192-token prompts, 256-token outputs. Prefill
+>      cost on long inputs.
+>   5. **smoke** -- 64 short requests, ~1 minute. Checks the wiring only;
+>      never a published number.
+>   Or give me your own ISL/OSL, rate and concurrency.
 
-`REQUEST_RATE=inf` means "all requests at time 0" -- combined with
-`MAX_CONCURRENCY` that is a closed-loop test, which measures peak
-throughput. A finite rate uses Poisson arrivals and measures behaviour under
-an offered load, which is what latency SLOs care about. They answer
-different questions; do not mix them in one sweep.
+#### Built-in defaults
 
-Sweep until at least one point saturates (TTFT climbing, or `completed`
-below `num_prompts`). A sweep that never saturates measured headroom.
+Each workload is a complete set of values -- adopt them as-is unless the
+user overrides a specific knob. `SWEEP` is a list of `rate:concurrency`
+points; `vllm bench serve` is **single-shot**, so each point is one separate
+invocation of the wrapper (see step 4).
+
+| Workload | `DATASET_NAME` | `INPUT_LEN` | `OUTPUT_LEN` | `NUM_PROMPTS` | `SWEEP` (`rate:conc`) | Extra flags |
+|---|---|---|---|---|---|---|
+| **balanced** (default) | `random` | 1024 | 256 | 512 | `2:64 4:64 8:64 16:64` | -- |
+| **max-throughput** | `random` | 1024 | 256 | 512 | `inf:16 inf:32 inf:64 inf:128` | -- |
+| **prefix-heavy** | `prefix_repetition` | (unused) | (unused) | 512 | `2:64 4:64 8:64` | `--prefix-repetition-prefix-len 256 --prefix-repetition-suffix-len 256 --prefix-repetition-num-prefixes 10 --prefix-repetition-output-len 256` |
+| **long-context** | `random` | 8192 | 256 | 256 | `1:32 2:32 4:32` | -- |
+| **smoke** | `random` | 256 | 128 | 64 | `inf:8` | -- |
+
+`REQUEST_RATE=inf` means "issue every request at time 0", so with
+`MAX_CONCURRENCY` it is a closed-loop test measuring peak throughput. A
+finite rate uses Poisson arrivals and measures behaviour under an offered
+load, which is what latency SLOs care about. The two answer different
+questions -- do not mix them in a single sweep.
+
+`prefix_repetition` ignores `INPUT_LEN`/`OUTPUT_LEN` and takes its shape
+from its own flags, which go in `EXTRA_ARGS`. It must **not** be given
+`--dataset-path` (nor may `random`); vLLM rejects that combination.
+
+#### Other datasets
+
+`--dataset-name` also accepts `sharegpt`, `burstgpt`, `sonnet`, `hf`,
+`custom`, and several multimodal variants. These need a real corpus, so pass
+`--dataset-path <file-or-hf-id>` through `EXTRA_ARGS` and mount it into the
+bench pod. Use one when the user asks for realistic traffic rather than
+synthetic prompts; otherwise prefer `random`, whose ISL/OSL are exactly
+controllable and therefore reproducible.
+
+#### Sizing the sweep against the recipe
+
+Match offered load to the recipe's `--max-num-batched-tokens` from step 2. A
+recipe pinned at 64 absorbs a 1024-token prompt in ~16 chunked-prefill
+steps, so a high rate puts it in permanent backpressure and the report
+measures queueing rather than the recipe. Long-context makes this sharper:
+an 8192-token prompt at that budget needs ~128 steps.
+
+Sweep until at least one point saturates -- TTFT climbing, or `completed`
+below `NUM_PROMPTS`. A sweep where nothing saturates measured headroom, not
+capacity, and the report has to say so.
 
 ### 4. Run the sweep
 
@@ -113,15 +130,19 @@ The pod runs the AFD image, so the wrapper is already on disk at
   `--metric-percentiles` to `99` only, so without this the report cannot
   show end-to-end latency or p90.
 
+Export the workload chosen in step 3 -- these are the `balanced` defaults:
+
 ```bash
+DATASET_NAME=random
 INPUT_LEN=1024
 OUTPUT_LEN=256
 NUM_PROMPTS=512
-SWEEP="2:64 4:64 8:64 16:64"      # rate:concurrency, from step 3
+SWEEP="2:64 4:64 8:64 16:64"      # rate:concurrency
+WORKLOAD_ARGS=""                  # e.g. the --prefix-repetition-* flags
 
 kubectl delete pod vllm-bench --ignore-not-found
 
-envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS}' <<'EOF' | kubectl apply -f -
+envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS}' <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -168,13 +189,13 @@ spec:
             echo "=== sweep point rate=${rate} concurrency=${conc} ==="
             MODEL_PATH="${MODEL_ID}" \
             HOST=vllm-service PORT=18305 \
-            DATASET_NAME=random \
+            DATASET_NAME="${DATASET_NAME}" \
             INPUT_LEN="${INPUT_LEN}" OUTPUT_LEN="${OUTPUT_LEN}" \
             NUM_PROMPTS="${NUM_PROMPTS}" \
             REQUEST_RATE="${rate}" MAX_CONCURRENCY="${conc}" \
             RESULT_DIR="$OUT" \
             RESULT_FILENAME="rate_${rate}_conc_${conc}.json" \
-            EXTRA_ARGS="--percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 90,99 --label rate_${rate}_conc_${conc}" \
+            EXTRA_ARGS="--percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 90,99 --label rate_${rate}_conc_${conc} ${WORKLOAD_ARGS}" \
             bash "$GEN" || { echo "sweep point rate=${rate} conc=${conc} FAILED"; rc=1; }
           done
 
@@ -280,8 +301,7 @@ reason the pod holds.
 
 **If that pod is already gone** -- an interrupted run, or an earlier
 `RUN_ID` -- reports remain on the `vllm-bench-reports` PVC. See
-[fetching-past-reports.md](../run-inference-perf-k8s/references/fetching-past-reports.md),
-with `REPORTS_PVC=vllm-bench-reports`.
+[references/fetching-past-reports.md](references/fetching-past-reports.md).
 
 ### 6. Record the run manifest
 
@@ -295,8 +315,9 @@ cat > "${LOCAL_DIR}/run.json" <<EOF
   "image": "${AFD_PLUGIN_IMAGE}",
   "gpu_count": ${GPU_COUNT},
   "max_num_batched_tokens": <from deploy step 2>,
-  "profile": "<smoke|throughput-ramp|max-throughput|custom>",
-  "dataset": "random",
+  "workload": "<balanced|max-throughput|prefix-heavy|long-context|smoke|custom>",
+  "dataset": "${DATASET_NAME}",
+  "workload_args": "${WORKLOAD_ARGS}",
   "input_len": ${INPUT_LEN},
   "output_len": ${OUTPUT_LEN},
   "num_prompts": ${NUM_PROMPTS},
@@ -307,8 +328,9 @@ cat > "${LOCAL_DIR}/run.json" <<EOF
 EOF
 ```
 
-`"harness": "vllm-bench-serve"` is what stops a later comparison from
-pairing this run with an inference-perf one.
+Recording the workload and sweep next to the numbers is what keeps the
+report interpretable after the cluster is torn down, and lets
+`comparing-runs.md` check that two runs are actually comparable.
 
 ### 7. Report this run
 
@@ -352,18 +374,9 @@ was offered.
 
 ### 8. Comparing several runs
 
-Use
-[comparing-runs.md](../run-inference-perf-k8s/references/comparing-runs.md)
-for the method -- confirming runs are comparable, deriving a non-AFD
-baseline recipe, and reporting per-point deltas. Two substitutions apply:
-
-- "stage" there means "sweep point" here; compare points with the same
-  `rate:concurrency`, and refuse to compare across different sweeps.
-- Its field names are inference-perf's. Use the table in step 7 instead:
-  `mean_ttft_ms` / `mean_tpot_ms` / `output_throughput` in place of
-  `successes.latency.*` and `successes.throughput.*`.
-
-Both runs must have `"harness": "vllm-bench-serve"` in `run.json`.
+See [references/comparing-runs.md](references/comparing-runs.md) --
+confirming two runs are comparable, deriving the non-AFD baseline recipe to
+compare against, and reporting per-point deltas.
 
 ### 9. Leave the cluster in a known state
 

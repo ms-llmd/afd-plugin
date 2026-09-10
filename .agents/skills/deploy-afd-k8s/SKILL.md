@@ -1,6 +1,6 @@
 ---
 name: deploy-afd-k8s
-description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift - creating the model PVC, recipe ConfigMap, serve pod, and Service, and waiting until the endpoint answers. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e). To drive load against what this deploys, see run-inference-perf-k8s.
+description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift - creating the model PVC, recipe ConfigMap, serve pod, and Service, and waiting until the endpoint answers. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e). To drive load against what this deploys, see run-vllm-bench-k8s.
 ---
 
 # Deploy an AFD GPU recipe on Kubernetes
