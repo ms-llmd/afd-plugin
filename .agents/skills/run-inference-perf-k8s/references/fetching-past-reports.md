@@ -1,8 +1,8 @@
 # Fetching reports whose pod is already gone
 
-The main skill's step 6 copies reports straight out of the `inference-perf`
-pod, which holds open until the copy is done. Use this instead when that pod
-no longer exists:
+Shared by `run-inference-perf-k8s` and `run-vllm-bench-k8s` -- both hold
+their load-generator pod open and copy reports straight out of it. Use this
+instead when that pod no longer exists:
 
 - the run was interrupted, or the pod was deleted, evicted, or hit
   `activeDeadlineSeconds`
@@ -10,16 +10,23 @@ no longer exists:
   comparison (see [comparing-runs.md](comparing-runs.md))
 - you want to see which `RUN_ID`s are on the PVC at all
 
-Reports live on the `inference-perf-reports` PVC, independently of any pod,
-so every past run is still retrievable as long as that PVC exists. Mount it
-from a short-lived busybox helper, pinned to the serving node -- the PVC is
-`ReadWriteOnce`, so a second pod can only attach it from the node where it
-is already mounted, otherwise `Multi-Attach error for volume ...` leaves the
-helper `Pending` indefinitely.
+Reports live on a reports PVC, independently of any pod, so every past run
+is still retrievable as long as that PVC exists. Mount it from a short-lived
+busybox helper, pinned to the serving node -- the PVC is `ReadWriteOnce`, so
+a second pod can only attach it from the node where it is already mounted,
+otherwise `Multi-Attach error for volume ...` leaves the helper `Pending`
+indefinitely.
 
-Set `RUN_ID` to the run you want and `LOCAL_DIR` to where it should land:
+Set `REPORTS_PVC` to the calling skill's PVC, `RUN_ID` to the run you want,
+and `LOCAL_DIR` to where it should land:
+
+| Calling skill | `REPORTS_PVC` |
+|---|---|
+| `run-inference-perf-k8s` | `inference-perf-reports` |
+| `run-vllm-bench-k8s` | `vllm-bench-reports` |
 
 ```bash
+REPORTS_PVC=<pvc-name>
 RUN_ID=<run-id>
 LOCAL_DIR="./reports/${RUN_ID}"
 ```
@@ -29,7 +36,7 @@ HELPER=inference-perf-reports-copy
 VLLM_NODE="$(kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}')"
 
 kubectl delete pod "${HELPER}" --ignore-not-found
-envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
+envsubst '${HELPER} ${VLLM_NODE} ${REPORTS_PVC}' <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -51,7 +58,7 @@ spec:
   volumes:
     - name: reports
       persistentVolumeClaim:
-        claimName: inference-perf-reports
+        claimName: ${REPORTS_PVC}
         readOnly: true
 EOF
 
