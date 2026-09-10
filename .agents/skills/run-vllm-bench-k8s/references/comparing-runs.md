@@ -41,10 +41,11 @@ but with attention and FFN merged back into ordinary non-disaggregated vLLM
 data-parallel replicas and AFD/DBO removed.
 
 Look for an existing `baseline*.sh` in the same topology directory matching
-mode + TP + total GPU count before creating anything -- e.g.
-`baseline_graph_dp4tp1.sh` already covers `2a2f_graph_dbo_dp2tp1.sh`, while a
-`4a4f_..._dp2tp2` variant would need its own `baseline_graph_dp4tp2.sh` (8
-GPUs).
+mode + TP + total GPU count before creating anything -- e.g. under
+`qwen3_5_122b_a10b_fp8/prefill_decode_colocation/`, `baseline_graph_dp4tp1.sh`
+covers `2a2f_graph_dp2tp1.sh`. Most topology directories have no baseline
+yet, so expect to derive one; a `4a4f_..._dp2tp2` variant would need its own
+`baseline_graph_dp4tp2.sh` (8 GPUs).
 
 ### The merge rule
 

@@ -35,6 +35,9 @@ echo "RUN_ID=${RUN_ID}"
 Every artifact is keyed on `RUN_ID`, which is what keeps one run's numbers
 from being confused with another's.
 
+If the recipe is not provided, ask which recipe to use. Use the `./recipe`
+folder as the list of possible recipes.
+
 ### 2. Deploy the recipe
 
 Follow **`deploy-afd-k8s`** with `RECIPE_SCRIPT_PATH`. It returns

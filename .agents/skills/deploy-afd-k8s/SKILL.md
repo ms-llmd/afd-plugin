@@ -44,17 +44,30 @@ Callers only need `MODEL_ID`, `PVC_NAME`, and `GPU_COUNT` back.
 - A live, authenticated `kubectl`/`oc` session able to create/delete Pods,
   Services, ConfigMaps, and PVCs in the target namespace.
 - `envsubst` (from `gettext`) locally.
-- An image built from
-  [docker/Dockerfile.k8s-cuda](../../../docker/Dockerfile.k8s-cuda) and
-  pushed where the cluster can pull it. Use this file, **not**
-  `Dockerfile.ci`: the CI image uses BuildKit-only `COPY --link` (rejected by
-  the buildah/imagebuilder backend OpenShift Builds uses) and leaves
-  `HOME=/`, unwritable by the restricted SCC's random UID.
+- A benchmark image, pushed where the cluster can pull it, that satisfies
+  **all** of the following. There is no ready-made Dockerfile for this in
+  the repo -- ask the user which image to use, and confirm it meets this
+  spec before deploying:
+
+  | Requirement | Why |
+  |---|---|
+  | vLLM base matching `pyproject.toml` (`vllm==0.26.0`) | the recipe's flags are version-specific |
+  | An `afd-plugin` install | the recipe loads the plugin |
+  | Repo sources on disk (conventionally `/opt/afd-plugin`) | recipes and `tools/` are read from the image |
+  | No BuildKit-only syntax (`COPY --link`, `RUN --mount`) *if* built with buildah/imagebuilder | OpenShift Builds rejects it |
+  | App dir group-writable (`chgrp -R 0 <dir> && chmod -R g=u <dir>`) | the restricted SCC runs a random UID in group 0 |
+  | `HOME` set to a writable path | otherwise `HOME=/` and anything expanding `~` fails |
+  | `PYTHONDONTWRITEBYTECODE=1` | the random UID cannot write `__pycache__` into the app dir |
+
+  `docker/Dockerfile.ci` is the closest starting point in the repo, but it
+  does **not** meet this spec as written: it uses `COPY --link`, leaves
+  `HOME=/`, and does not make the app dir group-writable. Adjust those three
+  before using it on OpenShift, or supply an image that already conforms.
+
   ```bash
-  IMAGE=<registry>/<repo>:<tag>
-  docker build -f docker/Dockerfile.k8s-cuda -t "$IMAGE" .
-  docker push "$IMAGE"
+  IMAGE=<registry>/<repo>:<tag>     # must satisfy the table above
   ```
+
   The image supplies only the `afd-plugin` install. The recipe script is
   mounted fresh from local disk on every run (step 4b), so editing or adding
   a recipe never requires a rebuild.
