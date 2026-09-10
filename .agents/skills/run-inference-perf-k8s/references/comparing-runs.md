@@ -90,11 +90,19 @@ Compare **per stage**, then the pooled summary. At low offered rate variants
 usually look alike; the interesting result is the rate at which one starts
 queueing and the other doesn't, and pooling averages that away.
 
-For each stage present in all runs, tabulate from `successes.latency` --
-`request_latency` mean/p90/p99, `time_per_output_token`,
-`normalized_time_per_output_token` -- plus `successes.count` against the
-offered count. Give both absolute delta and percentage, always naming which
-run is the reference:
+For each stage present in all runs, tabulate the same metrics the single-run
+report uses -- **TTFT (`time_to_first_token`) and TPOT
+(`time_per_output_token`) are required**, mean and p99, alongside
+`request_latency`, `normalized_time_per_output_token`, throughput, and
+`successes.count` against the offered count.
+
+TTFT and TPOT are what make an AFD-vs-baseline delta interpretable: splitting
+attention from FFN changes prefill and decode by different amounts, so a
+single end-to-end number can stay flat while TTFT improves and TPOT
+regresses (or the reverse). Report the two separately and say which moved.
+
+Give both absolute delta and percentage, always naming which run is the
+reference:
 
 ```
 Reference: <baseline RUN_ID>
@@ -107,13 +115,16 @@ Model <MODEL_ID>, <n> GPUs, profile <name> (identical across runs)
 
 Call out, in this order:
 
-1. **Saturation point per run** -- the first stage where latency departs
-   from flat or successes drop. A recipe that saturates two stages later is
-   the headline result, more than any single-stage percentage.
-2. **Stages where the runs diverge**, with the direction named.
-3. **Stages where they are within noise** -- say so explicitly rather than
+1. **Saturation point per run** -- the first stage where TTFT departs from
+   flat (it moves before end-to-end latency) or successes drop. A recipe
+   that saturates two stages later is the headline result, more than any
+   single-stage percentage.
+2. **Which of TTFT / TPOT moved**, and in which direction. "Faster" with no
+   split between prefill and decode is not a usable finding.
+3. **Stages where the runs diverge**, with the direction named.
+4. **Stages where they are within noise** -- say so explicitly rather than
    reporting a small percentage as a finding.
-4. **Any run where no stage saturated** -- the ramp measured headroom, so
+5. **Any run where no stage saturated** -- the ramp measured headroom, so
    the comparison bounds the difference from below and nothing more.
 
 A single pooled percentage as the sole result is not an acceptable report:
