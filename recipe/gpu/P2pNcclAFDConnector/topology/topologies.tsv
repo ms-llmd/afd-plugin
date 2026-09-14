@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+#
+# The single source of truth for AFD deployment shapes. One row = one vLLM
+# process. `afd_launch.sh` derives everything else from these rows, so A, F,
+# --data-parallel-size, --data-parallel-start-rank and --headless cannot drift
+# out of agreement with each other.
+#
+# Columns (whitespace-separated):
+#
+#   scenario   name passed to afd_launch.sh
+#   proc       unique process id within the scenario; also the log file name
+#   role       attention | ffn
+#   host       host SLOT, not an address. afd_launch.sh maps slots to real
+#              addresses via HOSTS="h0=10.0.0.1 h1=10.0.0.2"; unmapped slots
+#              default to 127.0.0.1, which is what makes single-host scenarios
+#              need no configuration at all.
+#   dp_local   data-parallel engines this process runs (--data-parallel-size-local)
+#   tp         tensor-parallel size (--tensor-parallel-size); must be equal
+#              across every process of the same role
+#   gpus       CUDA_VISIBLE_DEVICES for this process, host-local device ids.
+#              Must list exactly dp_local * tp devices.
+#
+# Derived by afd_launch.sh, never written here:
+#
+#   dp_size       = sum of dp_local over the role's rows
+#   dp_start_rank = sum of dp_local over the role's PRECEDING rows, so ROW ORDER
+#                   DEFINES RANK ORDER. The role's first row owns DP rank 0.
+#   A, F          = dp_size * tp, per role
+#   AFD_HOST      = address of the host slot on the ffn row with dp_start_rank 0
+#   DP_ADDRESS    = address of the host slot on that role's dp_start_rank 0 row
+#   --headless    = set on every row whose dp_start_rank is not 0
+#
+# Runtime knobs are NOT in this table on purpose: MODE=eager|graph, DBO,
+# MODEL_PATH, MAX_NUM_SEQS and friends are environment variables, so any
+# scenario can be run in any mode without duplicating rows.
+#
+# scenario              proc    role        host    dp_local  tp  gpus
+
+# --- Single host -------------------------------------------------------------
+
+# Smallest shape that exercises the connector. 2 GPUs.
+1a1f                    attn0   attention   h0      1         1   0
+1a1f                    ffn0    ffn         h0      1         1   1
+
+# 4 GPUs. Equivalent to 2a2f_eager_dbo_dp2tp1.sh.
+2a2f-dp2tp1             attn0   attention   h0      2         1   0,1
+2a2f-dp2tp1             ffn0    ffn         h0      2         1   2,3
+
+# 4 GPUs, parallelism inside each rank instead of across ranks.
+# Equivalent to 2a2f_eager_dbo_dp1tp2.sh.
+2a2f-dp1tp2             attn0   attention   h0      1         2   0,1
+2a2f-dp1tp2             ffn0    ffn         h0      1         2   2,3
+
+# 8 GPUs. Equivalent to 4a4f_eager_dbo_dp2tp2.sh.
+4a4f-dp2tp2             attn0   attention   h0      2         2   0,1,2,3
+4a4f-dp2tp2             ffn0    ffn         h0      2         2   4,5,6,7
+
+# 6 GPUs, ratio 2: each FFN rank fans in from two Attention ranks.
+4a2f-ratio2             attn0   attention   h0      4         1   0,1,2,3
+4a2f-ratio2             ffn0    ffn         h0      2         1   4,5
+
+# --- Multi host --------------------------------------------------------------
+
+# One role per host, 2 GPUs each. This is the shape verified on OpenShift on
+# 2026-09-08, and the issue #327 "placement B" that succeeds: both FFN ranks
+# share one network namespace, so only FFN rank 0 ever binds AFD_HOST.
+2a2f-two-host           attn0   attention   h0      2         1   0,1
+2a2f-two-host           ffn0    ffn         h1      2         1   0,1
+
+# Issue #327 "placement C": the FFN role is split across hosts, so FFN rank 1
+# tries to bind AFD_HOST -- an address it does not own -- and fails. Expect
+# OSError: [Errno 99] before PR #328, and a healthy endpoint after it.
+2a2f-split-ffn          attn0   attention   h0      2         1   1,2
+2a2f-split-ffn          ffn0    ffn         h0      1         1   0
+2a2f-split-ffn          ffn1    ffn         h1      1         1   0
+
+# The mirror image: the Attention role is split across hosts instead. Both FFN
+# ranks stay together, so this succeeds on either side of PR #328. Run it beside
+# 2a2f-split-ffn to show that only the split role differs.
+2a2f-split-attn         attn0   attention   h0      1         1   1
+2a2f-split-attn         attn1   attention   h1      1         1   1
+2a2f-split-attn         ffn0    ffn         h0      2         1   0,2
+
+# Fully split: one rank per process, four host slots. On Kubernetes this is one
+# pod per rank, which is the closest match to the EKS setup in issue #327.
+2a2f-four-proc          attn0   attention   h0      1         1   0
+2a2f-four-proc          attn1   attention   h1      1         1   0
+2a2f-four-proc          ffn0    ffn         h2      1         1   0
+2a2f-four-proc          ffn1    ffn         h3      1         1   0
