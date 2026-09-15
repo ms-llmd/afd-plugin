@@ -7,7 +7,18 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
-from afd_plugin import _MODEL_REGISTRATIONS, _QWEN3_5_MODEL_REGISTRATIONS
+from afd_plugin import (
+    _INKLING_MODEL_REGISTRATIONS,
+    _MODEL_REGISTRATIONS,
+    _QWEN3_5_MODEL_REGISTRATIONS,
+)
+
+# Model families whose AFD implementation exists for CUDA only, keyed by the
+# family name used in the rejection message.
+_CUDA_ONLY_MODEL_FAMILIES = {
+    "Qwen3.5/3.6": _QWEN3_5_MODEL_REGISTRATIONS,
+    "Inkling": _INKLING_MODEL_REGISTRATIONS,
+}
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -31,11 +42,13 @@ def get_afd_model_config(
 
     for model_arch in model_config.hf_config.architectures:
         if model_arch in _MODEL_REGISTRATIONS:
-            if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
-                raise ValueError(
-                    "AFD Qwen3.5/3.6 supports CUDA execution only; "
-                    f"got device_type={device_type!r}",
-                )
+            if device_type != "cuda":
+                for family, registrations in _CUDA_ONLY_MODEL_FAMILIES.items():
+                    if model_arch in registrations:
+                        raise ValueError(
+                            f"AFD {family} supports CUDA execution only; "
+                            f"got device_type={device_type!r}",
+                        )
             # deepcopy preserves aliasing within the copied object graph, so
             # the pure-text identity hf_text_config is hf_config is retained
             # automatically. vLLM Ascend uses that identity to distinguish
