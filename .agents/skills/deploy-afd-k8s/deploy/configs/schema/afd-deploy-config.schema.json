@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/afd-plugin/.agents/skills/deploy-afd-k8s/deploy/configs/schema/afd-deploy-config.schema.json",
+  "title": "AFD deployment config",
+  "description": "Generalized description of a P2pNcclAFDConnector recipe (recipe/gpu/P2pNcclAFDConnector/**), consumed by .agents/skills/deploy-afd-k8s/deploy/generate_recipe.py to produce a recipe .sh (plus a manifest) that the deploy-afd-k8s skill deploys.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "model", "topology", "placement", "execution", "serving"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+      "description": "Used to name generated files, ConfigMaps, and labels. Must be a valid k8s name segment."
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "model_id"],
+      "properties": {
+        "family": {
+          "type": "string",
+          "description": "Recipe directory name this config generalizes, e.g. 'deepseek_v2_lite'. Used only for labeling."
+        },
+        "model_id": {
+          "type": "string",
+          "description": "HF Hub repo id (e.g. 'deepseek-ai/DeepSeek-V2-Lite') or a literal in-container path (e.g. '/models/Qwen3.5-122B-A10B-FP8') matching the recipe's own MODEL_PATH convention."
+        },
+        "trust_remote_code": {
+          "type": "boolean",
+          "default": true
+        },
+        "extra_serve_args": {
+          "type": "object",
+          "description": "Model-specific fixed vllm serve flags, keyed by flag name without leading '--'. Boolean true emits a bare flag (e.g. {\"language-model-only\": true} -> --language-model-only); any other value emits '--flag value'. Preserves insertion order.",
+          "additionalProperties": {
+            "type": ["string", "number", "boolean"]
+          },
+          "default": {}
+        }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "afd_enabled", "attention"],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["colocation"],
+          "description": "prefill_decode_disaggregation is out of scope for deploy-afd-k8s (see SKILL.md Scope) and is intentionally not representable here."
+        },
+        "afd_enabled": {
+          "type": "boolean",
+          "description": "false generates a baseline (non-AFD) recipe: a single DP/TP group with no --additional-config, using the 'attention' block below as the sole group."
+        },
+        "num_attention_ranks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required when afd_enabled is true. Must equal attention.data_parallel_size * attention.tensor_parallel_size."
+        },
+        "num_ffn_ranks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required when afd_enabled is true. Must equal ffn.data_parallel_size * ffn.tensor_parallel_size. Must divide num_attention_ranks evenly, with num_attention_ranks >= num_ffn_ranks."
+        },
+        "attention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["data_parallel_size", "tensor_parallel_size"],
+          "properties": {
+            "data_parallel_size": {"type": "integer", "minimum": 1},
+            "tensor_parallel_size": {"type": "integer", "minimum": 1}
+          }
+        },
+        "ffn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["data_parallel_size", "tensor_parallel_size"],
+          "properties": {
+            "data_parallel_size": {"type": "integer", "minimum": 1},
+            "tensor_parallel_size": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    },
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_mode"],
+      "properties": {
+        "node_mode": {
+          "type": "string",
+          "enum": ["single", "multi"],
+          "description": "single: attention+ffn in one recipe.sh / one Pod (today's behavior). multi: attention and ffn each get their own recipe.sh / Pod, scheduled on different nodes. multi requires afd_enabled=true. Experimental -- see SKILL.md caveat."
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["eager", "graph"]
+        },
+        "cudagraph_capture_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required when mode is 'graph'. Emitted as both --max-cudagraph-capture-size and the single entry of --compilation-config's cudagraph_capture_sizes."
+        }
+      }
+    },
+    "dbo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "decode_token_threshold": {"type": "integer", "minimum": 0, "default": 2},
+        "prefill_token_threshold": {"type": "integer", "minimum": 0, "default": 12}
+      },
+      "default": {"enabled": false}
+    },
+    "serving": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_num_seqs", "max_num_batched_tokens", "max_model_len"],
+      "properties": {
+        "max_num_seqs": {"type": "integer", "minimum": 1},
+        "max_num_batched_tokens": {"type": "integer", "minimum": 1},
+        "max_model_len": {"type": "integer", "minimum": 1},
+        "enable_expert_parallel": {"type": "boolean", "default": true}
+      }
+    }
+  }
+}
