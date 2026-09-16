@@ -257,6 +257,9 @@ def parse_args() -> argparse.Namespace:
             "afd-eager-2a2f",
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
+            "afd-eager-1a4f",
+            "afd-graph-1a4f",
+            "afd-graph-dbo-1a4f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
             *V2_SCENARIOS,
@@ -370,6 +373,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-eager-2a2f": (False, False, False, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
+        # FFN-skewed topology for families whose expert weights do not fit two
+        # ranks. Attention stays at one rank so attention TP and DP are both 1.
+        "afd-eager-1a4f": (False, False, False, 1, 4),
+        "afd-graph-1a4f": (False, True, False, 1, 4),
+        "afd-graph-dbo-1a4f": (False, True, True, 1, 4),
         ASYNC_CAM_SCENARIO: (
             False,
             False,

@@ -13,7 +13,8 @@ Recipes are organized by hardware backend, connector, and model:
 recipe/
 ├── gpu/
 │   └── P2pNcclAFDConnector/
-│       └── deepseek_v2_lite/
+│       ├── deepseek_v2_lite/
+│       └── inkling_small/
 └── npu/
     ├── CAMAsyncAFDConnector/
     │   └── deepseek_v3_2/
@@ -34,6 +35,7 @@ Directory names follow these conventions:
 | Hardware | Connector | Model | Recommended stage | v0.26 status | Recipe |
 | --- | --- | --- | --- | --- | --- |
 | GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Validated | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
+| GPU | `P2pNcclAFDConnector` | Inkling-Small | Decode | Unvalidated; no hardware run yet. Attention and FFN TP are fixed at 1 and `--language-model-only` is mandatory | [Launch examples](gpu/P2pNcclAFDConnector/inkling_small/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Validated | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Experimental v0.26 DP+TP/SP path; post-fix DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation; legacy PCP8 results are v0.19-only | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
 
