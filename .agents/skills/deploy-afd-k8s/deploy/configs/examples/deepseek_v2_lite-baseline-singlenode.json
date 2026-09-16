@@ -1,0 +1,23 @@
+{
+  "name": "deepseek-v2-lite-baseline-singlenode",
+  "model": {
+    "family": "deepseek_v2_lite",
+    "model_id": "deepseek-ai/DeepSeek-V2-Lite",
+    "trust_remote_code": true,
+    "extra_serve_args": {}
+  },
+  "topology": {
+    "strategy": "colocation",
+    "afd_enabled": false,
+    "attention": {"data_parallel_size": 4, "tensor_parallel_size": 1}
+  },
+  "placement": {"node_mode": "single"},
+  "execution": {"mode": "graph", "cudagraph_capture_size": 64},
+  "dbo": {"enabled": false},
+  "serving": {
+    "max_num_seqs": 64,
+    "max_num_batched_tokens": 64,
+    "max_model_len": 8192,
+    "enable_expert_parallel": true
+  }
+}

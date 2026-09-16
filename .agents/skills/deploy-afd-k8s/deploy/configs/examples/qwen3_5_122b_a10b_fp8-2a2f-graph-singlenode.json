@@ -1,0 +1,32 @@
+{
+  "name": "qwen3-5-122b-a10b-fp8-2a2f-graph-singlenode",
+  "model": {
+    "family": "qwen3_5_122b_a10b_fp8",
+    "model_id": "/path/model_weights/Qwen3.5-122B-A10B-FP8",
+    "trust_remote_code": false,
+    "extra_serve_args": {
+      "dtype": "bfloat16",
+      "language-model-only": true,
+      "mamba-cache-mode": "align",
+      "all2all-backend": "allgather_reducescatter",
+      "seed": 0
+    }
+  },
+  "topology": {
+    "strategy": "colocation",
+    "afd_enabled": true,
+    "num_attention_ranks": 2,
+    "num_ffn_ranks": 2,
+    "attention": {"data_parallel_size": 2, "tensor_parallel_size": 1},
+    "ffn": {"data_parallel_size": 2, "tensor_parallel_size": 1}
+  },
+  "placement": {"node_mode": "single"},
+  "execution": {"mode": "graph", "cudagraph_capture_size": 32},
+  "dbo": {"enabled": false},
+  "serving": {
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 114688,
+    "enable_expert_parallel": true
+  }
+}
