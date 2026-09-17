@@ -4,19 +4,28 @@
 
 Runs the ModelOpt NVFP4 checkpoint, the only quantized Inkling format the
 pinned vLLM 0.26.0 expert loader reads. The FFN role holds roughly 150 GB of
-routed experts, so the AFD scenarios use an FFN-skewed ``1a4f`` topology --
-four FFN ranks at ``--tensor-parallel-size 1`` with expert parallelism, which
-shards the experts by data parallelism rather than by TP. The adapter rejects
-``tensor_parallel_size > 1`` on both roles, so TP is never a capacity lever
-here.
+routed experts, so the AFD scenarios shard those experts across three FFN
+ranks at ``--tensor-parallel-size 1`` with expert parallelism, by data
+parallelism rather than by TP. The adapter rejects ``tensor_parallel_size > 1``
+on both roles, so TP is never a capacity lever here.
+
+The topology is the balanced ``3a3f`` rather than an FFN-skewed ``1a4f``:
+``P2pNcclAFDConnector`` orders its world as ``[F0, F1, ..., A0, A1, ...]`` and
+gives every FFN rank a subgroup of itself plus one or more consecutive
+Attention ranks, which requires ``num_attention_ranks >= num_ffn_ranks``. An
+FFN-skewed split is rejected outright by ``validate_p2p_topology``, so three
+ranks per role is the cheapest shape that keeps the expert capacity while
+satisfying that bound. ``n_routed_experts`` need not divide the FFN rank count:
+``determine_expert_map`` hands any remainder to the low ranks one expert at a
+time, so this checkpoint's 256 experts split 86/85/85.
 
 ``--language-model-only`` is mandatory, not a preference: Inkling builds its
 vision and audio towers from the checkpoint config, and the AFD adapter fails
 closed at model construction unless every multimodal per-prompt limit is zero.
 
-This suite requires a single node with at least five 80 GB GPUs and is not part
-of the ``test-ready`` gate, which runs on four L4s. ``afd-graph-1a4f`` and
-``afd-graph-dbo-1a4f`` exercise configurations that have no prior Inkling
+This suite requires a single node with at least six 80 GB GPUs and is not part
+of the ``test-ready`` gate, which runs on four L4s. ``afd-graph-3a3f`` and
+``afd-graph-dbo-3a3f`` exercise configurations that have no prior Inkling
 evidence: CUDA-graph capture across ``InklingMoE``'s aux-stream sink-expert
 overlap, and AFD's DBO yield interleaved with the native ``defer_mlp_add``
 cross-layer pipelining. Treat a failure in either as a finding about that mode,
@@ -46,15 +55,15 @@ INKLING_SMALL_MAX_MODEL_LEN = 4096
 # The conv-state page packs K/V and both short-conv streams into one block at
 # the model dtype, so the cache stays bfloat16 and the model dtype is pinned.
 INKLING_SMALL_DTYPE = "bfloat16"
-DEFAULT_DEVICE_IDS = ("0", "1", "2", "3", "4")
-ATTENTION_DEVICE_COUNT = 1
-AFD_FFN_DEVICE_COUNT = 4
+DEFAULT_DEVICE_IDS = ("0", "1", "2", "3", "4", "5")
+ATTENTION_DEVICE_COUNT = 3
+AFD_FFN_DEVICE_COUNT = 3
 BASELINE_DEVICE_COUNT = 4
 SCENARIOS = (
     "baseline-graph",
-    "afd-eager-1a4f",
-    "afd-graph-1a4f",
-    "afd-graph-dbo-1a4f",
+    "afd-eager-3a3f",
+    "afd-graph-3a3f",
+    "afd-graph-dbo-3a3f",
 )
 
 

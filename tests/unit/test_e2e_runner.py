@@ -166,7 +166,7 @@ def test_qwen3_6_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
 
 def test_inkling_small_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8,10")
+    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8,10,12")
     monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
 
     command = inkling_small_e2e.build_runner_command("baseline-graph", tmp_path)
@@ -176,19 +176,21 @@ def test_inkling_small_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("scenario", inkling_small_e2e.SCENARIOS[1:])
-def test_inkling_small_afd_entrypoint_uses_an_ffn_skewed_1a4f_split(
+def test_inkling_small_afd_entrypoint_uses_a_balanced_3a3f_split(
     monkeypatch,
     tmp_path,
     scenario,
 ):
+    # P2pNcclAFDConnector requires num_attention_ranks >= num_ffn_ranks, so the
+    # roles split the device list evenly rather than skewing it toward FFN.
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8,10")
+    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8,10,12")
     monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
 
     command = inkling_small_e2e.build_runner_command(scenario, tmp_path)
 
-    assert command[command.index("--attention-devices") + 1] == "2"
-    assert command[command.index("--ffn-devices") + 1] == "4,6,8,10"
+    assert command[command.index("--attention-devices") + 1] == "2,4,6"
+    assert command[command.index("--ffn-devices") + 1] == "8,10,12"
     assert (
         command[command.index("--served-model-name-prefix") + 1] == "inkling-small-afd"
     )
@@ -226,8 +228,8 @@ def test_inkling_small_scenarios_keep_both_roles_at_tensor_parallel_one(scenario
 
     assert runner.role_tp_size(args, "attention") == 1
     assert runner.role_tp_size(args, "ffn") == 1
-    assert args.num_attention_ranks == 1
-    assert args.num_ffn_ranks == 4
+    assert args.num_attention_ranks == 3
+    assert args.num_ffn_ranks == 3
 
 
 def test_inkling_small_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
@@ -235,7 +237,7 @@ def test_inkling_small_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path
     monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
 
     with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
-        inkling_small_e2e.build_runner_command("afd-eager-1a4f", tmp_path)
+        inkling_small_e2e.build_runner_command("afd-eager-3a3f", tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -548,6 +550,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-1a4f", (False, False, False, 1, 4, 1, 1, 1, False)),
         ("afd-graph-1a4f", (False, True, False, 1, 4, 1, 1, 1, False)),
         ("afd-graph-dbo-1a4f", (False, True, True, 1, 4, 1, 1, 1, False)),
+        ("afd-eager-3a3f", (False, False, False, 3, 3, 1, 1, 1, False)),
+        ("afd-graph-3a3f", (False, True, False, 3, 3, 1, 1, 1, False)),
+        ("afd-graph-dbo-3a3f", (False, True, True, 3, 3, 1, 1, 1, False)),
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),

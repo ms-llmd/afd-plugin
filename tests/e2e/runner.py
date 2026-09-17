@@ -260,6 +260,9 @@ def parse_args() -> argparse.Namespace:
             "afd-eager-1a4f",
             "afd-graph-1a4f",
             "afd-graph-dbo-1a4f",
+            "afd-eager-3a3f",
+            "afd-graph-3a3f",
+            "afd-graph-dbo-3a3f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
             *V2_SCENARIOS,
@@ -378,6 +381,14 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-eager-1a4f": (False, False, False, 1, 4),
         "afd-graph-1a4f": (False, True, False, 1, 4),
         "afd-graph-dbo-1a4f": (False, True, True, 1, 4),
+        # Balanced topology for the same FFN-heavy families. P2pNcclAFDConnector
+        # requires num_attention_ranks >= num_ffn_ranks, so the 1a4f split above
+        # cannot be served by it; 3a3f keeps three FFN ranks for expert capacity
+        # while satisfying that bound. Expert counts need not divide the FFN rank
+        # count: vLLM spreads any remainder one expert per low rank.
+        "afd-eager-3a3f": (False, False, False, 3, 3),
+        "afd-graph-3a3f": (False, True, False, 3, 3),
+        "afd-graph-dbo-3a3f": (False, True, True, 3, 3),
         ASYNC_CAM_SCENARIO: (
             False,
             False,
