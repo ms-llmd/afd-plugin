@@ -81,14 +81,16 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
+| `InklingForCausalLM` | `AFDInklingForCausalLM` | `AFDInklingForCausalLM` |
+| `InklingForConditionalGeneration` | `AFDInklingForConditionalGeneration` | `AFDInklingForConditionalGeneration` |
 
 Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
 The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
-V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
-separate wrapper around their matching native architecture. These aliases
+V2-derived implementation. DeepSeek V4, Qwen3 MoE, Qwen3.5/3.6, and Inkling
+each have a separate wrapper around their matching native architecture. These aliases
 express known compatible architecture families; they do not make any wrapper
 a generic MoE model API.
 
@@ -168,6 +170,35 @@ LoRA before language-model construction; NPU model-config resolution fails
 before model loading. Attention-side router transport, DBO, DP/EP/PP, async
 communication, multi-node, quantization, and performance are outside this
 adapter's current contract.
+
+### Inkling CUDA boundary
+
+`AFDInklingForCausalLM` and `AFDInklingForConditionalGeneration` wrap vLLM's
+native Inkling architecture. The split is the `self.mlp(mlp_in)` call inside
+`InklingDecoderLayer.forward`. Attention owns embeddings, norms, attention,
+both short convolutions, and the conv-state cache; FFN owns `InklingMoE`
+(router and sink experts included) or `InklingDenseMLP`. Both short
+convolutions stay on Attention because the MLP short-conv stream is a sub-range
+of the same paged block as K/V, which only the Attention role allocates.
+
+Unlike every other model AFD serves, the wrapped call does not return a
+finished residual contribution: it returns a TP-partial, pre-reduce,
+pre-convolution delta that the native layer feeds into a fused reduce-scatter →
+short convolution → all-gather → residual add → RMSNorm kernel. At
+`tensor_parallel_size=1` both collectives short-circuit, the fused Lamport path
+cannot be constructed, and the residual path degenerates to semantics a
+connector can feed with one tensor each way. The adapter therefore fails closed
+at construction for wider TP on either role; expert capacity comes from data
+parallelism with expert parallelism instead.
+
+This path is CUDA-only and text-only. It requires `--language-model-only` (or
+zero per-prompt limits for every modality), `--dtype bfloat16`,
+`--kv-cache-dtype auto`, `compute_gate_on_attention=false`, and
+`pipeline_parallel_size=1`, and accepts unquantized or ModelOpt NVFP4
+checkpoints only. Multimodal execution, sequence-parallel MoE, EPLB,
+speculative decoding (including the checkpoint's MTP depth layers), LoRA, and
+NPU are rejected before construction. The MTP and tower checkpoint prefixes are
+dropped on both roles.
 
 ## Forward-context contract
 

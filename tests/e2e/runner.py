@@ -373,8 +373,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-eager-2a2f": (False, False, False, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
-        # FFN-skewed topology for families whose expert weights do not fit two
-        # ranks. Attention stays at one rank so attention TP and DP are both 1.
         # Balanced topology for FFN-heavy families. P2pNcclAFDConnector requires
         # num_attention_ranks >= num_ffn_ranks, so an FFN-skewed split cannot be
         # served by it at all. Four ranks per role keeps the FFN expert capacity

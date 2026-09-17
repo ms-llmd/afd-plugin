@@ -10,16 +10,18 @@ AFD (Attention-FFN Disaggregation) plugin on vLLM `v0.26.0`.
 
 ## Prerequisites
 
-- At least 5 GPUs of 80 GB on one node (H100-class). The FFN role alone holds
-  roughly 150 GB of routed experts.
+- Eight GPUs of 80 GB on one node (H100-class): four Attention ranks and four
+  FFN ranks. The FFN role holds roughly 150 GB of routed experts, which the
+  four-way expert shard brings to roughly 41 GB per FFN GPU.
 - vLLM `v0.26.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
 - [`thinkingmachines/Inkling-Small-NVFP4`](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4)
   weights on disk. Both scripts default to
   `/path/model_weights/Inkling-Small-NVFP4`; override with `MODEL_PATH=...`
   when launching.
-- A free TCP port `6269` on `127.0.0.1` for the AFD p2p connector, and port
-  `18305` for the vLLM HTTP servers.
+- Free TCP port `6269` on `127.0.0.1` for the AFD p2p connector, and ports
+  `18305` (Attention) and `18306` (FFN) for the vLLM HTTP servers. Send traffic
+  to the Attention port; the FFN server is not an inference entry point.
 
 `--trust-remote-code` is not required: vLLM 0.26.0 registers `inkling_mm_model`
 in its own config registry.
@@ -89,6 +91,60 @@ multimodal input. `--language-model-only` is what makes every per-prompt
 modality limit zero; **without it the server exits during model
 construction**. Passing `--limit-mm-per-prompt '{"image":0,"audio":0}'` works
 equally well; `--enable-mm-embeds` is rejected either way.
+
+## Running
+
+Run either script from the repository root. Each one backgrounds both roles and
+writes `attn.log` and `ffn.log` into the current directory. Wait for
+`Application startup complete` in `attn.log` before sending traffic.
+
+```bash
+export MODEL_PATH=/path/model_weights/Inkling-Small-NVFP4
+bash recipe/gpu/P2pNcclAFDConnector/inkling_small/prefill_decode_colocation/4a4f_eager_dp4.sh
+```
+
+The graph variant takes the same environment plus an optional capture size,
+which fixes `--max-num-seqs`, `--max-num-batched-tokens`, and the single
+captured decode batch:
+
+```bash
+export MODEL_PATH=/path/model_weights/Inkling-Small-NVFP4
+export CUDA_GRAPH_CAPTURE_SIZE=8   # default
+bash recipe/gpu/P2pNcclAFDConnector/inkling_small/prefill_decode_colocation/4a4f_graph_dp4.sh
+```
+
+Requests go to the Attention server on port `18305`:
+
+```bash
+curl http://127.0.0.1:18305/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "'"$MODEL_PATH"'", "prompt": "The capital of France is",
+       "max_tokens": 32}'
+```
+
+## Scenarios
+
+`4a4f` is the only AFD topology this recipe ships, for the reasons above. The
+E2E suite (`tests/e2e/models/inkling_small/test_inkling_small.py`) runs four
+scenarios over the same 8-GPU node:
+
+| E2E scenario | Topology | Recipe script |
+| --- | --- | --- |
+| `baseline-graph` | Native DP4/TP1/EP4 on four GPUs, no AFD | none — stock vLLM, the accuracy reference |
+| `afd-eager-4a4f` | 4A4F, eager | [`4a4f_eager_dp4.sh`](prefill_decode_colocation/4a4f_eager_dp4.sh) |
+| `afd-graph-4a4f` | 4A4F, `FULL_DECODE_ONLY` CUDA graph | [`4a4f_graph_dp4.sh`](prefill_decode_colocation/4a4f_graph_dp4.sh) |
+| `afd-graph-dbo-4a4f` | 4A4F, graph plus native DBO | none — E2E only |
+
+DBO has no launch script here. Inkling's native `defer_mlp_add` already
+pipelines a layer's FFN contribution into the next layer, so interleaving AFD's
+DBO yield with it is exercised only under the E2E gate; add
+`--dbo-decode-token-threshold` / `--dbo-prefill-token-threshold` to the graph
+script if you want to reproduce that scenario by hand.
+
+An `8a8f` split would also satisfy both constraints (balanced, and 8 divides
+256) but needs a second node. `2a2f` divides the experts evenly as well, yet
+leaves roughly 75 GB of routed experts on each of two FFN GPUs, which does not
+leave 80 GB cards room for activations; it is untested here.
 
 ## Other pinned settings
 

@@ -8,9 +8,11 @@ MODEL_PATH=${MODEL_PATH:-/path/model_weights/Inkling-Small-NVFP4}
 # The fallback is the path AFD requires; silence the benign traceback.
 export LAMPORT_RS_SCONV=0
 
-# CUDA-graph capture over Inkling has no published AFD evidence yet: the MoE
-# layer overlaps its sink experts on an aux stream. Validate against the eager
-# recipe before relying on this variant.
+# CUDA-graph capture spans InklingMoE's aux-stream sink-expert overlap. This
+# recipe has been run at 4a4f on 8x H100-80GB and captured real graphs
+# (CUDA graph memory: FULL=1) rather than falling back; see ../README.md for
+# the full validation status. The capture size below fixes the single decode
+# batch that gets captured.
 CUDA_GRAPH_CAPTURE_SIZE=${CUDA_GRAPH_CAPTURE_SIZE:-8}
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve "$MODEL_PATH" \
