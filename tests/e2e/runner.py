@@ -260,9 +260,9 @@ def parse_args() -> argparse.Namespace:
             "afd-eager-1a4f",
             "afd-graph-1a4f",
             "afd-graph-dbo-1a4f",
-            "afd-eager-3a3f",
-            "afd-graph-3a3f",
-            "afd-graph-dbo-3a3f",
+            "afd-eager-4a4f",
+            "afd-graph-4a4f",
+            "afd-graph-dbo-4a4f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
             *V2_SCENARIOS,
@@ -383,12 +383,14 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-graph-dbo-1a4f": (False, True, True, 1, 4),
         # Balanced topology for the same FFN-heavy families. P2pNcclAFDConnector
         # requires num_attention_ranks >= num_ffn_ranks, so the 1a4f split above
-        # cannot be served by it; 3a3f keeps three FFN ranks for expert capacity
-        # while satisfying that bound. Expert counts need not divide the FFN rank
-        # count: vLLM spreads any remainder one expert per low rank.
-        "afd-eager-3a3f": (False, False, False, 3, 3),
-        "afd-graph-3a3f": (False, True, False, 3, 3),
-        "afd-graph-dbo-3a3f": (False, True, True, 3, 3),
+        # cannot be served by it. Four ranks per role keeps the FFN expert
+        # capacity while satisfying that bound, and the rank count must also
+        # divide the model's routed expert count -- Inkling pads num_experts up
+        # to a multiple of the EP size, and a padded count hands the last rank
+        # expert ids the checkpoint does not contain.
+        "afd-eager-4a4f": (False, False, False, 4, 4),
+        "afd-graph-4a4f": (False, True, False, 4, 4),
+        "afd-graph-dbo-4a4f": (False, True, True, 4, 4),
         ASYNC_CAM_SCENARIO: (
             False,
             False,
