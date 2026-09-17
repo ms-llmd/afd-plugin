@@ -84,3 +84,59 @@ is where the TTFT rise shows up instead.
 - **CUDA-graph capture is genuine at all 9 sizes** (`FULL=9 (largest=256)`,
   captured in 9 s for 0.13 GiB), which extends the previously validated
   capture evidence beyond the single size-8 path.
+
+## Per-GPU memory (measured 2026-09-17, both roles live)
+
+Device total is 81,559 MiB (79.65 GiB) per H100; vLLM sees 79.18 GiB usable.
+
+| GPU | Role | In use | Weights | KV cache | KV tokens | Activation | Non-torch | CUDA graph |
+|-----|------|--------|---------|----------|-----------|------------|-----------|------------|
+| 0 | Attention DP0 | 76,672 MiB (74.88 GiB) | 6.52 GiB | 63.48 GiB | 43,956 | 0.87 GiB | 1.83 GiB | 0.13 GiB |
+| 1 | Attention DP1 | 76,672 MiB (74.88 GiB) | 6.52 GiB | 63.48 GiB | 43,956 | 0.87 GiB | 1.83 GiB | 0.13 GiB |
+| 2 | Attention DP2 | 76,672 MiB (74.88 GiB) | 6.52 GiB | 63.48 GiB | 43,956 | 0.87 GiB | 1.83 GiB | 0.13 GiB |
+| 3 | Attention DP3 | 76,672 MiB (74.88 GiB) | 6.52 GiB | 63.48 GiB | 43,956 | 0.87 GiB | 1.83 GiB | 0.13 GiB |
+| 4 | FFN DP0/EP0 | 49,540 MiB (48.38 GiB) | ~46.5 GiB (derived) | **none** | 0 | — | ~1.8 GiB | — |
+| 5 | FFN DP1/EP1 | 49,540 MiB (48.38 GiB) | ~46.5 GiB (derived) | **none** | 0 | — | ~1.8 GiB | — |
+| 6 | FFN DP2/EP2 | 49,540 MiB (48.38 GiB) | ~46.5 GiB (derived) | **none** | 0 | — | ~1.8 GiB | — |
+| 7 | FFN DP3/EP3 | 49,540 MiB (48.38 GiB) | ~46.5 GiB (derived) | **none** | 0 | — | ~1.8 GiB | — |
+
+Attention-role figures are vLLM's own profiler output (`gpu_worker.py:857`),
+identical on all four ranks and reproducible across two independent bring-ups.
+The per-role sum is 72.83 GiB, matching the `--gpu-memory-utilization 0.92`
+target of 72.84 GiB.
+
+**The FFN role emits no memory-profiling or KV-cache lines at all** — it sizes
+no KV cache, so vLLM's profiling path never runs there. Its weight figure is
+therefore *derived*: measured device usage minus a CUDA-context/non-torch
+allowance of the same order the attention role reports. It covers the routed
+expert shard (256 experts / EP4 = 64 per GPU) plus Marlin workspace and
+activations. The checkpoint is 159.01 GiB on disk.
+
+The split is strongly asymmetric, and it is the same fact as the saturation
+result: attention GPUs run at 94% occupancy and are 85% KV cache, while FFN
+GPUs sit at 59% with ~31 GiB idle each. **All KV capacity is stranded on half
+the node.** Whole node: ~493 GiB of 637 GiB in use.
+
+## The idle stack self-destructs after 30 minutes
+
+Unrelated to the sweep but load-bearing for anyone re-running this: the FFN
+role dies of a NCCL watchdog timeout when left idle.
+
+```
+[rank0] Watchdog caught collective operation timeout:
+  WorkNCCL(SeqNum=30579, OpType=RECV, ..., Timeout(ms)=1800000)
+  ran for 1800013 milliseconds before timing out
+RuntimeError: Engine core process EngineCore_DP1 died unexpectedly
+```
+
+The FFN ranks block in an AFD p2p `RECV` waiting for attention traffic. With no
+requests the default 1800 s watchdog fires and tears down every FFN engine
+core; the attention server survives, so the pod stays `Running` and `/health`
+keeps answering while the stack is actually dead.
+
+Timing confirms it is purely an idle timer: the last sweep point completed at
+13:27:19 and the watchdog fired at 13:57:19, exactly 1800 s later. **All five
+sweep points ran against a healthy stack** (0 failed requests, full completion
+counts at every point), so the benchmark numbers above are unaffected. But a
+`Running` pod is not evidence the stack is alive — check `nvidia-smi` for four
+FFN compute processes, or the tail of `ffn.log`, before trusting a re-run.
