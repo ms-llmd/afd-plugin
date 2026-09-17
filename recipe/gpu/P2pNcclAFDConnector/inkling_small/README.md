@@ -28,22 +28,37 @@ in its own config registry.
 
 ```text
 .
-└── prefill_decode_colocation/     # prefill_decode_colocation, 1A4F topology
-    ├── 1a4f_eager_dp4.sh
-    └── 1a4f_graph_dp4.sh
+└── prefill_decode_colocation/     # prefill_decode_colocation, 4A4F topology
+    ├── 4a4f_eager_dp4.sh
+    └── 4a4f_graph_dp4.sh
 ```
 
-## Topology — `1a4f`
+## Topology — `4a4f`
 
-2 processes, 5 GPUs:
+2 processes, 8 GPUs:
 
 | GPUs       | Role      | DP | TP | Port  |
 |------------|-----------|----|----|-------|
-| 0          | Attention | 1  | 1  | 18305 |
-| 1, 2, 3, 4 | FFN       | 4  | 1  | 18305 |
+| 0, 1, 2, 3 | Attention | 4  | 1  | 18305 |
+| 4, 5, 6, 7 | FFN       | 4  | 1  | 18306 |
 
-Unlike the DeepSeek-V2-Lite recipes, this layout is deliberately **FFN-skewed
-and does not offer a TP variant**. Two properties of Inkling force it.
+Unlike the DeepSeek-V2-Lite recipes, this layout **does not offer a TP
+variant**, and the two roles carry equal rank counts. Three properties of
+Inkling and the connector force it.
+
+### The rank counts must be balanced, and must divide the expert count
+
+An earlier revision of this recipe used an FFN-skewed `1a4f` split. It cannot
+run: `P2pNcclAFDConnector` gives each FFN rank a subgroup of itself plus one or
+more consecutive Attention ranks, so `validate_p2p_topology` rejects
+`num_attention_ranks < num_ffn_ranks` before any weight loads.
+
+Four ranks per role is the smallest balanced shape that also loads. `InklingMoE`
+pads its FusedMoE expert count up to a multiple of the EP size, because the
+TRTLLM kernels assume equal contiguous per-rank slabs. With 256 routed experts
+an EP size of 3 pads to 258 and hands the last rank expert ids the checkpoint
+does not contain, failing in `load_expert_weight`. EP sizes 1, 2, 4 and 8 divide
+256 and load cleanly; 3, 5 and 6 do not.
 
 ### Tensor parallelism must be 1 on both roles
 
@@ -91,10 +106,18 @@ loader reads; an unquantized BF16 checkpoint also loads but needs roughly
 
 ## Validation status
 
-The eager script follows the adapter's supported contract. The graph script is
-**unvalidated**: CUDA-graph capture spans `InklingMoE`'s aux-stream sink-expert
-overlap, which has no published AFD evidence for this family. Validate against
-`1a4f_eager_dp4.sh` before relying on it.
+Both scripts have been exercised at `4a4f` on 8x H100-80GB. Each served GSM8K
+through the AFD boundary, and the graph variant captured real CUDA graphs
+(`CUDA graph memory: FULL=1`) rather than silently falling back, so the
+aux-stream sink-expert overlap does capture.
+
+Two caveats before relying on either. The E2E runs still fail their gate on a
+teardown hang: after the evaluation completes, the role processes survive
+SIGKILL (`process group still alive after SIGKILL`), independently of the
+teardown budget and of eager/graph/DBO mode. GPU memory always returns to 0 MiB,
+so nothing leaks, but scripted teardown needs checking. And the accuracy
+evidence is a 7-sample gate whose run-to-run spread is a full sample, which is
+too noisy to rank the modes against each other or against native.
 
 On H100 the NVFP4 routed experts run through the Marlin MoE backend, which
 dequantizes to BF16 activations (effectively W4A16). Confirm from the startup
