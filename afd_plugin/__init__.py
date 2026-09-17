@@ -131,11 +131,24 @@ _QWEN3_5_MODEL_REGISTRATIONS = MappingProxyType(
     }
 )
 
+_INKLING_MODEL_REGISTRATIONS = MappingProxyType(
+    {
+        "InklingForCausalLM": (
+            "afd_plugin.model_executor.models.inkling:AFDInklingForCausalLM"
+        ),
+        "InklingForConditionalGeneration": (
+            "afd_plugin.model_executor.models.inkling"
+            ":AFDInklingForConditionalGeneration"
+        ),
+    }
+)
+
 _MODEL_REGISTRATIONS = MappingProxyType(
     {
         **_DEEPSEEK_MODEL_REGISTRATIONS,
         **_QWEN_MODEL_REGISTRATIONS,
         **_QWEN3_5_MODEL_REGISTRATIONS,
+        **_INKLING_MODEL_REGISTRATIONS,
     }
 )
 
@@ -219,6 +232,7 @@ __all__ = [
     "parse_optional_afd_config",
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
+    "_INKLING_MODEL_REGISTRATIONS",
     "_MODEL_REGISTRATIONS",
     "_QWEN_MODEL_REGISTRATIONS",
     "_QWEN3_5_MODEL_REGISTRATIONS",

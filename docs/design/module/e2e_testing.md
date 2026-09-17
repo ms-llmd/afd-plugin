@@ -27,6 +27,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
+  - "tests/e2e/models/inkling_small/test_inkling_small.py"
 upstream_refs:
   - "vLLM 0.26.0 serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
@@ -141,6 +142,20 @@ synchronous AFD 2A1F for `afd-eager`, `afd-graph`, and `afd-graph-dbo`.
 Multimodal, NPU, `compute_gate_on_attention=true`, pipeline-parallel,
 asynchronous, and multi-node execution are outside this case; quantization is
 unverified.
+
+The Inkling-Small suite has CUDA E2E coverage through
+`thinkingmachines/Inkling-Small-NVFP4` at `--tensor-parallel-size 1` on both
+roles with `--language-model-only`. `baseline-graph` uses native DP4/TP1/EP4;
+`afd-eager-4a4f`, `afd-graph-4a4f`, and `afd-graph-dbo-4a4f` use synchronous
+4A4F. `4a4f` is the only AFD topology the adapter and `P2pNcclAFDConnector`
+admit: the connector requires `num_attention_ranks >= num_ffn_ranks`, and the
+FFN rank count must divide the checkpoint's 256 routed experts because
+`InklingMoE` pads its expert count to a multiple of the EP size. The suite
+needs eight 80 GB GPUs, so it is outside the four-L4 gate and is not listed
+under `verified_platform_refs`: its runs serve GSM8K through the AFD boundary
+but still fail the case on a teardown hang. Multimodal, NPU,
+`compute_gate_on_attention=true`, pipeline-parallel, asynchronous, and
+multi-node execution are outside this case.
 
 ## Accuracy gate
 

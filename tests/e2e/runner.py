@@ -257,6 +257,9 @@ def parse_args() -> argparse.Namespace:
             "afd-eager-2a2f",
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
+            "afd-eager-4a4f",
+            "afd-graph-4a4f",
+            "afd-graph-dbo-4a4f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
             *V2_SCENARIOS,
@@ -370,6 +373,16 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-eager-2a2f": (False, False, False, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
+        # Balanced topology for FFN-heavy families. P2pNcclAFDConnector requires
+        # num_attention_ranks >= num_ffn_ranks, so an FFN-skewed split cannot be
+        # served by it at all. Four ranks per role keeps the FFN expert capacity
+        # while satisfying that bound, and the rank count must also divide the
+        # model's routed expert count -- Inkling pads num_experts up to a
+        # multiple of the EP size, and a padded count hands the last rank expert
+        # ids the checkpoint does not contain.
+        "afd-eager-4a4f": (False, False, False, 4, 4),
+        "afd-graph-4a4f": (False, True, False, 4, 4),
+        "afd-graph-dbo-4a4f": (False, True, True, 4, 4),
         ASYNC_CAM_SCENARIO: (
             False,
             False,

@@ -1,8 +1,10 @@
 # End-to-End Tests
 
 These tests validate DeepSeek-V2-Lite on real GPU or Ascend NPU hardware,
-Qwen3 MoE on real GPU hardware, and Qwen3.6 MoE through the Qwen3.5/3.6
-adapter family on real CUDA hardware.
+Qwen3 MoE on real GPU hardware, Qwen3.6 MoE through the Qwen3.5/3.6
+adapter family on real CUDA hardware, and Inkling-Small on real CUDA hardware.
+The Inkling-Small suite needs eight 80 GB GPUs and is not part of the gate; see
+[Inkling-Small](#inkling-small) below.
 Each default gate runs four scenarios:
 
 - `baseline-graph`
@@ -103,6 +105,52 @@ python -m pytest -q -s \
   "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-2a1f]" \
   "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-dbo-2a1f]"
 ```
+
+### Inkling-Small
+
+This suite is not part of the `test-ready` gate, which runs on four L4s. It
+needs one node with at least eight 80 GB GPUs (H100-class) because the FFN role
+holds roughly 150 GB of routed experts. Its four scenarios are:
+
+- `baseline-graph` — native DP4/TP1/EP4 on the first four devices, no AFD
+- `afd-eager-4a4f`
+- `afd-graph-4a4f`
+- `afd-graph-dbo-4a4f`
+
+`4a4f` is the only AFD topology. `P2pNcclAFDConnector` requires
+`num_attention_ranks >= num_ffn_ranks`, so an FFN-skewed split is rejected
+before any weight loads, and the FFN rank count must divide the checkpoint's
+256 routed experts: `InklingMoE` pads the FusedMoE expert count up to a
+multiple of the EP size, and a padded count hands the last rank expert ids the
+checkpoint does not contain. Four is the smallest balanced count that
+satisfies both.
+
+The model is `thinkingmachines/Inkling-Small-NVFP4`, the only quantized Inkling
+format the pinned vLLM 0.26.0 expert loader reads. Every scenario runs at
+`--tensor-parallel-size 1` on both roles — the adapter rejects wider TP — and
+passes `--language-model-only`, without which model construction fails on the
+checkpoint's vision and audio towers. The AFD scenarios put Attention on the
+first four devices and FFN on the last four; `AFD_E2E_DEVICES` overrides the
+`0,...,7` default.
+
+`afd-graph-4a4f` and `afd-graph-dbo-4a4f` cover configurations with no prior
+Inkling evidence: CUDA-graph capture across `InklingMoE`'s aux-stream
+sink-expert overlap, and AFD's DBO yield interleaved with the native
+`defer_mlp_add` cross-layer pipelining. Treat a failure in either as a finding
+about that mode, not about the eager boundary.
+
+```bash
+export HF_HOME=/path/to/huggingface
+export AFD_E2E_BACKEND=gpu
+# Optional: export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7
+# Optional if the model is already local:
+# export AFD_GPU_E2E_MODEL=/path/to/Inkling-Small-NVFP4
+python -m pytest -q -s \
+  tests/e2e/models/inkling_small/test_inkling_small.py
+```
+
+Launch scripts for the same topology live in
+[`recipe/gpu/P2pNcclAFDConnector/inkling_small`](../../recipe/gpu/P2pNcclAFDConnector/inkling_small/README.md).
 
 ### GPU ModelRunnerV2 evidence matrix
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import importlib.metadata
@@ -49,7 +52,22 @@ def test_qwen3_moe_afd_model_registration_path_is_lazy_string():
         **afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS,
         **registrations,
         **afd_plugin._QWEN3_5_MODEL_REGISTRATIONS,
+        **afd_plugin._INKLING_MODEL_REGISTRATIONS,
     } == afd_plugin._MODEL_REGISTRATIONS
+
+
+def test_inkling_afd_model_registration_paths_are_lazy_strings():
+    registrations = afd_plugin._INKLING_MODEL_REGISTRATIONS
+
+    assert registrations == {
+        "InklingForCausalLM": (
+            "afd_plugin.model_executor.models.inkling:AFDInklingForCausalLM"
+        ),
+        "InklingForConditionalGeneration": (
+            "afd_plugin.model_executor.models.inkling"
+            ":AFDInklingForConditionalGeneration"
+        ),
+    }
 
 
 def test_qwen3_5_afd_model_registration_path_is_lazy_string():
