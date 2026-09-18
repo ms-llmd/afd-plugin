@@ -18,7 +18,6 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
-from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
@@ -199,11 +198,20 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
         self.vllm_config = vllm_config
         self.config = config
         self.top_k = int(config.num_experts_per_tok)
-        self.gate = ReplicatedLinear(
+        # Native DeepseekV2MoE builds its gate as GateLinear and passes the
+        # architecture's router dtype through out_dtype. GLM-5.2
+        # (``glm_moe_dsa``) forces fp32 routing without exposing
+        # ``moe_router_dtype``, so a plain ReplicatedLinear here would emit
+        # router logits in the activation dtype and silently diverge from the
+        # native expert selection. Reuse the native gate layer so every
+        # registered architecture keeps its own router dtype. GateLinear
+        # degrades to ReplicatedLinear plus the out_dtype cast off CUDA, which
+        # is what the native model does on those platforms as well.
+        self.router_dtype = native._get_moe_router_dtype(config)
+        self.gate = native.GateLinear(
             config.hidden_size,
             config.n_routed_experts,
-            bias=False,
-            quant_config=None,
+            out_dtype=self.router_dtype,
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -839,7 +847,26 @@ class AFDDeepseekV3ForCausalLM(AFDDeepseekV2ForCausalLM):
 
 
 class AFDGlmMoeDsaForCausalLM(AFDDeepseekV2ForCausalLM):
-    pass
+    """GLM-5.2 (``glm_moe_dsa``) causal LM wrapper for AFD execution.
+
+    GLM-5.2 reuses DeepSeek V3.2's DeepSeek Sparse Attention and DeepSeek's MoE
+    block unchanged, so the DeepSeek V2-derived role-aware construction, the
+    remote-experts boundary, and role-filtered weight loading all apply as-is.
+    Two GLM-specific config properties are load-bearing for AFD:
+
+    * ``index_topk`` is always present, so the Attention role always allocates
+      the DSA lightning-indexer ``topk_indices_buffer``.
+    * ``native._get_moe_router_dtype`` forces fp32 routing for ``glm_moe_dsa``
+      even though the checkpoint does not set ``moe_router_dtype``, so the
+      router logits crossing the AFD connector are fp32 rather than the
+      activation dtype.
+
+    vLLM 0.26.0 resolves the native ``GlmMoeDsaForCausalLM`` to
+    ``vllm.model_executor.models.deepseek_v2``; the NVIDIA-fused
+    ``vllm.models.deepseek_v32`` tree is reachable only through the
+    ``model_class_overrides`` development flag. This wrapper therefore mirrors
+    the native default implementation on CUDA.
+    """
 
 
 __all__ = [

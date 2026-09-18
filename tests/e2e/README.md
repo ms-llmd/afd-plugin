@@ -125,6 +125,56 @@ python -m pytest -q -s \
   -k 'afd-v2'
 ```
 
+### GLM-5.2 (`glm_moe_dsa`) — written, never executed
+
+The GLM-5.2 suite lives at
+`tests/e2e/models/glm_moe_dsa/test_glm_moe_dsa.py` and mirrors the Qwen3.6
+shape: a native `baseline-graph-ep16` control plus AFD eager, graph, and
+graph+DBO scenarios, all on GSM8K-7. It differs from every other suite in one
+respect: **it cannot run on a single node, and it has not been run at all.**
+
+GLM-5.2 is a ~744B checkpoint. With `compute_gate_on_attention=false` the FFN
+role owns 730.3B of the parameters — the routed experts alone are 724.8B, or
+98% of the model — while the Attention role owns 15.5B. The FFN rank count is
+therefore set by expert memory, not by preference:
+
+| dtype | FFN weights per rank | minimum FFN ranks | minimum topology | H100s |
+| --- | --- | --- | --- | --- |
+| FP8 | 730.3 GB / y | 16 (45.6 GB) | `16A16F` | 32 (4 nodes) |
+| BF16 | 1460.6 GB / y | 32 (45.6 GB) | `32A32F` | 64 (8 nodes) |
+
+Eight FFN ranks need 91.3 GB each in FP8 and do not fit an 80 GB card.
+`n_routed_experts=256` also requires the FFN rank count to divide 256, and
+`P2pNcclAFDConnector` requires `num_attention_ranks >= num_ffn_ranks`
+(`afd_plugin/distributed/topology.py`), which pins the Attention side at 16
+even though it only holds 15.5 GB. `16A16F` lands on node boundaries: FFN
+ranks are ordered first, so ranks 0-15 are FFN and 16-31 are Attention.
+
+Two gaps stand between this suite and evidence:
+
+1. **The runner is single-host.** `tests.e2e.runner` launches both roles with
+   local `subprocess.Popen` and `CUDA_VISIBLE_DEVICES`, with `--api-host` and
+   `--afd-host` defaulting to `127.0.0.1`. A 32-device run needs a multi-node
+   launcher that does not exist yet. The scenario table entries are in place,
+   so the remaining delta is the launcher, not the topology.
+2. **The checkpoint must be FP8.** A BF16 checkpoint doubles every figure
+   above and moves the minimum to `32A32F` on eight nodes. Point
+   `AFD_GPU_E2E_MODEL` at a local FP8 conversion if the upstream repo does not
+   publish one.
+
+Because no default device set can serve this model, the module requires
+`AFD_E2E_DEVICES` to name all 32 devices explicitly and skips otherwise:
+
+```bash
+export AFD_E2E_BACKEND=gpu
+export AFD_E2E_DEVICES=$(seq -s, 0 31)
+python -m pytest -q -s tests/e2e/models/glm_moe_dsa/test_glm_moe_dsa.py
+```
+
+The scaffolding itself — device split, scenario topology, and the argument
+contract — is covered by unit tests in `tests/unit/test_e2e_runner.py`, which
+run everywhere.
+
 ### Weekly GSM8K
 
 The weekly pipeline runs the Qwen3 MoE and Qwen3.6 MoE suites (baseline,

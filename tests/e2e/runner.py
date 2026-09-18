@@ -55,6 +55,26 @@ V2_SINGLE_RANK_SCENARIOS = frozenset(
 V2_TENSOR_PARALLEL_SCENARIOS = frozenset(
     ("afd-v2-eager-tp2", "afd-v2-graph-tp2"),
 )
+# GLM-5.2 (``glm_moe_dsa``) is a ~744B DSA MoE checkpoint whose FFN role owns
+# 730B of routed-expert weights, i.e. 98% of the model. An FP8 checkpoint needs
+# 16 FFN ranks to stay under an 80GB card, ``n_routed_experts=256`` requires the
+# FFN rank count to divide 256, and P2pNcclAFDConnector requires
+# num_attention_ranks >= num_ffn_ranks. 16A16F is therefore the smallest
+# topology that can serve it at all.
+GLM_MOE_DSA_BASELINE_SCENARIO = "baseline-graph-ep16"
+GLM_MOE_DSA_SCENARIOS = (
+    "afd-eager-16a16f",
+    "afd-graph-16a16f",
+    "afd-graph-dbo-16a16f",
+)
+GLM_MOE_DSA_ATTENTION_RANKS = 16
+GLM_MOE_DSA_FFN_RANKS = 16
+# Attention ranks expected by each baseline scenario; the baseline runs the
+# native model on one role with no FFN ranks.
+BASELINE_ATTENTION_RANKS = {
+    "baseline-graph": 4,
+    GLM_MOE_DSA_BASELINE_SCENARIO: GLM_MOE_DSA_ATTENTION_RANKS,
+}
 E2E_RUN_ID_ENV = "AFD_E2E_RUN_ID"
 E2E_PROCESS_ROLE_ENV = "AFD_E2E_PROCESS_ROLE"
 PROCESS_TERMINATION_TIMEOUT_S = 20
@@ -260,6 +280,8 @@ def parse_args() -> argparse.Namespace:
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
             *V2_SCENARIOS,
+            GLM_MOE_DSA_BASELINE_SCENARIO,
+            *GLM_MOE_DSA_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
@@ -390,6 +412,34 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-1a1f": (False, True, False, 1, 1),
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
+        GLM_MOE_DSA_BASELINE_SCENARIO: (
+            True,
+            True,
+            False,
+            GLM_MOE_DSA_ATTENTION_RANKS,
+            0,
+        ),
+        "afd-eager-16a16f": (
+            False,
+            False,
+            False,
+            GLM_MOE_DSA_ATTENTION_RANKS,
+            GLM_MOE_DSA_FFN_RANKS,
+        ),
+        "afd-graph-16a16f": (
+            False,
+            True,
+            False,
+            GLM_MOE_DSA_ATTENTION_RANKS,
+            GLM_MOE_DSA_FFN_RANKS,
+        ),
+        "afd-graph-dbo-16a16f": (
+            False,
+            True,
+            True,
+            GLM_MOE_DSA_ATTENTION_RANKS,
+            GLM_MOE_DSA_FFN_RANKS,
+        ),
     }
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
@@ -499,9 +549,14 @@ def validate_topology(
             f"--ffn-devices must contain exactly {args.num_ffn_ranks} device",
         )
     if args.baseline:
-        if args.num_attention_ranks != 4 or args.num_ffn_ranks != 0:
+        expected_attention_ranks = BASELINE_ATTENTION_RANKS[args.scenario]
+        if (
+            args.num_attention_ranks != expected_attention_ranks
+            or args.num_ffn_ranks != 0
+        ):
             raise ValueError(
-                "baseline E2E requires four Attention ranks and no FFN ranks",
+                f"baseline E2E scenario {args.scenario} requires "
+                f"{expected_attention_ranks} Attention ranks and no FFN ranks",
             )
         if role_tp_size(args, "attention") != 1:
             raise ValueError("baseline E2E requires Attention TP=1")

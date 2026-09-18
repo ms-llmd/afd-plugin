@@ -28,6 +28,7 @@ verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA boundary has focused unit coverage only"
+  - "GLM-5.2 alias has focused unit coverage only; no E2E or accuracy evidence"
 related_issues:
   - "#86"
   - "#88"
@@ -57,6 +58,7 @@ make a backend-specific worker class the shared model API.
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
+| GLM-5.2 alias contract | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_glm_moe_dsa_construction.py`](../../../tests/unit/model_executor/models/test_glm_moe_dsa_construction.py), [`test_glm_moe_dsa_weight_policy.py`](../../../tests/unit/model_executor/models/test_glm_moe_dsa_weight_policy.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
@@ -87,7 +89,18 @@ alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
 The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
-V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
+V2-derived implementation. GLM-5.2 (`glm_moe_dsa`) is a true alias: it reuses
+DeepSeek V3.2's sparse attention and DeepSeek's MoE block unchanged, and vLLM
+0.26.0 resolves the native `GlmMoeDsaForCausalLM` to
+`vllm.model_executor.models.deepseek_v2` as well, so the wrapper mirrors the
+native default implementation rather than the NVIDIA-fused
+`vllm.models.deepseek_v32` tree, which is reachable only through the
+`model_class_overrides` development flag. Two GLM-specific config properties
+are load-bearing and carry focused unit coverage: `index_topk` is always
+present, so the Attention role always allocates the DSA indexer buffer, and
+`_get_moe_router_dtype` forces fp32 routing for `glm_moe_dsa`, so router logits
+cross the connector as fp32. The alias rewrite changes `architectures` only,
+leaving the `model_type`-keyed fp32 routing intact. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
 separate wrapper around their matching native architecture. These aliases
 express known compatible architecture families; they do not make any wrapper
 a generic MoE model API.
