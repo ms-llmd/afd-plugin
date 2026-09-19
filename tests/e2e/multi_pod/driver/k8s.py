@@ -31,6 +31,10 @@ JOB_COMPLETION_INDEX_LABELS = (
 )
 LOG_ATTACH_RETRIES = 5
 LOG_ATTACH_RETRY_INTERVAL_S = 3.0
+# A long run outlives transient API-server or DNS failures on the driver's own
+# machine; losing one poll must not discard a test that is still running.
+KUBECTL_RETRIES = 6
+KUBECTL_RETRY_INTERVAL_S = 5.0
 POD_POLL_INTERVAL_S = 5.0
 TERMINAL_PHASES = ("Succeeded", "Failed")
 
@@ -126,14 +130,39 @@ def kubectl(args: argparse.Namespace, *command: str) -> list[str]:
     return invocation
 
 
+def run_kubectl(
+    args: argparse.Namespace,
+    *command: str,
+    stdin: str | None = None,
+    capture_output: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a kubectl command, retrying transient failures."""
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(KUBECTL_RETRIES):
+        try:
+            return subprocess.run(
+                kubectl(args, *command),
+                input=stdin,
+                text=True,
+                check=True,
+                capture_output=capture_output,
+                stdout=None if capture_output else subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempt < KUBECTL_RETRIES - 1:
+                print(
+                    f"kubectl {command[0]} failed ({exc.returncode}); "
+                    f"retry {attempt + 1}/{KUBECTL_RETRIES - 1}",
+                    flush=True,
+                )
+                time.sleep(KUBECTL_RETRY_INTERVAL_S)
+    assert last_error is not None
+    raise last_error
+
+
 def kubectl_apply(args: argparse.Namespace, obj: dict) -> None:
-    subprocess.run(
-        kubectl(args, "apply", "-f", "-"),
-        input=json.dumps(obj),
-        text=True,
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    run_kubectl(args, "apply", "-f", "-", stdin=json.dumps(obj))
 
 
 def apply_source_overlay(args: argparse.Namespace, spec: JobSpec) -> None:
@@ -141,36 +170,30 @@ def apply_source_overlay(args: argparse.Namespace, spec: JobSpec) -> None:
     configmap = spec.source_overlay_configmap
     if configmap is None:
         raise ValueError("--source-overlay given but the spec names no ConfigMap")
-    rendered = subprocess.run(
-        kubectl(
-            args,
-            "create",
-            "configmap",
-            configmap,
-            f"--from-file=source.tgz={args.source_overlay}",
-            "--dry-run=client",
-            "-o",
-            "json",
-        ),
-        text=True,
-        check=True,
+    rendered = run_kubectl(
+        args,
+        "create",
+        "configmap",
+        configmap,
+        f"--from-file=source.tgz={args.source_overlay}",
+        "--dry-run=client",
+        "-o",
+        "json",
         capture_output=True,
     ).stdout
-    subprocess.run(
-        kubectl(args, "apply", "-f", "-"),
-        input=rendered,
-        text=True,
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    run_kubectl(args, "apply", "-f", "-", stdin=rendered)
     print(f"published source overlay {spec.source_overlay_configmap}", flush=True)
 
 
 def list_pods(args: argparse.Namespace, spec: JobSpec) -> list[dict]:
-    result = subprocess.run(
-        kubectl(args, "get", "pods", "-l", f"job-name={spec.name}", "-o", "json"),
-        text=True,
-        check=True,
+    result = run_kubectl(
+        args,
+        "get",
+        "pods",
+        "-l",
+        f"job-name={spec.name}",
+        "-o",
+        "json",
         capture_output=True,
     )
     return json.loads(result.stdout)["items"]

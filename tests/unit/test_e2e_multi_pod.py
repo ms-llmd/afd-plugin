@@ -763,3 +763,54 @@ def test_terminate_process_groups_reaps_orphans_before_reporting_survivors(
 
     assert reaped == [True]
     assert not any("still alive after SIGKILL" in failure for failure in failures)
+
+
+def test_group_is_spent_when_every_member_is_a_zombie(tmp_path: Path):
+    _write_stat(tmp_path, "443", "VLLM::Worker_DP", "Z", "443")
+    _write_stat(tmp_path, "444", "VLLM::Worker_DP", "Z", "443")
+
+    assert process_utils.group_is_spent(443, proc_root=tmp_path) is True
+
+
+def test_group_is_not_spent_while_one_member_still_runs(tmp_path: Path):
+    _write_stat(tmp_path, "443", "VLLM::Worker_DP", "Z", "443")
+    _write_stat(tmp_path, "444", "pt_main_thread", "D", "443")
+
+    assert process_utils.group_is_spent(443, proc_root=tmp_path) is False
+
+
+def test_group_is_not_spent_when_it_cannot_be_inspected(tmp_path: Path):
+    """An uninspectable group must still be reported, never assumed dead."""
+    assert process_utils.group_is_spent(443, proc_root=tmp_path / "absent") is False
+
+
+def test_terminate_stops_waiting_once_the_group_is_only_zombies(
+    monkeypatch, tmp_path: Path
+):
+    """The SIGTERM wait must not burn its whole budget on dead-but-unreaped kids."""
+    _write_stat(tmp_path, "321", "VLLM::Worker_DP", "Z", "321")
+
+    class FakeProcess:
+        pid = 321
+        args = ["vllm"]
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(
+        process_utils.os, "killpg", lambda _pgid, _sig: None, raising=False
+    )
+    monkeypatch.setattr(process_utils.os, "kill", lambda _pid, _sig: None)
+
+    failures = process_utils.terminate_process_groups(
+        [cast(Any, FakeProcess())],
+        termination_timeout_s=120,
+        poll_interval_s=0,
+        reap_timeout_s=0,
+        proc_root=tmp_path,
+    )
+
+    assert failures == []

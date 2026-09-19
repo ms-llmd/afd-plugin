@@ -59,6 +59,7 @@ def terminate_process_groups(
     process_name: str = "",
     deferred_sigkill_pgids: Collection[int] = (),
     reap_orphans: Callable[[], int] | None = None,
+    proc_root: Path = PROC_ROOT,
 ) -> list[str]:
     """Terminate process groups with one deadline and reap their leaders.
 
@@ -115,6 +116,8 @@ def terminate_process_groups(
                 failures.append(
                     f"liveness check failed for {group_description} {pgid}: {exc}",
                 )
+            if group_is_spent(pgid, proc_root=proc_root):
+                continue
             surviving_pgids.append(pgid)
         live_pgids = surviving_pgids
         if not live_pgids or time.monotonic() >= deadline:
@@ -170,6 +173,8 @@ def terminate_process_groups(
                     f"post-SIGKILL liveness check failed for "
                     f"{group_description} {pgid}: {exc}",
                 )
+            if group_is_spent(pgid, proc_root=proc_root):
+                continue
             still_alive.append(pgid)
         surviving_pgids = still_alive
         if not surviving_pgids or time.monotonic() >= reap_deadline:
@@ -186,19 +191,34 @@ def terminate_process_groups(
     return failures
 
 
-def describe_process_group(
+@dataclass(frozen=True)
+class ProcessGroupMember:
+    """One process seen in a process group, as /proc reports it."""
+
+    pid: int
+    command: str
+    state: str
+    parent_pid: int
+
+    @property
+    def is_zombie(self) -> bool:
+        """Whether this process has exited and is only awaiting a reap."""
+        return self.state == "Z"
+
+    def __str__(self) -> str:
+        return (
+            f"pid {self.pid} ({self.command}) state={self.state} "
+            f"ppid={self.parent_pid}"
+        )
+
+
+def process_group_members(
     pgid: int,
     *,
     proc_root: Path = PROC_ROOT,
-) -> list[str]:
-    """Describe the live members of a process group, for teardown diagnostics.
-
-    The state letter is what distinguishes the two ways a group can survive
-    SIGKILL: ``Z`` means the process is already dead and merely unreaped, so a
-    survivor report is spurious, while ``D`` means an uninterruptible kernel
-    wait that SIGKILL genuinely cannot interrupt.
-    """
-    members: list[str] = []
+) -> list[ProcessGroupMember]:
+    """Return the processes currently in ``pgid``, empty if none can be read."""
+    members: list[ProcessGroupMember] = []
     try:
         entries = sorted(proc_root.iterdir(), key=lambda path: path.name)
     except OSError:
@@ -210,19 +230,51 @@ def describe_process_group(
             stat = (entry / "stat").read_text()
         except OSError:
             continue
-        # "pid (comm) state ppid pgrp ..."; comm may itself contain spaces
-        # and parentheses, so split after its final ')'.
+        # "pid (comm) state ppid pgrp ..."; comm may itself contain spaces and
+        # parentheses, so split after its final ')'.
         close = stat.rfind(")")
         if close == -1:
             continue
-        command = stat[stat.find("(") + 1 : close]
         fields = stat[close + 2 :].split()
         if len(fields) < 3 or fields[2] != str(pgid):
             continue
         members.append(
-            f"pid {entry.name} ({command}) state={fields[0]} ppid={fields[1]}",
+            ProcessGroupMember(
+                pid=int(entry.name),
+                command=stat[stat.find("(") + 1 : close],
+                state=fields[0],
+                parent_pid=int(fields[1]),
+            ),
         )
     return members
+
+
+def describe_process_group(
+    pgid: int,
+    *,
+    proc_root: Path = PROC_ROOT,
+) -> list[str]:
+    """Describe the members of a process group, for teardown diagnostics.
+
+    The state letter distinguishes the two ways a group can appear to survive
+    SIGKILL: ``Z`` means already dead and merely unreaped, ``D`` means an
+    uninterruptible kernel wait that SIGKILL genuinely cannot interrupt.
+    """
+    return [str(member) for member in process_group_members(pgid, proc_root=proc_root)]
+
+
+def group_is_spent(pgid: int, *, proc_root: Path = PROC_ROOT) -> bool:
+    """Whether every remaining member of ``pgid`` is an unreaped zombie.
+
+    A zombie still answers ``killpg(pgid, 0)``, so without this a process group
+    whose members have all exited is reported as surviving teardown. Returns
+    False when the group cannot be inspected at all, so an uninspectable group
+    is still reported rather than silently assumed dead.
+    """
+    members = process_group_members(pgid, proc_root=proc_root)
+    if not members:
+        return False
+    return all(member.is_zombie for member in members)
 
 
 def find_processes_matching_environment(
