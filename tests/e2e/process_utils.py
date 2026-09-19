@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +32,24 @@ def close_process_identities(processes: Sequence[ProcessIdentity]) -> None:
             os.close(process.pidfd)
 
 
+def reap_orphan_descendants() -> int:
+    """Reap every already-exited descendant, returning how many were reaped.
+
+    Only safe once the caller has waited on its own ``Popen`` children: a bare
+    ``waitpid(-1)`` would otherwise consume an exit status ``Popen.wait`` still
+    needs.
+    """
+    reaped = 0
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return reaped
+        if pid == 0:
+            return reaped
+        reaped += 1
+
+
 def terminate_process_groups(
     processes: Sequence[subprocess.Popen[str]],
     *,
@@ -40,6 +58,7 @@ def terminate_process_groups(
     reap_timeout_s: float,
     process_name: str = "",
     deferred_sigkill_pgids: Collection[int] = (),
+    reap_orphans: Callable[[], int] | None = None,
 ) -> list[str]:
     """Terminate process groups with one deadline and reap their leaders.
 
@@ -121,6 +140,9 @@ def terminate_process_groups(
                 )
             forced_pgids.append(pgid)
 
+    # A caller that is PID 1 must reap orphaned descendants before the liveness
+    # check below: an unreaped zombie still answers ``killpg(pgid, 0)``, so it
+    # would be reported as a survivor although it is already dead.
     reap_deadline = time.monotonic() + reap_timeout_s
     for process in processes:
         try:
@@ -129,6 +151,9 @@ def terminate_process_groups(
             failures.append(
                 f"wait failed for {process_description} {process.pid}: {exc}",
             )
+
+    if reap_orphans is not None:
+        reap_orphans()
 
     surviving_pgids = [
         pgid for pgid in forced_pgids if pgid not in deferred_sigkill_pgids
@@ -150,6 +175,8 @@ def terminate_process_groups(
         if not surviving_pgids or time.monotonic() >= reap_deadline:
             break
         time.sleep(poll_interval_s)
+        if reap_orphans is not None:
+            reap_orphans()
 
     for pgid in surviving_pgids:
         failures.append(
@@ -157,6 +184,45 @@ def terminate_process_groups(
         )
 
     return failures
+
+
+def describe_process_group(
+    pgid: int,
+    *,
+    proc_root: Path = PROC_ROOT,
+) -> list[str]:
+    """Describe the live members of a process group, for teardown diagnostics.
+
+    The state letter is what distinguishes the two ways a group can survive
+    SIGKILL: ``Z`` means the process is already dead and merely unreaped, so a
+    survivor report is spurious, while ``D`` means an uninterruptible kernel
+    wait that SIGKILL genuinely cannot interrupt.
+    """
+    members: list[str] = []
+    try:
+        entries = sorted(proc_root.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        # "pid (comm) state ppid pgrp ..."; comm may itself contain spaces
+        # and parentheses, so split after its final ')'.
+        close = stat.rfind(")")
+        if close == -1:
+            continue
+        command = stat[stat.find("(") + 1 : close]
+        fields = stat[close + 2 :].split()
+        if len(fields) < 3 or fields[2] != str(pgid):
+            continue
+        members.append(
+            f"pid {entry.name} ({command}) state={fields[0]} ppid={fields[1]}",
+        )
+    return members
 
 
 def find_processes_matching_environment(
