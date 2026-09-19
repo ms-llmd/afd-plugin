@@ -165,9 +165,7 @@ def test_plan_local_dp_sizes_sum_to_the_global_dp_size():
 
     for role_kind in (ATTENTION_ROLE, FFN_ROLE):
         slots = [
-            _slot(pod, role_kind)
-            for pod in pods
-            if pod.slot(role_kind) is not None
+            _slot(pod, role_kind) for pod in pods if pod.slot(role_kind) is not None
         ]
         assert sum(slot.dp_size_local for slot in slots) == slots[0].dp_size
 
