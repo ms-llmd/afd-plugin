@@ -1,0 +1,56 @@
+# AFD plugin E2E image for multi-pod runs on OpenShift.
+#
+# Differs from docker/Dockerfile.ci only where OpenShift requires it:
+#   - `COPY . .` instead of `COPY --link . .`  (buildah rejects --link)
+#   - a writable HOME and a group-writable app dir (restricted SCC runs an
+#     arbitrary UID in group 0)
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai
+ARG VLLM_BASE_TAG=v0.26.0
+
+FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
+
+ARG APP_DIR=/opt/afd-plugin
+WORKDIR ${APP_DIR}
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+RUN mkdir -p afd_plugin && touch afd_plugin/__init__.py
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml setup.py uv.lock README.md LICENSE ./
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    AFD_BUILD_ASCEND_OPS=0 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_LINK_MODE=copy \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_AFD_PLUGIN=0.0.0+ci \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+ci
+
+RUN uv export --locked --group dev --no-emit-project -o /tmp/requirements-dev.txt \
+    && uv pip install --system -r /tmp/requirements-dev.txt \
+    && uv pip install --system -e .
+
+# The GSM8K evaluation path shells out to `python -m lm_eval`, but lm_eval and
+# scipy appear in neither pyproject.toml nor uv.lock. Installed here so the
+# suite can run; declaring them upstream is the real fix.
+RUN uv pip install --system "lm_eval[api]" scipy
+
+FROM deps
+ARG APP_DIR=/opt/afd-plugin
+WORKDIR ${APP_DIR}
+
+COPY . .
+
+# The restricted SCC runs an arbitrary UID in group 0: the app dir must be
+# group-writable, and HOME must point somewhere that UID can write.
+ENV HOME=/work/home
+RUN mkdir -p /work/home \
+    && chgrp -R 0 ${APP_DIR} /work \
+    && chmod -R g=u ${APP_DIR} /work
+
+ENTRYPOINT []
