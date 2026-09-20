@@ -41,7 +41,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # system-Python layout while still honoring uv.lock.
 # Do NOT reinstall after the final COPY --link, or Buildkite would need to pull
 # the heavy base image for every source-only change.
-RUN uv export --locked --group dev --no-emit-project -o /tmp/requirements-dev.txt \
+RUN uv export --locked --group dev --group e2e-tests --no-emit-project -o /tmp/requirements-dev.txt \
     && uv pip install --system -r /tmp/requirements-dev.txt \
     && uv pip install --system -e .
 
