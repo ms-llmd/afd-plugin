@@ -47,14 +47,9 @@ from tests.e2e.multi_pod.rendezvous import (
     VERDICT_KEY,
     Rendezvous,
 )
-from tests.e2e.process_utils import (
-    describe_process_group,
-    reap_orphan_descendants,
-)
 from tests.e2e.runner import (
     ASYNC_CAM_SCENARIO,
     LOG_THREAD_JOIN_TIMEOUT_S,
-    PROCESS_TERMINATION_TIMEOUT_S,
     add_scenario_arguments,
     attention_api_port,
     build_baseline_command,
@@ -137,18 +132,11 @@ def main() -> int:
                         args,
                         processes,
                     ),
-                    termination_timeout_s=args.termination_timeout,
-                    reap_orphans=reap_orphan_descendants,
                 )
             finally:
                 for thread in log_threads:
                     thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
         except BaseException as exc:
-            # Name what survived and in which state, so a spurious survivor
-            # report (unreaped zombies) is distinguishable from a real hang.
-            for entry in processes:
-                for member in describe_process_group(entry.process.pid):
-                    print(f"[pod-{pod_index}] survivor: {member}", flush=True)
             publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", str(exc))
             raise
         publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", "ok")
@@ -444,16 +432,6 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="KEY=VALUE added to every launched vLLM process environment.",
-    )
-    parser.add_argument(
-        "--termination-timeout",
-        type=float,
-        default=PROCESS_TERMINATION_TIMEOUT_S,
-        help=(
-            "Seconds to wait for this pod's own children to disappear. Node "
-            "dependent: workers in uninterruptible driver teardown can need "
-            "far longer than the default."
-        ),
     )
     parser.add_argument("--launch-timeout", type=float, default=900)
     parser.add_argument("--serving-timeout", type=float, default=1800)

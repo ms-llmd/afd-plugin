@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,24 +32,6 @@ def close_process_identities(processes: Sequence[ProcessIdentity]) -> None:
             os.close(process.pidfd)
 
 
-def reap_orphan_descendants() -> int:
-    """Reap every already-exited descendant, returning how many were reaped.
-
-    Only safe once the caller has waited on its own ``Popen`` children: a bare
-    ``waitpid(-1)`` would otherwise consume an exit status ``Popen.wait`` still
-    needs.
-    """
-    reaped = 0
-    while True:
-        try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return reaped
-        if pid == 0:
-            return reaped
-        reaped += 1
-
-
 def terminate_process_groups(
     processes: Sequence[subprocess.Popen[str]],
     *,
@@ -58,8 +40,6 @@ def terminate_process_groups(
     reap_timeout_s: float,
     process_name: str = "",
     deferred_sigkill_pgids: Collection[int] = (),
-    reap_orphans: Callable[[], int] | None = None,
-    proc_root: Path = PROC_ROOT,
 ) -> list[str]:
     """Terminate process groups with one deadline and reap their leaders.
 
@@ -116,8 +96,6 @@ def terminate_process_groups(
                 failures.append(
                     f"liveness check failed for {group_description} {pgid}: {exc}",
                 )
-            if group_is_spent(pgid, proc_root=proc_root):
-                continue
             surviving_pgids.append(pgid)
         live_pgids = surviving_pgids
         if not live_pgids or time.monotonic() >= deadline:
@@ -143,9 +121,6 @@ def terminate_process_groups(
                 )
             forced_pgids.append(pgid)
 
-    # A caller that is PID 1 must reap orphaned descendants before the liveness
-    # check below: an unreaped zombie still answers ``killpg(pgid, 0)``, so it
-    # would be reported as a survivor although it is already dead.
     reap_deadline = time.monotonic() + reap_timeout_s
     for process in processes:
         try:
@@ -154,9 +129,6 @@ def terminate_process_groups(
             failures.append(
                 f"wait failed for {process_description} {process.pid}: {exc}",
             )
-
-    if reap_orphans is not None:
-        reap_orphans()
 
     surviving_pgids = [
         pgid for pgid in forced_pgids if pgid not in deferred_sigkill_pgids
@@ -173,15 +145,11 @@ def terminate_process_groups(
                     f"post-SIGKILL liveness check failed for "
                     f"{group_description} {pgid}: {exc}",
                 )
-            if group_is_spent(pgid, proc_root=proc_root):
-                continue
             still_alive.append(pgid)
         surviving_pgids = still_alive
         if not surviving_pgids or time.monotonic() >= reap_deadline:
             break
         time.sleep(poll_interval_s)
-        if reap_orphans is not None:
-            reap_orphans()
 
     for pgid in surviving_pgids:
         failures.append(
@@ -189,91 +157,6 @@ def terminate_process_groups(
         )
 
     return failures
-
-
-@dataclass(frozen=True)
-class ProcessGroupMember:
-    """One process seen in a process group, as /proc reports it."""
-
-    pid: int
-    command: str
-    state: str
-    parent_pid: int
-
-    @property
-    def is_zombie(self) -> bool:
-        """Whether this process has exited and is only awaiting a reap."""
-        return self.state == "Z"
-
-    def __str__(self) -> str:
-        return (
-            f"pid {self.pid} ({self.command}) state={self.state} ppid={self.parent_pid}"
-        )
-
-
-def process_group_members(
-    pgid: int,
-    *,
-    proc_root: Path = PROC_ROOT,
-) -> list[ProcessGroupMember]:
-    """Return the processes currently in ``pgid``, empty if none can be read."""
-    members: list[ProcessGroupMember] = []
-    try:
-        entries = sorted(proc_root.iterdir(), key=lambda path: path.name)
-    except OSError:
-        return members
-    for entry in entries:
-        if not entry.name.isdecimal():
-            continue
-        try:
-            stat = (entry / "stat").read_text()
-        except OSError:
-            continue
-        # "pid (comm) state ppid pgrp ..."; comm may itself contain spaces and
-        # parentheses, so split after its final ')'.
-        close = stat.rfind(")")
-        if close == -1:
-            continue
-        fields = stat[close + 2 :].split()
-        if len(fields) < 3 or fields[2] != str(pgid):
-            continue
-        members.append(
-            ProcessGroupMember(
-                pid=int(entry.name),
-                command=stat[stat.find("(") + 1 : close],
-                state=fields[0],
-                parent_pid=int(fields[1]),
-            ),
-        )
-    return members
-
-
-def describe_process_group(
-    pgid: int,
-    *,
-    proc_root: Path = PROC_ROOT,
-) -> list[str]:
-    """Describe the members of a process group, for teardown diagnostics.
-
-    The state letter distinguishes the two ways a group can appear to survive
-    SIGKILL: ``Z`` means already dead and merely unreaped, ``D`` means an
-    uninterruptible kernel wait that SIGKILL genuinely cannot interrupt.
-    """
-    return [str(member) for member in process_group_members(pgid, proc_root=proc_root)]
-
-
-def group_is_spent(pgid: int, *, proc_root: Path = PROC_ROOT) -> bool:
-    """Whether every remaining member of ``pgid`` is an unreaped zombie.
-
-    A zombie still answers ``killpg(pgid, 0)``, so without this a process group
-    whose members have all exited is reported as surviving teardown. Returns
-    False when the group cannot be inspected at all, so an uninspectable group
-    is still reported rather than silently assumed dead.
-    """
-    members = process_group_members(pgid, proc_root=proc_root)
-    if not members:
-        return False
-    return all(member.is_zombie for member in members)
 
 
 def find_processes_matching_environment(

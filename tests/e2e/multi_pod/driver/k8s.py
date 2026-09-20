@@ -103,15 +103,7 @@ def build_job_spec(
         ),
         pod_env=parse_key_values(args.pod_env, option="--pod-env"),
         container_env=parse_key_values(args.container_env, option="--container-env"),
-        runner_args=(
-            list(args.runner_arg)
-            if args.termination_timeout is None
-            else [
-                *args.runner_arg,
-                "--termination-timeout",
-                str(args.termination_timeout),
-            ]
-        ),
+        runner_args=args.runner_arg,
         spread_across_nodes=args.spread_across_nodes,
         pack_onto_one_node=args.pack_onto_one_node,
         excluded_nodes=args.exclude_node,
@@ -389,12 +381,6 @@ def parse_args() -> argparse.Namespace:
         help="Require every pod on the same node (real pod boundary, one host).",
     )
     parser.add_argument("--exclude-node", action="append", default=[])
-    parser.add_argument(
-        "--termination-timeout",
-        type=float,
-        default=None,
-        help="Forwarded to each pod's runner as --termination-timeout.",
-    )
     parser.add_argument("--schedule-timeout", type=float, default=600)
     parser.add_argument("--run-timeout", type=float, default=5400)
     parser.add_argument("--active-deadline", type=int, default=None)

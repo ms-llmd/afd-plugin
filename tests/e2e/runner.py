@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -953,20 +953,10 @@ def terminate_processes(
     *,
     deferred_sigkill_pgids: tuple[int, ...] = (),
     force_kill_environment: dict[str, str] | None = None,
-    termination_timeout_s: float = PROCESS_TERMINATION_TIMEOUT_S,
-    reap_orphans: Callable[[], int] | None = None,
 ) -> None:
-    """Tear down local process groups and report any that survive.
-
-    ``termination_timeout_s`` is surfaced because the cost of a clean teardown
-    varies by an order of magnitude across nodes: workers can sit in
-    uninterruptible NVIDIA driver calls well past the default budget, and that
-    is a property of the host, not of the scenario.
-    """
     failures = terminate_process_groups(
         processes,
-        termination_timeout_s=termination_timeout_s,
-        reap_orphans=reap_orphans,
+        termination_timeout_s=PROCESS_TERMINATION_TIMEOUT_S,
         poll_interval_s=PROCESS_POLL_INTERVAL_S,
         reap_timeout_s=PROCESS_REAP_TIMEOUT_S,
         deferred_sigkill_pgids=deferred_sigkill_pgids,
