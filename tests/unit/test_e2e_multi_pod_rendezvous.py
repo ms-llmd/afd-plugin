@@ -49,11 +49,13 @@ def pods(store_port: int):
 
 
 def test_rendezvous_rejects_a_pod_index_outside_the_layout(store_port):
+    """A pod cannot join a rendezvous it has no place in."""
     with pytest.raises(ValueError, match="outside 0..1"):
         Rendezvous(host="127.0.0.1", port=store_port, pod_index=2, num_pods=2)
 
 
 def test_barrier_releases_when_every_pod_arrives(pods):
+    """A barrier releases once every pod has arrived, and not before."""
     zero, one = pods
     errors: list[BaseException] = []
 
@@ -72,6 +74,7 @@ def test_barrier_releases_when_every_pod_arrives(pods):
 
 
 def test_barrier_timeout_names_the_pods_that_did_not_arrive(pods):
+    """A barrier timeout identifies which pods are missing."""
     zero, _one = pods
 
     with pytest.raises(BarrierTimeoutError) as error:
@@ -82,6 +85,7 @@ def test_barrier_timeout_names_the_pods_that_did_not_arrive(pods):
 
 
 def test_a_peer_abort_unwinds_every_barrier_before_its_deadline(pods):
+    """One pod's failure unwinds its peers in seconds instead of at the deadline."""
     zero, one = pods
     one.publish_abort("FFN exited (rc=1) during launch")
 
@@ -90,6 +94,7 @@ def test_a_peer_abort_unwinds_every_barrier_before_its_deadline(pods):
 
 
 def test_abort_is_published_once_per_pod(pods):
+    """A pod's first failure is the one reported, not whatever followed it."""
     _zero, one = pods
     one.publish_abort("first")
     one.publish_abort("second")
@@ -98,6 +103,7 @@ def test_abort_is_published_once_per_pod(pods):
 
 
 def test_a_pod_does_not_abort_on_its_own_message(pods):
+    """A pod does not mistake its own abort for a peer failure."""
     zero, _one = pods
     zero.publish_abort("local failure")
 
@@ -105,6 +111,7 @@ def test_a_pod_does_not_abort_on_its_own_message(pods):
 
 
 def test_verify_agreement_publishes_from_pod_zero(pods):
+    """Pods launched with matching arguments agree and proceed."""
     zero, one = pods
     zero.verify_agreement("2A0F,0A2F", "afd-graph-2a2f")
 
@@ -112,6 +119,7 @@ def test_verify_agreement_publishes_from_pod_zero(pods):
 
 
 def test_verify_agreement_rejects_a_mismatched_layout(pods):
+    """Pods launched with different layouts fail fast instead of hanging."""
     zero, one = pods
     zero.verify_agreement("2A0F,0A2F", "afd-graph-2a2f")
 
@@ -120,6 +128,7 @@ def test_verify_agreement_rejects_a_mismatched_layout(pods):
 
 
 def test_verify_agreement_rejects_a_mismatched_scenario(pods):
+    """Pods launched for different scenarios fail fast instead of hanging."""
     zero, one = pods
     zero.verify_agreement("2A0F,0A2F", "afd-graph-2a2f")
 
@@ -128,6 +137,7 @@ def test_verify_agreement_rejects_a_mismatched_scenario(pods):
 
 
 def test_wait_for_key_returns_the_published_verdict(pods):
+    """A pod that does not evaluate still learns the run's verdict."""
     zero, one = pods
     zero.set(VERDICT_KEY, PASS_VERDICT)
 
@@ -135,6 +145,7 @@ def test_wait_for_key_returns_the_published_verdict(pods):
 
 
 def test_wait_for_key_times_out_when_nothing_is_published(pods):
+    """Waiting for a verdict that never comes ends at the deadline, naming the key."""
     _zero, one = pods
 
     with pytest.raises(BarrierTimeoutError, match="verdict was not published"):
@@ -142,6 +153,7 @@ def test_wait_for_key_times_out_when_nothing_is_published(pods):
 
 
 def test_a_barrier_reports_a_local_child_failure_through_on_poll(pods):
+    """A pod waiting at a barrier still notices its own children dying."""
     zero, _one = pods
 
     def local_child_died() -> None:
@@ -152,6 +164,7 @@ def test_a_barrier_reports_a_local_child_failure_through_on_poll(pods):
 
 
 def test_get_returns_none_for_a_key_that_was_never_set(pods):
+    """Reading an unset key answers at once rather than blocking."""
     zero, _one = pods
 
     assert zero.get("phase/1/serving") is None
