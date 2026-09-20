@@ -207,8 +207,7 @@ class ProcessGroupMember:
 
     def __str__(self) -> str:
         return (
-            f"pid {self.pid} ({self.command}) state={self.state} "
-            f"ppid={self.parent_pid}"
+            f"pid {self.pid} ({self.command}) state={self.state} ppid={self.parent_pid}"
         )
 
 
