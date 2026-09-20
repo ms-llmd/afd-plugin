@@ -43,7 +43,8 @@ Before starting pytest, confirm:
 - The backend model variable is set to a local path, or the environment can
   download the selected suite's checkpoint via huggingface_hub.
 - The selected vllm command runs.
-- pytest, afd_plugin, lm_eval, datasets, and huggingface_hub are importable.
+- pytest, afd_plugin, lm_eval, datasets, and huggingface_hub are importable
+  (`uv sync --group dev --group e2e-tests` installs all of these.
 - HF_HOME points to the Hugging Face cache used for GSM8K and model weights.
 - HF_ENDPOINT is reachable: `gsm8k.py` defaults the lm-eval child to
   `https://hf-mirror.com`, so an unreachable mirror stalls or fails at GSM8K
@@ -52,8 +53,11 @@ Before starting pytest, confirm:
 - GPU: the selected devices are visible to CUDA.
 - NPU: torch_npu and the Ascend runtime work.
 
-Install missing lm_eval only in the runner environment, never in pyproject.toml
-or uv.lock.
+`lm_eval` is declared in the `e2e-tests` uv dependency-group in
+`pyproject.toml` and pinned in `uv.lock` (and baked into the CI image), so
+the runner never needs an ad-hoc `pip install` for it. This keeps E2E runs
+reproducible and removes a manual setup step every runner environment used
+to require by hand.
 
 Fail before pytest when a prerequisite is missing; never turn it into a skip.
 

@@ -29,7 +29,8 @@ adding a model or case.
 ## Run
 
 Run from the repository root. The environment needs `vllm`, `pytest`,
-`afd_plugin`, `lm_eval`, `datasets`, and `huggingface_hub`. NPU also needs
+`afd_plugin`, `lm_eval`, `datasets`, and `huggingface_hub` (install
+by running `uv sync --group dev --group e2e-tests`). NPU also needs
 `torch_npu`.
 
 The selected test downloads/caches `openai/gsm8k` and its Hugging Face model
