@@ -29,7 +29,8 @@ adding a model or case.
 ## Run
 
 Run from the repository root. The environment needs `vllm`, `pytest`,
-`afd_plugin`, `lm_eval`, `datasets`, and `huggingface_hub`. NPU also needs
+`afd_plugin`, `lm_eval`, `datasets`, and `huggingface_hub` (install
+by running `uv sync --group dev --group e2e-tests`). NPU also needs
 `torch_npu`.
 
 The selected test downloads/caches `openai/gsm8k` and its Hugging Face model
@@ -144,6 +145,53 @@ python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py
 For a full 1319-sample run, export `AFD_GSM8K_LIMIT=all` before invoking
 pytest. Without `AFD_GSM8K_LIMIT`, each scenario evaluates the first 7
 samples.
+
+## DSV4 Flash async CAM concurrent requests (local, 16 NPUs)
+
+`afd-dsv4-flash-async-cam-dp2tp4-ep8` runs Attention DP2/TP4 on the first
+eight devices and FFN DP8/TP1/EP8 on the last eight. This is a standalone
+Ascend 910C case, outside the four-device PR gate. Use DSV4 Flash W8A8
+weights and a DSV4-capable vLLM/vLLM-Ascend runtime with CAM operators.
+
+The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
+max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024.
+Both roles explicitly disable `enable_dsv4_shared_compressor_workspace`.
+CAM uses `dynamicQuant=1`, Attention-side gating, and two token-split async
+MoE ubatches. FlashComm1 is enabled only on Attention. CPU binding and
+128-thread weight loading follow the reference prefill scripts. Prefix
+caching, native DBO, and KV transfer are not enabled.
+
+After startup, an async HTTP client schedules ten independent chat requests together.
+They ask for `12 + 7` through `21 + 7`, with temperature=0, thinking=false,
+and max_tokens=256. Every response must contain one nonempty answer and
+finish with `stop`; HTTP errors, truncated answers, missing responses, or
+non-overlapping request timings fail the case. The test prints all outputs
+and saves complete responses and monotonic timestamps in the pytest temporary
+directory, including per-request errors and partial results on cancellation.
+SIGTERM/SIGINT cancels pending HTTP operations before service cleanup, without
+waiting for the request timeout. It does **not** run GSM8K or establish general
+model accuracy.
+Service liveness and owned-process cleanup are also required to pass.
+This 16-NPU case allows 60 seconds for service shutdown before escalation;
+Attention SIGKILL escalation remains a failure. FFN uses the existing scoped
+async CAM cleanup exception.
+
+```bash
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-w8a8-mtp
+export HCCL_IF_IP=<local-communication-ip>
+export HCCL_SOCKET_IFNAME=eth0
+python -m pytest -q -s \
+  'tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py::test_deepseek_v4_flash_async_cam[afd-dsv4-flash-async-cam-dp2tp4-ep8]'
+```
+
+Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
+1800 seconds. Override these using `AFD_NPU_DSV4_E2E_API_PORT`,
+`AFD_NPU_DSV4_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
+`AFD_NPU_E2E_VLLM_BIN` selects the executable. `CAM_VENDOR` overrides
+`/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM`. Model and all sixteen device
+IDs must be supplied explicitly; missing setup fails rather than skips.
 
 ## Run with the Codex skill
 

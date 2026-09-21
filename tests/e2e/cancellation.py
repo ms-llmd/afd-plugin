@@ -55,7 +55,15 @@ def cancellable_run(cleanup: Callable[[], None]) -> Iterator[None]:
                     cleanup()
                 finally:
                     for signum, previous_handler in previous_handlers.items():
-                        signal.signal(signum, previous_handler)
+                        # Preloaded native libraries can install handlers
+                        # unknown to Python (getsignal returns None). Python
+                        # cannot restore those; reset to the OS default.
+                        signal.signal(
+                            signum,
+                            signal.SIG_DFL
+                            if previous_handler is None
+                            else previous_handler,
+                        )
             except BaseException as exc:
                 cleanup_error = exc
         finally:

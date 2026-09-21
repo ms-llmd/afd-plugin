@@ -413,6 +413,7 @@ def _args() -> argparse.Namespace:
         attention_vllm_arg=[],
         ffn_vllm_arg=[],
         gsm8k_output_path="/tmp/gsm8k-results",
+        completion_output_path="/tmp/dsv4-completions.json",
         use_v2_model_runner=False,
     )
 
@@ -472,6 +473,7 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-graph-dbo-2a2f", (False, True, True, 2, 2, 1, 1, 1, False)),
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
+        (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2, True)),
@@ -1412,9 +1414,11 @@ def test_terminate_processes_rejects_cleanup_failure(monkeypatch):
         runner.terminate_processes([])
 
 
+@pytest.mark.parametrize("native_handler", [False, True])
 def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
     monkeypatch,
     capsys,
+    native_handler,
 ):
     args = _args()
     args.attention_devices = "0"
@@ -1424,7 +1428,7 @@ def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
     checked_processes = []
     installed_handlers = []
     previous_handlers = {
-        signal.SIGTERM: "previous-term-handler",
+        signal.SIGTERM: None if native_handler else "previous-term-handler",
         signal.SIGINT: "previous-int-handler",
     }
 
@@ -1472,7 +1476,10 @@ def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
 
     assert checked_processes == [[process, process]] * 2
     assert log_thread.joined is True
-    assert installed_handlers[2:] == list(previous_handlers.items())
+    assert installed_handlers[2:] == [
+        (signum, signal.SIG_DFL if handler is None else handler)
+        for signum, handler in previous_handlers.items()
+    ]
     assert "E2E SCENARIO" not in capsys.readouterr().out
     with pytest.raises(SystemExit) as exit_error:
         installed_handlers[0][1](signal.SIGTERM, None)
