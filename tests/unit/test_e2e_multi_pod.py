@@ -13,6 +13,7 @@ import pytest
 
 from tests.e2e import runner
 from tests.e2e.multi_pod import identity
+from tests.e2e.multi_pod.driver import docker as docker_driver
 from tests.e2e.multi_pod.driver import manifest
 from tests.e2e.multi_pod.layout import (
     ATTENTION_ROLE,
@@ -464,6 +465,7 @@ def test_resolve_pod_index_rejects_an_index_outside_the_layout():
 
 def test_find_stale_run_markers_reports_only_other_runs(tmp_path: Path):
     """Leftovers from an earlier run are reported; this run's own processes are not."""
+
     def _write(pid: str, value: str) -> None:
         entry = tmp_path / pid
         entry.mkdir()
@@ -511,6 +513,7 @@ def test_wait_for_address_returns_once_the_record_appears():
 
 def test_wait_for_address_reports_the_host_it_could_not_resolve():
     """A name that never resolves fails with the host named."""
+
     def never(_host: str) -> object:
         raise OSError("Name or service not known")
 
@@ -716,3 +719,99 @@ def test_pod_spec_rejects_an_unknown_role():
     """An unknown AFD role is rejected rather than silently counted as zero."""
     with pytest.raises(ValueError, match="unknown AFD role"):
         PodSpec(attention=1, ffn=1).ranks("decode")
+
+
+# -- docker driver rendering ----------------------------------------------
+
+
+def _docker_spec(**overrides: Any) -> docker_driver.DockerRunSpec:
+    defaults: dict[str, Any] = dict(
+        name="afd-e2e-run1",
+        image="ghcr.io/ronenkat/afd-plugin-e2e:multipod",
+        scenario="afd-graph-2a2f",
+        pod_layout="2A0F,0A2F",
+        num_pods=2,
+        run_id="run1",
+        model="deepseek-ai/DeepSeek-V2-Lite",
+        gsm8k_output_path="/tmp/e2e-runs/run1",
+        gpus_per_pod=2,
+        hf_cache_dir="/home/ci/.cache/huggingface",
+    )
+    defaults.update(overrides)
+    return docker_driver.DockerRunSpec(**defaults)
+
+
+def test_docker_render_writes_one_command_per_pod_plus_the_network():
+    """The whole run: a network-create command, then one container per pod."""
+    commands = docker_driver.render(_docker_spec(num_pods=3))
+
+    assert len(commands) == 4
+    assert commands[0][:3] == ["docker", "network", "create"]
+    assert all(command[:2] == ["docker", "run"] for command in commands[1:])
+
+
+def test_docker_render_network_command_uses_the_run_name():
+    """The network is named after the run, so concurrent runs don't collide."""
+    command = docker_driver.render_network_command(_docker_spec(name="afd-e2e-run2"))
+
+    assert command[-1] == "afd-e2e-run2"
+
+
+def test_docker_gpu_flag_slices_contiguous_devices_per_pod():
+    """Each pod gets a disjoint, contiguous device range, matching upstream's math."""
+    spec = _docker_spec(gpus_per_pod=2)
+
+    assert docker_driver.render_gpu_flag(spec, 0) == "device=0,1"
+    assert docker_driver.render_gpu_flag(spec, 1) == "device=2,3"
+
+
+def test_docker_render_run_command_carries_pod_identity_and_address():
+    """A pod's identity and network address come from the container, not argv."""
+    spec = _docker_spec()
+    command = docker_driver.render_run_command(spec, 1)
+
+    assert "--name" in command
+    assert command[command.index("--name") + 1] == "afd-e2e-run1-1"
+    assert command[command.index("--ip") + 1] == "192.168.10.11"
+    assert "-e" in command
+    assert f"{identity.POD_INDEX_ENV}=1" in command
+
+
+def test_docker_render_run_command_carries_identical_runner_argv_per_pod():
+    """Every pod's container runs the same program; only its own env differs."""
+    spec = _docker_spec()
+    leader = docker_driver.render_run_command(spec, 0)
+    follower = docker_driver.render_run_command(spec, 1)
+
+    runner_argv = leader[leader.index(spec.image) + 1 :]
+    assert follower[follower.index(spec.image) + 1 :] == runner_argv
+    assert runner_argv == docker_driver.render_runner_command(spec)
+
+
+def test_docker_render_runner_command_carries_explicit_pod_addresses():
+    """Static container IPs are handed to every pod, skipping address exchange."""
+    spec = _docker_spec(num_pods=2)
+    command = docker_driver.render_runner_command(spec)
+
+    assert command[command.index("--store-host") + 1] == "192.168.10.10"
+    assert (
+        command[command.index("--pod-addresses") + 1] == "192.168.10.10,192.168.10.11"
+    )
+
+
+def test_docker_render_passes_pod_env_through_to_the_runner():
+    """Caller-supplied pod env reaches the in-pod runner's own argv."""
+    spec = _docker_spec(pod_env={"NCCL_SOCKET_IFNAME": "eth0"})
+    command = docker_driver.render_runner_command(spec)
+
+    assert "--pod-env" in command
+    assert command[command.index("--pod-env") + 1] == "NCCL_SOCKET_IFNAME=eth0"
+
+
+def test_docker_render_run_command_mounts_the_hf_cache():
+    """The host's Hugging Face cache is bind-mounted so repeated runs stay warm."""
+    spec = _docker_spec(hf_cache_dir="/home/ci/.cache/huggingface")
+    command = docker_driver.render_run_command(spec, 0)
+
+    mount = f"/home/ci/.cache/huggingface:{docker_driver.HF_CACHE_CONTAINER_PATH}"
+    assert mount in command
