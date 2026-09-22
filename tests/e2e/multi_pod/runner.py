@@ -49,6 +49,8 @@ from tests.e2e.multi_pod.rendezvous import (
 )
 from tests.e2e.runner import (
     ASYNC_CAM_SCENARIO,
+    E2E_PROCESS_ROLE_ENV,
+    E2E_RUN_ID_ENV,
     LOG_THREAD_JOIN_TIMEOUT_S,
     add_scenario_arguments,
     attention_api_port,
@@ -131,6 +133,14 @@ def main() -> int:
                     deferred_sigkill_pgids=deferred_sigkill_pgids(
                         args,
                         processes,
+                    ),
+                    force_kill_environment=(
+                        {
+                            E2E_RUN_ID_ENV: pod_e2e_run_id(args.run_id, pod_index),
+                            E2E_PROCESS_ROLE_ENV: FFN_ROLE,
+                        }
+                        if uses_npu_async_process_cleanup(args)
+                        else None
                     ),
                 )
             finally:
@@ -278,7 +288,7 @@ def launch_slot(
         visible_devices,
         args,
         role=slot.role,
-        e2e_run_id=f"{args.run_id}-pod{pod_plan.index}",
+        e2e_run_id=pod_e2e_run_id(args.run_id, pod_plan.index),
         extra_env=parse_key_values(args.pod_env, option="--pod-env"),
     )
     print_command(label, command, args.device_backend, visible_devices)
@@ -333,6 +343,11 @@ def deferred_sigkill_pgids(
     if not uses_npu_async_process_cleanup(args):
         return ()
     return tuple(entry.process.pid for entry in processes if entry.role == FFN_ROLE)
+
+
+def pod_e2e_run_id(run_id: str, pod_index: int) -> str:
+    """This pod's own E2E run marker, shared by process launch and teardown."""
+    return f"{run_id}-pod{pod_index}"
 
 
 def resolve_addresses(
