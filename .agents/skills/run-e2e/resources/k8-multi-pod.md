@@ -5,39 +5,65 @@ layout splits Attention and FFN ranks across more than one pod — optionally
 spread across nodes, for a genuine cross-node fabric test — rather than
 running everything in one process on one machine.
 
+This walkthrough assumes the model under test is
+`deepseek-ai/DeepSeek-V2-Lite`; substitute `MODEL`, `MODEL_PVC`, and the
+scenario's topology if you're running a different model.
+
 ## How it works
 
-A Kubernetes Indexed Job creates one pod per pod-layout entry, behind a
-headless Service that gives each pod a stable DNS name
-(`<job-name>-<index>.<job-name>`). Every pod runs the identical in-pod
-runner command and derives its own role (which Attention/FFN ranks to
-launch) from its Kubernetes-assigned completion index, then rendezvous with
-its peers over a shared store before serving and evaluating GSM8K. No
-process outside the pods holds test state or drives the run: you apply the
-Service and Job once, and every pod decides its own role, coordinates with
-its peers, and reports its own pass/fail through its container exit code.
+The e2e test on Kubernetes runs as a Kubernetes Indexed Job that creates one
+pod per pod-layout entry, behind a headless Service that gives each pod a
+stable DNS name (`<job-name>-<index>.<job-name>`). Every pod runs the
+identical in-pod runner command and derives its own role (which
+Attention/FFN ranks to launch) from its Kubernetes-assigned completion
+index, then rendezvous with its peers over a shared store before serving
+and evaluating GSM8K. No process outside the pods holds test state or
+drives the run: you apply the Service and Job once, and every pod decides
+its own role, coordinates with its peers, and reports its own pass/fail
+through its container exit code.
 
 ## Prerequisites
 
 - An image with the AFD plugin, the full repo (including `tests/`), and the
-  E2E test dependencies (`pytest`, `lm_eval[api]`, `scipy`, `datasets`,
-  `huggingface_hub`) installed. `docker/Dockerfile.e2e-multipod` builds
-  exactly this image:
+  E2E test dependencies installed. `docker/Dockerfile.ci` builds this: its
+  deps stage runs `uv export --group dev --group e2e-tests`, so `pytest`,
+  `datasets`, and `huggingface_hub` (from `dev`) and `lm_eval[api]` (from
+  `e2e-tests`, which pulls in `scipy` transitively) are already installed —
+  there's no separate `lm_eval`/`scipy` install step to add.
 
   ```bash
-  docker build -f docker/Dockerfile.e2e-multipod -t <registry>/afd-plugin-e2e:<tag> .
+  docker build -f docker/Dockerfile.ci -t <registry>/afd-plugin-e2e:<tag> .
   docker push <registry>/afd-plugin-e2e:<tag>
   ```
 
   Use an already-built image instead if one meeting that contract exists.
-  Either way, the app directory must be group-writable and `HOME` must point
-  somewhere writable — pods run as an arbitrary UID against a read-only
-  image filesystem outside `/work` (the Job template below relies on this).
+
+  **Building for OpenShift:** `Dockerfile.ci`'s final stage isn't usable
+  as-is on OpenShift — build a variant with these changes:
+
+  - Replace `COPY --link . .` with a plain `COPY . .`; `buildah` (the
+    builder behind OpenShift's `BuildConfig`s) rejects `--link`.
+  - OpenShift's default restricted Security Context Constraint (SCC) runs
+    the container as an arbitrary, unpredictable UID that only belongs to
+    group `0`, against an otherwise read-only image filesystem. Give that
+    UID somewhere to write by setting a writable `HOME` and making the app
+    directory group-writable:
+
+    ```dockerfile
+    ENV HOME=/work/home
+    RUN mkdir -p /work/home \
+        && chgrp -R 0 ${APP_DIR} /work \
+        && chmod -R g=u ${APP_DIR} /work
+    ```
+
+  The Job template below relies on both of these — it also sets `fsGroup`
+  under `securityContext` for the same SCC restriction (see **Optional
+  additions**).
 - A pre-existing, pre-warmed PersistentVolumeClaim holding the model
   weights. Nothing here creates or populates it — mount it into every pod
   yourself, as the Job template below does.
 - `kubectl` configured against the target namespace/context, with rights to
-  create/delete Services, Jobs, and (if you use a source overlay) ConfigMaps.
+  create/delete Services and Jobs.
 
 ## Choose a pod layout
 
@@ -46,12 +72,18 @@ pod: the number of Attention ranks and FFN ranks that pod should launch.
 The number of entries fixes the pod count. For example, `2A0F,0A2F` is a
 2-pod layout where pod 0 carries both Attention ranks and pod 1 carries
 both FFN ranks; that string becomes the runner's `--pod-layout` argument
-below, and the entry count becomes `NUM_PODS`.
+below, and its entry count becomes `NUM_PODS`, computed automatically from
+`POD_LAYOUT` in the Deploy script — you don't set it yourself.
 
 The ranks across all entries must sum to the scenario's topology (a
 `2a2f` scenario needs 2 Attention and 2 FFN ranks in total), and no single
 pod's rank count for a role may exceed that role's TP size — a TP group
 cannot span pods.
+
+This assumes every pod requests the same number of GPUs (`GPUS_PER_POD`
+below): the layout can vary how many Attention/FFN ranks each pod carries,
+but the Job template applies one shared `resources` block to every pod, so
+per-pod GPU counts aren't supported as written.
 
 ## Deploy
 
@@ -65,7 +97,7 @@ NAMESPACE=afd-e2e
 IMAGE=<registry>/afd-plugin-e2e:<tag>
 SCENARIO=afd-graph-2a2f
 POD_LAYOUT=2A0F,0A2F
-NUM_PODS=2                      # must equal POD_LAYOUT's entry count
+NUM_PODS=$(($(tr -cd ',' <<<"$POD_LAYOUT" | wc -c) + 1))   # entry count of POD_LAYOUT
 RUN_ID=$(date +%s)
 MODEL=deepseek-ai/DeepSeek-V2-Lite
 GSM8K_OUTPUT_PATH=/work/gsm8k-results
@@ -175,68 +207,6 @@ entry of `POD_LAYOUT` is its own; nothing in the pod spec sets it directly.
 
 ## Optional additions
 
-- **Ship local/uncommitted source without rebuilding the image.** Publish a
-  tarball as a ConfigMap (keep it small — a full repo clone stalls the
-  in-pod copy):
-
-  ```bash
-  kubectl create configmap ${JOB_NAME}-src --from-file=source.tgz=./dist/source.tgz \
-    --dry-run=client -o yaml | kubectl apply -f -
-  ```
-
-  Then add a volume and mount:
-
-  ```yaml
-  - name: source-overlay
-    configMap: {name: ${JOB_NAME}-src}
-  ```
-
-  ```yaml
-  - {name: source-overlay, mountPath: /overlay, readOnly: true}
-  ```
-
-  and change the container's `command` and `workingDir` to unpack it over
-  the image's copy before running:
-
-  ```yaml
-  command: ["/bin/bash", "-c", "set -euo pipefail\nmkdir -p /work/home /work/tmp /work/hf_modules\ncp -a /opt/afd-plugin /work/src\ntar xzf /overlay/source.tgz -C /work/src\ncd /work/src\nexec \"$@\"", "afd-e2e"]
-  workingDir: /work/src
-  ```
-
-- **Require every pod on a different node**, to actually exercise a
-  cross-node fabric rather than incidentally landing on one node:
-
-  ```yaml
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector: {matchLabels: {run: ${JOB_NAME}}}
-          topologyKey: kubernetes.io/hostname
-  ```
-
-- **Pin every pod to one node** while still keeping the pod boundary (and
-  its private `/dev/shm`) real — mutually exclusive with the anti-affinity
-  above:
-
-  ```yaml
-  affinity:
-    podAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector: {matchLabels: {run: ${JOB_NAME}}}
-          topologyKey: kubernetes.io/hostname
-  ```
-
-- **Steer around a known-bad node:**
-
-  ```yaml
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - {key: kubernetes.io/hostname, operator: NotIn, values: ["<bad-node>"]}
-  ```
-
 - **Set an env var for the launched vLLM processes** (not the container
   itself): append to `args`, once per variable —
   `- --pod-env`, `- KEY=VALUE`. The in-pod runner merges these into every
@@ -246,9 +216,11 @@ entry of `POD_LAYOUT` is its own; nothing in the pod spec sets it directly.
 - **A hard ceiling on the Job's own runtime**, independent of how long you
   wait on it below: add `activeDeadlineSeconds: <seconds>` under `spec:` on
   the Job.
-- **fsGroup for a restricted-SCC cluster (OpenShift):** add
-  `securityContext: {fsGroup: <n>}` under the pod template's `spec:`, using
-  a group id the namespace actually allows.
+- **Set `fsGroup` to satisfy the namespace's Security Context Constraint
+  (SCC) range (OpenShift):** add `securityContext: {fsGroup: <n>}` under
+  the pod template's `spec:`, using a group id the namespace's SCC actually
+  allows — check with `oc get scc restricted -o yaml` (or whichever SCC the
+  namespace binds) or ask a cluster admin.
 
 ## Run and observe
 
@@ -282,7 +254,6 @@ state yet (still running when the wait timed out) is not a pass.
 
 ```bash
 kubectl delete job/${JOB_NAME} service/${JOB_NAME} -n ${NAMESPACE} --ignore-not-found
-kubectl delete configmap/${JOB_NAME}-src -n ${NAMESPACE} --ignore-not-found  # if used
 ```
 
 A completed Job's pod template is immutable, so re-applying under the same
