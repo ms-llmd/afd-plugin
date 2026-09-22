@@ -4,11 +4,11 @@
 
 This test runs as *one pod's slice* of an already-provisioned multi-pod
 deployment: the k8s pods or Docker containers must already exist -- brought
-up by hand, or with `tests.e2e.multi_pod.driver.k8s` /
-`tests.e2e.multi_pod.driver.docker` run separately -- before this test is
-invoked once inside each of them. Every test decision -- launch order,
-readiness, evaluation, teardown -- is made by the in-pod runner itself; this
-only supplies what the runner cannot infer from its own pod's environment.
+up by hand, following `.agents/skills/run-e2e/resources/k8-multi-pod.md` --
+before this test is invoked once inside each of them. Every test decision --
+launch order, readiness, evaluation, teardown -- is made by the in-pod
+runner itself; this only supplies what the runner cannot infer from its own
+pod's environment.
 """
 
 from __future__ import annotations
