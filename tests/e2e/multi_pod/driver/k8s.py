@@ -3,10 +3,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Kubernetes driver for the multi-pod AFD E2E runner.
 
-Its whole job: render manifests, apply them, stream logs, collect exit codes,
-and clean up. It holds no test state and makes no test decision -- launch order,
-readiness, evaluation, and teardown all belong to the pods. ``--render-only``
-exists so that claim stays falsifiable.
+Its whole job: render manifests, apply them, block on kubectl's own
+Job-completion primitive, collect exit codes and logs, and clean up. It holds
+no test state and makes no test decision -- launch order, readiness,
+evaluation, and teardown all belong to the pods, and this driver never polls
+them itself: after the scheduling check below, it hands the wait to
+`kubectl wait` rather than re-implementing readiness/completion tracking.
+``--render-only`` exists so that claim stays falsifiable.
 """
 
 from __future__ import annotations
@@ -15,7 +18,6 @@ import argparse
 import json
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -29,8 +31,6 @@ JOB_COMPLETION_INDEX_LABELS = (
     "batch.kubernetes.io/job-completion-index",
     "apps.kubernetes.io/job-completion-index",
 )
-LOG_ATTACH_RETRIES = 5
-LOG_ATTACH_RETRY_INTERVAL_S = 3.0
 # A long run outlives transient API-server or DNS failures on the driver's own
 # machine; losing one poll must not discard a test that is still running.
 KUBECTL_RETRIES = 6
@@ -64,10 +64,10 @@ def main() -> int:
 
     try:
         pods = wait_for_pods(args, spec, layout.num_pods)
-        streams = [stream_pod_logs(args, index, name) for index, name in pods.items()]
-        exit_codes = wait_for_completion(args, spec, pods)
-        for stream in streams:
-            stream.join(timeout=args.log_join_timeout)
+        wait_for_job(args, spec)
+        exit_codes = collect_exit_codes(args, spec, pods)
+        for index, name in pods.items():
+            print_pod_log(args, index, name)
     finally:
         if not args.keep:
             cleanup(args, spec)
@@ -241,65 +241,60 @@ def pending_reason(pod: dict) -> str:
     return "Pending"
 
 
-def stream_pod_logs(
-    args: argparse.Namespace,
-    index: int,
-    pod_name: str,
-) -> threading.Thread:
-    def worker() -> None:
-        # A pod can be Running before its container accepts a log stream, so a
-        # first attach that returns nothing is retried rather than lost.
-        for attempt in range(LOG_ATTACH_RETRIES):
-            process = subprocess.Popen(
-                kubectl(args, "logs", "-f", pod_name),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            assert process.stdout is not None
-            streamed = False
-            for line in process.stdout:
-                streamed = True
-                print(f"[pod-{index}] {line}", end="", flush=True)
-            process.wait()
-            if streamed or attempt == LOG_ATTACH_RETRIES - 1:
-                return
-            time.sleep(LOG_ATTACH_RETRY_INTERVAL_S)
+def wait_for_job(args: argparse.Namespace, spec: JobSpec) -> None:
+    """Block on kubectl's own Job-completion primitive; the driver never polls.
 
-    thread = threading.Thread(target=worker, name=f"pod-{index}-logs", daemon=True)
-    thread.start()
-    return thread
+    A non-zero exit here can mean the Job reached condition=Failed or that the
+    wait itself timed out -- kubectl distinguishes those in its own message,
+    but either way this driver does not need to: ``collect_exit_codes`` reads
+    every pod's actual terminal status afterward, once, and that is what
+    decides the result.
+    """
+    subprocess.run(
+        kubectl(
+            args,
+            "wait",
+            f"job/{spec.name}",
+            "--for=condition=complete",
+            f"--timeout={int(args.run_timeout)}s",
+        ),
+        check=False,
+    )
 
 
-def wait_for_completion(
+def collect_exit_codes(
     args: argparse.Namespace,
     spec: JobSpec,
     pods: dict[int, str],
 ) -> dict[int, int | None]:
-    """Collect each pod's container exit code; they are the authoritative result."""
-    deadline = time.monotonic() + args.run_timeout
+    """Read every pod's terminal exit code, once, after the Job has finished."""
     exit_codes: dict[int, int | None] = dict.fromkeys(pods)
-    while True:
-        for pod in list_pods(args, spec):
-            index = completion_index(pod)
-            if index is None or pod["status"]["phase"] not in TERMINAL_PHASES:
-                continue
-            for status in pod["status"].get("containerStatuses", []):
-                terminated = status["state"].get("terminated")
-                if terminated is not None:
-                    exit_codes[index] = terminated["exitCode"]
-        if all(code is not None for code in exit_codes.values()):
-            return exit_codes
-        if time.monotonic() >= deadline:
-            unfinished = [index for index, code in exit_codes.items() if code is None]
-            print(
-                f"run timed out after {args.run_timeout:.0f}s; "
-                f"pods still running: {unfinished}",
-                flush=True,
-            )
-            return exit_codes
-        time.sleep(POD_POLL_INTERVAL_S)
+    for pod in list_pods(args, spec):
+        index = completion_index(pod)
+        if index is None or pod["status"]["phase"] not in TERMINAL_PHASES:
+            continue
+        for status in pod["status"].get("containerStatuses", []):
+            terminated = status["state"].get("terminated")
+            if terminated is not None:
+                exit_codes[index] = terminated["exitCode"]
+    unfinished = [index for index, code in exit_codes.items() if code is None]
+    if unfinished:
+        print(f"pods still running after the wait: {unfinished}", flush=True)
+    return exit_codes
+
+
+def print_pod_log(args: argparse.Namespace, index: int, pod_name: str) -> None:
+    """Fetch one pod's full log, once, after the Job has already finished."""
+    result = subprocess.run(
+        kubectl(args, "logs", pod_name),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in result.stdout.splitlines():
+        print(f"[pod-{index}] {line}", flush=True)
+    for line in result.stderr.splitlines():
+        print(f"[pod-{index}] {line}", flush=True)
 
 
 def cleanup(args: argparse.Namespace, spec: JobSpec) -> None:
@@ -384,7 +379,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schedule-timeout", type=float, default=600)
     parser.add_argument("--run-timeout", type=float, default=5400)
     parser.add_argument("--active-deadline", type=int, default=None)
-    parser.add_argument("--log-join-timeout", type=float, default=30)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument(
         "--render-only",
