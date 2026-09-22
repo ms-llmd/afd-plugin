@@ -59,6 +59,10 @@ coverage.xml
 csrc/npu/output/
 cover/
 
+# Ascend runtime-generated custom-op and kernel cache artifacts
+afd_plugin/_cann_ops_custom/
+kernel_meta/
+
 # Translations
 *.mo
 *.pot

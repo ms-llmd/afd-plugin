@@ -209,8 +209,11 @@ last FFN result and completes the model's pipeline-rank output logic.
 The FFN runner calls the causal-LM wrapper's `compute_ffn_output()`, which
 dispatches to the selected decoder layer. Normal mode executes that layer's
 MLP. Attention-side-gate mode requires connector-produced group/routing and
-quantization metadata, executes the Ascend expert path, and can return
-separate routed/shared outputs in `AFDF2ATransferPayload`.
+quantization metadata and executes the Ascend routed-expert path. Async CAM
+returns only routed output in `AFDF2ATransferPayload`; Attention owns the
+native shared MLP, uses replicated weights on its local tokens, and adds
+the shared result after restoring the routed token layout. Pending stages
+retain separate shared tensors; failed forwards discard pending routing references.
 
 ```mermaid
 sequenceDiagram
@@ -227,7 +230,8 @@ sequenceDiagram
     AttentionLayer->>Connector: Hidden states, AFDTransferMetadata, routing payload
     Connector->>FFNLayer: compute_ffn_output(layer_idx)
     alt MoE layer
-        FFNLayer->>FFNLayer: Expert/shared-expert computation
+        FFNLayer->>FFNLayer: Routed-expert computation
+        AttentionLayer->>AttentionLayer: Shared-expert computation
     else Dense layer in normal split mode
         FFNLayer->>FFNLayer: Dense MLP computation
     end

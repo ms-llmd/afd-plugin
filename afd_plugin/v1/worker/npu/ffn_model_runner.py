@@ -360,8 +360,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     layer_idx=layer_idx,
                     group_list=states.group_list,
                     dynamic_scales=states.dynamic_scales,
-                    expand_x_shared=states.expand_x_shared,
-                    dynamic_scales_shared=states.dynamic_scales_shared,
                 )
                 rank_ffn_output = connector.send_ffn_work_item_output(
                     work_item,

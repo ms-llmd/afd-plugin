@@ -85,7 +85,7 @@ def test_async_model_forward_preserves_pp_boundaries(
         ),
     )
     forward_context = SimpleNamespace()
-    afd_metadata = object()
+    afd_metadata = SimpleNamespace()
     monkeypatch.setattr(async_forward, "get_forward_context", lambda: forward_context)
     monkeypatch.setattr(
         async_forward,
@@ -255,6 +255,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         is_moe_layer = True
 
         layer_idx = 0
+        mlp = SimpleNamespace(shared_experts=lambda x: 2 * x)
 
         def compute_attn_output(
             self,
@@ -286,7 +287,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         afd_metadata,
     )
 
-    assert torch.equal(output, hidden_states + 2)
+    assert torch.equal(output, (hidden_states + 1) * 9 + 3)
     assert residual is None
     assert connector_calls == ["send", "recv", "send", "recv"]
     assert restored_layouts == dispatch_layouts
@@ -533,6 +534,9 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
                 SimpleNamespace(
                     is_moe_layer=True,
                     layer_idx=layer_idx,
+                    mlp=SimpleNamespace(
+                        shared_experts=lambda x, offset=layer_idx + 1: x + offset,
+                    ),
                     compute_attn_output=compute_attn_output,
                 )
                 for layer_idx in range(2)
@@ -569,6 +573,8 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
         restored is expected
         for restored, expected in zip(output, stage_hidden_states, strict=True)
     )
+    torch.testing.assert_close(output[0], torch.full((1, 8), 4.0))
+    torch.testing.assert_close(output[1], torch.full((2, 8), 8.0))
     assert residual is None
     assert forward_context.attn_metadata == {"layer": "full"}
     assert forward_context.num_tokens == 4

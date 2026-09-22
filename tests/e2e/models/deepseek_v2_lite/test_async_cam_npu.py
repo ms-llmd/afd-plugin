@@ -16,9 +16,6 @@ from tests.e2e.environment import (
     devices_from_env as _devices,
 )
 from tests.e2e.environment import (
-    prepend_env_paths as _prepend_env_paths,
-)
-from tests.e2e.environment import (
     required_env as _required_env,
 )
 from tests.e2e.runner import (
@@ -30,9 +27,6 @@ from tests.e2e.runner import (
     ASYNC_UBATCH_SCENARIO,
 )
 
-CAM_VENDOR_PATH = Path("/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM")
-CAM_OP_API_PATH = CAM_VENDOR_PATH / "op_api"
-CAM_OP_API_LIB_PATH = CAM_OP_API_PATH / "lib"
 CAM_HCCL_BUFFER_SIZE_MB = 4096
 CAM_MAX_NUM_SEQUENCES = "8"
 CAM_MAX_BATCHED_TOKENS = "8000"
@@ -47,13 +41,6 @@ def _async_cam_env() -> dict[str, str]:
     env.setdefault("ASCEND_LAUNCH_BLOCKING", "1")
     env.setdefault("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "1")
     env.setdefault("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
-    _prepend_env_paths(
-        env,
-        "LD_LIBRARY_PATH",
-        CAM_OP_API_PATH,
-        CAM_OP_API_LIB_PATH,
-    )
-    _prepend_env_paths(env, "ASCEND_CUSTOM_OPP_PATH", CAM_VENDOR_PATH)
     return env
 
 

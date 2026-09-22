@@ -189,9 +189,8 @@ python -m pytest -q -s \
 Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
 1800 seconds. Override these using `AFD_NPU_DSV4_E2E_API_PORT`,
 `AFD_NPU_DSV4_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
-`AFD_NPU_E2E_VLLM_BIN` selects the executable. `CAM_VENDOR` overrides
-`/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM`. Model and all sixteen device
-IDs must be supplied explicitly; missing setup fails rather than skips.
+`AFD_NPU_E2E_VLLM_BIN` selects the executable. Build the plugin-owned 910C
+operators before running. Model and all sixteen device IDs must be supplied explicitly; missing setup fails rather than skips.
 
 ## Run with the Codex skill
 
@@ -219,10 +218,10 @@ export AFD_E2E_BACKEND=npu
 export AFD_E2E_DEVICES=0,1,2,3
 export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V2-Lite
 python -m pytest -q -s \
-  tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py
+  tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py::test_deepseek_v2_lite_async_cam
 ```
 
-The CAM/CANN runtime and custom operators must already be installed. Missing
+The CANN runtime and source-built AFD custom operators must be installed. Missing
 model configuration or a device list other than four unique IDs fails the
 test.
 
@@ -239,7 +238,7 @@ export AFD_E2E_BACKEND=npu
 export AFD_E2E_DEVICES=0,1,2
 export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V2-Lite
 python -m pytest -q -s \
-  tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py -k async_ubatch
+  tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py::test_deepseek_v2_lite_async_ubatch
 ```
 
 The device count is derived from the scenario's Attention/FFN rank constants,

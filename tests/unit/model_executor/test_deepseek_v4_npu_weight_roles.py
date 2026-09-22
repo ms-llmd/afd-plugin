@@ -207,3 +207,16 @@ def test_shared_and_non_layer_paths_are_shared(name: str) -> None:
             name,
             attn_owns_gate=attn_owns_gate,
         ) == frozenset({"attention", "ffn"})
+
+
+@pytest.mark.parametrize("stage", ["ffn", "mlp"])
+@pytest.mark.parametrize("suffix", ["weight", "weight_scale", "input_scale", "bias"])
+def test_async_shared_weights_follow_attention_for_checkpoint_and_runtime_names(
+    stage, suffix
+):
+    name = f"model.layers.0.{stage}.shared_experts.gate_proj.{suffix}"
+    assert _checkpoint_weight_roles(
+        name,
+        attention_shared_experts=True,
+    ) == frozenset({"attention"})
+    assert _checkpoint_weight_roles(name) == frozenset({"ffn"})

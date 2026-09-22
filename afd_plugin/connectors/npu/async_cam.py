@@ -5,7 +5,7 @@
 ``CAMAsyncAFDConnector`` is the eager-only Ascend inference data path.
 Attention ranks run MoE routing, submit activations with CAM async
 dispatch-send, and receive combined expert output with combine-recv. FFN ranks
-receive routed and shared-expert activations with dispatch-recv, execute their
+receive routed-expert activations with dispatch-recv, execute their
 local experts, and return the results with combine-send.
 
 The connector creates one HCCL world ordered as
@@ -168,26 +168,15 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
 
 @dataclass(slots=True)
 class AFDAsyncTransferState(AFDTransferState):
-    """CAM-side transfer state carried from dispatch recv to combine send.
-
-    ``batch_size``, ``hidden_size``, ``topk`` and ``layer_idx`` size the CAM
-    operators, while ``token_nums_rankid_layeridx`` and
-    ``expert_token_nums_shared`` are the dispatch-recv outputs the matching send
-    and FFN token accounting need. ``group_list``, ``dynamic_scales``,
-    ``expand_x_shared`` and ``dynamic_scales_shared`` are the routed/shared MoE
-    compute payloads the FFN model runner feeds into ``compute_ffn_output``.
-    """
+    """Routed activations, counts and untouched compact combine metadata."""
 
     batch_size: int = 1
     hidden_size: int = 1
     topk: int = 1
     layer_idx: int = 0
     token_nums_rankid_layeridx: Tensor | None = None
-    expert_token_nums_shared: Tensor | None = None
     group_list: Tensor | None = None
     dynamic_scales: Tensor | None = None
-    expand_x_shared: Tensor | None = None
-    dynamic_scales_shared: Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -201,7 +190,6 @@ class AFDAsyncFFNWorkItem:
     stage_idx: int
     num_tokens: int
     total_num_tokens: int
-    shared_num_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,13 +247,16 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self._initialized = False
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
+        self.activation_dtype = vllm_config.model_config.dtype
         self.topk = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
         extra_info = cast(AFDAsyncExtraInfo, self.extra_info)
         self.dynamic_quant = extra_info.dynamic_quant
         self.hccl_buffer_size_mb = extra_info.hccl_buffer_size
         self.group_name = ""
-        self.max_seq_len = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         self.comm_id = CAM_COMM_ID
         self.tp_size = extra_info.attn_ranks_per_dp
         self.cam_pg: ProcessGroup | None = None
@@ -318,7 +309,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.comm_args = torch.empty((1,), dtype=torch.float16, device=device)
         self._placeholder = torch.empty(
             (1,),
-            dtype=torch.bfloat16,
+            dtype=self.activation_dtype,
             device=device,
         )
         self._initialized = True
@@ -349,13 +340,13 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     ) -> AFDAsyncFFNWorkItem:
         """Receive and normalize one connector-driven FFN dispatch item.
 
-        CAM metadata supplies the actual layer and routed/shared token counts;
+        CAM metadata supplies the actual layer and routed token counts;
         returned tensors are sliced from operator capacity to those counts.
         """
         recv_output = self.recv_attn_output(
             stage_idx=stage_idx,
             layer_idx=0,
-            batch_size=max(1, self.max_seq_len or max_num_tokens),
+            batch_size=max(1, self.max_num_batched_tokens or max_num_tokens),
             ubatch_idx=stage_idx,
         )
         context = recv_output.context
@@ -367,51 +358,26 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 "AFD async CAM FFN work item requires "
                 "TokenNums_Rankid_Layeridx from async_dispatch_recv",
             )
-        expert_token_nums_shared = states.expert_token_nums_shared
-        if expert_token_nums_shared is None:
-            raise RuntimeError(
-                "AFD async CAM FFN work item requires "
-                "expert_token_nums_shared from async_dispatch_recv",
-            )
         expert_token_nums = states.group_list
-        if expert_token_nums is None:
-            raise RuntimeError(
-                "AFD async CAM FFN work item requires expert_token_nums "
-                "from async_dispatch_recv",
-            )
-        # Pack the CAM control fields before crossing to the host. Python needs
-        # the layer and slice lengths, but four separate scalar D2H reads are
-        # unnecessary. Keep the original header untouched for combine-send.
+        assert expert_token_nums is not None
+        # Preserve the full compact metadata for combine-send. Its total is
+        # rank-wide, while counts describe only this receive chunk.
         control = torch.stack(
             (
-                token_nums_rankid_layeridx[0].to(torch.int64),
-                token_nums_rankid_layeridx[2].to(torch.int64),
-                expert_token_nums_shared[0].to(torch.int64),
+                token_nums_rankid_layeridx[0],
+                token_nums_rankid_layeridx[2],
                 expert_token_nums.sum(dtype=torch.int64),
-            ),
+            )
         )
-        total_num_tokens, layer_idx, shared_num_tokens, num_tokens = (
-            control.cpu().tolist()
-        )
-        # Zero routed work is valid; those ranks still participate in
-        # combine-send using the existing BF16 placeholder path.
-        total_num_tokens = max(1, total_num_tokens)
-        shared_num_tokens = max(0, shared_num_tokens)
-        num_tokens = max(0, num_tokens)
+        total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
 
         metadata.layer_idx = layer_idx
         metadata.stage_idx = stage_idx
         metadata.seq_lens = [num_tokens]
 
         hidden_states = recv_output.hidden_states[:num_tokens]
-        if states.expand_x_shared is not None:
-            states.expand_x_shared = states.expand_x_shared[:shared_num_tokens]
         if states.dynamic_scales is not None:
             states.dynamic_scales = states.dynamic_scales[:num_tokens]
-        if states.dynamic_scales_shared is not None:
-            states.dynamic_scales_shared = states.dynamic_scales_shared[
-                :shared_num_tokens
-            ]
 
         return AFDAsyncFFNWorkItem(
             hidden_states=hidden_states,
@@ -421,7 +387,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             stage_idx=stage_idx,
             num_tokens=num_tokens,
             total_num_tokens=total_num_tokens,
-            shared_num_tokens=shared_num_tokens,
         )
 
     def _send_ffn_output_payload(
@@ -439,13 +404,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             )
             return
 
-        kwargs: dict[str, object] = {"ubatch_idx": stage_idx}
-        if ffn_output.shared_output is not None:
-            kwargs["expand_x_shared"] = ffn_output.shared_output
         self.send_ffn_output(
             ffn_output.routed_output,
             context,
-            **kwargs,
+            ubatch_idx=stage_idx,
         )
 
     def send_ffn_work_item_output(
@@ -453,9 +415,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         work_item: AFDAsyncFFNWorkItem,
         ffn_output: Tensor | AFDF2ATransferPayload,
     ) -> Tensor | AFDF2ATransferPayload:
-        """Return one FFN work item's routed/shared outputs through CAM.
+        """Return one FFN work item's routed output through CAM.
 
-        A one-token BF16 routed placeholder is used when a rank receives no
+        A one-token floating routed placeholder is used when a rank receives no
         routed tokens because CAM combine-send cannot consume the dynamic
         quantized dispatch buffer as an empty routed result.
         """
@@ -469,21 +431,19 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
 
         # Temporary NPU workaround: CAM combine-send does not accept the int8
         # dispatch-recv buffer as routed output. When this FFN rank has no
-        # routed tokens, send one fake bf16 routed token instead of reusing the
+        # routed tokens, send one fake floating routed token instead of reusing the
         # dynamicQuant int8 input buffer.
         fake_routed_output = torch.zeros(
             (1, work_item.recv_output.hidden_states.shape[-1]),
-            dtype=torch.bfloat16,
+            dtype=self.activation_dtype,
             device=work_item.recv_output.hidden_states.device,
         )
         if isinstance(ffn_output, AFDF2ATransferPayload):
             ffn_output = AFDF2ATransferPayload(
                 routed_output=fake_routed_output,
-                shared_output=ffn_output.shared_output,
             )
         else:
             ffn_output = fake_routed_output
-        work_item.context.metadata.seq_lens = [1]
         self._send_ffn_output_payload(
             ffn_output,
             work_item.context,
@@ -523,17 +483,19 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             raise RuntimeError(
                 "CAMAsyncAFDConnector send_attn_output requires topk_ids/topk_weights",
             )
+        topk_ids = topk_ids.to(dtype=torch.int32).contiguous()
+        topk_weights = topk_weights.to(dtype=torch.float32).contiguous()
         _validate_topk_payload(
             topk_ids,
             topk_weights,
             batch_size=states.batch_size,
             topk=states.topk,
         )
-        self._pending_attention_payloads.setdefault(
-            context.metadata.stage_idx, []
-        ).append(
-            (context, topk_ids, topk_weights),
-        )
+        if states.batch_size > self.max_num_batched_tokens // self.tp_size:
+            raise ValueError(
+                "Async CAM batch exceeds max_num_batched_tokens / TP capacity"
+            )
+        hidden_states = hidden_states.contiguous()
 
         _log_cam_op_values(
             "async_dispatch_send",
@@ -542,7 +504,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             topk_ids=topk_ids,
             comm_args=self.comm_args,
             comm_id=self.comm_id,
-            max_seq_len=self.max_seq_len,
+            max_seq_len=self.max_num_batched_tokens,
             batch_size=states.batch_size,
             hidden_size=states.hidden_size,
             topk=states.topk,
@@ -556,12 +518,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        torch.ops.umdk_cam_op_lib.async_dispatch_send(
+        torch.ops.afd_ascend.afd_async_dispatch_send(
             hidden_states,
             topk_ids,
             self.comm_args,
             self.comm_id,
-            self.max_seq_len,
+            self.max_num_batched_tokens,
             states.batch_size,
             states.hidden_size,
             states.topk,
@@ -575,6 +537,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.dynamic_quant,
             self.group_name,
         )
+        self._pending_attention_payloads.setdefault(
+            context.metadata.stage_idx, []
+        ).append(
+            (context, topk_ids, topk_weights),
+        )
+
         return None
 
     def recv_ffn_output(
@@ -656,7 +624,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             world_size=self.topology.world_size,
             group_name=self.group_name,
         )
-        output = torch.ops.umdk_cam_op_lib.async_combine_recv(
+        output = torch.ops.afd_ascend.afd_async_combine_recv(
             placeholder,
             topk_ids,
             topk_weights,
@@ -680,15 +648,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> AFDA2FTransferPayload:
-        """Receive CAM-dispatched routed/shared activations on an FFN rank.
-
-        The returned payload preserves dynamic-quant scales, per-expert token
-        counts, shared-expert activations, and CAM token/rank/layer metadata so
-        local expert execution and the subsequent combine-send use the same
-        routing contract.
-        """
+        """Receive routed activations and preserve their compact metadata."""
         self._require_initialized()
-        batch_size = int(kwargs.get("batch_size", self.max_seq_len) or 1)
+        batch_size = int(kwargs.get("batch_size", self.max_num_batched_tokens) or 1)
         layer_idx = int(kwargs.get("layer_idx", 0) or 0)
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
@@ -712,6 +674,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             placeholder=placeholder,
             comm_args=self.comm_args,
             comm_id=self.comm_id,
+            max_seq_len=self.max_num_batched_tokens,
             batch_size=states.batch_size,
             hidden_size=states.hidden_size,
             topk=states.topk,
@@ -724,11 +687,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        outputs = torch.ops.umdk_cam_op_lib.async_dispatch_recv(
+        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
             placeholder,
             self.comm_args,
             self.comm_id,
-            states.batch_size,
+            self.max_num_batched_tokens,
             states.hidden_size,
             states.topk,
             self.ffn_size,
@@ -740,32 +703,18 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.dynamic_quant,
             self.group_name,
         )
-        (
-            hidden_states,
-            expand_x_shared,
-            dynamic_scales,
-            dynamic_scales_shared,
-            token_nums_rankid_layeridx,
-            expert_token_nums,
-            expert_token_nums_shared,
-        ) = outputs
+        hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         _log_cam_op_values(
             "async_dispatch_recv",
             "outputs",
             hidden_states=hidden_states,
-            expand_x_shared=expand_x_shared,
             dynamic_scales=dynamic_scales,
-            dynamic_scales_shared=dynamic_scales_shared,
-            token_nums_rankid_layeridx=token_nums_rankid_layeridx,
+            batch_info=batch_info,
             expert_token_nums=expert_token_nums,
-            expert_token_nums_shared=expert_token_nums_shared,
         )
-        states.token_nums_rankid_layeridx = token_nums_rankid_layeridx
-        states.expert_token_nums_shared = expert_token_nums_shared
+        states.token_nums_rankid_layeridx = batch_info
         states.group_list = expert_token_nums
         states.dynamic_scales = dynamic_scales
-        states.expand_x_shared = expand_x_shared
-        states.dynamic_scales_shared = dynamic_scales_shared
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,
@@ -777,16 +726,13 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        """Send routed and optional shared-expert outputs for CAM combination.
+        """Send routed expert outputs for CAM combination.
 
         ``TokenNums_Rankid_Layeridx`` from the matching dispatch-recv is
         mandatory because CAM uses it to return results to Attention ranks.
         """
         self._require_initialized()
         states = _require_async_transfer_state(context)
-        expand_x_shared = kwargs.get("expand_x_shared")
-        if expand_x_shared is None:
-            expand_x_shared = ffn_output
         token_nums_rankid_layeridx = states.token_nums_rankid_layeridx
         if token_nums_rankid_layeridx is None:
             token_nums_rankid_layeridx = kwargs.get("token_nums_rankid_layeridx")
@@ -799,10 +745,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             "async_combine_send",
             "inputs",
             ffn_output=ffn_output,
-            expand_x_shared=expand_x_shared,
             comm_args=self.comm_args,
             token_nums_rankid_layeridx=token_nums_rankid_layeridx,
             comm_id=self.comm_id,
+            max_seq_len=self.max_num_batched_tokens,
             batch_size=states.batch_size,
             hidden_size=states.hidden_size,
             topk=states.topk,
@@ -814,13 +760,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        torch.ops.umdk_cam_op_lib.async_combine_send(
+        torch.ops.afd_ascend.afd_async_combine_send(
             ffn_output,
-            expand_x_shared,
             self.comm_args,
             token_nums_rankid_layeridx,
             self.comm_id,
-            states.batch_size,
+            self.max_num_batched_tokens,
             states.hidden_size,
             states.topk,
             self.ffn_size,
@@ -889,9 +834,8 @@ def build_async_topology(
 
     The world is Attention-first: Attention role rank ``i`` maps to world rank
     ``i`` and FFN role rank ``j`` maps to
-    ``num_attention_ranks + j``. Routed experts are distributed across FFN
-    ranks using a ceiling division; production model layouts should keep the
-    routed-expert count divisible by the FFN rank count.
+    ``num_attention_ranks + j``. Routed experts are evenly distributed across FFN
+    ranks, so the routed-expert count must divide by the FFN rank count.
     """
     attn_size = afd_config.num_attention_ranks
     ffn_size = afd_config.num_ffn_ranks
@@ -917,8 +861,10 @@ def build_async_topology(
     else:
         raise ValueError(f"unknown AFD role {afd_config.role!r}")
 
-    expert_count = num_routed_experts or 1
-    expert_per_rank = (expert_count + ffn_size - 1) // ffn_size
+    expert_count = num_routed_experts if num_routed_experts is not None else ffn_size
+    if expert_count % ffn_size:
+        raise ValueError("Async CAM requires routed experts divisible by FFN ranks")
+    expert_per_rank = expert_count // ffn_size
     return AFDAsyncTopology(
         role=afd_config.role,
         role_rank=role_rank,

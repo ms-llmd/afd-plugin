@@ -6,9 +6,9 @@ operators for Ascend 910C (`ascend910_93`). They use the
 in dispatch and combine; shared-expert payloads and reserved expert slots are
 absent.
 
-This change adds native sources, build registration, PyTorch bindings, and
-tests. It does not switch `CAMAsyncAFDConnector` to this protocol. The existing
-connector still uses its external CAM dependency and legacy interface.
+`CAMAsyncAFDConnector` uses these four source-built operators and their compact
+metadata. The package includes the native sources, build registration,
+PyTorch bindings and standalone numerical tests.
 
 ## Operator identities and ownership
 
@@ -185,33 +185,25 @@ cleanup results. Validate all four phases together, including:
 - Rebuilding and loading with existing A2E/E2A operators, with the 950 build
   continuing to exclude these 910C-only operators.
 
-This integration has not been built or run on NPU hardware. CPU and Meta
-checks do not qualify NPU communication, accuracy, performance, or ACL graph
-support; device validation remains follow-up work for Ascend 910C.
+The standalone device check is
+`tests/e2e/operators/async_cam_roundtrip.py`. Run it with `torchrun` using
+TP1/2/4 plus two FFN ranks, both FP16/BF16, and quantization off/on. Each run
+compares against an independent CPU weighted-sum/quantization reference and
+covers sparse/empty ranks, multiple chunks and repeated window reuse. Model
+E2E and per-layer reference checks remain separate acceptance gates.
 
-## Follow-up: migrate CAM without shared-expert transfers
+## Routed-only connector and model contract
 
-The intended next step is a routed-only CAM connector. Shared-expert outputs
-remain part of model semantics where the model defines them, but must be
-computed and combined locally outside this communication protocol.
+`CAMAsyncAFDConnector` requires these four source-built operators on every
+rank. Its receive path preserves the full compact metadata for combine-send
+and computes chunk length from expert counts. Shared activations and outputs
+do not cross the A/F boundary.
 
-That migration must update the connector and model boundary together:
+DeepSeek-V2 and DeepSeek-V4 Attention roles construct the pinned native shared
+MLP using replicated weights and local model tokens. They load shared weights,
+scales and biases on Attention, then add the shared result after restoring the
+routed output layout. FFN ranks construct routed experts only. Two-stage
+execution keeps shared results separate by stage; interrupted model forwards
+release pending routing references and require process-group teardown.
 
-1. Replace the external legacy calls with the four `afd_ascend` calls and
-   require the matching compact protocol on every rank.
-2. Change dispatch-receive unpacking from the legacy seven outputs to the
-   four routed-only outputs and adopt zero-based expert indexing and compact
-   batch metadata.
-3. Remove shared-expert send/receive buffers, shared counts, and the
-   `expand_x_shared` combine argument from connector work items and
-   synchronization requirements.
-4. Define and implement model-side shared-expert computation and final
-   combination without remote shared payloads. Existing model paths that
-   require a returned shared tensor must change in the same migration.
-5. Preserve dispatch/combine ordering, empty-rank notifications, window
-   lifetimes, cancellation and shutdown across FFN work items and ubatching.
-6. Validate native-versus-AFD numerical behavior and the intended eager,
-   quantization and ubatching configurations on NPU before enabling this path.
-
-The current `CAMAsyncAFDConnector` and existing model paths retain their
-legacy behavior until that migration is implemented and validated.
+The synchronous CAMP2P and GPU paths retain their existing ownership contracts.

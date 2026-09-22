@@ -31,7 +31,7 @@ Designs: `docs/design/module/attention_runtime.md`,
   gates must state how `baseline-graph` and AFD scenarios remain comparable.
 - Cover the matrix edge the change implies (graph/eager, DBO on/off, DBO +
   2A1F) in at least one named scenario or an explicit follow-up.
-- Cross-node setups (`tools/itask/launch_dsv4_afd_cross_node.sh`) additionally
+- Cross-node setups additionally
   name host/port and rank assumptions; flag silent assumptions about network
   interfaces or device ordering.
 

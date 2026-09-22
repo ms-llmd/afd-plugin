@@ -32,8 +32,10 @@ ascend_kernels/
   a2e/{op_api,op_host,op_kernel}
   e2a/{op_api,op_host,op_kernel}
   afd_async_*/{op_api,op_host,op_kernel}  # four routed-only ops
-  utils/op_host/           # CAM host logging/check headers
-  utils/op_kernel/         # comm_args.h, data_copy.h, moe_distribute_base.h
+  grouped_matmul_swiglu_quant_v2_layered/{op_api,op_host,op_kernel}
+  grouped_matmul_layered/{op_api,op_host,op_kernel}
+  utils/op_host/           # CAM host logging/check/tiling-base headers
+  utils/op_kernel/         # comm_args.h, data_copy.h, moe_distribute_base.h, layered/
 ```
 
 The supported SOC generations and the operators compiled for each are declared
@@ -87,6 +89,17 @@ csrc/npu/scripts/compile_ascend_proj.sh # msopgen + cmake for one SOC generation
 generated `CMakePresets.json` through `scripts/set_conf.py`, then emits a
 deterministically named run package at `csrc/npu/output/AFD_<soc>.run`.
 
+Staging copies each selected operator's `op_host/`, `op_kernel/`, and `op_api/`
+trees recursively, so operators that keep sources in nested directories (for
+example `grouped_matmul_swiglu_quant_v2_layered`, whose tiling implementation
+lives in `op_host/op_tiling/`) keep that layout in the generated project.
+`cmake_files/op_host/CMakeLists.txt` therefore collects host sources recursively
+and hands them to both `npu_op_code_gen` and `cust_optiling`; a top-level-only
+collection would drop a nested operator's tiling registration from the run
+package without failing the registry or Meta tests. After an Ascend build, that
+registration can be re-checked in the packaged library, for example with
+`strings .../vendors/afd-plugin/.../libcust_optiling.so | grep -i <OpName>`.
+
 The generated artifacts are installed into the Python package:
 
 ```text
@@ -123,6 +136,20 @@ ensure_afd_ascend_ops_loaded()
 A2E/E2A continue to serve the existing CAMP2P connector. The four 910C
 routed-only CAM operators are an experimental native integration and are not
 yet selected by `CAMAsyncAFDConnector`, which retains its external legacy CAM
-interface. No new NPU correctness, performance, or ACL graph support is
-claimed without device validation. The new operators are inference-only and
-do not transfer shared-expert payloads.
+interface.
+
+`grouped_matmul_swiglu_quant_v2_layered` is a fused
+grouped-matmul + SiLU + dynamic-quantization CAM operator (A4W4 / A8W4-MSD
+variants) built for `ascend910_93`. It is registered as
+`torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
+autograd grad) and is excluded from `ascend950` builds. Nothing selects it at
+runtime yet; switching a connector/model path to it is a separate follow-up.
+
+For CANN 9.0.1, the layered ACLNN entry explicitly registers
+`grouped_matmul_swiglu_quant_v2_layered.json` as a kernel configuration
+candidate. The default runtime name conversion of `V2Layered` does not match
+opbuild's filename (issue #372). No extra JSON aliases are installed.
+
+No new NPU correctness, performance, or ACL graph support is claimed without
+device validation. The new operators are inference-only and do not transfer
+shared-expert payloads.

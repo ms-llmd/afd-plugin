@@ -143,25 +143,19 @@ def test_dsv4_rejects_gpu(monkeypatch, tmp_path):
         )
 
 
-def test_dsv4_environment_requires_cam_and_preserves_network(monkeypatch, tmp_path):
+def test_dsv4_environment_uses_source_ops_and_preserves_network(monkeypatch):
     monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
     monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth-test")
-    monkeypatch.setenv("CAM_VENDOR", str(tmp_path))
-    with pytest.raises(RuntimeError, match="CAM operator library"):
-        entrypoint.build_environment()
-    library = tmp_path / "op_api/lib/libopapi.so"
-    library.parent.mkdir(parents=True)
-    library.touch()
     env = entrypoint.build_environment()
     assert env["HCCL_BUFFSIZE"] == "4096"
     assert env["GLOO_SOCKET_IFNAME"] == "eth-test"
     assert env["TP_SOCKET_IFNAME"] == "eth-test"
     assert env["AFD_FORCE_BALANCED_TOPK_IDS"] == "0"
-    assert env["CAM_CUST_OPAPI_LIB_PATH"] == str(library)
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "empty", "truncated", "choices", "http", "json", "timeout"]
+    "failure",
+    [None, "empty", "truncated", "choices", "http", "json", "timeout", "wrong-answer"],
 )
 def test_ten_requests_overlap_and_validate_every_response(
     monkeypatch,
@@ -194,7 +188,9 @@ def test_ten_requests_overlap_and_validate_every_response(
             ]
         }
         if operand == 21:
-            if failure == "empty":
+            if failure == "wrong-answer":
+                result["choices"][0]["message"]["content"] = "999"
+            elif failure == "empty":
                 result["choices"][0]["message"]["content"] = ""
             elif failure == "truncated":
                 result["choices"][0]["finish_reason"] = "length"

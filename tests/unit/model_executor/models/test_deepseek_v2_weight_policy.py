@@ -5,10 +5,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = pytest.importorskip("torch")
+
 pytest.importorskip("vllm")
 
 from vllm.model_executor.models import deepseek_v2 as native  # noqa: E402
@@ -172,7 +177,9 @@ def test_load_weights_passes_one_shot_generator_to_native_loader(
     object.__setattr__(
         model,
         "afd_config",
-        SimpleNamespace(compute_gate_on_attention=False),
+        SimpleNamespace(
+            compute_gate_on_attention=False, connector="CAMP2pAFDConnector"
+        ),
     )
     object.__setattr__(model, "config", _config())
 
@@ -235,3 +242,25 @@ def test_moe_metadata_and_backend_loading_remain_native_owned() -> None:
         REPO_ROOT / "afd_plugin" / "model_executor" / "models" / "deepseek_v2.py"
     ).read_text(encoding="utf-8")
     assert "vllm_ascend" not in source
+
+
+@pytest.mark.parametrize("suffix", ["weight", "weight_scale", "input_scale", "bias"])
+def test_async_shared_weights_belong_to_attention(suffix):
+    name = f"model.layers.3.mlp.shared_experts.gate_proj.{suffix}"
+    assert (
+        _checkpoint_weight_roles(
+            name,
+            _config(),
+            compute_gate_on_attention=True,
+            attention_shared_experts=True,
+        )
+        == ATTENTION_ROLES
+    )
+    assert (
+        _checkpoint_weight_roles(
+            name,
+            _config(),
+            compute_gate_on_attention=True,
+        )
+        == FFN_ROLES
+    )

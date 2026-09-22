@@ -77,6 +77,7 @@ def _vllm_stub() -> Iterator[None]:
 
 
 with _vllm_stub():
+    from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
     from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
         hash_input_ids_from_context,
         local_hash_input_ids,
@@ -308,3 +309,45 @@ def test_remote_moe_without_context_ids_raises_instead_of_sending_activations_on
         layer.forward(torch.zeros(3, 8))
 
     assert layer.sent == []
+
+
+@pytest.mark.parametrize(
+    "scoring_func,selector",
+    [
+        ("sqrtsoftplus", "_compute_sqrtsoftplus_topk"),
+        ("softmax", "_compute_standard_topk"),
+    ],
+)
+def test_dsv4_router_uses_model_gate(monkeypatch, scoring_func, selector):
+    hidden = torch.tensor([[1.0, 0.25]], dtype=torch.bfloat16)
+    router_logits = torch.tensor([[1.25, 1.251953125]], dtype=torch.float32)
+    gate_inputs = []
+
+    def gate(hidden_states):
+        gate_inputs.append(hidden_states)
+        return router_logits, None
+
+    moe = types.SimpleNamespace(
+        gate=gate,
+        scoring_func=scoring_func,
+    )
+    captured = []
+
+    def select(_moe, logits):
+        captured.append(logits)
+        ids = logits.argmax(dim=-1, keepdim=True)
+        return torch.ones_like(ids, dtype=torch.float32), ids
+
+    def unexpected_selector(*_args):
+        raise AssertionError("incorrect selector for scoring_func")
+
+    for name in ("_compute_sqrtsoftplus_topk", "_compute_standard_topk"):
+        monkeypatch.setattr(deepseek_v4_attention_gate, name, unexpected_selector)
+    monkeypatch.setattr(deepseek_v4_attention_gate, selector, select)
+    weights, ids = deepseek_v4_attention_gate.compute_attention_gate_topk(moe, hidden)
+
+    assert len(gate_inputs) == 1
+    assert gate_inputs[0] is hidden
+    assert captured[0] is router_logits
+    assert ids.tolist() == [[1]]
+    assert weights.dtype == torch.float32

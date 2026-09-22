@@ -202,18 +202,19 @@ control-plane receive. For each layer, the runner:
 
 1. receives a normalized `AFDAsyncFFNWorkItem` from
    `connector.recv_ffn_work_item(...)`; CAM metadata supplies the actual layer
-   index plus routed/shared token counts, and the connector slices tensors
+   index and compact expert interval; counts.sum() supplies this chunk’s routed token count, and the connector slices tensors
    from operator capacity down to those counts;
 2. builds a single-stage forward context sized to the work item's token count,
    with `dp_metadata = None`;
 3. installs the work item's `AFDTransferContext.metadata` as `afd_metadata`;
-4. calls the role-aware FFN compute, forwarding the routed/shared MoE compute
-   payloads (`group_list`, `dynamic_scales`, `expand_x_shared`,
-   `dynamic_scales_shared`) from the work item's `AFDAsyncTransferState` on
+4. calls the role-aware FFN compute, forwarding the routed MoE compute
+   payloads (`group_list`, `dynamic_scales`) from the work item's `AFDAsyncTransferState` on
    `AFDTransferContext.states`;
-5. returns the routed/shared outputs through
+5. returns the routed outputs through
    `connector.send_ffn_work_item_output(...)`, which also handles the
-   zero-routed-token placeholder required by CAM combine-send.
+   floating zero-routed-token placeholder required by CAM combine-send.
+   A layer is complete only when the received interval ends at the final
+   local expert; earlier intervals continue the receive loop.
 
 CAM async is eager-only and does not use the FFN graph-control path; the graph
 cache is keyed by DP metadata, which does not exist without a control plane.

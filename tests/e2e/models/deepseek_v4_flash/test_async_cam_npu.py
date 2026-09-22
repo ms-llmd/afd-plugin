@@ -11,14 +11,12 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_runner
-from tests.e2e.environment import devices_from_env, prepend_env_paths, required_env
+from tests.e2e.environment import devices_from_env, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ASYNC_CAM_SCENARIO,
     DSV4_ATTENTION_RANKS,
     DSV4_FFN_RANKS,
 )
-
-CAM_VENDOR_PATH = Path("/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM")
 
 
 def build_runner_command(output_path: Path) -> list[str]:
@@ -60,11 +58,6 @@ def build_environment() -> dict[str, str]:
     env = os.environ.copy()
     interface = required_env("HCCL_SOCKET_IFNAME")
     required_env("HCCL_IF_IP")
-    vendor = Path(env.get("CAM_VENDOR", str(CAM_VENDOR_PATH)))
-    op_api = vendor / "op_api"
-    library = op_api / "lib" / "libopapi.so"
-    if not library.is_file():
-        raise RuntimeError(f"CAM operator library does not exist: {library}")
     env.update(
         {
             "VLLM_USE_V1": "1",
@@ -85,15 +78,8 @@ def build_environment() -> dict[str, str]:
             "AFD_ASYNC_MOE_LAYOUT_LOG": "0",
             "GLOO_SOCKET_IFNAME": interface,
             "TP_SOCKET_IFNAME": interface,
-            "CAM_CUST_OPAPI_LIB_PATH": str(library),
         }
     )
-    for name, paths in (
-        ("ASCEND_CUSTOM_OPP_PATH", (vendor,)),
-        ("LD_LIBRARY_PATH", (op_api / "lib", op_api)),
-        ("LD_PRELOAD", (library,)),
-    ):
-        prepend_env_paths(env, name, *paths)
     return env
 
 

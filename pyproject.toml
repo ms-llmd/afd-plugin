@@ -159,4 +159,30 @@ extend-ignore-identifiers-re = [
     # (output feature dim), not "doubt".
     ".*dout.*",
     ".*DOUT.*",
+    # Vendored CANN/AscendC identifiers under csrc/npu/ascend_kernels/ whose
+    # camelCase segments spell a word the dictionary flags. These are part of
+    # the CANN API surface (renaming them breaks compilation against the CANN
+    # headers) or upstream spellings kept as-is so the vendored tree stays
+    # diffable against its origin. The `nd`/`ND` entries above only match a
+    # trailing or all-lowercase `nd`, not a mid-identifier camelCase segment.
+    # ND->NZ copies and their stride/param names.
+    ".*[Nn]d2[Nn]z.*",
+    ".*[Nn]d[A-Z].*",
+    # ND_ALIGN, ND_WEIGHT_DIM_LIMIT, ND_WEIGHT_MULTI_TENSOR_DIM, MIN_ND_DIM.
+    ".*ND_WEIGHT.*",
+    ".*MIN_ND_DIM.*",
+    ".*ND_ALIGN.*",
+    # CANN registration macro.
+    ".*REGIST_MATMUL_OBJ.*",
+    # Upstream-spelled local names: preGoupList, reformatedTensor,
+    # reformatedWeight, isFisrtBlock, copyedL1Left, worskspaceOffset,
+    # DataCopyPad2DA8W4NDNew, isND2NZ, enVecND2NZ.
+    ".*[Gg]oup.*",
+    ".*reformated.*",
+    ".*Fisrt.*",
+    ".*copyed.*",
+    ".*worskspace.*",
+    "DataCopyPad2DA8W4NDNew",
+    ".*isND2NZ.*",
+    ".*enVecND2NZ.*",
 ]

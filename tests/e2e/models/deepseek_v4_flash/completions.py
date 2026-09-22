@@ -52,6 +52,14 @@ def evaluate_completions(*, url: str, model: str, output_path: Path) -> None:
             response.raise_for_status()
             item["response"] = response.json()
             validate_response(item["response"])
+            expected = (
+                DSV4_PROMPT_FIRST_OPERAND + item["index"] + DSV4_PROMPT_SECOND_OPERAND
+            )
+            content = item["response"]["choices"][0]["message"]["content"].strip()
+            if content != str(expected):
+                raise RuntimeError(
+                    f"wrong answer: expected {expected}, got {content!r}"
+                )
             del item["error"]
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
             item["error"] = f"{type(exc).__name__}: {exc}"

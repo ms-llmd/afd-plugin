@@ -161,6 +161,11 @@ def _fail_if_unsupported_npu_afd_async_features(
             f"{type(extra_info).__name__}",
         )
 
+    if vllm_config.additional_config.get("mix_placement", False):
+        raise RuntimeError(
+            "Async CAM uses routed-only expert IDs and does not support mix_placement"
+        )
+
     parallel_config = vllm_config.parallel_config
     if not is_afd_async_dp(vllm_config):
         raise RuntimeError(

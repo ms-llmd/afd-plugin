@@ -11,6 +11,7 @@ import threading
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
@@ -1531,8 +1532,6 @@ def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monke
             states=AFDAsyncTransferState(
                 group_list="groups",
                 dynamic_scales="scales",
-                expand_x_shared="shared-hidden",
-                dynamic_scales_shared="shared-scales",
             ),
         ),
     )
@@ -1542,13 +1541,16 @@ def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monke
     assert runner.model.calls == [("hidden", 0, {})]
 
 
-def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch):
+@pytest.mark.parametrize("layer_sequence", [(7,), (7, 7, 7, 8)])
+def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
+    monkeypatch, layer_sequence
+):
     _require_npu_runtime()
     from afd_plugin.connectors.npu.async_cam import (
         AFDAsyncFFNWorkItem,
         AFDAsyncTransferState,
     )
-    from afd_plugin.v1.worker.npu import ffn_model_runner
+    from afd_plugin.v1.worker.npu import ffn_model_runner, ffn_worker
 
     context_calls = []
     sent_outputs = []
@@ -1569,9 +1571,10 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
     )
     runner = _new_ffn_runner()
     runner.vllm_config = _vllm_config(role="ffn")
-    runner.connector = SimpleNamespace(control_plane=None)
+    runner.connector = SimpleNamespace(control_plane=None, expert_per_rank=2)
     runner.model = _RecordingFakeModel()
-    runner.num_layers = 1
+    runner.num_layers = len(set(layer_sequence))
+    runner.prof = None
     runner.max_num_tokens = 16
     metadata = AFDTransferMetadata.create_ffn_metadata(
         layer_idx=7,
@@ -1585,8 +1588,6 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
         layer_idx=7,
         group_list="groups",
         dynamic_scales="scales[:5]",
-        expand_x_shared="shared-hidden[:2]",
-        dynamic_scales_shared="shared-scales[:2]",
     )
     context = AFDTransferContext(metadata=metadata, states=states)
     recv_output = AFDA2FTransferPayload(
@@ -1601,36 +1602,65 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
         stage_idx=0,
         num_tokens=5,
         total_num_tokens=7,
-        shared_num_tokens=2,
     )
+
+    # Three chunks for layer 7 cross the two-item runner-call boundary.
+    # The real daemon must continue receiving rather than treat that boundary
+    # as completion of the layer or of the request.
+    work_items = [
+        replace(
+            work_item,
+            layer_idx=layer_idx,
+            hidden_states=f"chunk-{index}",
+            context=AFDTransferContext(
+                metadata=replace(metadata, layer_idx=layer_idx),
+                states=replace(states, layer_idx=layer_idx),
+            ),
+        )
+        for index, layer_idx in enumerate(layer_sequence)
+    ]
+    pending = iter(work_items)
+    event = threading.Event()
+    step_boundaries = []
 
     def recv_ffn_work_item(*, stage_idx, max_num_tokens):
         assert stage_idx == 0
         assert max_num_tokens == 16
-        return work_item
+        return next(pending)
 
     def send_ffn_work_item_output(sent_work_item, ffn_output):
         sent_outputs.append((sent_work_item, ffn_output))
+        if len(sent_outputs) == len(work_items):
+            event.set()
         return ffn_output
 
     runner.connector.recv_ffn_work_item = recv_ffn_work_item
     runner.connector.send_ffn_work_item_output = send_ffn_work_item_output
 
-    runner._ffn_forward_connector_driven()
+    worker = _new_ffn_worker()
+    worker.model_runner = runner
+    worker.device = SimpleNamespace(type="cpu")
+    worker._ffn_shutdown_event = event
+    monkeypatch.setattr(
+        ffn_worker.torch.npu,
+        "synchronize",
+        lambda: step_boundaries.append(len(sent_outputs)),
+    )
+    worker._run_ffn_server_loop()
 
     assert runner.model.calls == [
         (
-            "hidden[:5]",
-            7,
-            {
-                "group_list": "groups",
-                "dynamic_scales": "scales[:5]",
-                "expand_x_shared": "shared-hidden[:2]",
-                "dynamic_scales_shared": "shared-scales[:2]",
-            },
-        ),
+            item.hidden_states,
+            item.layer_idx,
+            {"group_list": "groups", "dynamic_scales": "scales[:5]"},
+        )
+        for item in work_items
     ]
-    assert sent_outputs == [(work_item, "npu-ffn(hidden[:5], layer=7)")]
+    assert sent_outputs == [
+        (item, f"npu-ffn({item.hidden_states}, layer={item.layer_idx})")
+        for item in work_items
+    ]
+    assert step_boundaries == ([1] if len(layer_sequence) == 1 else [2, 4])
     assert context_calls[0]["num_tokens"] == 5
     assert context_calls[0]["skip_mc2_mask"] is True
     assert context_calls[0]["afd_metadata"].tokens_lens == [5]

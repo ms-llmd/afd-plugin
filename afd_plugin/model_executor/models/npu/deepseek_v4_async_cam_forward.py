@@ -132,6 +132,7 @@ def run_async_moe_ubatch_forward(
         None for _ in metadata.stages
     ]
     stage_dispatch_refs: list[torch.Tensor | None] = [None for _ in metadata.stages]
+    stage_shared_outputs: list[torch.Tensor | None] = [None for _ in metadata.stages]
     stage_pending_dispatches: list[CAMDispatchPayload | None] = [
         None for _ in metadata.stages
     ]
@@ -208,6 +209,11 @@ def run_async_moe_ubatch_forward(
                 None,
                 use_sequence_parallel=metadata.use_sequence_parallel,
             )
+        stage_shared_outputs[stage_idx] = (
+            layer.mlp.shared_experts(stage_hidden)
+            if layer.mlp.shared_experts is not None
+            else None
+        )
         stage_pending_dispatches[stage_idx] = dispatch
         stage_ffn_state[stage_idx] = (ffn_residual, ffn_post, ffn_comb)
 
@@ -251,6 +257,10 @@ def run_async_moe_ubatch_forward(
             ubatch_idx=stage_idx,
         )
         ffn_output = restore_cam_dispatch_output(local_output, layout)
+        shared_output = stage_shared_outputs[stage_idx]
+        if shared_output is not None:
+            ffn_output = ffn_output + shared_output
+        stage_shared_outputs[stage_idx] = None
         ffn_residual, ffn_post, ffn_comb = ffn_state
         with override_forward_context(stage_context(stage_idx)):
             stage_hidden_states[stage_idx] = layer.hc_post(
@@ -271,6 +281,7 @@ def run_async_moe_ubatch_forward(
             send_stage_attention,
             receive_and_complete,
         )
+
     restored_hidden_states = restore_async_moe_stage_outputs(
         stage_hidden_states,
         metadata,
