@@ -20,7 +20,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 RUN mkdir -p afd_plugin && touch afd_plugin/__init__.py
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git jq && \
+    apt-get install -y --no-install-recommends git jq tini && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -52,4 +52,8 @@ WORKDIR ${APP_DIR}
 
 COPY --link . .
 
-ENTRYPOINT []
+# tini reaps orphaned processes (e.g. vLLM workers whose parent exited first)
+# that a Python PID 1 such as pytest never waits on; left as zombies they keep
+# their process group alive and fail E2E teardown checks. -s registers tini as
+# a subreaper when something else is PID 1 (e.g. shareProcessNamespace).
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
