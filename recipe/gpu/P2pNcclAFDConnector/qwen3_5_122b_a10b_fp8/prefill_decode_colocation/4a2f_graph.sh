@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
-MODEL_PATH=${MODEL_PATH:-/path/model_weights/DeepSeek-V2-Lite}
+MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3.5-122B-A10B-FP8}
 export VLLM_USE_V2_MODEL_RUNNER=0
 
 # Fixed topology for this recipe -- always sent to AFD for rendezvous,
 # regardless of which role(s) this node launches locally.
-ATTENTION_DP_SIZE=2
-ATTENTION_TP_SIZE=2
+ATTENTION_DP_SIZE=4
+ATTENTION_TP_SIZE=1
 FFN_DP_SIZE=2
-FFN_TP_SIZE=2
+FFN_TP_SIZE=1
 NUM_ATTENTION_RANKS=$((ATTENTION_DP_SIZE * ATTENTION_TP_SIZE))
 NUM_FFN_RANKS=$((FFN_DP_SIZE * FFN_TP_SIZE))
 
@@ -20,7 +20,7 @@ ATTENTION_DP_RANKS=${ATTENTION_DP_RANKS:-$ATTENTION_DP_SIZE}
 FFN_DP_RANKS=${FFN_DP_RANKS:-$FFN_DP_SIZE}
 
 AFD_CONNECTOR_HOST=${AFD_CONNECTOR_HOST:-127.0.0.1}
-AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-6269}
+AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-1239}
 
 # DP sharding: lets a single role's DP group be split across multiple pods.
 # Defaults reproduce today's single-pod-per-role behavior exactly (local
@@ -45,6 +45,12 @@ if [ "$ATTENTION_DP_RANKS" -gt 0 ]; then
       --data-parallel-rpc-port "$ATTENTION_DP_RPC_PORT" \
       --tensor-parallel-size "$ATTENTION_TP_SIZE" \
       --enable-expert-parallel \
+      --dtype bfloat16 \
+      --language-model-only \
+      --max-model-len 114688 \
+      --mamba-cache-mode align \
+      --all2all-backend allgather_reducescatter \
+      --seed 0 \
       --additional-config '{
           "afd": {
               "role": "attention",
@@ -55,16 +61,15 @@ if [ "$ATTENTION_DP_RANKS" -gt 0 ]; then
               "num_ffn_ranks": '"${NUM_FFN_RANKS}"'
           }
       }' \
-      --max-num-seqs 64 \
-      --max-num-batched-tokens 64 \
-      --enable-dbo \
-      --dbo-decode-token-threshold 2 \
-      --dbo-prefill-token-threshold 12 \
-      --enforce-eager \
+      --max-num-seqs 32 \
+      --max-num-batched-tokens 8192 \
+      --max-cudagraph-capture-size 32 \
+      --compilation-config '{
+          "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[32]
+      }' \
       $([ "$ATTENTION_HEADLESS" = "1" ] && echo --headless) \
       --host 127.0.0.1 \
-      --port 18305 \
-      --trust-remote-code > attn.log 2>&1 &
+      --port 18305 > attn.log 2>&1 &
 fi
 
 if [ "$FFN_DP_RANKS" -gt 0 ]; then
@@ -79,6 +84,12 @@ if [ "$FFN_DP_RANKS" -gt 0 ]; then
       --data-parallel-rpc-port "$FFN_DP_RPC_PORT" \
       --tensor-parallel-size "$FFN_TP_SIZE" \
       --enable-expert-parallel \
+      --dtype bfloat16 \
+      --language-model-only \
+      --max-model-len 114688 \
+      --mamba-cache-mode align \
+      --all2all-backend allgather_reducescatter \
+      --seed 0 \
       --additional-config '{
           "afd": {
               "role": "ffn",
@@ -89,16 +100,15 @@ if [ "$FFN_DP_RANKS" -gt 0 ]; then
               "num_ffn_ranks": '"${NUM_FFN_RANKS}"'
           }
       }' \
-      --max-num-seqs 64 \
-      --enable-dbo \
-      --dbo-decode-token-threshold 2 \
-      --dbo-prefill-token-threshold 12 \
-      --max-num-batched-tokens 64 \
-      --enforce-eager \
+      --max-num-seqs 32 \
+      --max-num-batched-tokens 8192 \
+      --max-cudagraph-capture-size 32 \
+      --compilation-config '{
+          "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[32]
+      }' \
       $([ "$FFN_HEADLESS" = "1" ] && echo --headless) \
       --host 127.0.0.1 \
-      --port 18305 \
-      --trust-remote-code > ffn.log 2>&1 &
+      --port 18305 > ffn.log 2>&1 &
 fi
 
 wait
