@@ -1,6 +1,6 @@
 ---
 name: deploy-afd-k8s
-description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. Supports single-node and (experimental) multi-node placement, the latter via recipes parameterized with ATTENTION_RANKS/FFN_RANKS env vars. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e). To drive load against what this deploys, see run-vllm-bench-k8s.
+description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. For multi-node-capable recipes (parameterized with ATTENTION_DP_RANKS/FFN_DP_RANKS env vars), ask the caller for an explicit placement plan -- how many attention/FFN ranks go in each Pod, and how many Pods -- rather than assuming a shape; a plan can range from one Pod holding every rank to many Pods with arbitrary, possibly mixed, per-Pod shares (experimental beyond the single-Pod case). Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e). To drive load against what this deploys, see run-vllm-bench-k8s.
 ---
 
 # Deploy an AFD GPU recipe on Kubernetes
@@ -17,20 +17,22 @@ On success this skill guarantees, in the target namespace:
 |---|---|
 | Endpoint | `http://vllm-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `CLIENT_PORT` defaults to `18305`, resolved in step 1) |
 | Serving | the model named by `MODEL_ID` |
-| Pod / Service | `vllm-pod` / `vllm-service`, labels `app=afd-recipe,role=serve` |
+| Pod(s) / Service | one or more Pods, named per the caller's placement plan (step 1b) for a multi-node-capable recipe, or the single `vllm-pod` for a plain fixed recipe; Service `vllm-service`, labels `app=afd-recipe,role=serve` |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs |
 
-Callers only need `MODEL_ID`, `PVC_NAME`, and `GPU_COUNT` back.
+Callers only need `MODEL_ID`, `PVC_NAME`, and `GPU_COUNT` back for a plain
+fixed single-node recipe.
 
-For a multi-node-capable recipe deployed with `node_mode: "multi"` (two
-Pods, `vllm-attn-pod` / `vllm-ffn-pod`, both running the *same* recipe
-script with opposite `ATTENTION_RANKS`/`FFN_RANKS` env overrides), the same
-contract holds -- `vllm-service:${CLIENT_PORT}` still answers
-OpenAI-compatible traffic, backed by the attention Pod. An additional
-internal-only `vllm-ffn-p2p-service` also exists solely to carry AFD
-rendezvous traffic between the two Pods; callers never talk to it
-directly.
+For a multi-node-capable recipe, the caller's placement plan (step 1b)
+decides how many Pods exist and what each is named. The same contract still
+holds -- `vllm-service:${CLIENT_PORT}` answers OpenAI-compatible traffic,
+backed by whichever Pod holds attention rank 0. Whenever the plan spans more
+than one Pod, an additional internal-only `vllm-ffn-p2p-service` also exists
+solely to carry AFD rendezvous traffic to whichever Pod holds FFN rank 0;
+callers never talk to it directly. If either role is itself split across
+more than one Pod, a `vllm-attn-dp-service` and/or `vllm-ffn-dp-service` also
+exist to carry that role's internal DP-RPC coordination traffic.
 
 ## Scope
 
@@ -49,19 +51,25 @@ directly.
 - Recipes are hand-written shell scripts, not JSON configs -- there is no
   generator step and no manifest to read.
 - A recipe is **multi-node-capable** when it gates its `vllm serve` blocks
-  on `ATTENTION_RANKS`/`FFN_RANKS` env vars (e.g.
-  `if [ "$ATTENTION_RANKS" -gt 0 ]`) and embeds the literal string
-  `AFD_FFN_HOST_PLACEHOLDER` in its AFD `host` field (e.g.
-  `4a2f_graph_multinode.sh`) -- grep for both before assuming a script only
-  supports single-node. Deploying such a script with `node_mode: "multi"`
-  splits attention and FFN across two Pods/nodes instead of one, by running
-  the *same* script twice with opposite `ATTENTION_RANKS`/`FFN_RANKS`
-  overrides. This is **experimental**: upstream documents cross-node
+  on `ATTENTION_DP_RANKS`/`FFN_DP_RANKS` env vars (e.g.
+  `if [ "$ATTENTION_DP_RANKS" -gt 0 ]`) and reads its AFD `host` field from an
+  `AFD_CONNECTOR_HOST` env var (e.g.
+  `AFD_CONNECTOR_HOST=${AFD_CONNECTOR_HOST:-127.0.0.1}`, used as
+  `"host": "'"${AFD_CONNECTOR_HOST}"'"` inside `--additional-config`; see
+  e.g. the `deepseek_v2_lite/prefill_decode_colocation/*.sh` recipes) --
+  grep for both before assuming a script only supports single-node.
+  Deploying such a script means asking the caller for an explicit
+  **placement plan** (step 1b): a list of Pods, each carrying its own share
+  of attention/FFN ranks (summing to the recipe's fixed `NUM_ATTENTION_RANKS`/
+  `NUM_FFN_RANKS` totals) -- anywhere from one Pod holding every rank, to a
+  dedicated Pod per role, to many Pods each holding an arbitrary, possibly
+  mixed, share of either role. **Never assume a shape on the caller's
+  behalf** -- ask, every time. Placements beyond a single Pod holding
+  everything are **experimental**: upstream documents cross-node
   `P2pNcclAFDConnector` use as "not established by the current recipes ...
   treated as unverified" (`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`).
-  Deploy it when asked, but don't present its throughput as validated, and
-  default to `node_mode: "single"` unless the caller specifically wants
-  cross-node placement.
+  Deploy whatever the caller asks for, but don't present throughput as
+  validated once the plan spans more than one Pod.
 - Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
 
 ## Requirements
@@ -69,28 +77,14 @@ directly.
 - A live, authenticated `kubectl`/`oc` session able to create/delete Pods,
   Services, ConfigMaps, and PVCs in the target namespace.
 - `envsubst` (from `gettext`) locally.
-- A benchmark image, pushed where the cluster can pull it, that satisfies
-  **all** of the following. There is no ready-made Dockerfile for this in
-  the repo -- ask the user which image to use, and confirm it meets this
-  spec before deploying:
-
-  | Requirement | Why |
-  |---|---|
-  | vLLM base matching `pyproject.toml` (`vllm==0.26.0`) | the recipe's flags are version-specific |
-  | An `afd-plugin` install | the recipe loads the plugin |
-  | Repo sources on disk (conventionally `/opt/afd-plugin`) | recipes and `tools/` are read from the image |
-  | No BuildKit-only syntax (`COPY --link`, `RUN --mount`) *if* built with buildah/imagebuilder | OpenShift Builds rejects it |
-  | App dir group-writable (`chgrp -R 0 <dir> && chmod -R g=u <dir>`) | the restricted SCC runs a random UID in group 0 |
-  | `HOME` set to a writable path | otherwise `HOME=/` and anything expanding `~` fails |
-  | `PYTHONDONTWRITEBYTECODE=1` | the random UID cannot write `__pycache__` into the app dir |
-
-  `docker/Dockerfile.ci` is the closest starting point in the repo, but it
-  does **not** meet this spec as written: it uses `COPY --link`, leaves
-  `HOME=/`, and does not make the app dir group-writable. Adjust those three
-  before using it on OpenShift, or supply an image that already conforms.
+- An image, pushed where the cluster can pull it. Ask the user whether to
+  use an image they already have, or to build one from `docker/Dockerfile.ci`
+  and push it to a registry they provide:
 
   ```bash
-  IMAGE=<registry>/<repo>:<tag>     # must satisfy the table above
+  IMAGE=<registry>/<repo>:<tag>
+  docker build -t "$IMAGE" -f docker/Dockerfile.ci .
+  docker push "$IMAGE"
   ```
 
   The image supplies only the `afd-plugin` install. The recipe script is
@@ -121,21 +115,17 @@ Take the recipe path from the user, or ask. Read the script and note, per
   host/port)
 
 **Check whether the script is multi-node-capable** by grepping for
-`ATTENTION_RANKS`/`FFN_RANKS` env-var gating (e.g.
-`if [ "$ATTENTION_RANKS" -gt 0 ]`) and the literal string
-`AFD_FFN_HOST_PLACEHOLDER`. Both present means the script can run either as
-one pod (defaults run the full topology locally) or as two pods (each
-overriding one of `ATTENTION_RANKS`/`FFN_RANKS` to `0`). Neither present
-means it's a plain fixed single-node script -- skip straight to step 2.
-If the script is multi-node-capable, ask the caller whether they want
-`node_mode: "single"` (default -- one pod, no env overrides needed) or
-`node_mode: "multi"` (two pods); default to `"single"` per Scope unless
-they specifically want cross-node placement.
+`ATTENTION_DP_RANKS`/`FFN_DP_RANKS` env-var gating (e.g.
+`if [ "$ATTENTION_DP_RANKS" -gt 0 ]`) and an `AFD_CONNECTOR_HOST` env-var
+default (e.g. `AFD_CONNECTOR_HOST=${AFD_CONNECTOR_HOST:-127.0.0.1}`).
+Neither present means it's a plain fixed single-node script -- skip straight
+to step 2. Both present means the script's fixed rank totals (below) can be
+placed across Pods however the caller wants -- continue to step 1b.
 
 For a multi-node-capable script, also read its hardcoded topology constants
 (`NUM_ATTENTION_RANKS=`, `NUM_FFN_RANKS=`, near the top -- fixed per recipe
-and always sent to AFD for rendezvous regardless of which role(s) a given
-pod runs locally) and its `AFD_CONNECTOR_PORT` default
+and always sent to AFD for rendezvous regardless of how the caller places
+them) and its `AFD_CONNECTOR_PORT` default
 (`AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-<port>}`). Only export
 `AFD_CONNECTOR_PORT` before deploying if the caller specifically asked for
 a non-default rendezvous port.
@@ -161,28 +151,94 @@ than published on HF Hub -- matching the script's own `MODEL_PATH` default.
 The serve pod handles either form transparently. **Tell the caller which
 form it is**; consumers that load their own tokenizer need to know.
 
+### 1b. Ask for a placement plan (multi-node-capable scripts only)
+
+Skip this step entirely for a plain fixed single-node script (step 1 already
+sent it straight to step 2).
+
+Ask the caller how they want the recipe's fixed `NUM_ATTENTION_RANKS`
+attention ranks and `NUM_FFN_RANKS` FFN ranks placed across Pods. **Do not
+default to a particular shape** -- these are all equally valid answers to
+the same question:
+
+- one Pod holding every rank (`attn_ranks=NUM_ATTENTION_RANKS,
+  ffn_ranks=NUM_FFN_RANKS` on a single Pod) -- the simplest shape, and the
+  only one that isn't experimental;
+- a dedicated Pod per role (one Pod with all attention ranks, another with
+  all FFN ranks);
+- either role split across several Pods (e.g. attention's ranks spread
+  2-and-2 across two Pods, FFN whole in a third);
+- Pods that mix a partial share of both roles (e.g. two Pods of `2 attention
+  + 1 ffn` each for a 4-attention/2-ffn recipe).
+
+Record the plan as a list of `(pod_name, attn_ranks, ffn_ranks)` tuples, in
+the order the caller wants them evaluated. Validate before proceeding:
+
+- every `pod_name` is unique;
+- `sum(attn_ranks) == NUM_ATTENTION_RANKS` and `sum(ffn_ranks) ==
+  NUM_FFN_RANKS` across the whole plan -- AFD's rendezvous always expects
+  the recipe's fixed totals regardless of how they're distributed, so an
+  under- or over-count silently breaks rendezvous rather than failing
+  loudly;
+- every Pod has `attn_ranks + ffn_ranks >= 1` (no empty Pods).
+
+**Derive per-role rank ordering**, needed for `_START_RANK`/`_HEADLESS`/
+`_DP_ADDRESS` in step 4-placed: within each role, walk the plan in the given
+order and set that Pod's `start_rank` for the role to the running sum of the
+role's local counts from every earlier Pod carrying it. The first Pod
+carrying a nonzero share of a role is that role's **head**
+(`start_rank=0`, `headless=0` -- it runs attention's API server, or binds
+FFN's rendezvous rank 0); every later Pod carrying that role is a **worker**
+(`headless=1`). A role that is whole in one Pod trivially has only a head,
+no workers.
+
+Only a role that is genuinely split across more than one Pod needs
+`_START_RANK`/`_HEADLESS`/`_DP_ADDRESS` to vary at all -- and only if the
+recipe exposes `ATTENTION_DP_START_RANK`/`FFN_DP_START_RANK`,
+`ATTENTION_HEADLESS`/`FFN_HEADLESS`, `ATTENTION_DP_ADDRESS`/`FFN_DP_ADDRESS`
+env vars (grep for `_START_RANK`/`_HEADLESS`; a script only gated on
+`ATTENTION_DP_RANKS`/`FFN_DP_RANKS`/`AFD_CONNECTOR_HOST` can place each role
+freely relative to the other, but can't split a single role across more
+than one Pod). Flag this to the caller before proposing a plan that would
+require it.
+
+**Resolve `AFD_CONNECTOR_HOST`** from the plan's Pod count, not from a fixed
+mode: exactly one Pod in the plan means the recipe's loopback default
+(`127.0.0.1`) already works -- no Service needed, don't override it. More
+than one Pod means every Pod's container env must set `AFD_CONNECTOR_HOST`
+to `vllm-ffn-p2p-service` (created in step 4-placed), including Pods that
+carry no FFN ranks themselves -- per
+`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`, every participating rank must
+agree on the same host string, and the Pod holding FFN rank 0 both binds and
+is reached through that name.
+
+**Node placement is left to the scheduler by default.** Do not add
+`podAntiAffinity` forcing Pods onto separate nodes unless the caller
+explicitly asks to exercise cross-node placement -- an unforced multi-Pod
+plan may legitimately land every Pod on the same node, and that's fine.
+Only add the shared-label `podAntiAffinity` block in step 4-placed if asked.
+
 ### 2. Compute GPU_COUNT
 
-For a plain single-node script: `GPU_COUNT` = number of distinct GPU
-indices across every literal `CUDA_VISIBLE_DEVICES=` in the script (union,
-not sum -- each index appears in exactly one block).
+For a plain single-node script (step 1 found no `ATTENTION_DP_RANKS`/
+`FFN_DP_RANKS` gating): `GPU_COUNT` = number of distinct GPU indices across
+every literal `CUDA_VISIBLE_DEVICES=` in the script (union, not sum -- each
+index appears in exactly one block).
 
-For a multi-node-capable script (step 1 found `ATTENTION_RANKS`/
-`FFN_RANKS` gating), `CUDA_VISIBLE_DEVICES` is computed at runtime rather
-than literal, so derive `GPU_COUNT` from the constants read in step 1
-instead:
-- `node_mode: "single"`: `GPU_COUNT = NUM_ATTENTION_RANKS + NUM_FFN_RANKS`
-  (both roles run on the one pod, sharing a contiguous device pool).
-- `node_mode: "multi"`: two counts instead of one --
-  `GPU_COUNT_ATTN = NUM_ATTENTION_RANKS`, `GPU_COUNT_FFN = NUM_FFN_RANKS`.
+For a multi-node-capable script, `GPU_COUNT` is per-Pod, read straight off
+the placement plan from step 1b: for each Pod, `GPU_COUNT = attn_ranks +
+ffn_ranks` assigned to it there.
 
 ### 3. Confirm before touching the cluster
 
 State and confirm: target cluster/namespace, `AFD_PLUGIN_IMAGE`, `MODEL_ID`,
-`PVC_NAME`, `GPU_COUNT`, `CLIENT_PORT`, `RECIPE_SCRIPT_PATH`. Flag explicitly
-that step 4c **deletes any existing `vllm-pod`** (or
-`vllm-attn-pod`/`vllm-ffn-pod` in the multi-node variant) -- if one exists
-from unrelated work, that is destructive and needs approval first.
+`PVC_NAME`, `CLIENT_PORT`, `RECIPE_SCRIPT_PATH`, and either `GPU_COUNT`
+(plain single-node script) or the full placement plan as a table of
+`pod_name | attn_ranks | ffn_ranks | GPU_COUNT` (multi-node-capable script).
+Flag explicitly that step 4 **deletes any existing Pod(s) with the same
+name(s)** as what's about to be deployed (`vllm-pod`, or every `pod_name` in
+the placement plan) -- if one exists from unrelated work, that is
+destructive and needs approval first.
 
 `RECIPE_SCRIPT_PATH` is a *local* path. It need not be committed, exist in
 the image, or live at any particular depth -- but per Scope it must be a
@@ -192,21 +248,36 @@ colocation recipe, since nothing rewrites `SCRIPT_DIR`-relative lookups.
 AFD_PLUGIN_IMAGE=<image>
 MODEL_ID=<model-id>
 PVC_NAME=<pvc-name>
-GPU_COUNT=<n>
 CLIENT_PORT=<n>   # from the script's --port; default 18305
 RECIPE_SCRIPT_PATH=<local-recipe-script-path>
 VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}   # pulled from the caller's env, default 0
 ```
 
-When step 1 identified a `node_mode: "multi"` deploy, confirm two GPU
-counts instead of one -- `RECIPE_SCRIPT_PATH` stays a single path, since the
-same script deploys to both pods with opposite `ATTENTION_RANKS`/
-`FFN_RANKS`:
+For a plain single-node script:
 
 ```bash
-GPU_COUNT_ATTN=<script's NUM_ATTENTION_RANKS>
-GPU_COUNT_FFN=<script's NUM_FFN_RANKS>
+GPU_COUNT=<n>
+```
+
+For a multi-node-capable script, confirm the full placement plan instead,
+e.g. for a 4-attention/2-ffn recipe split as two attention Pods of 2 ranks
+each plus a dedicated FFN Pod:
+
+```bash
+# pod_name         attn_ranks  ffn_ranks  gpu_count
+# vllm-attn-pod-0   2          0          2
+# vllm-attn-pod-1   2          0          2
+# vllm-ffn-pod      0          2          2
+
 AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-<script's default>}   # only export if overriding
+AFD_CONNECTOR_HOST=vllm-ffn-p2p-service   # only when the plan has >1 pod (step 1b); leave unset/loopback for a single-pod plan
+```
+
+or, for the same recipe placed as one Pod holding every rank:
+
+```bash
+# pod_name    attn_ranks  ffn_ranks  gpu_count
+# vllm-pod-0   4          2          6
 ```
 
 ### 4. Deploy
@@ -221,35 +292,36 @@ the GPUs are already claimed. Set `STORAGE_CLASS` to a class the cluster
 actually offers; leaving it unset falls to the default, which is often
 RWO-only or absent and leaves the pod `Pending`.
 
-For `node_mode: "multi"`, the PVC **must** be `ReadWriteMany` (RWX), not
-`ReadWriteOnce`. The attention and FFN Pods are forced onto different nodes
-by anti-affinity (step 4c-multi), and an RWO volume can only attach on one
-node at a time -- the second Pod fails at admission with `Multi-Attach
-error for volume ... already used by pod(s) ...` and sits `Pending`
-forever. This is a hard deadlock, not something that resolves by waiting
-longer. Before deploying multi-node, confirm the storage class actually
-supports RWX (a throwaway 1Gi PVC requesting `ReadWriteMany` against the
-same `STORAGE_CLASS` either binds or it doesn't -- delete it after). If an
-existing single-node PVC is RWO and already holds downloaded weights you
-want to reuse for a multi-node deploy, provision a new RWX PVC and copy the
-data across rather than re-downloading -- e.g. a short-lived Pod pinned via
-`nodeName` to whichever node already holds the RWO mount (same-node
-multi-mount of an RWO volume is fine), with both PVCs as volumes, running
-`cp -a /old/. /new/.` (a nonzero exit purely from failing to preserve the
-top-level directory's mtime is cosmetic; verify with `du -sh` on both sides
-instead of trusting the exit code).
+Whenever the placement plan (step 1b) has more than one Pod, the PVC
+**must** be `ReadWriteMany` (RWX), not `ReadWriteOnce` -- even without
+forced anti-affinity (step 1b defaults to leaving node placement to the
+scheduler), nothing guarantees the Pods land on the same node, and an RWO
+volume can only attach on one node at a time. The second Pod to need it
+fails at admission with `Multi-Attach error for volume ... already used by
+pod(s) ...` and sits `Pending` forever. This is a hard deadlock, not
+something that resolves by waiting longer. Before deploying a multi-Pod
+plan, confirm the storage class actually supports RWX (a throwaway 1Gi PVC
+requesting `ReadWriteMany` against the same `STORAGE_CLASS` either binds or
+it doesn't -- delete it after). If an existing single-Pod PVC is RWO and
+already holds downloaded weights you want to reuse for a multi-Pod plan,
+provision a new RWX PVC and copy the data across rather than re-downloading
+-- e.g. a short-lived Pod pinned via `nodeName` to whichever node already
+holds the RWO mount (same-node multi-mount of an RWO volume is fine), with
+both PVCs as volumes, running `cp -a /old/. /new/.` (a nonzero exit purely
+from failing to preserve the top-level directory's mtime is cosmetic;
+verify with `du -sh` on both sides instead of trusting the exit code).
 
 ```bash
 MODEL_PVC_SIZE=${MODEL_PVC_SIZE:-100Gi}
 STORAGE_CLASS=${STORAGE_CLASS:-}    # e.g. ocs-storagecluster-cephfs
-PVC_ACCESS_MODE=${PVC_ACCESS_MODE:-ReadWriteOnce}   # ReadWriteMany for node_mode "multi"
+PVC_ACCESS_MODE=${PVC_ACCESS_MODE:-ReadWriteOnce}   # ReadWriteMany whenever the placement plan has more than one Pod
 
 if kubectl get pvc "${PVC_NAME}" >/dev/null 2>&1; then
   have="$(kubectl get pvc "${PVC_NAME}" -o jsonpath='{.spec.resources.requests.storage}')"
   have_modes="$(kubectl get pvc "${PVC_NAME}" -o jsonpath='{.spec.accessModes}')"
   echo "PVC ${PVC_NAME} exists (${have}, ${have_modes}); serving ${MODEL_ID} from its warm HF_HOME cache"
   echo "NOTE: verify ${have} fits ${MODEL_ID} -- an undersized reused PVC fails mid-download"
-  echo "NOTE: for node_mode multi, ${have_modes} must include ReadWriteMany or the FFN Pod will deadlock on attach"
+  echo "NOTE: for a multi-Pod placement plan, ${have_modes} must include ReadWriteMany or the second Pod will deadlock on attach"
 else
   envsubst '${PVC_NAME} ${MODEL_PVC_SIZE} ${STORAGE_CLASS} ${PVC_ACCESS_MODE}' <<'EOF' | \
     grep -v 'storageClassName: *$' | kubectl apply -f -
@@ -271,8 +343,10 @@ fi
 ```
 
 **4b. Recipe ConfigMap.** This is what lets the pod run any local recipe --
-edited, uncommitted, or brand new -- without rebuilding the image. Run from
-wherever `RECIPE_SCRIPT_PATH` resolves (e.g. the repo root):
+edited, uncommitted, or brand new -- without rebuilding the image. Shared as-
+is regardless of how many Pods the placement plan has (it's the *same*
+script mounted into every Pod). Run from wherever `RECIPE_SCRIPT_PATH`
+resolves (e.g. the repo root):
 
 ```bash
 kubectl create configmap afd-recipe-script \
@@ -280,12 +354,13 @@ kubectl create configmap afd-recipe-script \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-**4c. Serve pod.** The container runs the mounted recipe unmodified except
-for rebinding the client-facing port off loopback: the recipe binds
-`:${CLIENT_PORT}` on `127.0.0.1` (it is normally driven from inside the same
-host), but the Service needs `0.0.0.0`. Every internal worker port stays on
-loopback. The `uv` shim on `PATH` strips `uv run` -- the image's base
-environment is already correct.
+**4c. Serve pod** (plain fixed single-node script only -- for a multi-node-
+capable script, skip to **4-placed** below instead). The container runs the
+mounted recipe unmodified except for rebinding the client-facing port off
+loopback: the recipe binds `:${CLIENT_PORT}` on `127.0.0.1` (it is normally
+driven from inside the same host), but the Service needs `0.0.0.0`. Every
+internal worker port stays on loopback. The `uv` shim on `PATH` strips
+`uv run` -- the image's base environment is already correct.
 
 `fsGroup` must be inside the namespace's allowed range or the pod is
 rejected at admission (`fsGroup: Invalid value: ... is not an allowed
@@ -541,72 +616,75 @@ done
 echo "=== serve pod ready at http://vllm-service:${CLIENT_PORT} ==="
 ```
 
-### 4-multi. Multi-node variant
+### 4-placed. Placement-plan-driven variant
 
-Only applies when step 1 identified a multi-node-capable script and the
-caller wants `node_mode: "multi"`. Step 4a (the model PVC) is shared -- both
-Pods mount the same PVC -- but per step 4a's note it must be provisioned
-`ReadWriteMany`, not the single-node default `ReadWriteOnce`, or the FFN
-Pod deadlocks trying to attach on its own node. Step 4b (the recipe
-ConfigMap) is also shared as-is: it's the *same* script for both pods now,
-so there is only one ConfigMap, not one per role. Everything below
-replaces steps 4c-4f.
+Only applies when step 1 identified a multi-node-capable script -- use the
+placement plan and per-role rank ordering worked out in step 1b. Step 4a
+(the model PVC) is shared -- every Pod in the plan mounts the same PVC --
+but per step 4a's note it must be provisioned `ReadWriteMany` whenever the
+plan has more than one Pod. Step 4b (the recipe ConfigMap) is also shared
+as-is: the same script is mounted into every Pod regardless of how many the
+plan has, since it already reads its rank counts and AFD host from env
+vars -- no mutation needed. Everything below replaces steps 4c-4f.
 
-**Resolve the FFN host placeholder.** The recipe script contains the
-literal string `AFD_FFN_HOST_PLACEHOLDER` wherever `host` appears inside
-`--additional-config`. Per `docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`,
-`host` must resolve to FFN's first rank, and every participating rank
-(including attention) must agree on the same value. Since both pods mount
-the *same* ConfigMap, substitute once, before creating it:
+**Look up `fsGroup`**, same as step 4c:
 
 ```bash
-FFN_HOST="vllm-ffn-p2p-service"   # short form resolves within the namespace
-sed -i "s/AFD_FFN_HOST_PLACEHOLDER/${FFN_HOST}/g" "$RECIPE_SCRIPT_PATH"
+FS_GROUP="$(kubectl get ns "$(kubectl config view --minify -o jsonpath='{..namespace}')" \
+  -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}' 2>/dev/null \
+  | cut -d/ -f1)"
+FS_GROUP="${FS_GROUP:-1000}"
+echo "using fsGroup=${FS_GROUP}"
 ```
 
-**Recipe ConfigMap (shared, same as step 4b):**
+**Resolve the FFN host value** (skip if the plan has only one Pod -- step 1b
+already said to leave `AFD_CONNECTOR_HOST` at its loopback default). Per
+`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`, `host` must resolve to FFN's
+first rank, and every participating rank (including attention) must agree
+on the same value:
 
 ```bash
-kubectl create configmap afd-recipe-script \
-  --from-file=recipe.sh="${RECIPE_SCRIPT_PATH}" \
-  --dry-run=client -o yaml | kubectl apply -f -
+AFD_CONNECTOR_HOST="vllm-ffn-p2p-service"   # short form resolves within the namespace; short-circuit to 127.0.0.1 for a single-Pod plan
 ```
 
-**4c-multi. Two Pods, forced onto different nodes.** Same container script
-body, env, and `uv` shim as step 4c, both mounting the one shared
-ConfigMap. Differences from step 4c: each Pod passes `ATTENTION_RANKS`/
-`FFN_RANKS` env vars so the script's own gating
-(`if [ "$ATTENTION_RANKS" -gt 0 ]` / `if [ "$FFN_RANKS" -gt 0 ]`) runs only
-its role locally -- the attention Pod sets `ATTENTION_RANKS=$GPU_COUNT_ATTN
-FFN_RANKS=0`, the FFN Pod sets `ATTENTION_RANKS=0 FFN_RANKS=$GPU_COUNT_FFN`;
-each Pod requests only its own role's GPU count (`GPU_COUNT_ATTN` /
-`GPU_COUNT_FFN`, not the union); and the two Pods share an
-`afd-multinode-group` label so a `podAntiAffinity` can force them onto
-different nodes -- matching GPU requests alone don't guarantee that on a
-cluster with multiple GPU nodes. Only the attention Pod's startup wait hits
-`/health`; the FFN Pod only waits on its own log marker (`ffn.log` -> `AFD
-FFN EngineCore started`) and never opens an HTTP port, so a `/health` check
-there would hang forever.
+This is passed as the `AFD_CONNECTOR_HOST` container env var to *every* Pod
+in the plan below, including Pods carrying no FFN ranks themselves -- no
+script mutation needed, since the recipe already reads `host` from that env
+var.
 
-Because the shared script always contains both `> attn.log` and
-`> ffn.log` redirects (one inside each role's `if` block), grepping the
-script text for log redirects -- as step 4c does for plain scripts --
-would wrongly expect a log that this pod's disabled role never produces.
-Derive the expected log(s) instead from this pod's own
-`ATTENTION_RANKS`/`FFN_RANKS` values:
+**One Pod per plan entry, each requesting only its own share of GPUs.** Same
+container script body, env, and `uv` shim as step 4c, but driven by two
+independent role positions (`attn_*` / `ffn_*`) per Pod instead of one
+combined role, since a single Pod can now carry a share of either role,
+both, or (in a one-Pod-holds-everything plan) all of both:
 
 ```bash
-kubectl delete pod vllm-attn-pod vllm-ffn-pod --ignore-not-found
+# delete every Pod name that appears in the placement plan before redeploying
+kubectl delete pod <pod_name_1> <pod_name_2> ... --ignore-not-found
 
-deploy_role_pod() {
-  local role="$1" pod_name="$2" attn_ranks="$3" ffn_ranks="$4"
+# attn_start_rank/attn_headless/attn_dp_address and their ffn_ counterparts
+# describe this Pod's position within each role's DP group -- defaults
+# (0, 0, 127.0.0.1) mean "this Pod is the whole role" or "this Pod is that
+# role's head". Only a role actually split across more than one Pod (step
+# 1b) needs non-default values for that role.
+deploy_pod() {
+  local pod_name="$1" attn_ranks="$2" ffn_ranks="$3" \
+        attn_start_rank="${4:-0}" attn_headless="${5:-0}" attn_dp_address="${6:-127.0.0.1}" \
+        ffn_start_rank="${7:-0}" ffn_headless="${8:-0}" ffn_dp_address="${9:-127.0.0.1}"
   local gpu_n=$((attn_ranks + ffn_ranks))
+  local attn_node_role="none" ffn_node_role="none"
+  [ "$attn_ranks" -gt 0 ] && attn_node_role=$([ "$attn_headless" = "1" ] && echo worker || echo head)
+  [ "$ffn_ranks" -gt 0 ] && ffn_node_role=$([ "$ffn_headless" = "1" ] && echo worker || echo head)
+
   TEMPLATE_IMAGE="$AFD_PLUGIN_IMAGE" TEMPLATE_MODEL="$MODEL_ID" TEMPLATE_POD="$pod_name" \
-  TEMPLATE_ROLE="$role" TEMPLATE_ATTN_RANKS="$attn_ranks" TEMPLATE_FFN_RANKS="$ffn_ranks" \
-  TEMPLATE_GPU="$gpu_n" TEMPLATE_GROUP="afd-multinode" TEMPLATE_PVC="$PVC_NAME" \
+  TEMPLATE_ATTN_RANKS="$attn_ranks" TEMPLATE_FFN_RANKS="$ffn_ranks" \
+  TEMPLATE_ATTN_START_RANK="$attn_start_rank" TEMPLATE_ATTN_HEADLESS="$attn_headless" TEMPLATE_ATTN_DP_ADDRESS="$attn_dp_address" \
+  TEMPLATE_FFN_START_RANK="$ffn_start_rank" TEMPLATE_FFN_HEADLESS="$ffn_headless" TEMPLATE_FFN_DP_ADDRESS="$ffn_dp_address" \
+  TEMPLATE_ATTN_NODE_ROLE="$attn_node_role" TEMPLATE_FFN_NODE_ROLE="$ffn_node_role" \
+  TEMPLATE_GPU="$gpu_n" TEMPLATE_PVC="$PVC_NAME" \
   TEMPLATE_FSGROUP="$FS_GROUP" TEMPLATE_CLIENT_PORT="$CLIENT_PORT" \
-  TEMPLATE_AFD_PORT="${AFD_CONNECTOR_PORT:-}" \
-  envsubst '${TEMPLATE_IMAGE} ${TEMPLATE_MODEL} ${TEMPLATE_POD} ${TEMPLATE_ROLE} ${TEMPLATE_ATTN_RANKS} ${TEMPLATE_FFN_RANKS} ${TEMPLATE_GPU} ${TEMPLATE_GROUP} ${TEMPLATE_PVC} ${TEMPLATE_FSGROUP} ${TEMPLATE_CLIENT_PORT} ${TEMPLATE_AFD_PORT} ${VLLM_USE_V2_MODEL_RUNNER}' <<'EOF' | kubectl apply -f -
+  TEMPLATE_AFD_PORT="${AFD_CONNECTOR_PORT:-}" TEMPLATE_AFD_HOST="${AFD_CONNECTOR_HOST:-127.0.0.1}" \
+  envsubst '${TEMPLATE_IMAGE} ${TEMPLATE_MODEL} ${TEMPLATE_POD} ${TEMPLATE_ATTN_RANKS} ${TEMPLATE_FFN_RANKS} ${TEMPLATE_ATTN_START_RANK} ${TEMPLATE_ATTN_HEADLESS} ${TEMPLATE_ATTN_DP_ADDRESS} ${TEMPLATE_FFN_START_RANK} ${TEMPLATE_FFN_HEADLESS} ${TEMPLATE_FFN_DP_ADDRESS} ${TEMPLATE_ATTN_NODE_ROLE} ${TEMPLATE_FFN_NODE_ROLE} ${TEMPLATE_GPU} ${TEMPLATE_PVC} ${TEMPLATE_FSGROUP} ${TEMPLATE_CLIENT_PORT} ${TEMPLATE_AFD_PORT} ${TEMPLATE_AFD_HOST} ${VLLM_USE_V2_MODEL_RUNNER}' <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -614,19 +692,12 @@ metadata:
   labels:
     app: afd-recipe
     role: serve
-    afd-role: ${TEMPLATE_ROLE}
-    afd-multinode-group: ${TEMPLATE_GROUP}
+    afd-attn-node-role: ${TEMPLATE_ATTN_NODE_ROLE}
+    afd-ffn-node-role: ${TEMPLATE_FFN_NODE_ROLE}
 spec:
   restartPolicy: Never
   securityContext:
     fsGroup: ${TEMPLATE_FSGROUP}
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchExpressions:
-              - {key: afd-multinode-group, operator: In, values: ["${TEMPLATE_GROUP}"]}
-          topologyKey: kubernetes.io/hostname
   volumes:
     - name: model-storage
       persistentVolumeClaim:
@@ -654,7 +725,7 @@ spec:
           chmod +x /work/bin/uv
           export PATH="/work/bin:$PATH"
 
-          echo "=== launching $(basename "$RECIPE_SCRIPT") recipe (role: ${TEMPLATE_ROLE}) ==="
+          echo "=== launching $(basename "$RECIPE_SCRIPT") recipe (attn_ranks=${TEMPLATE_ATTN_RANKS} ffn_ranks=${TEMPLATE_FFN_RANKS}) ==="
 
           RECIPE_BASENAME="$(basename "$RECIPE_SCRIPT" .sh)"
           PATCHED_SCRIPT="/work/${RECIPE_BASENAME}.patched.sh"
@@ -687,12 +758,24 @@ spec:
             sleep infinity
           }
 
-          [ -n "$LOGS" ] || fail "this pod's ATTENTION_RANKS/FFN_RANKS are both 0 -- nothing to run"
+          [ -n "$LOGS" ] || fail "this pod's attn_ranks/ffn_ranks are both 0 -- nothing to run"
 
+          # A headless pod (worker shard of a role split across multiple
+          # Pods, per --headless) never starts an API server, so it never
+          # logs "Application startup complete" -- fall back to the
+          # EngineCore's own init-complete line, which fires regardless of
+          # headless status (unverified marker; not live-validated).
           ready_marker() {
             case "$1" in
               ffn.log) echo "AFD FFN EngineCore started" ;;
-              *)       echo "Application startup complete" ;;
+              attn.log)
+                if [ "${TEMPLATE_ATTN_HEADLESS}" = "1" ]; then
+                  echo "init engine (profile, create kv cache, warmup model) took"
+                else
+                  echo "Application startup complete"
+                fi
+                ;;
+              *) echo "Application startup complete" ;;
             esac
           }
           for log in $LOGS; do
@@ -709,7 +792,7 @@ spec:
             [ "$ready" = "1" ] || fail "timed out waiting for $log"
           done
 
-          if [ "${TEMPLATE_ATTN_RANKS}" -gt 0 ]; then
+          if [ "${TEMPLATE_ATTN_RANKS}" -gt 0 ] && [ "${TEMPLATE_ATTN_HEADLESS}" != "1" ]; then
             echo "--- waiting on attention server /health (127.0.0.1:${TEMPLATE_CLIENT_PORT}) ---"
             endpoint_ready=0
             for i in $(seq 1 60); do
@@ -719,7 +802,7 @@ spec:
             [ "$endpoint_ready" = "1" ] || fail "attention server did not answer /health"
           fi
 
-          echo "=== ${TEMPLATE_ROLE} role READY ==="
+          echo "=== pod ${TEMPLATE_POD} READY (attn_ranks=${TEMPLATE_ATTN_RANKS} ffn_ranks=${TEMPLATE_FFN_RANKS}) ==="
           sleep infinity
       env:
         - {name: USER, value: "vllm"}
@@ -733,9 +816,16 @@ spec:
         - {name: UV_CACHE_DIR, value: "/work/uv"}
         - {name: VLLM_LOGGING_LEVEL, value: "INFO"}
         - {name: VLLM_USE_V2_MODEL_RUNNER, value: "${VLLM_USE_V2_MODEL_RUNNER}"}
-        - {name: ATTENTION_RANKS, value: "${TEMPLATE_ATTN_RANKS}"}
-        - {name: FFN_RANKS, value: "${TEMPLATE_FFN_RANKS}"}
+        - {name: ATTENTION_DP_RANKS, value: "${TEMPLATE_ATTN_RANKS}"}
+        - {name: FFN_DP_RANKS, value: "${TEMPLATE_FFN_RANKS}"}
+        - {name: ATTENTION_DP_START_RANK, value: "${TEMPLATE_ATTN_START_RANK}"}
+        - {name: FFN_DP_START_RANK, value: "${TEMPLATE_FFN_START_RANK}"}
+        - {name: ATTENTION_HEADLESS, value: "${TEMPLATE_ATTN_HEADLESS}"}
+        - {name: FFN_HEADLESS, value: "${TEMPLATE_FFN_HEADLESS}"}
+        - {name: ATTENTION_DP_ADDRESS, value: "${TEMPLATE_ATTN_DP_ADDRESS}"}
+        - {name: FFN_DP_ADDRESS, value: "${TEMPLATE_FFN_DP_ADDRESS}"}
         - {name: AFD_CONNECTOR_PORT, value: "${TEMPLATE_AFD_PORT}"}
+        - {name: AFD_CONNECTOR_HOST, value: "${TEMPLATE_AFD_HOST}"}
         - name: HF_TOKEN
           valueFrom:
             secretKeyRef: {name: hf-token-secret, key: token}
@@ -749,19 +839,108 @@ spec:
         - {name: recipe-script, mountPath: /recipe, readOnly: true}
 EOF
 }
-
-deploy_role_pod attention vllm-attn-pod "$GPU_COUNT_ATTN" 0
-deploy_role_pod ffn       vllm-ffn-pod  0 "$GPU_COUNT_FFN"
 ```
+
+Call `deploy_pod` once per entry in the placement plan. One Pod holding
+every rank of a 4-attention/2-ffn recipe:
+
+```bash
+deploy_pod vllm-pod-0 4 2 0 0 127.0.0.1 0 0 127.0.0.1
+```
+
+A dedicated Pod per role, attention split 2-and-2 across two Pods, FFN whole
+in a third:
+
+```bash
+deploy_pod vllm-attn-pod-0 2 0 0 0 vllm-attn-dp-service       0 0 127.0.0.1
+deploy_pod vllm-attn-pod-1 2 0 2 1 vllm-attn-dp-service        0 0 127.0.0.1
+deploy_pod vllm-ffn-pod    0 2 0 0 127.0.0.1                  0 0 127.0.0.1
+```
+
+`vllm-attn-pod-1`'s `attn_start_rank=2` because `vllm-attn-pod-0` already
+claimed local ranks `[0, 2)`; `vllm-attn-dp-service` is the DP-coordination
+Service (below) exposing `vllm-attn-pod-0`'s DP-RPC port.
+
+`vllm-attn-pod-0`'s own `_DP_ADDRESS` matters here, and it must be the
+**same headless Service name** the worker connects through (`vllm-attn-dp-service`),
+not `127.0.0.1` and not `0.0.0.0`. Two separate mechanisms consume this one
+value on the head, with conflicting requirements:
+
+- vLLM's `DPCoordinator` uses `--data-parallel-address` as the literal ZMQ
+  **bind** address. `127.0.0.1` binds loopback-only and the worker's
+  connection hangs until it times out -- this needs `0.0.0.0` or a real,
+  non-loopback address.
+- Separately, when the recipe passes `--enable-expert-parallel`, every
+  rank -- including the worker's, on the other Pod -- calls
+  `ParallelConfig.stateless_init_dp_group()` (`vllm/config/parallel.py`),
+  which reuses this same address as the **connect target** for a second,
+  independent rendezvous. `0.0.0.0` satisfies the bind case but is not a
+  dialable address, so the worker's ranks hang trying to connect to it and
+  the whole DP group fails after that rendezvous's timeout.
+
+Because a headless Service with a selector matching exactly one Pod
+resolves to that Pod's real IP from anywhere in the cluster -- including
+from the Pod itself -- pointing the head's own `_DP_ADDRESS` at
+`vllm-attn-dp-service` satisfies both: it binds to the head's real
+interface (not loopback) and is dialable by the worker (not the wildcard).
+This only applies to a head Pod whose role is split (`_headless=0` but
+another Pod shares the same role) -- a Pod that is whole in one Pod (like
+`vllm-ffn-pod` above, or the single-Pod example before it) keeps
+`127.0.0.1` since nothing external ever needs to reach it, and there's no
+second Pod for `stateless_init_dp_group` to hang against. Two Pods mixing a
+partial share of both roles (e.g. `2 attention + 1 ffn` each, for a
+4-attention/2-ffn recipe):
+
+```bash
+deploy_pod vllm-mixed-pod-0 2 1 0 0 vllm-attn-dp-service       0 0 vllm-ffn-dp-service
+deploy_pod vllm-mixed-pod-1 2 1 2 1 vllm-attn-dp-service        1 1 vllm-ffn-dp-service
+```
+
+Both of `vllm-mixed-pod-0`'s `_DP_ADDRESS` values point at the matching
+headless Service (its own head address for each split role) rather than
+`0.0.0.0` -- same bind-and-connect reasoning as above, applied to each role
+independently.
+
+Splitting a role across Pods this way additionally requires the recipe to
+expose the `_START_RANK`/`_HEADLESS`/`_DP_ADDRESS` env vars noted in step 1b
+-- confirm that before proposing such a plan.
 
 `AFD_CONNECTOR_PORT` above defaults to an empty string when the caller
 didn't override it -- an empty env value still falls through to the
-script's own `${AFD_CONNECTOR_PORT:-<port>}` default, so it's safe to
-always pass the container env entry.
+script's own `${AFD_CONNECTOR_PORT:-<port>}` default, so it's safe to always
+pass the container env entry.
 
-**4d-multi. Two Services.** `vllm-service` keeps its existing shape and
-contract (client-facing, port `${CLIENT_PORT}`) but now selects `afd-role: attention`
-instead of the generic `role: serve`:
+**Forced cross-node placement, only if the caller explicitly asked for it**
+(step 1b defaults to leaving node placement to the scheduler). Add this
+label to every Pod's `metadata.labels` in the manifest above, and this
+`affinity` block to every Pod's `spec`:
+
+```yaml
+  labels:
+    afd-multinode-group: afd-multinode
+  spec:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+                - {key: afd-multinode-group, operator: In, values: ["afd-multinode"]}
+            topologyKey: kubernetes.io/hostname
+```
+
+This is the same experimental caveat already noted in Scope for cross-Pod
+`P2pNcclAFDConnector` use: any plan beyond a single Pod deploys correctly by
+construction (correct AFD/DP flags, correct port exposure per
+`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`), but has not been validated
+end-to-end on a live cluster in this repo. Treat it as exploratory and say
+so when reporting results.
+
+**Services.** `vllm-service` keeps its existing shape and contract (client-
+facing, port `${CLIENT_PORT}`) but selects on `afd-attn-node-role: head`
+instead of the generic `role: serve` -- this resolves to whichever Pod holds
+attention rank 0, whether that Pod is dedicated to attention or also carries
+FFN ranks (including the single-Pod-holds-everything plan, where the one
+Pod is trivially both roles' head):
 
 ```bash
 kubectl apply -f - <<EOF
@@ -771,33 +950,33 @@ metadata:
   name: vllm-service
   labels: {app: afd-recipe, role: serve}
 spec:
-  selector: {app: afd-recipe, afd-role: attention}
+  selector: {app: afd-recipe, afd-attn-node-role: head}
   ports:
     - {name: http, port: ${CLIENT_PORT}, targetPort: ${CLIENT_PORT}}
 EOF
 ```
 
-`vllm-ffn-p2p-service` is internal-only, exposing the AFD rendezvous port
-range so the attention Pod's AFD rendezvous and per-subgroup connections
-can reach FFN rank 0 -- both the control-plane port and every derived
-subgroup port must be reachable, not just the base port. The range is
-`[AFD_CONNECTOR_PORT, AFD_CONNECTOR_PORT + NUM_FFN_RANKS]` (one derived
+`vllm-ffn-p2p-service` -- only needed when the plan has more than one Pod --
+is internal-only, exposing the AFD rendezvous port range so every Pod's AFD
+rendezvous and per-subgroup connections can reach whichever Pod holds FFN
+rank 0 (`afd-ffn-node-role: head`). Both the control-plane port and every
+derived subgroup port must be reachable, not just the base port. The range
+is `[AFD_CONNECTOR_PORT, AFD_CONNECTOR_PORT + NUM_FFN_RANKS]` (one derived
 port per FFN subgroup, plus the base control-plane port).
 
 This Service **must be headless** (`clusterIP: None`). The FFN role's
-`host` value (the same string every rank agrees on, resolved in
-step "Resolve the FFN host placeholder" above) is used both to *connect*
-(by the attention Pod's rendezvous client) and to *bind* (by the FFN Pod's
-own server loop). A normal ClusterIP is a virtual address that exists only
-in iptables/ipvs rules -- connect works through it, but bind does not,
-since it isn't assigned to any real interface. The FFN Pod fails with
-`OSError: [Errno 99] Cannot assign requested address` trying to bind to
-its own Service's ClusterIP. `clusterIP: None` makes DNS resolve the name
-directly to the FFN Pod's actual IP, which it can bind:
+`host` value (the same string every rank agrees on, resolved above) is used
+both to *connect* (by every other Pod's rendezvous client) and to *bind* (by
+the FFN-head Pod's own server loop). A normal ClusterIP is a virtual address
+that exists only in iptables/ipvs rules -- connect works through it, but
+bind does not, since it isn't assigned to any real interface. The FFN-head
+Pod fails with `OSError: [Errno 99] Cannot assign requested address` trying
+to bind to its own Service's ClusterIP. `clusterIP: None` makes DNS resolve
+the name directly to that Pod's actual IP, which it can bind:
 
 ```bash
 FFN_PORT_START="${AFD_CONNECTOR_PORT:-<script's default>}"
-FFN_PORT_END="$((FFN_PORT_START + GPU_COUNT_FFN))"
+FFN_PORT_END="$((FFN_PORT_START + NUM_FFN_RANKS))"
 PORT_ENTRIES="$(for p in $(seq "$FFN_PORT_START" "$FFN_PORT_END"); do
   printf '    - {name: p%s, port: %s, targetPort: %s}\n' "$p" "$p" "$p"
 done)"
@@ -809,26 +988,53 @@ metadata:
   labels: {app: afd-recipe, role: serve}
 spec:
   clusterIP: None
-  selector: {app: afd-recipe, afd-role: ffn}
+  selector: {app: afd-recipe, afd-ffn-node-role: head}
   ports:
 ${PORT_ENTRIES}
 EOF
 ```
 
-**4e/4f-multi. Wait.** Wait for both Pods to reach `Running` (same bounded
-15-minute pattern as step 4e, applied to `vllm-attn-pod` and
-`vllm-ffn-pod`), then poll both Pods' logs the same way as step 4f, but for
-each Pod's own readiness line (`=== attention role READY ===` /
-`=== ffn role READY ===` from the command body above) instead of a single
-shared "stack READY" marker. Only report the endpoint ready once both have
-printed theirs; the FFN Pod becoming ready doesn't imply the attention Pod
-did, and vice versa.
+**DP-coordination Services** -- only needed when a role is split across more
+than one Pod in the plan (skip entirely for a plan where every role is
+whole in one Pod). Same bind-vs-connect reasoning as `vllm-ffn-p2p-service`
+above: a worker Pod's `_DP_ADDRESS` must resolve to the head Pod's real IP
+so the head's DP-RPC coordinator can bind it, so this too must be headless
+(`clusterIP: None`). One per split role, selecting only that role's head Pod
+on its `_DP_RPC_PORT`:
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-attn-dp-service
+  labels: {app: afd-recipe, role: serve}
+spec:
+  clusterIP: None
+  selector: {app: afd-recipe, afd-attn-node-role: head}
+  ports:
+    - {name: dp-rpc, port: 13345, targetPort: 13345}
+EOF
+```
+
+(symmetrically `vllm-ffn-dp-service` / port `13346` / selector
+`afd-ffn-node-role: head`, if FFN is ever the role being split.)
+
+**Wait.** Wait for every Pod named in the placement plan to reach `Running`
+(same bounded 15-minute pattern as step 4e, applied to each `pod_name`),
+then poll each Pod's own logs the same way as step 4f, but for that Pod's
+own readiness line (`=== pod ${pod_name} READY ...===` from the command body
+above) instead of a single shared "stack READY" marker. Only report the
+endpoint ready once every Pod in the plan has printed its own -- one Pod
+becoming ready doesn't imply the others did.
 
 ### 5. Report back
 
 Tell the caller: the endpoint URL, `MODEL_ID` (and whether it is a HF repo id
 or an in-container path), `PVC_NAME`, `GPU_COUNT`, the recipe deployed, its
-`--max-num-batched-tokens`, and the node it landed on:
+`--max-num-batched-tokens`, and the node(s) it landed on.
+
+For a plain single-node script:
 
 ```bash
 kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}{"\n"}'
@@ -837,15 +1043,16 @@ kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}{"\n"}'
 The node matters to any caller that needs to mount the same `ReadWriteOnce`
 PVC from a second pod -- it can only attach from that node.
 
-For the multi-node variant, report both node names:
+For a multi-node-capable script deployed via a placement plan, report every
+Pod's node:
 
 ```bash
-kubectl get pod vllm-attn-pod vllm-ffn-pod -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+kubectl get pod <pod_name_1> <pod_name_2> ... -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
 ```
 
-Both matter now: either Pod may have been the one to trigger the PVC's
-first `ReadWriteOnce` bind, and a follow-up pod can only attach from that
-Pod's node.
+Every node matters now: whichever Pod triggered the PVC's first
+`ReadWriteMany`/`ReadWriteOnce` bind constrains where a follow-up pod can
+attach from.
 
 ### 6. Teardown
 
@@ -853,16 +1060,21 @@ The pod(s) and Service(s) are **left running by design**, so weights stay
 warm. Report what is still up and how to remove it; do not delete unless
 asked:
 
+For a plain single-node script:
+
 ```bash
 kubectl delete pod vllm-pod
 kubectl delete svc vllm-service
 ```
 
-For the multi-node variant, list all four resources instead:
+For a multi-node-capable script deployed via a placement plan, list every
+Pod name from the plan plus whichever Services were actually created
+(`vllm-service` always; `vllm-ffn-p2p-service` if the plan had more than one
+Pod; `vllm-attn-dp-service`/`vllm-ffn-dp-service` if that role was split):
 
 ```bash
-kubectl delete pod vllm-attn-pod vllm-ffn-pod
-kubectl delete svc vllm-service vllm-ffn-p2p-service
+kubectl delete pod <pod_name_1> <pod_name_2> ...
+kubectl delete svc vllm-service vllm-ffn-p2p-service vllm-attn-dp-service vllm-ffn-dp-service
 ```
 
 The model PVC is intentionally not listed -- deleting it discards the warm
@@ -870,22 +1082,41 @@ cache and forces a full re-download.
 
 ## Caveats
 
-- Redeploying a different recipe means re-running steps 4b-4f (or their
-  multi-node equivalents); the pod(s) are replaced, not reconfigured. Two
-  recipes cannot share a pod or its GPUs.
+- Redeploying a different recipe means re-running steps 4b-4f (or the
+  placement-plan-driven equivalent); the pod(s) are replaced, not
+  reconfigured. Two recipes cannot share a pod or its GPUs.
 - Startup markers are keyed on log filename (`ffn.log` -> `AFD FFN
-  EngineCore started`, everything else -> `Application startup complete`). A
-  recipe using different log names gets the generic marker.
-- Multi-node placement requires a recipe written in the parameterized
-  style (`ATTENTION_RANKS`/`FFN_RANKS` gating + `AFD_FFN_HOST_PLACEHOLDER`,
-  e.g. `4a2f_graph_multinode.sh`). Older fixed two-block recipes (both
-  roles backgrounded unconditionally, literal `CUDA_VISIBLE_DEVICES`) only
-  support `node_mode: "single"` -- don't attempt to split one of those
-  across two Pods.
-- The multi-node variant is experimental: it deploys correctly (two Pods
-  forced onto different nodes, correct port exposure per
-  `docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`), but upstream has not
-  validated `P2pNcclAFDConnector` correctness or performance across nodes.
-  NCCL runs over whatever the cluster's pod network provides -- no RDMA is
-  assumed. Treat throughput numbers from a multi-node deployment as
+  EngineCore started`, everything else -> `Application startup complete`,
+  or -- for a headless attention Pod sharding a split role -- `init engine
+  (profile, create kv cache, warmup model) took`). A recipe using different
+  log names gets the generic marker.
+- A placement plan requires a recipe written in the parameterized style
+  (`ATTENTION_DP_RANKS`/`FFN_DP_RANKS` gating + an `AFD_CONNECTOR_HOST`
+  env-var default for the AFD `host` field, e.g. the
+  `deepseek_v2_lite/prefill_decode_colocation/*.sh` recipes). Older fixed
+  two-block recipes (both roles backgrounded unconditionally, literal
+  `CUDA_VISIBLE_DEVICES`, hardcoded `host`) aren't multi-node-capable at all
+  -- they only support the plain step 4c/4d/4e/4f path, one Pod, no
+  placement question. Don't attempt to place one of those across more than
+  one Pod.
+- Any placement plan beyond a single Pod holding every rank is
+  **experimental**: it deploys correctly (correct port exposure per
+  `docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`, correct AFD/DP flags per
+  Pod), but upstream has not validated `P2pNcclAFDConnector` correctness or
+  performance across Pods -- whether or not those Pods land on the same
+  node. NCCL runs over whatever the cluster's pod network provides -- no
+  RDMA is assumed. Treat throughput numbers from any multi-Pod deployment as
   exploratory, and say so when reporting results.
+- Splitting a single role across more than one Pod additionally requires
+  the recipe to expose `_START_RANK`/`_HEADLESS`/`_DP_ADDRESS` env vars
+  (grep for `_START_RANK`/`_HEADLESS`; a script only gated on
+  `ATTENTION_DP_RANKS`/`FFN_DP_RANKS`/`AFD_CONNECTOR_HOST` supports placing
+  each role in its own Pod, or colocating both roles in one Pod, but not
+  finer sharding of a single role). This is source-backed against vLLM's
+  native multi-node DP flags (`--data-parallel-size-local`,
+  `--data-parallel-start-rank`, `--data-parallel-address`,
+  `--data-parallel-rpc-port`, `--headless` -- confirmed present in
+  `vllm/entrypoints/openai/cli_args.py` and `vllm/engine/arg_utils.py`) but
+  has not been live-validated on a cluster -- in particular the
+  headless-attention readiness marker above is an assumption, not a
+  confirmed observation. Flag this explicitly if asked to deploy it.
