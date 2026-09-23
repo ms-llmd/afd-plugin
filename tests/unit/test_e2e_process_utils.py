@@ -167,6 +167,69 @@ def test_terminate_process_groups_reports_a_group_that_survives_sigkill(
     assert group_liveness_checks >= 2
 
 
+def _write_proc_stat(proc_root, pid, *, state, pgrp, comm="python3"):
+    process_dir = proc_root / str(pid)
+    process_dir.mkdir()
+    (process_dir / "stat").write_text(f"{pid} ({comm}) {state} 1 {pgrp} {pgrp} 0\n")
+
+
+def _patch_group_that_never_disappears(monkeypatch):
+    monkeypatch.setattr(process_utils.os, "kill", lambda _pid, _sig: None)
+    monkeypatch.setattr(process_utils.os, "killpg", lambda _pid, _sig: None)
+    monkeypatch.setattr(process_utils.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
+
+
+class _UnreapedLeader:
+    pid = 101
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_terminate_process_groups_ignores_a_group_of_only_zombies(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_group_that_never_disappears(monkeypatch)
+    _write_proc_stat(tmp_path, 4481, state="Z", pgrp=101, comm="VLLM::Worker) x")
+    _write_proc_stat(tmp_path, 4482, state="S", pgrp=202)
+    (tmp_path / "self").mkdir()
+
+    failures = process_utils.terminate_process_groups(
+        [_UnreapedLeader()],  # type: ignore[list-item]
+        termination_timeout_s=0,
+        poll_interval_s=0,
+        reap_timeout_s=0,
+        proc_root=tmp_path,
+    )
+
+    assert failures == []
+
+
+def test_terminate_process_groups_still_reports_a_live_member_beside_zombies(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_group_that_never_disappears(monkeypatch)
+    _write_proc_stat(tmp_path, 4481, state="Z", pgrp=101)
+    _write_proc_stat(tmp_path, 4483, state="D", pgrp=101)
+
+    failures = process_utils.terminate_process_groups(
+        [_UnreapedLeader()],  # type: ignore[list-item]
+        termination_timeout_s=0,
+        poll_interval_s=0,
+        reap_timeout_s=0,
+        proc_root=tmp_path,
+    )
+
+    assert any("forced SIGKILL" in failure for failure in failures)
+    assert any("still alive after SIGKILL" in failure for failure in failures)
+
+
 def test_find_processes_matching_environment_uses_exact_entries(
     monkeypatch,
     tmp_path,
