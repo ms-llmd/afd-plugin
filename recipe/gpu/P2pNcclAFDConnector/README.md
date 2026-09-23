@@ -50,11 +50,7 @@ provisions the model PVC, mounts the chosen recipe script into a serve pod
 via a ConfigMap (no image rebuild needed to try an edited or new recipe),
 and waits until an OpenAI-compatible endpoint answers.
 
-```
-/deploy-afd-k8s
-```
-
-then give it the recipe path (e.g.
+The skill requires the recipe path (e.g.
 `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh`)
 plus the image, model id, and PVC name it needs. It derives `GPU_COUNT`
 itself for a plain single-node recipe; for a multi-node-capable recipe it
