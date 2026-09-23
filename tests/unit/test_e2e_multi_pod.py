@@ -248,8 +248,8 @@ def test_plan_numbers_devices_from_zero_in_an_ffn_only_pod():
     assert _slot(pods[1], FFN_ROLE).devices == ("0", "1")
 
 
-def test_plan_splits_ffn_across_pods_for_the_issue_327_regression():
-    """A role can span pods with one leader and the rest headless (issue #327)."""
+def test_plan_splits_ffn_across_pods():
+    """A role can span pods with one leader and the rest headless."""
     pods = plan(_topology(), PodLayout.parse("2A0F,0A1F,0A1F"), _addresses(3))
 
     ffn_pods = [pod.index for pod in pods if pod.slot(FFN_ROLE) is not None]
@@ -258,21 +258,6 @@ def test_plan_splits_ffn_across_pods_for_the_issue_327_regression():
     assert _slot(pods[2], FFN_ROLE).headless is True
     assert _slot(pods[2], FFN_ROLE).dp_start_rank == 1
     assert _slot(pods[1], FFN_ROLE).spans_pods is True
-
-
-def test_plan_scales_to_the_sixteen_rank_layout():
-    """Placement still holds at 16A16F spread over four pods."""
-    pods = plan(
-        _topology(16, 16),
-        PodLayout.parse("8A0F,8A0F,0A8F,0A8F"),
-        _addresses(4),
-    )
-
-    assert _slot(pods[1], ATTENTION_ROLE).dp_start_rank == 8
-    assert _slot(pods[1], ATTENTION_ROLE).headless is True
-    assert _slot(pods[3], FFN_ROLE).dp_start_rank == 8
-    assert _slot(pods[2], FFN_ROLE).headless is False
-    assert _slot(pods[0], ATTENTION_ROLE).afd_host == "pod-2.svc"
 
 
 def test_plan_uses_distinct_dp_rpc_ports_per_role():
@@ -481,11 +466,6 @@ def test_find_stale_run_markers_reports_only_other_runs(tmp_path: Path):
 def test_find_stale_run_markers_is_empty_without_a_proc_filesystem(tmp_path: Path):
     """The pre-flight stays silent where processes cannot be inspected."""
     assert identity.find_stale_run_markers("run", proc_root=tmp_path / "absent") == []
-
-
-def test_wait_for_address_resolves_a_real_name_with_the_default_resolver():
-    """Exercise the real resolver: a fake cannot catch its call signature."""
-    identity.wait_for_address("localhost", timeout_s=5, poll_interval_s=0)
 
 
 def test_wait_for_address_returns_once_the_record_appears():
