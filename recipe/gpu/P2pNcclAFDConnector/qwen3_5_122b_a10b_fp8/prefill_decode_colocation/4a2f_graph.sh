@@ -36,6 +36,7 @@ FFN_DP_RPC_PORT=${FFN_DP_RPC_PORT:-13346}
 
 if [ "$ATTENTION_DP_RANKS" -gt 0 ]; then
   ATTN_DEVICES=$(seq -s, 0 $((ATTENTION_DP_RANKS * ATTENTION_TP_SIZE - 1)))
+  # shellcheck disable=SC2046
   CUDA_VISIBLE_DEVICES="$ATTN_DEVICES" uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size "$ATTENTION_DP_SIZE" \
       --data-parallel-size-local "$ATTENTION_DP_RANKS" \
@@ -74,6 +75,7 @@ fi
 if [ "$FFN_DP_RANKS" -gt 0 ]; then
   FFN_DEVICE_START=$((ATTENTION_DP_RANKS * ATTENTION_TP_SIZE))
   FFN_DEVICES=$(seq -s, "$FFN_DEVICE_START" $((FFN_DEVICE_START + FFN_DP_RANKS * FFN_TP_SIZE - 1)))
+  # shellcheck disable=SC2046
   CUDA_VISIBLE_DEVICES="$FFN_DEVICES" uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size "$FFN_DP_SIZE" \
       --data-parallel-size-local "$FFN_DP_RANKS" \
