@@ -18,6 +18,8 @@
 namespace afd_plugin::grouped_matmul_layered {
 namespace {
 
+using tensor_list = std::vector<at::Tensor>;
+
 constexpr int64_t SPLIT_ITEM_MIN = 0;
 constexpr int64_t SPLIT_ITEM_MAX = 3;
 constexpr int64_t B4_PER_B32 = 8;  // eight int4 nibbles per int32 word
