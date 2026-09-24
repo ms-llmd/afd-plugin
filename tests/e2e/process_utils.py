@@ -38,7 +38,8 @@ def process_group_is_alive(pgid: int, *, proc_root: Path = PROC_ROOT) -> bool:
     ``os.killpg(pgid, 0)`` also succeeds for zombies, which a non-reaping PID 1
     (for example ``exec pytest`` in a container) never collects. Zombies hold no
     device memory, so a group whose only members are zombies counts as gone.
-    Errors from ``os.killpg`` other than ``ProcessLookupError`` propagate.
+    Errors from ``os.killpg`` other than ``ProcessLookupError`` propagate, and a
+    ``stat`` entry whose process group cannot be parsed raises ``ValueError``.
     """
     try:
         os.killpg(pgid, 0)
@@ -53,15 +54,16 @@ def process_group_is_alive(pgid: int, *, proc_root: Path = PROC_ROOT) -> bool:
         if not process_entry.name.isdecimal():
             continue
         try:
-            stat = (process_entry / "stat").read_text()
+            # Read bytes: comm is arbitrary bytes and need not be valid UTF-8.
+            stat = (process_entry / "stat").read_bytes()
         except OSError:
             # Processes may exit or be inaccessible while /proc is scanned.
             continue
         # comm may contain spaces or ')'; state, ppid and pgrp follow the last ')'.
-        fields = stat[stat.rfind(")") + 2 :].split()
+        fields = stat[stat.rfind(b")") + 2 :].split()
         if len(fields) < 3 or int(fields[2]) != pgid:
             continue
-        if fields[0] not in ("Z", "X"):
+        if fields[0] not in (b"Z", b"X"):
             return True
         found_zombie_member = True
     # Finding no member at all means /proc is unavailable or the group exited
@@ -131,7 +133,7 @@ def terminate_process_groups(
             try:
                 if not process_group_is_alive(pgid, proc_root=proc_root):
                     continue
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 failures.append(
                     f"liveness check failed for {group_description} {pgid}: {exc}",
                 )
@@ -178,7 +180,7 @@ def terminate_process_groups(
             try:
                 if not process_group_is_alive(pgid, proc_root=proc_root):
                     continue
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 failures.append(
                     f"post-SIGKILL liveness check failed for "
                     f"{group_description} {pgid}: {exc}",
