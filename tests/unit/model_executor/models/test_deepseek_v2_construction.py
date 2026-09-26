@@ -674,3 +674,37 @@ def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
 
     assert all(not calls for calls in construction_env.values())
+
+
+def test_async_ffn_omits_shared_with_real_hf_config(monkeypatch, construction_env):
+    from transformers import DeepseekV2Config
+
+    original = DeepseekV2Config(
+        n_shared_experts=1,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        first_k_dense_replace=1,
+    )
+    config = _vllm_config()
+    config.model_config.hf_config = original
+    native_configs = []
+
+    class RoutedMoE(nn.Module):
+        def __init__(self, *, config, **kwargs):
+            super().__init__()
+            native_configs.append(config)
+
+    monkeypatch.setattr(adapter.native, "DeepseekV2MoE", RoutedMoE)
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: AFDConfig(
+            role="ffn",
+            connector="CAMAsyncAFDConnector",
+            compute_gate_on_attention=True,
+        ),
+    )
+    adapter.AFDDeepseekV2DecoderLayer(config, "model.layers.3")
+    assert native_configs[0] is not original
+    assert native_configs[0].n_shared_experts is None
+    assert original.n_shared_experts == 1

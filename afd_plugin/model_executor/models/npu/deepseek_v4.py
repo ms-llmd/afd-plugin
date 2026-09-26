@@ -12,7 +12,8 @@ constructs the native MoE module and exposes it through the runner-facing
 """
 
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any
+from copy import copy
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,9 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
+from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
+    AFDDeepseekV4SharedExperts,
+)
 
 try:
     from vllm_ascend.models import deepseek_v4 as native
@@ -40,6 +44,9 @@ except ImportError as exc:  # pragma: no cover - only reachable off Ascend.
     raise ImportError(
         "DSV4 AFD support requires the vLLM-Ascend native DSV4 model"
     ) from exc
+
+if TYPE_CHECKING:
+    from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
 
 
 _ATTENTION_ROLE = "attention"
@@ -69,12 +76,23 @@ def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
     return None
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    attn_owns_gate: bool = True,
+    attention_shared_experts: bool = False,
+) -> frozenset[str]:
     """Return the AFD owner for a DSV4 checkpoint path.
 
     DSV4 checkpoints use ``attn``/``ffn`` names while the Ascend runtime
     model exposes ``self_attn``/``mlp``.  The native loader performs that name
     conversion later, so filtering must understand both spellings here.
+
+    ``attn_owns_gate`` describes whether the Attention role built a router for
+    the current configuration. Handing a role a path it never registered is not
+    a harmless no-op: the upstream Ascend loader indexes its parameter dict by
+    name without a membership check, so it raises ``KeyError`` instead of
+    skipping.
     """
 
     layer_path = _weight_layer_path(name)
@@ -85,8 +103,18 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
     if stage in ("attn", "self_attn"):
         return frozenset((_ATTENTION_ROLE,))
     if stage in ("ffn", "mlp"):
+        if attention_shared_experts and remainder and remainder[0] == "shared_experts":
+            return frozenset((_ATTENTION_ROLE,))
         if remainder and remainder[0] == "gate":
-            return _BOTH_ROLES
+            # Every router parameter, including the Hash id table, belongs to
+            # each role that built a router: with the gate on Attention, the
+            # Attention gate shell registers ``tid2eid`` for Hash layers and
+            # routes from it, and the native FFN MoE registers its own copy.
+            # With the gate on FFN the Attention MoE slot is parameter-free, so
+            # Attention must not receive any of them.
+            if attn_owns_gate:
+                return _BOTH_ROLES
+            return frozenset((_FFN_ROLE,))
         return frozenset((_FFN_ROLE,))
     # HC parameters and any future shared layer parameters are required by
     # both role-local model instances.
@@ -97,10 +125,50 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    attn_owns_gate: bool = True,
+    attention_shared_experts: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
+        if role in _checkpoint_weight_roles(
+            name,
+            attn_owns_gate=attn_owns_gate,
+            attention_shared_experts=attention_shared_experts,
+        ):
             yield name, loaded_weight
+
+
+class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
+    """DSV4 gate-on-FFN shell that sends Hash ids alongside the activations.
+
+    The FFN role owns the gate for this configuration. Its Hash layers route by
+    token identity, and only Attention holds ``input_ids``, so Attention sends
+    the rank-local ids that the FFN rank's tokens correspond to. Connectors that
+    do not transport ids ignore the extra argument, which keeps this shell valid
+    for gate-on-FFN configurations in general.
+
+    Whether ids cross the boundary is a run-level decision the two roles share
+    through the model's ``afd_requires_input_ids`` declaration, not a per-layer
+    one, because the FFN role cannot tell Hash layers from non-Hash ones. A
+    forward context with no ids is therefore an error here rather than a silent
+    activations-only send.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
+            hash_input_ids_from_context,
+        )
+
+        # The FFN rank asks for the operator's ids channel on every layer, so
+        # this side must send ids rather than fall back to an activations-only
+        # transfer. ``hash_input_ids_from_context`` raises if the forward context
+        # cannot supply them.
+        return self._send_and_receive(
+            hidden_states,
+            input_ids=hash_input_ids_from_context(
+                forward_context=get_forward_context(),
+                router_tokens=int(hidden_states.shape[0]),
+            ),
+        )
 
 
 class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
@@ -112,6 +180,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         config: Any,
         layer_idx: int,
         prefix: str,
+        vllm_config: VllmConfig,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
         self.top_k = int(config.num_experts_per_tok)
@@ -122,6 +191,22 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         self.topk_group = int(getattr(config, "topk_group", 1))
         self.routed_scaling_factor = float(
             getattr(config, "routed_scaling_factor", 1.5),
+        )
+        # Native SP MLP owns replicated shared weights and consumes local
+        # tokens, including FlashComm1 shards, without a TP reduction.
+        self.shared_experts = (
+            AFDDeepseekV4SharedExperts(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                hidden_act=config.hidden_act,
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                quant_config=vllm_config.quant_config,
+                is_sequence_parallel=True,
+                prefix=f"{prefix}.shared_experts",
+            )
+            if config.n_shared_experts
+            else None
         )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -167,7 +252,10 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
-        return restore_cam_dispatch_output(output, dispatch_payload.layout)
+        output = restore_cam_dispatch_output(output, dispatch_payload.layout)
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(hidden_states)
+        return output
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -232,14 +320,22 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                     config=config,
                     layer_idx=layer_idx,
                     prefix=f"{prefix}.mlp",
+                    vllm_config=vllm_config,
                 )
             else:
-                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
+                self.mlp = AFDDeepseekV4RemoteMoE(layer_idx=layer_idx)
         elif afd_config.role == _FFN_ROLE:
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
+            moe_config = config
+            if afd_config.connector == AFD_ASYNC_CONNECTOR:
+                moe_config = copy(config)
+                # HF validates this public field as int, but pinned native
+                # MoE uses only None to omit shared construction (0 builds a
+                # zero-width MLP). Keep the original model config unchanged.
+                object.__setattr__(moe_config, "n_shared_experts", None)
             self.mlp = native.DeepseekV4MoE(
-                config=config,
+                config=moe_config,
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
@@ -303,6 +399,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
             )
+        # The native MoE runs the gate internally when the gate is not on
+        # Attention. Its Hash layers route by token identity, and vLLM-Ascend's
+        # fused-expert selector reads ``forward_context.input_ids``, which the
+        # FFN runner installs from the transfer. The native forward takes no
+        # ``input_ids`` argument, so the ambient context is the whole channel.
         return self.mlp(hidden_states)
 
 
@@ -533,10 +634,18 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
 
     model_cls = AFDDeepseekV4Model
 
+    # DSV4 Hash layers route by token identity. The FFN role does not hold
+    # input_ids, so the connector must transport them and the FFN runner
+    # installs them in the forward context before the FFN compute.
+    afd_requires_input_ids = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def get_async_cam_w4a8_layers(self) -> "tuple[list[W4A8LayerWeights], str]":
+        return _extract_async_cam_w4a8_layers(self.model.layers)
 
     def compute_ffn_output(
         self,
@@ -568,7 +677,80 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_iter_role_weights(weights, role=self.afd_role))
+        # Only the gate-on-Attention configuration gives Attention a router; with
+        # the gate on FFN its MoE slot is a parameter-free transfer shell.
+        role_weights = _iter_role_weights(
+            weights,
+            role=self.afd_role,
+            attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
+            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+        )
+        loaded = super().load_weights(role_weights)
+        return loaded
+
+
+def _extract_async_cam_w4a8_layers(
+    layers: Iterable[AFDDeepseekV4DecoderLayer],
+) -> "tuple[list[W4A8LayerWeights], str]":
+    """Expose loaded DeepSeek V4 routed-expert weights to the layered executor."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_ascend.quantization.quant_type import QuantType
+
+    from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+
+    layers = [layer for layer in layers if layer.is_moe_layer]
+    quant_types = {layer.mlp.experts.quant_type for layer in layers}
+    if quant_types != {QuantType.W4A8}:
+        return [], f"non-W4A8 or mixed quantization: {quant_types}"
+    weights = []
+    for layer in layers:
+        experts = layer.mlp.experts
+        if experts.dynamic_eplb:
+            raise ValueError(
+                f"layered GMM layer {layer.layer_idx}: dynamic EPLB is unsupported"
+            )
+        if experts.activation != MoEActivation.SILU:
+            raise ValueError(
+                f"layered GMM layer {layer.layer_idx}: requires SiLU activation"
+            )
+        if experts._shared_experts is not None:
+            raise ValueError(
+                f"layered GMM layer {layer.layer_idx}: "
+                "shared experts must run on Attention"
+            )
+        owner = experts.routed_experts
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_scale_bias",
+            "w2_scale_bias",
+        ):
+            if owner._parameters.get(name) is None:
+                raise ValueError(
+                    f"layered GMM layer {layer.layer_idx}: missing loaded {name}"
+                )
+        weights.append(
+            W4A8LayerWeights(
+                layer_idx=layer.layer_idx,
+                w13=owner.w13_weight,
+                w2=owner.w2_weight,
+                w13_scale=owner.w13_weight_scale,
+                w2_scale=owner.w2_weight_scale,
+                w13_bias=owner.w13_scale_bias,
+                w2_bias=owner.w2_scale_bias,
+                per_channel=owner.quant_method.quant_method.is_per_channel_weight,
+                swiglu_limit=float(layer.mlp.swiglu_limit or 0.0),
+                # DSV4 already applies routed scaling in Attention top-k.
+                routed_scaling_factor=1.0,
+            )
+        )
+    # One layered call shares static geometry, quantization, and scaling
+    # across every selectable layer; heterogeneous layers use the legacy path.
+    if any(weight.signature() != weights[0].signature() for weight in weights):
+        return [], "heterogeneous W4A8 geometry, quantization or model semantics"
+    return weights, ""
 
 
 __all__ = [

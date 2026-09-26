@@ -103,7 +103,7 @@ the corresponding runtime stack.
 | Graph policy/keying | `v1/worker/cuda_graph.py` | shared policy/keying plus ACL/NPUGraph integration |
 | Native ubatching | `AFDUBatchWrapper` and vLLM ubatching APIs | `AscendUBatchWrapper`, Ascend contexts, streams, and slice utilities |
 | Profiling | `compat/profiler.py` | `compat/npu/profiler.py` |
-| Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P | plugin CANN A2E/E2A ops or external CAM async ops |
+| Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P | plugin CANN A2E/E2A and routed-only async CAM ops |
 | Build/packaging | no plugin CUDA extension | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
 
 ```mermaid
@@ -116,7 +116,7 @@ flowchart TB
     CUDA --> NCCL["NCCL P2P transport"]
     NPU --> NPU_RUNNERS["NPUModelRunner extensions"]
     NPU --> ACL["ACL/NPUGraph and AscendUBatchWrapper"]
-    NPU --> CANN["CANN A2E/E2A or external CAM operators"]
+    NPU --> CANN["Plugin CANN A2E/E2A and async CAM operators"]
     CUDA_GRAPH --> DEVICE["Device execution"]
     GPU_RUNNERS --> DEVICE
     NCCL --> DEVICE
@@ -273,6 +273,11 @@ registry is exposed only through the active forward context under
 `afd_mla_graph_params`; the compatibility resolver falls back to upstream
 process-global state outside that scope.
 
+This protocol belongs to the plain MLA backend alone. Upstream's sparse (SFA)
+and compressor (DSA) backends implement `update_graph_params()` as a no-op and
+register no FIA workspace, so those models, DeepSeek V4 among them, take the
+generic two-stage path with no MLA registries.
+
 The NPU V2 runner supports eager, `FULL`, and `FULL_DECODE_ONLY`. Like CUDA V2,
 it publishes descriptor-matched warmup/capture control outside formal graph
 capture and installs an instance-scoped pre-replay hook because native full
@@ -302,10 +307,13 @@ CMake extension, and packages `_cann_ops_custom`. Loading remains lazy:
 the connector initializes. The package can therefore be imported without the
 NPU extension, but the CAMP2P data path cannot run without it.
 
-`CAMAsyncAFDConnector` instead requires `torch_npu`, `umdk_cam_op_lib`, and the
-real CAM dispatch/combine operator namespace. Its loader verifies
-`async_dispatch_send`, `async_dispatch_recv`, `async_combine_send`, and
-`async_combine_recv` when the connector initializes.
+`CAMAsyncAFDConnector` loads the same AFD extension and additionally requires
+all four `torch.ops.afd_ascend.afd_async_*` operators. The 910C package uses
+compact routed-only metadata; Attention owns shared experts and FFN owns
+routed experts. The 950 package does not register these async operators.
+See [the routed-only guide](../../npu/CAM_ASYNC_ROUTED_OPS.md) for metadata
+and window lifetime contracts. Device validation remains necessary for each
+target topology.
 
 ### NPU profiling
 
@@ -327,7 +335,7 @@ an expansion of the supported runtime contract.
 | CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | DeepSeek-V2-Lite eager/graph DP2 and TP2 accuracy E2E, plus focused V2 unit tests |
 | Ascend V1 + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | Backend-neutral DeepSeek-V2-Lite eager/graph/DBO accuracy cases plus NPU runtime, graph, ops, connector, and profiler unit tests |
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | Focused runner, context, validation, and device-contract unit tests; no repository hardware E2E case |
-| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental v0.26 port; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; external CAM ops required | Focused unit coverage; pre-fix DP3TP2/EP2 six-case E2E matrix; post-fix full 61-layer DP2TP8+EP16 token-split run reached `0.9522` strict match on the complete GSM8K evaluation |
+| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental v0.26 port; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Focused unit coverage; pre-fix DP3TP2/EP2 six-case E2E matrix; post-fix full 61-layer DP2TP8+EP16 token-split run reached `0.9522` strict match on the complete GSM8K evaluation |
 
 All rows target vLLM 0.26.0. Hardware validation exists for CUDA V1/V2 and the
 recorded Ascend V1 paths; the Ascend V2 row is an implemented, unit-tested

@@ -122,6 +122,7 @@ def run_attention_gate_afd_forward(
     afd_connector = afd_metadata.connector
     forward_context = get_forward_context()
     stage_idx = afd_metadata.stage_idx
+    pending_shared_output: torch.Tensor | None = None
     pending_ffn_recv = False
     pending_dispatch_layout: CAMDispatchLayout | None = None
     pending_dispatch_ref: torch.Tensor | None = None
@@ -142,6 +143,9 @@ def run_attention_gate_afd_forward(
                 local_ffn_output,
                 pending_dispatch_layout,
             )
+            if pending_shared_output is not None:
+                hidden_states = hidden_states + pending_shared_output
+            pending_shared_output = None
             pending_ffn_recv = False
             pending_dispatch_layout = None
             pending_dispatch_ref = None
@@ -188,6 +192,7 @@ def run_attention_gate_afd_forward(
             topk_ids=dispatch_payload.topk_ids,
             router_logits=dispatch_payload.router_logits,
         )
+        pending_shared_output = compute_shared_output(layer, hidden_states)
         pending_ffn_recv = True
         pending_dispatch_layout = dispatch_payload.layout
         pending_dispatch_ref = dispatch_payload.hidden_states
@@ -207,6 +212,8 @@ def run_attention_gate_afd_forward(
             local_ffn_output,
             pending_dispatch_layout,
         )
+        if pending_shared_output is not None:
+            hidden_states = hidden_states + pending_shared_output
     return hidden_states, residual
 
 
@@ -274,6 +281,9 @@ def run_async_moe_ubatch_afd_forward(
         None for _ in stage_hidden_states
     ]
     stage_dispatch_refs: list[torch.Tensor | None] = [None for _ in stage_hidden_states]
+    stage_shared_outputs: list[torch.Tensor | None] = [
+        None for _ in stage_hidden_states
+    ]
 
     def compute_stage_attention(
         layer: AFDDeepseekV2DecoderLayer,
@@ -386,6 +396,9 @@ def run_async_moe_ubatch_afd_forward(
             topk_ids=dispatch_payload.topk_ids,
             router_logits=dispatch_payload.router_logits,
         )
+        stage_shared_outputs[stage_idx] = compute_shared_output(
+            layer, stage_hidden_states[stage_idx]
+        )
         stage_dispatch_layouts[stage_idx] = dispatch_payload.layout
         stage_dispatch_refs[stage_idx] = dispatch_payload.hidden_states
 
@@ -404,6 +417,12 @@ def run_async_moe_ubatch_afd_forward(
             local_ffn_output,
             dispatch_layout,
         )
+        shared_output = stage_shared_outputs[stage_idx]
+        if shared_output is not None:
+            stage_hidden_states[stage_idx] = (
+                stage_hidden_states[stage_idx] + shared_output
+            )
+        stage_shared_outputs[stage_idx] = None
         stage_dispatch_layouts[stage_idx] = None
         stage_dispatch_refs[stage_idx] = None
 
@@ -470,6 +489,21 @@ def run_async_moe_ubatch_afd_forward(
         stage_residual,
         async_moe_ubatch_metadata,
     )
+
+
+def compute_shared_output(
+    layer: AFDDeepseekV2DecoderLayer,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    """Evaluate native replicated shared weights in the model token layout."""
+    if layer.mlp.shared_experts is None:
+        return None
+    output = layer.mlp.shared_experts(hidden_states)
+    # Match native DeepSeek's FP16 overflow-avoidance convention. Routed
+    # outputs are unscaled in FP16; the decoder restores the common scale.
+    if hidden_states.dtype == torch.float16:
+        output = output / layer.routed_scaling_factor
+    return output
 
 
 def _restore_async_moe_stage_state(

@@ -25,12 +25,10 @@ The complete W8A8 checkpoint must be available at the same path on both nodes.
 Its `config.json` must report `model_type=deepseek_v32` (or architecture
 `DeepseekV32ForCausalLM`) and `num_hidden_layers=61`.
 
-Set the CAM operator paths on both nodes before launching:
+Build the plugin-owned operators on both nodes before launching:
 
 ```bash
-export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM:${ASCEND_CUSTOM_OPP_PATH:-}
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM/op_api/lib:${LD_LIBRARY_PATH:-}
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM/op_api:${LD_LIBRARY_PATH}
+SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 pip install -e . -v --no-build-isolation
 ```
 
 ## Launch

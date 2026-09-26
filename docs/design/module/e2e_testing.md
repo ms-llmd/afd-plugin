@@ -25,6 +25,11 @@ validation_paths:
   - "tests/unit/test_e2e_process_utils.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
+  - "tests/unit/test_dsv4_e2e.py"
+  - "tests/e2e/environment.py"
+  - "tests/e2e/models/deepseek_v4_flash/config.py"
+  - "tests/e2e/models/deepseek_v4_flash/completions.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
@@ -111,7 +116,7 @@ graph mode.
 `afd-eager-async-cam` is a separate NPU-only smoke test. It uses four devices
 for Attention DP1/TP2 and FFN DP2/TP1/EP2. It is not part of the PR gate above.
 The NPU async CAM cases may require SIGKILL escalation because a pending CAM
-receive cannot be interrupted cleanly. For these two scenarios, the runner
+receive cannot be interrupted cleanly. For these scenarios, the runner
 adds a unique run id and role marker to each launched process environment.
 After normal process-group cleanup, it finds every FFN process carrying those
 markers through `/proc/*/environ` and sends SIGKILL to each matching PID. This
@@ -122,6 +127,18 @@ SIGKILL (measured up to ~45s on A3), so this path waits up to 120s before
 reporting survivors. Marker-scan signal-delivery and survivor failures, plus
 normal process-reaping failures, remain fatal. This test-scoped exception
 should be removed when the runtime supports graceful cancellation.
+
+`afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
+W8A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
+It uses eager async CAM with two token-split MoE ubatches, MBT=8192, and
+`enable_dsv4_shared_compressor_workspace=false` on both roles. It validates
+ten simultaneous chat requests, records their outputs and overlapping
+request intervals, and checks service liveness and cleanup. Its cancellable
+async HTTP client saves per-request responses/errors even on failure or
+interruption, before the runner tears down services. Model-specific fixed
+settings live alongside the model entrypoint. It does not run
+GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
+FFN cleanup exception above and is not selected by the four-device PR gate.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,
@@ -149,16 +166,23 @@ unverified.
 | Task | GSM8K | GSM8K |
 | Few-shot examples | 8 | 8 |
 | Generated-token limit | 512 | 512 |
-| Samples | first 7 | first 7 |
+| Samples | first 7; DBO gates floor at 24 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | 0.27 | 0.27 |
 | Cases | four legacy cases plus four CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
-An accuracy of `0.27` requires at least 2 correct answers out of 7.
+An accuracy of `0.27` requires at least 2 correct answers out of 7 (7 out
+of 24 in DBO scenarios).
 
 - PR and weekly CI leave `AFD_GSM8K_LIMIT` unset.
 - Set `AFD_GSM8K_LIMIT=all` locally for a full 1319-sample run.
 - Other limits are for local debugging, not CI gates.
+- DBO scenarios (`--enable-dbo`) run GSM8K with 12 concurrent requests and
+  floor the sample count at 24: a sequential client never satisfies the
+  DP-wide split agreement, so live requests would never run as two ubatches
+  and only warmup/capture would exercise the split path. The gate asserts
+  that at least one live two-ubatch step was recorded; `AFD_GSM8K_LIMIT=all`
+  still bypasses the floor.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.
