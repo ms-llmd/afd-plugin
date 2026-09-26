@@ -222,7 +222,9 @@ def test_load_weights_filters_a_glm_checkpoint_once(
     object.__setattr__(
         model,
         "afd_config",
-        SimpleNamespace(compute_gate_on_attention=False),
+        SimpleNamespace(
+            compute_gate_on_attention=False, connector="P2pNcclAFDConnector"
+        ),
     )
     object.__setattr__(model, "config", config)
 
