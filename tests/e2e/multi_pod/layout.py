@@ -14,6 +14,8 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from tests.e2e.models.deepseek_v4_flash.config import DSV4_ASYNC_CAM_SCENARIO
+
 ATTENTION_ROLE = "attention"
 FFN_ROLE = "ffn"
 BASELINE_ROLE = "baseline"
@@ -34,6 +36,11 @@ DP_RPC_PORT_BY_ROLE = {
     ATTENTION_ROLE: 29550,
     FFN_ROLE: 29551,
 }
+
+# DSV4 pins its own --data-parallel-address and rejects extra vLLM arguments,
+# which conflicts with per-pod slot placement, and has no multi-pod NPU
+# validation.
+UNSUPPORTED_SCENARIOS = frozenset({DSV4_ASYNC_CAM_SCENARIO})
 
 _POD_SPEC_PATTERN = re.compile(r"\A(?:(\d+)A)?(?:(\d+)F)?\Z")
 
@@ -217,6 +224,14 @@ class PodPlan:
         return tuple(device for slot in self.slots for device in slot.devices)
 
 
+def reject_unsupported_scenario(scenario: str) -> None:
+    """Fail fast on a scenario the multi-pod runner cannot place."""
+    if scenario in UNSUPPORTED_SCENARIOS:
+        raise ValueError(
+            f"scenario {scenario} is not supported by the multi-pod runner"
+        )
+
+
 def validate_layout(topology: Topology, layout: PodLayout) -> None:
     """Check a layout against the logical topology the scenario id fixes."""
     for role_kind in ROLE_KINDS:
@@ -240,6 +255,12 @@ def validate_layout(topology: Topology, layout: PodLayout) -> None:
                 )
     if topology.baseline and layout.total_ranks(FFN_ROLE) != 0:
         raise ValueError("baseline scenarios cannot place FFN ranks")
+    # build_baseline_command has no slot placement flags, so a split baseline
+    # would start independent servers instead of one DP group.
+    if topology.baseline and layout.num_pods > 1:
+        raise ValueError(
+            f"baseline scenarios must run on one pod, got layout {layout.canonical()}",
+        )
 
 
 def plan(

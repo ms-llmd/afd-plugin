@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.e2e import runner
+from tests.e2e.models.deepseek_v4_flash.config import DSV4_ASYNC_CAM_SCENARIO
 from tests.e2e.multi_pod import identity
 from tests.e2e.multi_pod.layout import (
     ATTENTION_ROLE,
@@ -22,6 +23,7 @@ from tests.e2e.multi_pod.layout import (
     RoleTopology,
     Topology,
     plan,
+    reject_unsupported_scenario,
     validate_layout,
 )
 
@@ -126,6 +128,30 @@ def test_validate_layout_rejects_ffn_ranks_in_a_baseline_scenario():
             _topology(4, 0, baseline=True),
             PodLayout.parse("2A0F,2A2F"),
         )
+
+
+def test_validate_layout_rejects_a_baseline_split_over_pods():
+    """A native baseline has no cross-pod placement, so it stays on one pod."""
+    with pytest.raises(ValueError, match="baseline scenarios must run on one pod"):
+        validate_layout(
+            _topology(4, 0, baseline=True),
+            PodLayout.parse("2A0F,2A0F"),
+        )
+
+
+def test_validate_layout_accepts_a_one_pod_baseline():
+    """The one-pod baseline remains the control case."""
+    validate_layout(_topology(4, 0, baseline=True), PodLayout.parse("4A0F"))
+
+
+def test_reject_unsupported_scenario_rejects_dsv4():
+    """DSV4 fixes its own placement flags, which multi-pod slots would conflict with."""
+    with pytest.raises(ValueError, match="not supported by the multi-pod runner"):
+        reject_unsupported_scenario(DSV4_ASYNC_CAM_SCENARIO)
+
+
+def test_reject_unsupported_scenario_accepts_afd_scenarios():
+    reject_unsupported_scenario("afd-graph-2a2f")
 
 
 # -- placement -----------------------------------------------------------

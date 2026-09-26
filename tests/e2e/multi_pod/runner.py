@@ -39,6 +39,7 @@ from tests.e2e.multi_pod.layout import (
     RoleSlot,
     Topology,
     plan,
+    reject_unsupported_scenario,
     validate_layout,
 )
 from tests.e2e.multi_pod.rendezvous import (
@@ -89,6 +90,7 @@ class PodProcess:
 
 def main() -> int:
     args = parse_args()
+    reject_unsupported_scenario(args.scenario)
     configure_scenario(args)
     layout = PodLayout.parse(args.pod_layout)
     topology = Topology.from_args(args)
