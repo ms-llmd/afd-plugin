@@ -67,25 +67,25 @@ V2_SINGLE_RANK_SCENARIOS = frozenset(
 V2_TENSOR_PARALLEL_SCENARIOS = frozenset(
     ("afd-v2-eager-tp2", "afd-v2-graph-tp2"),
 )
-# GLM-5.2 (``glm_moe_dsa``) is a ~744B DSA MoE checkpoint whose FFN role owns
-# 730B of routed-expert weights, i.e. 98% of the model. An FP8 checkpoint needs
-# 16 FFN ranks to stay under an 80GB card, ``n_routed_experts=256`` requires the
-# FFN rank count to divide 256, and P2pNcclAFDConnector requires
-# num_attention_ranks >= num_ffn_ranks. 16A16F is therefore the smallest
-# topology that can serve it at all.
-GLM_MOE_DSA_BASELINE_SCENARIO = "baseline-graph-ep16"
+# GLM-5.2 (``glm_moe_dsa``) is a ~753B DSA MoE checkpoint whose FFN role owns
+# 730B of routed-expert weights, i.e. 98% of the model. In FP8 on H200 (~140
+# GiB), 8 FFN ranks hold ~85 GiB each where 4 would need ~170 GiB;
+# ``n_routed_experts=256`` requires the FFN rank count to divide 256, and
+# P2pNcclAFDConnector requires num_attention_ranks >= num_ffn_ranks. 8A8F is
+# therefore the smallest topology that can serve it, and it only runs multi-pod
+# (tests/e2e/models/glm_moe_dsa). There is no native baseline: it would need
+# more devices in one pod than a multi-pod layout places.
 GLM_MOE_DSA_SCENARIOS = (
-    "afd-eager-16a16f",
-    "afd-graph-16a16f",
-    "afd-graph-dbo-16a16f",
+    "afd-eager-8a8f",
+    "afd-graph-8a8f",
+    "afd-graph-dbo-8a8f",
 )
-GLM_MOE_DSA_ATTENTION_RANKS = 16
-GLM_MOE_DSA_FFN_RANKS = 16
+GLM_MOE_DSA_ATTENTION_RANKS = 8
+GLM_MOE_DSA_FFN_RANKS = 8
 # Attention ranks expected by each baseline scenario; the baseline runs the
 # native model on one role with no FFN ranks.
 BASELINE_ATTENTION_RANKS = {
     "baseline-graph": 4,
-    GLM_MOE_DSA_BASELINE_SCENARIO: GLM_MOE_DSA_ATTENTION_RANKS,
 }
 E2E_RUN_ID_ENV = "AFD_E2E_RUN_ID"
 E2E_PROCESS_ROLE_ENV = "AFD_E2E_PROCESS_ROLE"
@@ -292,7 +292,6 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
             ASYNC_UBATCH_SCENARIO,
             DSV4_ASYNC_CAM_SCENARIO,
             *V2_SCENARIOS,
-            GLM_MOE_DSA_BASELINE_SCENARIO,
             *GLM_MOE_DSA_SCENARIOS,
         ],
         required=True,
@@ -351,6 +350,14 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "JSON object merged into "
             "additional_config['afd']['connector_extra_config']."
+        ),
+    )
+    parser.add_argument(
+        "--afd-process-group-timeout-s",
+        type=int,
+        help=(
+            "Set additional_config['afd']['afd_process_group_timeout_s'], how "
+            "long each role waits for the other to join the AFD world."
         ),
     )
     parser.add_argument(
@@ -419,28 +426,21 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-1a1f": (False, True, False, 1, 1),
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
-        GLM_MOE_DSA_BASELINE_SCENARIO: (
-            True,
-            True,
-            False,
-            GLM_MOE_DSA_ATTENTION_RANKS,
-            0,
-        ),
-        "afd-eager-16a16f": (
+        "afd-eager-8a8f": (
             False,
             False,
             False,
             GLM_MOE_DSA_ATTENTION_RANKS,
             GLM_MOE_DSA_FFN_RANKS,
         ),
-        "afd-graph-16a16f": (
+        "afd-graph-8a8f": (
             False,
             True,
             False,
             GLM_MOE_DSA_ATTENTION_RANKS,
             GLM_MOE_DSA_FFN_RANKS,
         ),
-        "afd-graph-dbo-16a16f": (
+        "afd-graph-dbo-8a8f": (
             False,
             True,
             True,
@@ -691,6 +691,10 @@ def build_vllm_command(
         afd_config["afd"]["async"] = True
     if args.compute_gate_on_attention:
         afd_config["afd"]["compute_gate_on_attention"] = True
+    if args.afd_process_group_timeout_s is not None:
+        afd_config["afd"]["afd_process_group_timeout_s"] = (
+            args.afd_process_group_timeout_s
+        )
     connector_extra_config = parse_afd_connector_extra_config(
         args.afd_connector_extra_config,
     )
