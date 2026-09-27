@@ -26,6 +26,7 @@ from tests.e2e.models.deepseek_v2_lite import (
 from tests.e2e.models.glm_moe_dsa import test_glm_moe_dsa as glm_moe_dsa_e2e
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
+from tests.e2e.multi_pod.layout import PodLayout, Topology, plan
 
 
 def test_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
@@ -165,83 +166,97 @@ def test_qwen3_6_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
         qwen3_6_e2e.build_runner_command("afd-eager-2a1f", tmp_path)
 
 
-# GLM-5.2 needs 16A16F; see the sizing note in the E2E module.
-GLM_DEVICES = ",".join(str(index) for index in range(32))
-
-
-def test_glm_moe_dsa_baseline_entrypoint_uses_sixteen_devices(monkeypatch, tmp_path):
+# GLM-5.2 needs 8A8F on H200 and runs only multi-pod; see the sizing note in
+# the E2E module.
+def _glm_multi_pod_arguments(monkeypatch, scenario, layout_name):
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", GLM_DEVICES)
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = glm_moe_dsa_e2e.build_runner_command("baseline-graph-ep16", tmp_path)
-
-    expected = ",".join(str(index) for index in range(16))
-    assert command[command.index("--attention-devices") + 1] == expected
-    assert "--ffn-devices" not in command
-
-
-@pytest.mark.parametrize("scenario", glm_moe_dsa_e2e.SCENARIOS[1:])
-def test_glm_moe_dsa_afd_entrypoint_splits_devices_16a16f(
-    monkeypatch,
-    tmp_path,
-    scenario,
-):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", GLM_DEVICES)
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = glm_moe_dsa_e2e.build_runner_command(scenario, tmp_path)
-
-    assert command[command.index("--model") + 1] == "model"
-    assert command[command.index("--attention-devices") + 1] == ",".join(
-        str(index) for index in range(16)
-    )
-    assert command[command.index("--ffn-devices") + 1] == ",".join(
-        str(index) for index in range(16, 32)
-    )
-    assert command[command.index("--served-model-name-prefix") + 1] == "glm-moe-dsa-afd"
-    assert "--common-vllm-arg=--max-model-len=4096" in command
-    # GLM-5.2 is text-only; there is no multimodal shell to disable.
-    assert "--common-vllm-arg=--language-model-only" not in command
-
-
-@pytest.mark.parametrize("device_count", [0, 4, 31])
-def test_glm_moe_dsa_entrypoint_requires_thirty_two_devices(
-    monkeypatch,
-    tmp_path,
-    device_count,
-):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-    monkeypatch.setenv(
-        "AFD_E2E_DEVICES",
-        ",".join(str(index) for index in range(device_count)),
-    )
-
-    with pytest.raises(RuntimeError, match="requires 32 devices"):
-        glm_moe_dsa_e2e.build_runner_command("afd-eager-16a16f", tmp_path)
-
-
-def test_glm_moe_dsa_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", GLM_DEVICES)
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
-        glm_moe_dsa_e2e.build_runner_command("afd-eager-16a16f", tmp_path)
+    monkeypatch.setenv("AFD_E2E_RUN_ID", "run")
+    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "/models/glm")
+    monkeypatch.setenv("AFD_E2E_GSM8K_OUTPUT", "/work/gsm8k")
+    monkeypatch.setenv("AFD_E2E_STORE_HOST", "glm-0.glm")
+    command = glm_moe_dsa_e2e.build_runner_command(scenario, layout_name)
+    # The multi-pod runner module needs torch for its store; the scenario
+    # options it shares with the single-host runner parse identically here.
+    parser = argparse.ArgumentParser()
+    runner.add_scenario_arguments(parser)
+    args, pod_options = parser.parse_known_args(command[3:])
+    return command, args, pod_options
 
 
 @pytest.mark.parametrize(
-    ("scenario", "expected_ranks"),
-    [("baseline-graph", 4), ("baseline-graph-ep16", 16)],
+    ("scenario", "layout_name"),
+    glm_moe_dsa_e2e.MULTI_POD_CASES,
 )
-def test_baseline_scenarios_enforce_their_own_attention_rank_count(
-    scenario,
-    expected_ranks,
+def test_glm_moe_dsa_multi_pod_entrypoint(monkeypatch, scenario, layout_name):
+    command, args, pod_options = _glm_multi_pod_arguments(
+        monkeypatch,
+        scenario,
+        layout_name,
+    )
+
+    assert command[1:3] == ["-m", "tests.e2e.multi_pod.runner"]
+    assert args.scenario == scenario
+    assert args.model == "/models/glm"
+    assert args.gsm8k_output_path == "/work/gsm8k"
+    assert args.served_model_name_prefix == "glm-moe-dsa-afd"
+    assert args.common_vllm_arg == ["--max-model-len=4096"]
+    # GLM-5.2 is text-only; there is no multimodal shell to disable.
+    assert "--language-model-only" not in args.common_vllm_arg
+    layout = glm_moe_dsa_e2e.POD_LAYOUTS[layout_name]
+    assert pod_options[pod_options.index("--pod-layout") + 1] == layout
+    assert pod_options[pod_options.index("--store-host") + 1] == "glm-0.glm"
+    assert pod_options[pod_options.index("--serving-timeout") + 1] == "3600"
+
+
+@pytest.mark.parametrize("layout_name", list(glm_moe_dsa_e2e.POD_LAYOUTS))
+def test_glm_moe_dsa_layouts_place_8a8f_within_four_ranks_per_pod(
+    monkeypatch,
+    layout_name,
 ):
+    """Each layout matches the 8A8F topology and respects the per-pod cap."""
+    _, args, _ = _glm_multi_pod_arguments(monkeypatch, "afd-graph-8a8f", layout_name)
+    runner.configure_scenario(args)
+    topology = Topology.from_args(args)
+    layout = PodLayout.parse(glm_moe_dsa_e2e.POD_LAYOUTS[layout_name])
+
+    pods = plan(topology, layout, [f"192.0.2.{10 + i}" for i in range(4)])
+
+    assert (topology.attention.ranks, topology.ffn.ranks) == (8, 8)
+    assert len(pods) == 4
+    for pod in pods:
+        assert len(pod.devices) <= glm_moe_dsa_e2e.MAX_RANKS_PER_POD
+
+
+def test_glm_moe_dsa_multi_pod_cases_use_known_layouts_and_scenarios():
+    for scenario, layout_name in glm_moe_dsa_e2e.MULTI_POD_CASES:
+        assert scenario in runner.GLM_MOE_DSA_SCENARIOS
+        assert layout_name in glm_moe_dsa_e2e.POD_LAYOUTS
+
+
+def test_glm_moe_dsa_multi_pod_requires_its_environment(monkeypatch):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    for name in (
+        "AFD_E2E_RUN_ID",
+        "AFD_GPU_E2E_MODEL",
+        "AFD_E2E_GSM8K_OUTPUT",
+        "AFD_E2E_STORE_HOST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(RuntimeError, match="AFD_E2E_RUN_ID must be set"):
+        glm_moe_dsa_e2e.build_runner_command("afd-graph-8a8f", "4pod-role-split")
+
+
+def test_glm_moe_dsa_entrypoint_rejects_non_gpu_backends(monkeypatch):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+
+    with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
+        glm_moe_dsa_e2e.build_runner_command("afd-graph-8a8f", "4pod-role-split")
+
+
+def test_baseline_scenarios_enforce_their_own_attention_rank_count():
     """The baseline rank check is per scenario, not a hardcoded four."""
-    assert runner.BASELINE_ATTENTION_RANKS[scenario] == expected_ranks
+    assert runner.BASELINE_ATTENTION_RANKS == {"baseline-graph": 4}
 
 
 @pytest.mark.parametrize(
@@ -562,10 +577,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-v2-graph-1a1f", (False, True, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-graph-dp2", (False, True, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-graph-tp2", (False, True, False, 2, 2, 1, 2, 2, True)),
-        ("baseline-graph-ep16", (True, True, False, 16, 0, 1, 1, 1, False)),
-        ("afd-eager-16a16f", (False, False, False, 16, 16, 1, 1, 1, False)),
-        ("afd-graph-16a16f", (False, True, False, 16, 16, 1, 1, 1, False)),
-        ("afd-graph-dbo-16a16f", (False, True, True, 16, 16, 1, 1, 1, False)),
+        ("afd-eager-8a8f", (False, False, False, 8, 8, 1, 1, 1, False)),
+        ("afd-graph-8a8f", (False, True, False, 8, 8, 1, 1, 1, False)),
+        ("afd-graph-dbo-8a8f", (False, True, True, 8, 8, 1, 1, 1, False)),
     ],
 )
 def test_configure_scenario_overwrites_fixed_topology_and_features(
