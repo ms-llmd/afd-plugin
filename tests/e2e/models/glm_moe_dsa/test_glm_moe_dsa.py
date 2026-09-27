@@ -41,9 +41,10 @@ from tests.conftest import run_runner
 # FP8 is required for 8A8F; point AFD_GPU_E2E_MODEL at a local snapshot of it.
 GLM_MOE_DSA_REPO_ID = "zai-org/GLM-5.2-FP8"
 GLM_MOE_DSA_MAX_MODEL_LEN = 4096
-# Every FFN rank reads its experts out of a ~761 GB checkpoint, which outlasts
-# the runner's default serving timeout.
-GLM_MOE_DSA_SERVING_TIMEOUT_S = 3600
+# Every rank scans all 141 shards of the ~761 GB checkpoint. From a shared VAST
+# PVC on H200 that took ~28 s per shard with all 16 ranks reading, i.e. about
+# 65 minutes before CUDA graph capture, so an hour is not enough.
+GLM_MOE_DSA_SERVING_TIMEOUT_S = 7200
 MAX_RANKS_PER_POD = 4
 
 # The layout is a second axis, orthogonal to the scenario id, so accuracy

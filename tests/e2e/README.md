@@ -180,10 +180,10 @@ python -m pytest -s \
   'tests/e2e/models/glm_moe_dsa/test_glm_moe_dsa.py::test_glm_moe_dsa[afd-graph-8a8f-4pod-role-split]'
 ```
 
-Loading ~761 GB from the PVC outlasts the runner's default serving timeout,
-so the suite raises `--serving-timeout` to 3600 s. The command contract and
-the per-pod placement of both layouts are covered by unit tests in
-`tests/unit/test_e2e_runner.py`, which run everywhere.
+Every rank scans the whole ~761 GB checkpoint, which took about 65 minutes
+from a shared VAST PVC, so the suite raises `--serving-timeout` to 7200 s.
+The command contract and the per-pod placement of both layouts are covered
+by unit tests in `tests/unit/test_e2e_runner.py`, which run everywhere.
 
 ### Weekly GSM8K
 

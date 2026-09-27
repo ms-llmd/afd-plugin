@@ -205,7 +205,7 @@ def test_glm_moe_dsa_multi_pod_entrypoint(monkeypatch, scenario, layout_name):
     layout = glm_moe_dsa_e2e.POD_LAYOUTS[layout_name]
     assert pod_options[pod_options.index("--pod-layout") + 1] == layout
     assert pod_options[pod_options.index("--store-host") + 1] == "glm-0.glm"
-    assert pod_options[pod_options.index("--serving-timeout") + 1] == "3600"
+    assert pod_options[pod_options.index("--serving-timeout") + 1] == "7200"
 
 
 @pytest.mark.parametrize("layout_name", list(glm_moe_dsa_e2e.POD_LAYOUTS))
