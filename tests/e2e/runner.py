@@ -147,11 +147,7 @@ def main() -> int:
         try:
             terminate_processes(
                 processes,
-                termination_timeout_s=(
-                    DSV4_PROCESS_TERMINATION_TIMEOUT_S
-                    if args.scenario == DSV4_ASYNC_CAM_SCENARIO
-                    else PROCESS_TERMINATION_TIMEOUT_S
-                ),
+                termination_timeout_s=process_termination_timeout(args),
                 deferred_sigkill_pgids=deferred_sigkill_pgids,
                 force_kill_environment=(
                     {
@@ -215,14 +211,9 @@ def main() -> int:
         wait_for_openai_api(args, processes)
         ensure_processes_alive(processes)
 
-        if args.scenario == ASYNC_CAM_SCENARIO:
-            run_completion_evaluation(args)
-        elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
-            run_concurrent_completion_evaluation(args)
-        else:
-            if args.enable_dbo:
-                dbo_eval_started_at = time.time()
-            run_gsm8k_evaluation(args)
+        if args.enable_dbo:
+            dbo_eval_started_at = time.time()
+        run_scenario_evaluation(args)
         if args.enable_dbo:
             assert_dbo_live_split_coverage(dbo_split_steps, dbo_eval_started_at, args)
 
@@ -415,6 +406,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.enable_dbo = enable_dbo
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
+    args.attention_data_parallel_address = None
     args.tp_size = 1
     if is_dsv4:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
@@ -682,6 +674,19 @@ def build_vllm_command(
         )
         if slot.headless:
             cmd.append("--headless")
+    elif role == "attention" and args.attention_data_parallel_address is not None:
+        # A scenario-pinned Attention DP address is emitted exactly once; in a
+        # multi-pod run only the slot knows the pod that leads the role.
+        cmd.extend(
+            [
+                "--data-parallel-address",
+                (
+                    args.attention_data_parallel_address
+                    if slot is None
+                    else slot.dp_address
+                ),
+            ],
+        )
     if args.use_v2_model_runner:
         cmd.extend(
             [
@@ -776,6 +781,23 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
         ASYNC_UBATCH_SCENARIO,
         DSV4_ASYNC_CAM_SCENARIO,
     )
+
+
+def process_termination_timeout(args: argparse.Namespace) -> float:
+    """Return the scenario's teardown budget, shared by every runner."""
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        return DSV4_PROCESS_TERMINATION_TIMEOUT_S
+    return PROCESS_TERMINATION_TIMEOUT_S
+
+
+def run_scenario_evaluation(args: argparse.Namespace) -> None:
+    """Run the scenario's acceptance check, shared by every runner."""
+    if args.scenario == ASYNC_CAM_SCENARIO:
+        run_completion_evaluation(args)
+    elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        run_concurrent_completion_evaluation(args)
+    else:
+        run_gsm8k_evaluation(args)
 
 
 def decode_bench_connector_config() -> str:

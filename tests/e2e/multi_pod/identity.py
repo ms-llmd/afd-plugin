@@ -18,6 +18,7 @@ POD_INDEX_ENV = "AFD_E2E_POD_INDEX"
 JOB_COMPLETION_INDEX_ENV = "JOB_COMPLETION_INDEX"
 POD_ADDRESSES_ENV = "AFD_E2E_POD_ADDRESSES"
 POD_IP_ENV = "POD_IP"
+HCCL_IF_IP_ENV = "HCCL_IF_IP"
 HOSTNAME_ENV = "HOSTNAME"
 E2E_RUN_ID_ENV = "AFD_E2E_RUN_ID"
 PROC_ROOT = Path("/proc")
@@ -61,11 +62,16 @@ def local_address(
     *,
     environment: os._Environ[str] | dict[str, str] | None = None,
 ) -> str:
-    """This pod's own reachable address."""
+    """This pod's own reachable address.
+
+    An Ascend pod advertises its HCCL interface address, which HCCL and CAM
+    bind to and which need not be the pod IP.
+    """
     environment = os.environ if environment is None else environment
-    pod_ip = environment.get(POD_IP_ENV)
-    if pod_ip:
-        return pod_ip
+    for name in (HCCL_IF_IP_ENV, POD_IP_ENV):
+        address = environment.get(name)
+        if address:
+            return address
     return socket.gethostbyname(socket.gethostname())
 
 

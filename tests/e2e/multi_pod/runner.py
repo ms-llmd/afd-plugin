@@ -49,7 +49,6 @@ from tests.e2e.multi_pod.rendezvous import (
     Rendezvous,
 )
 from tests.e2e.runner import (
-    ASYNC_CAM_SCENARIO,
     E2E_PROCESS_ROLE_ENV,
     E2E_RUN_ID_ENV,
     LOG_THREAD_JOIN_TIMEOUT_S,
@@ -60,8 +59,8 @@ from tests.e2e.runner import (
     build_vllm_command,
     configure_scenario,
     print_command,
-    run_completion_evaluation,
-    run_gsm8k_evaluation,
+    process_termination_timeout,
+    run_scenario_evaluation,
     start_process,
     stream_output,
     terminate_processes,
@@ -132,6 +131,7 @@ def main() -> int:
             try:
                 terminate_processes(
                     [entry.process for entry in processes],
+                    termination_timeout_s=process_termination_timeout(args),
                     deferred_sigkill_pgids=deferred_sigkill_pgids(
                         args,
                         processes,
@@ -241,10 +241,7 @@ def run_pod(
     # Phase 10: exactly one pod evaluates, against its own local API.
     if pod_plan.is_evaluator:
         try:
-            if args.scenario == ASYNC_CAM_SCENARIO:
-                run_completion_evaluation(args)
-            else:
-                run_gsm8k_evaluation(args)
+            run_scenario_evaluation(args)
         except BaseException as exc:
             verdict = f"fail: {exc}"
             rendezvous.set(VERDICT_KEY, verdict)

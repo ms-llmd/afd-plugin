@@ -207,9 +207,10 @@ within one poll interval.
 - **Phase 10 — exactly one evaluator.** `pod_plan.is_evaluator` is true only
   for the pod holding the Attention role's leader rank (set in
   `layout.plan()`). That one pod runs the accuracy/completion check against
-  its **own local** API (`run_completion_evaluation` for the async-CAM
-  scenario, `run_gsm8k_evaluation` otherwise — both imported unchanged from
-  the single-host `tests/e2e/runner.py`), publishes the verdict string to
+  its **own local** API through `run_scenario_evaluation`, the same
+  scenario-to-evaluator mapping the single-host `tests/e2e/runner.py` uses
+  (teardown likewise shares `process_termination_timeout`), publishes the
+  verdict string to
   the store (`VERDICT_KEY`), and re-raises on failure after recording
   `"fail: {exc}"` and publishing an abort. Every *other* pod instead calls
   `rendezvous.wait_for_key(VERDICT_KEY, ...)` and blocks until that key
@@ -276,6 +277,8 @@ Three ways to learn every pod's address, tried in order:
 3. **Rendezvous exchange** — the fallback: this pod publishes its own
    `local_address()` under `addr/{pod_index}`, waits on `ADDRESS_BARRIER`
    for every pod to do the same, then reads all of them back in order.
+   `local_address()` prefers `HCCL_IF_IP` (an Ascend pod's HCCL interface,
+   which HCCL and CAM bind to), then `POD_IP`, then the hostname.
 
 ### `publish_quietly()` and `print_plan()` (lines 366–388)
 

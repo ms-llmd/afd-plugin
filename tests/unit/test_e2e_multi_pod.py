@@ -387,6 +387,24 @@ def test_a_split_role_adds_exactly_the_five_placement_flags():
     assert "--headless" in follower
 
 
+@pytest.mark.parametrize(
+    ("layout", "pod_index"),
+    [("1A1F,1A1F", 0), ("1A1F,1A1F", 1), ("2A0F,0A2F", 0)],
+)
+def test_a_pinned_attention_dp_address_yields_to_the_slot(layout, pod_index):
+    """A scenario pin never duplicates the flag and never names the wrong pod."""
+    args = _single_host_args()
+    args.attention_data_parallel_address = "192.0.2.1"
+    topology = Topology.from_args(args)
+    pods = plan(topology, PodLayout.parse(layout), ["pod-0.svc", "pod-1.svc"])
+    slot = _slot(pods[pod_index], ATTENTION_ROLE)
+
+    command = runner.build_vllm_command(args, role=ATTENTION_ROLE, slot=slot)
+
+    assert command.count("--data-parallel-address") == 1
+    assert command[command.index("--data-parallel-address") + 1] == "pod-0.svc"
+
+
 def test_a_headless_slot_binds_no_api_server():
     """A headless slot reserves no API port it would never use."""
     args = _single_host_args()
@@ -457,6 +475,19 @@ def test_build_env_merges_cluster_specific_variables():
 def test_resolve_pod_index_precedence(environment, expected):
     """A pod takes its identity from the highest-priority source available."""
     assert identity.resolve_pod_index(4, environment=environment) == expected
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({"HCCL_IF_IP": "192.0.2.7", "POD_IP": "10.0.0.7"}, "192.0.2.7"),
+        ({"HCCL_IF_IP": "", "POD_IP": "10.0.0.7"}, "10.0.0.7"),
+        ({"POD_IP": "10.0.0.7"}, "10.0.0.7"),
+    ],
+)
+def test_local_address_prefers_the_hccl_interface(environment, expected):
+    """An Ascend pod advertises the interface HCCL and CAM bind to."""
+    assert identity.local_address(environment=environment) == expected
 
 
 def test_resolve_pod_index_fails_when_nothing_identifies_the_pod():
