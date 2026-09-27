@@ -14,8 +14,6 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from tests.e2e.models.deepseek_v4_flash.config import DSV4_ASYNC_CAM_SCENARIO
-
 ATTENTION_ROLE = "attention"
 FFN_ROLE = "ffn"
 BASELINE_ROLE = "baseline"
@@ -36,11 +34,6 @@ DP_RPC_PORT_BY_ROLE = {
     ATTENTION_ROLE: 29550,
     FFN_ROLE: 29551,
 }
-
-# DSV4 pins its own --data-parallel-address and rejects extra vLLM arguments,
-# which conflicts with per-pod slot placement, and has no multi-pod NPU
-# validation.
-UNSUPPORTED_SCENARIOS = frozenset({DSV4_ASYNC_CAM_SCENARIO})
 
 _POD_SPEC_PATTERN = re.compile(r"\A(?:(\d+)A)?(?:(\d+)F)?\Z")
 
@@ -222,14 +215,6 @@ class PodPlan:
     @property
     def devices(self) -> tuple[str, ...]:
         return tuple(device for slot in self.slots for device in slot.devices)
-
-
-def reject_unsupported_scenario(scenario: str) -> None:
-    """Fail fast on a scenario the multi-pod runner cannot place."""
-    if scenario in UNSUPPORTED_SCENARIOS:
-        raise ValueError(
-            f"scenario {scenario} is not supported by the multi-pod runner"
-        )
 
 
 def validate_layout(topology: Topology, layout: PodLayout) -> None:

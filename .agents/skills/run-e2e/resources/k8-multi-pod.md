@@ -250,6 +250,43 @@ kubectl logs -n ${NAMESPACE} <pod-name>
 The run passed only if every pod's exit code is `0`; a pod with no terminal
 state yet (still running when the wait timed out) is not a pass.
 
+## DSV4 Flash on Ascend NPU
+
+`afd-dsv4-flash-async-cam-dp2tp4-ep8` splits its fixed 16-NPU deployment
+(Attention DP2/TP4, FFN DP8/TP1/EP8, async CAM) across two 8-NPU pods. Its
+pass criterion is the ten concurrent chat completions, not GSM8K. This path
+has unit coverage only; it has not yet run on NPU hardware.
+
+Start from the Deploy template above and change:
+
+- **Image and resources:** an Ascend image with vLLM-Ascend and the plugin,
+  requesting 8 NPUs per pod through your cluster's NPU device-plugin
+  resource instead of `nvidia.com/gpu`.
+- **Layout:** `8A0F,0A8F` (role split) or `4A4F,4A4F` (interleaved). A TP4
+  Attention group cannot span pods, so no other two-pod layout is valid.
+- **Command:** run the pytest entry for one layout in every pod, instead of
+  the runner directly:
+
+  ```bash
+  python -m pytest -s \
+    "tests/e2e/models/deepseek_v4_flash/test_deepseek_v4_flash_multi_pod.py::test_deepseek_v4_flash_multi_pod[2pod-role-split]"
+  ```
+
+- **Environment:** `AFD_E2E_BACKEND=npu`, `AFD_NPU_E2E_MODEL`,
+  `AFD_E2E_RUN_ID`, `AFD_E2E_STORE_HOST=${JOB_NAME}-0.${JOB_NAME}`,
+  `AFD_E2E_COMPLETION_OUTPUT`, `HCCL_SOCKET_IFNAME`, and `HCCL_IF_IP` set to
+  **this pod's own** HCCL interface address. Pods exchange addresses through
+  the rendezvous store and advertise `HCCL_IF_IP` there, so the async CAM
+  rendezvous and every DP placement flag name that interface. When it is not
+  the pod IP, derive it in the container command, for example
+  `export HCCL_IF_IP=$(ip -4 -o addr show "$HCCL_SOCKET_IFNAME" | awk '{print $4}' | cut -d/ -f1)`.
+- **Timeouts:** DSV4 loads slowly; `AFD_NPU_E2E_STARTUP_TIMEOUT` (default
+  1800 s) bounds serving readiness, and the Job's `kubectl wait` timeout must
+  exceed it.
+
+The evaluator is the pod leading the Attention role (pod 0 in both layouts);
+it writes the per-request results to `AFD_E2E_COMPLETION_OUTPUT`.
+
 ## Clean up
 
 ```bash
