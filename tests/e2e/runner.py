@@ -353,6 +353,14 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--afd-process-group-timeout-s",
+        type=int,
+        help=(
+            "Set additional_config['afd']['afd_process_group_timeout_s'], how "
+            "long each role waits for the other to join the AFD world."
+        ),
+    )
+    parser.add_argument(
         "--device-backend",
         choices=["gpu", "npu"],
         default="gpu",
@@ -683,6 +691,10 @@ def build_vllm_command(
         afd_config["afd"]["async"] = True
     if args.compute_gate_on_attention:
         afd_config["afd"]["compute_gate_on_attention"] = True
+    if args.afd_process_group_timeout_s is not None:
+        afd_config["afd"]["afd_process_group_timeout_s"] = (
+            args.afd_process_group_timeout_s
+        )
     connector_extra_config = parse_afd_connector_extra_config(
         args.afd_connector_extra_config,
     )

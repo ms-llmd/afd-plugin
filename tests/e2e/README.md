@@ -182,6 +182,9 @@ python -m pytest -s \
 
 Every rank scans the whole ~761 GB checkpoint, which took about 65 minutes
 from a shared VAST PVC, so the suite raises `--serving-timeout` to 7200 s.
+The roles also finish loading minutes apart, so it passes the same value as
+`--afd-process-group-timeout-s`; at the connector's 120 s default the first
+role to load gives up on the AFD world join before the other arrives.
 The command contract and the per-pod placement of both layouts are covered
 by unit tests in `tests/unit/test_e2e_runner.py`, which run everywhere.
 

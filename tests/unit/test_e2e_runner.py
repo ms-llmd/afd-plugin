@@ -225,6 +225,11 @@ def test_glm_moe_dsa_layouts_place_8a8f_within_four_ranks_per_pod(
     assert len(pods) == 4
     for pod in pods:
         assert len(pod.devices) <= glm_moe_dsa_e2e.MAX_RANKS_PER_POD
+        for slot in pod.slots:
+            command = runner.build_vllm_command(args, role=slot.role, slot=slot)
+            config = json.loads(command[command.index("--additional-config") + 1])
+            # Both roles must outwait the slower role's checkpoint load.
+            assert config["afd"]["afd_process_group_timeout_s"] == 7200
 
 
 def test_glm_moe_dsa_multi_pod_cases_use_known_layouts_and_scenarios():
@@ -504,6 +509,7 @@ def _args() -> argparse.Namespace:
         afd_async=False,
         compute_gate_on_attention=False,
         afd_connector_extra_config=[],
+        afd_process_group_timeout_s=None,
         use_decode_bench_connector=False,
         common_vllm_arg=[],
         attention_vllm_arg=[],

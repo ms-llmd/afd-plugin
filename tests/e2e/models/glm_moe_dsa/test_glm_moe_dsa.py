@@ -45,6 +45,10 @@ GLM_MOE_DSA_MAX_MODEL_LEN = 4096
 # PVC on H200 that took ~28 s per shard with all 16 ranks reading, i.e. about
 # 65 minutes before CUDA graph capture, so an hour is not enough.
 GLM_MOE_DSA_SERVING_TIMEOUT_S = 7200
+# The two roles finish loading minutes apart (FFN first on kermit, ~11 min vs
+# still loading Attention), so the AFD world join must outwait the slower role
+# instead of the connector's 120s default.
+GLM_MOE_DSA_AFD_PROCESS_GROUP_TIMEOUT_S = GLM_MOE_DSA_SERVING_TIMEOUT_S
 MAX_RANKS_PER_POD = 4
 
 # The layout is a second axis, orthogonal to the scenario id, so accuracy
@@ -101,6 +105,8 @@ def build_runner_command(scenario: str, layout_name: str) -> list[str]:
         "glm-moe-dsa-afd",
         "--serving-timeout",
         str(GLM_MOE_DSA_SERVING_TIMEOUT_S),
+        "--afd-process-group-timeout-s",
+        str(GLM_MOE_DSA_AFD_PROCESS_GROUP_TIMEOUT_S),
         f"--common-vllm-arg=--max-model-len={GLM_MOE_DSA_MAX_MODEL_LEN}",
     ]
     store_port = os.environ.get("AFD_E2E_STORE_PORT")
