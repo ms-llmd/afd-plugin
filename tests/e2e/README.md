@@ -180,8 +180,8 @@ python -m pytest -s \
   'tests/e2e/models/glm_moe_dsa/test_glm_moe_dsa.py::test_glm_moe_dsa[afd-graph-8a8f-4pod-role-split]'
 ```
 
-Every rank scans the whole ~761 GB checkpoint, which took about 65 minutes
-from a shared VAST PVC, so the suite raises `--serving-timeout` to 7200 s.
+Every rank scans the whole ~761 GB checkpoint, so the suite raises `--serving-timeout`
+to 7200 s.
 The roles also finish loading minutes apart, so it passes the same value as
 `--afd-process-group-timeout-s`; at the connector's 120 s default the first
 role to load gives up on the AFD world join before the other arrives.
