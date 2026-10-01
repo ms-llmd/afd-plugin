@@ -65,8 +65,10 @@ HCCL group for payloads. It passes the actual HCCL communicator name to every
 operator. `comm_id=0` and FP16 `comm_args` are reserved ABI placeholders.
 No ordinary HCCL collective is issued on the payload group's windows.
 
-`--window-mb` sets both `HCCL_BUFFSIZE` and `LCCL_BUFFER_SIZE`, as well as the
-HCCL group's `hccl_buffer_size`, before native initialization. `--capacity`
+`--window-mb` sets `HCCL_BUFFSIZE` and the HCCL group's `hccl_buffer_size`
+to the same value before native initialization. AFD host tiling reads
+`HCCL_BUFFSIZE` directly, keeping its window size aligned with the
+harness's HCCL allocation. `--capacity`
 sets `BATCH_SIZE_FACTOR=capacity/262144`; it must be a power of two and fit
 every TP-aggregated single expert. Multiple experts may require multiple
 receive chunks. The preflight rejects configurations outside the harness's

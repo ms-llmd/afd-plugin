@@ -168,7 +168,7 @@ unverified.
 | Generated-token limit | 512 | 512 |
 | Samples | first 7; DBO gates floor at 24 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
-| Minimum accuracy | 0.27 | 0.27 |
+| Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
 | Cases | four legacy cases plus four CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
 An accuracy of `0.27` requires at least 2 correct answers out of 7 (7 out

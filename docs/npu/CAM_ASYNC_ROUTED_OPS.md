@@ -41,6 +41,25 @@ The candidate's separate build system,
 generated binaries, placeholder backward functions, and unrelated components
 are not imported.
 
+## Communication window configuration
+
+AFD host tiling reads the HCCL runtime environment variable `HCCL_BUFFSIZE`
+in MiB. Set it explicitly to the intended window size on every rank. The
+host helper retains its 408 MiB fallback and 32768 MiB (32 GiB) cap; these
+are host-side limits, not a query of the HCCL domain's allocated memory.
+For HCCL, the variable also sets the process-wide allocation fallback for
+groups without a per-group override.
+
+If the HCCL group sets `hccl_buffer_size`, configure `HCCL_BUFFSIZE` to the
+same effective size. A per-group allocation override does not update the
+process environment. The operators use the host-tiling size for capacity
+checks and a window-tail state slot, so the values must remain aligned.
+The standalone harness sets both settings together via `--window-mb`.
+
+Migrate overrides of the previous LCCL-prefixed environment variable to
+`HCCL_BUFFSIZE`; the previous spelling is no longer read. Rebuild the native
+operator package after updating the source.
+
 ## Build and loading
 
 Use a matching Ascend development environment and the normal package build:

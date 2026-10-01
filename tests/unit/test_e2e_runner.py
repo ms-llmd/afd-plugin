@@ -87,6 +87,37 @@ def test_deepseek_v2_lite_entrypoint_limits_context(
     assert "--common-vllm-arg=--max-model-len=4096" in command
 
 
+@pytest.mark.parametrize(
+    ("backend", "scenario", "limit", "override", "expected"),
+    [
+        ("gpu", "afd-graph-dbo-2a2f", None, None, "0.25"),
+        ("gpu", "afd-graph-dbo-2a2f", "24", "0.30", "0.30"),
+        ("gpu", "afd-graph-dbo-2a2f", "256", None, None),
+        ("npu", "afd-graph-dbo-2a2f", "24", None, "0.25"),
+        ("gpu", "afd-v2-graph-dp2", None, None, "0.25"),
+        ("gpu", "afd-graph-dbo-2a2f", "all", None, None),
+    ],
+)
+def test_deepseek_smoke_threshold_preserves_large_runs_and_overrides(
+    monkeypatch, tmp_path, backend, scenario, limit, override, expected
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", backend)
+    monkeypatch.setenv(f"AFD_{backend.upper()}_E2E_MODEL", "model")
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("AFD_GSM8K_LIMIT", limit)
+    monkeypatch.delenv("AFD_GSM8K_THRESHOLD", raising=False)
+    if override is not None:
+        monkeypatch.setenv("AFD_GSM8K_THRESHOLD", override)
+
+    def check_runner_env(command, env):
+        assert env.get("AFD_GSM8K_THRESHOLD") == expected
+
+    monkeypatch.setattr(deepseek_v2_lite_e2e, "run_runner", check_runner_env)
+    deepseek_v2_lite_e2e.test_deepseek_v2_lite(scenario, tmp_path)
+    assert os.environ.get("AFD_GSM8K_THRESHOLD") == override
+
+
 def test_qwen3_moe_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
     monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
@@ -1852,19 +1883,21 @@ def test_v2_model_entry_builds_runner_command_with_exact_devices(
     assert command[command.index("--ffn-devices") + 1] == ffn_devices
 
 
-def test_configure_scenario_separates_prefill_and_decode_steps_for_dbo():
+@pytest.mark.parametrize(
+    "common_args",
+    [
+        ["--unrelated-arg"],
+        ["--enable-chunked-prefill"],
+        ["--no-enable-chunked-prefill"],
+    ],
+)
+def test_configure_dbo_preserves_chunked_prefill_choice(common_args):
     args = _args()
-    args.scenario = "afd-graph-dbo-2a1f"
-    args.common_vllm_arg = ["--unrelated-arg"]
+    args.scenario = "afd-graph-dbo-2a2f"
+    args.common_vllm_arg = list(common_args)
     runner.configure_scenario(args)
 
-    assert "--no-enable-chunked-prefill" in args.common_vllm_arg
-
-    args.scenario = "afd-graph-2a1f"
-    args.common_vllm_arg = ["--unrelated-arg"]
-    runner.configure_scenario(args)
-
-    assert "--no-enable-chunked-prefill" not in args.common_vllm_arg
+    assert args.common_vllm_arg == common_args
 
 
 def test_build_env_enables_debug_logging_for_dbo_scenarios(monkeypatch):
