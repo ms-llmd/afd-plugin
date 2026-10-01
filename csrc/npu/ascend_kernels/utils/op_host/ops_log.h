@@ -51,7 +51,9 @@ namespace optiling {
 #define OPS_LOG_EVENT(OPS_DESC, ...) ((void)0)
 
 // ----- helpers (migrated from error_log.h) -----
-constexpr char LCCL_BUFFER_SIZE[] = "LCCL_BUFFER_SIZE";
+// Read the HCCL runtime window setting for host tiling (MiB).
+// Any per-group hccl_buffer_size override must match this value.
+constexpr char HCCL_BUFFSIZE[] = "HCCL_BUFFSIZE";
 constexpr char BATCH_SIZE_FACTOR[] = "BATCH_SIZE_FACTOR";
 constexpr int DEFAULT_BUFFER_SIZE = 2 * (200 + 4);  // 408MB
 constexpr int MAX_BUFFER_SIZE = 32 * 1024;          // 32GB
@@ -60,17 +62,17 @@ constexpr float DEFAULT_BATCH_SIZE_FACTOR = 1.0;
 static inline uint64_t GetMaxWindowSize()
 {
     int size = DEFAULT_BUFFER_SIZE;
-    auto env = std::getenv(LCCL_BUFFER_SIZE);
+    auto env = std::getenv(HCCL_BUFFSIZE);
     if (env != nullptr) {
         try {
             std::string envStr(env);
             size = std::stoi(envStr);
             if (size > MAX_BUFFER_SIZE) {
-                fprintf(stderr, "LCCL_BUFFER_SIZE %d larger than MAX %d, clamped\n", size, MAX_BUFFER_SIZE);
+                fprintf(stderr, "HCCL_BUFFSIZE %d larger than MAX %d, clamped\n", size, MAX_BUFFER_SIZE);
                 size = MAX_BUFFER_SIZE;
             }
         } catch (...) {
-            fprintf(stderr, "Unknown exception parsing LCCL_BUFFER_SIZE\n");
+            fprintf(stderr, "Unknown exception parsing HCCL_BUFFSIZE\n");
         }
     }
     return static_cast<uint64_t>(size) * 1024UL * 1024UL;

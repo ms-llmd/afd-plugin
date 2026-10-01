@@ -581,7 +581,6 @@ class NativeHarness:
         # These are read by torch-npu/HCCL and the native host tiling. Explicit
         # CLI values are authoritative and must be set before importing them.
         os.environ["HCCL_BUFFSIZE"] = str(config.window_mb)
-        os.environ["LCCL_BUFFER_SIZE"] = str(config.window_mb)
         os.environ["BATCH_SIZE_FACTOR"] = str(config.capacity / MAX_SEQUENCE_LENGTH)
         # Runtime-only dependencies: --help, --dry-run and CPU unit tests do not
         # import torch, torch_npu, vLLM or the native extension.

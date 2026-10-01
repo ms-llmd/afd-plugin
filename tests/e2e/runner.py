@@ -484,14 +484,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
     if enable_dbo:
         args.dbo_decode_token_threshold = 1
         args.dbo_prefill_token_threshold = 8
-        if not any(
-            arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
-        ):
-            args.common_vllm_arg.append("--no-enable-chunked-prefill")
-        if not any(
-            arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
-        ):
-            args.common_vllm_arg.append("--no-enable-chunked-prefill")
 
 
 def parse_csv(value: str) -> list[str]:
