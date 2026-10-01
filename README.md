@@ -46,6 +46,7 @@ Model support:
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
+| GLM-5.2 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | Registered as an alias of the DeepSeek V2-derived adapter: GLM-5.2 reuses DeepSeek V3.2 sparse attention and DeepSeek's MoE block unchanged. `glm_moe_dsa` forces fp32 router logits across the AFD connector. Focused unit coverage only; no repository E2E or accuracy evidence yet. |
 | Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | Qwen3.5/Qwen3.6 adapter family. Repository CUDA E2E evidence currently covers text-only Qwen3.6-35B-A3B with `--language-model-only`, synchronous `P2pNcclAFDConnector`, native DP4/TP1/EP4 baseline, and AFD 2A1F eager/graph/graph+DBO. |
 
 Connector support:

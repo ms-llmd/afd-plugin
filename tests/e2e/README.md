@@ -129,6 +129,65 @@ python -m pytest -q -s \
   -k 'afd-v2'
 ```
 
+### GLM-5.2 (`glm_moe_dsa`) — multi-pod only
+
+The GLM-5.2 suite lives at
+`tests/e2e/models/glm_moe_dsa/test_glm_moe_dsa.py` and follows the
+DeepSeek-V2-Lite multi-pod shape: AFD eager, graph, and graph+DBO scenarios on
+GSM8K-7, each run as one pod's slice of an already-provisioned deployment. It
+cannot run on a single node.
+
+GLM-5.2 is a ~753B checkpoint. With `compute_gate_on_attention=false` the FFN
+role owns 730.3B of the parameters — the routed experts alone are 724.8B, or
+98% of the model — while the Attention role owns 15.5B. The FFN rank count is
+therefore set by expert memory, not by preference. On H200 (~140 GiB, of
+which vLLM uses 0.9):
+
+| dtype | FFN weights per rank | minimum FFN ranks | minimum topology | H200s |
+| --- | --- | --- | --- | --- |
+| FP8 (`zai-org/GLM-5.2-FP8`) | 730.3 GB / y | 8 (~85 GiB) | `8A8F` | 16 |
+| BF16 | 1460.6 GB / y | 16 (~85 GiB) | `16A16F` | 32 |
+
+Four FFN ranks need ~170 GiB each in FP8 and do not fit.
+`n_routed_experts=256` also requires the FFN rank count to divide 256, and
+`P2pNcclAFDConnector` requires `num_attention_ranks >= num_ffn_ranks`
+(`afd_plugin/distributed/topology.py`), which pins the Attention side at 8
+even though it only holds 15.5 GB. The suite targets FP8 `8A8F`.
+
+With at most four ranks per pod, `8A8F` spans four pods. Two layouts are
+exercised:
+
+| Case | Pod layout |
+| --- | --- |
+| `afd-graph-8a8f-4pod-role-split` | `4A0F,4A0F,0A4F,0A4F` |
+| `afd-graph-8a8f-4pod-interleaved` | `2A2F,2A2F,2A2F,2A2F` |
+| `afd-eager-8a8f-4pod-role-split` | `4A0F,4A0F,0A4F,0A4F` |
+| `afd-graph-dbo-8a8f-4pod-role-split` | `4A0F,4A0F,0A4F,0A4F` |
+
+There is no native baseline: serving GLM-5.2 without AFD needs at least
+eight devices in one pod, and the multi-pod runner refuses to split a
+baseline. Pass/fail is the absolute GSM8K threshold, as for every suite.
+
+Bring the pods up per `.agents/skills/run-e2e/resources/k8-multi-pod.md`
+with four GPUs each and a ReadWriteMany PVC holding the FP8 snapshot, then run
+the same pytest node inside every pod:
+
+```bash
+export AFD_E2E_RUN_ID=... AFD_E2E_STORE_HOST=<job>-0.<job>
+export AFD_GPU_E2E_MODEL=/models/.hf_home/hub/models--zai-org--GLM-5.2-FP8/snapshots/<rev>
+export AFD_E2E_GSM8K_OUTPUT=/work/gsm8k
+python -m pytest -s \
+  'tests/e2e/models/glm_moe_dsa/test_glm_moe_dsa.py::test_glm_moe_dsa[afd-graph-8a8f-4pod-role-split]'
+```
+
+Every rank scans the whole ~761 GB checkpoint, so the suite raises `--serving-timeout`
+to 7200 s.
+The roles also finish loading minutes apart, so it passes the same value as
+`--afd-process-group-timeout-s`; at the connector's 120 s default the first
+role to load gives up on the AFD world join before the other arrives.
+The command contract and the per-pod placement of both layouts are covered
+by unit tests in `tests/unit/test_e2e_runner.py`, which run everywhere.
+
 ### Weekly GSM8K
 
 The weekly pipeline runs the Qwen3 MoE and Qwen3.6 MoE suites (baseline,

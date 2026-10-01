@@ -23,8 +23,10 @@ from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
+from tests.e2e.models.glm_moe_dsa import test_glm_moe_dsa as glm_moe_dsa_e2e
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
+from tests.e2e.multi_pod.layout import PodLayout, Topology, plan
 
 
 def test_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
@@ -193,6 +195,104 @@ def test_qwen3_6_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
         qwen3_6_e2e.build_runner_command("afd-eager-2a1f", tmp_path)
+
+
+# GLM-5.2 needs 8A8F on H200 and runs only multi-pod; see the sizing note in
+# the E2E module.
+def _glm_multi_pod_arguments(monkeypatch, scenario, layout_name):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_RUN_ID", "run")
+    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "/models/glm")
+    monkeypatch.setenv("AFD_E2E_GSM8K_OUTPUT", "/work/gsm8k")
+    monkeypatch.setenv("AFD_E2E_STORE_HOST", "glm-0.glm")
+    command = glm_moe_dsa_e2e.build_runner_command(scenario, layout_name)
+    # The multi-pod runner module needs torch for its store; the scenario
+    # options it shares with the single-host runner parse identically here.
+    parser = argparse.ArgumentParser()
+    runner.add_scenario_arguments(parser)
+    args, pod_options = parser.parse_known_args(command[3:])
+    return command, args, pod_options
+
+
+@pytest.mark.parametrize(
+    ("scenario", "layout_name"),
+    glm_moe_dsa_e2e.MULTI_POD_CASES,
+)
+def test_glm_moe_dsa_multi_pod_entrypoint(monkeypatch, scenario, layout_name):
+    command, args, pod_options = _glm_multi_pod_arguments(
+        monkeypatch,
+        scenario,
+        layout_name,
+    )
+
+    assert command[1:3] == ["-m", "tests.e2e.multi_pod.runner"]
+    assert args.scenario == scenario
+    assert args.model == "/models/glm"
+    assert args.gsm8k_output_path == "/work/gsm8k"
+    assert args.served_model_name_prefix == "glm-moe-dsa-afd"
+    assert args.common_vllm_arg == ["--max-model-len=4096"]
+    # GLM-5.2 is text-only; there is no multimodal shell to disable.
+    assert "--language-model-only" not in args.common_vllm_arg
+    layout = glm_moe_dsa_e2e.POD_LAYOUTS[layout_name]
+    assert pod_options[pod_options.index("--pod-layout") + 1] == layout
+    assert pod_options[pod_options.index("--store-host") + 1] == "glm-0.glm"
+    assert pod_options[pod_options.index("--serving-timeout") + 1] == "7200"
+
+
+@pytest.mark.parametrize("layout_name", list(glm_moe_dsa_e2e.POD_LAYOUTS))
+def test_glm_moe_dsa_layouts_place_8a8f_within_four_ranks_per_pod(
+    monkeypatch,
+    layout_name,
+):
+    """Each layout matches the 8A8F topology and respects the per-pod cap."""
+    _, args, _ = _glm_multi_pod_arguments(monkeypatch, "afd-graph-8a8f", layout_name)
+    runner.configure_scenario(args)
+    topology = Topology.from_args(args)
+    layout = PodLayout.parse(glm_moe_dsa_e2e.POD_LAYOUTS[layout_name])
+
+    pods = plan(topology, layout, [f"192.0.2.{10 + i}" for i in range(4)])
+
+    assert (topology.attention.ranks, topology.ffn.ranks) == (8, 8)
+    assert len(pods) == 4
+    for pod in pods:
+        assert len(pod.devices) <= glm_moe_dsa_e2e.MAX_RANKS_PER_POD
+        for slot in pod.slots:
+            command = runner.build_vllm_command(args, role=slot.role, slot=slot)
+            config = json.loads(command[command.index("--additional-config") + 1])
+            # Both roles must outwait the slower role's checkpoint load.
+            assert config["afd"]["afd_process_group_timeout_s"] == 7200
+
+
+def test_glm_moe_dsa_multi_pod_cases_use_known_layouts_and_scenarios():
+    for scenario, layout_name in glm_moe_dsa_e2e.MULTI_POD_CASES:
+        assert scenario in runner.GLM_MOE_DSA_SCENARIOS
+        assert layout_name in glm_moe_dsa_e2e.POD_LAYOUTS
+
+
+def test_glm_moe_dsa_multi_pod_requires_its_environment(monkeypatch):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    for name in (
+        "AFD_E2E_RUN_ID",
+        "AFD_GPU_E2E_MODEL",
+        "AFD_E2E_GSM8K_OUTPUT",
+        "AFD_E2E_STORE_HOST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(RuntimeError, match="AFD_E2E_RUN_ID must be set"):
+        glm_moe_dsa_e2e.build_runner_command("afd-graph-8a8f", "4pod-role-split")
+
+
+def test_glm_moe_dsa_entrypoint_rejects_non_gpu_backends(monkeypatch):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+
+    with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
+        glm_moe_dsa_e2e.build_runner_command("afd-graph-8a8f", "4pod-role-split")
+
+
+def test_baseline_scenarios_enforce_their_own_attention_rank_count():
+    """The baseline rank check is per scenario, not a hardcoded four."""
+    assert runner.BASELINE_ATTENTION_RANKS == {"baseline-graph": 4}
 
 
 @pytest.mark.parametrize(
@@ -440,6 +540,7 @@ def _args() -> argparse.Namespace:
         afd_async=False,
         compute_gate_on_attention=False,
         afd_connector_extra_config=[],
+        afd_process_group_timeout_s=None,
         use_decode_bench_connector=False,
         common_vllm_arg=[],
         attention_vllm_arg=[],
@@ -447,6 +548,7 @@ def _args() -> argparse.Namespace:
         gsm8k_output_path="/tmp/gsm8k-results",
         completion_output_path="/tmp/dsv4-completions.json",
         use_v2_model_runner=False,
+        attention_data_parallel_address=None,
     )
 
 
@@ -512,6 +614,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-v2-graph-1a1f", (False, True, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-graph-dp2", (False, True, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-graph-tp2", (False, True, False, 2, 2, 1, 2, 2, True)),
+        ("afd-eager-8a8f", (False, False, False, 8, 8, 1, 1, 1, False)),
+        ("afd-graph-8a8f", (False, True, False, 8, 8, 1, 1, 1, False)),
+        ("afd-graph-dbo-8a8f", (False, True, True, 8, 8, 1, 1, 1, False)),
     ],
 )
 def test_configure_scenario_overwrites_fixed_topology_and_features(
@@ -570,6 +675,83 @@ def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
     assert attention_config["compute_gate_on_attention"] is True
     assert attention_config["connector_extra_config"]["attn_ranks_per_dp"] == 2
     assert "--enable-expert-parallel" in ffn_command
+
+
+def test_pinned_attention_dp_address_is_emitted_once_on_attention_only():
+    """A scenario-pinned DP address reaches Attention alone, exactly once."""
+    args = _args()
+    runner.configure_scenario(args)
+    args.attention_data_parallel_address = "192.0.2.1"
+
+    attention_command = runner.build_vllm_command(args, role="attention")
+    ffn_command = runner.build_vllm_command(args, role="ffn")
+
+    assert attention_command.count("--data-parallel-address") == 1
+    address_index = attention_command.index("--data-parallel-address") + 1
+    assert attention_command[address_index] == "192.0.2.1"
+    assert "--data-parallel-address" not in ffn_command
+
+
+def test_configure_scenario_pins_no_attention_dp_address_by_default():
+    args = _args()
+    runner.configure_scenario(args)
+
+    assert args.attention_data_parallel_address is None
+    command = runner.build_vllm_command(args, role="attention")
+    assert "--data-parallel-address" not in command
+
+
+@pytest.mark.parametrize(
+    ("scenario", "evaluator"),
+    [
+        ("afd-eager-async-cam", "run_completion_evaluation"),
+        (
+            "afd-dsv4-flash-async-cam-dp2tp4-ep8",
+            "run_concurrent_completion_evaluation",
+        ),
+        ("afd-graph-2a2f", "run_gsm8k_evaluation"),
+    ],
+)
+def test_run_scenario_evaluation_routes_to_the_scenario_evaluator(
+    monkeypatch,
+    scenario,
+    evaluator,
+):
+    """Both runners share this mapping, so a new evaluator reaches both."""
+    called: list[str] = []
+    for name in (
+        "run_completion_evaluation",
+        "run_concurrent_completion_evaluation",
+        "run_gsm8k_evaluation",
+    ):
+        monkeypatch.setattr(
+            runner,
+            name,
+            lambda _args, name=name: called.append(name),
+        )
+    args = _args()
+    args.scenario = scenario
+
+    runner.run_scenario_evaluation(args)
+
+    assert called == [evaluator]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "timeout_s"),
+    [
+        (
+            "afd-dsv4-flash-async-cam-dp2tp4-ep8",
+            runner.DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+        ),
+        ("afd-graph-2a2f", runner.PROCESS_TERMINATION_TIMEOUT_S),
+    ],
+)
+def test_process_termination_timeout_follows_the_scenario(scenario, timeout_s):
+    args = _args()
+    args.scenario = scenario
+
+    assert runner.process_termination_timeout(args) == timeout_s
 
 
 def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():

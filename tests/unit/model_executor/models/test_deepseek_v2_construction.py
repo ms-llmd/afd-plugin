@@ -12,14 +12,16 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+# The runtime bindings come from importorskip so the module skips cleanly
+# without torch/vLLM; the type-checking bindings let these names be used as
+# annotations and base classes.
 if TYPE_CHECKING:
     import torch
     from torch import nn
 else:
     torch = pytest.importorskip("torch")
+    pytest.importorskip("vllm")
     nn = torch.nn
-
-pytest.importorskip("vllm")
 
 from vllm.config import CompilationMode  # noqa: E402
 
@@ -78,7 +80,7 @@ def construction_env(monkeypatch):
     )
     monkeypatch.setattr(adapter.native, "DeepseekV2MLP", bind(dense_type))
     monkeypatch.setattr(adapter.native, "DeepseekV2MoE", bind(moe_type))
-    monkeypatch.setattr(adapter, "ReplicatedLinear", bind(gate_type))
+    monkeypatch.setattr(adapter.native, "GateLinear", bind(gate_type))
     monkeypatch.setattr(adapter.native, "RMSNorm", bind(norm_type))
     monkeypatch.setattr(
         adapter.native,
