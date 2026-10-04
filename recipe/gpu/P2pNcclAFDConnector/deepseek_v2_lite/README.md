@@ -22,7 +22,7 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 
 ## Directory layout
 
-```
+```text
 .
 ├── prefill_decode_disaggregation/        # prefill_decode_disaggregation, 2P1A1F topology
 │   ├── 2p1a1f_eager_dbo.sh
@@ -36,6 +36,7 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
     ├── 4a4f_graph_dbo_dp2tp2.sh
     └── multipod_2a_2f_graph_dbo_dp1tp2.sh  # 2a2f_graph_dbo_dp1tp2, split across 2 k8s pods
 ```
+
 ### 1. Prefill/Decode Disaggregation — `1a1f`
 
 5 processes, 4 GPU workers + 1 proxy server:
@@ -47,7 +48,6 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 | 2    | Decode (Attention)  | 18303 |
 | 3    | Decode (FFN)        | 18304 |
 | /    | Proxy Server        | 18305 |
-
 
 ### 2. Prefill/Decode Colocation — `2a2f`
 
@@ -68,12 +68,12 @@ unlike the scripts above, it is **not** meant to be run directly: with
 `AFD_CONNECTOR_HOST` default (`vllm-ffn-p2p-service`) only resolves inside
 the cluster the skill deploys it to:
 
-| File                            | DP | TP |
-|---------------------------------|----|----|
-| `2a2f_*_dp1tp2.sh`              | 1  | 2  |
-| `2a2f_*_dp2tp1.sh`              | 2  | 1  |
-| `4a4f_*_dp2tp2.sh`              | 2  | 2  |
-| `multipod_2a_2f_graph_dbo_dp1tp2.sh` | 1  | 2  |
+| File                                  | DP | TP |
+|---------------------------------------|----|----|
+| `2a2f_*_dp1tp2.sh`                    | 1  | 2  |
+| `2a2f_*_dp2tp1.sh`                    | 2  | 1  |
+| `4a4f_*_dp2tp2.sh`                    | 2  | 2  |
+| `multipod_2a_2f_graph_dbo_dp1tp2.sh`  | 1  | 2  |
 
 ## Running
 
@@ -84,6 +84,7 @@ Wait for `attn.log` (and `afd_prefill0.log`, `afd_prefill1.log` in disaggregatio
 before sending traffic.
 
 ### prefill_decode_colocation
+
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -145,7 +146,7 @@ and deployment configuration.
 
 Graph mode replaces `--enforce-eager` with:
 
-```
+```text
 --max-cudagraph-capture-size 64
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY",
                        "cudagraph_capture_sizes":[64]}'

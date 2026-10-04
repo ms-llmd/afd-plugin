@@ -18,6 +18,11 @@ ATTENTION_HEADLESS=${ATTENTION_HEADLESS:-0}
 ATTENTION_DP_ADDRESS=${ATTENTION_DP_ADDRESS:-vllm-attn-dp-service}
 ATTENTION_DP_RPC_PORT=${ATTENTION_DP_RPC_PORT:-13345}
 
+HEADLESS_ARGS=()
+if [[ "$ATTENTION_HEADLESS" == "1" ]]; then
+  HEADLESS_ARGS=(--headless)
+fi
+
 if [[ "$POD" == ATTENTION_* ]]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 4 \
@@ -50,7 +55,7 @@ if [[ "$POD" == ATTENTION_* ]]; then
       --compilation-config '{
           "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[32]
       }' \
-      $([ "$ATTENTION_HEADLESS" = "1" ] && echo --headless) \
+      "${HEADLESS_ARGS[@]}" \
       --host 127.0.0.1 \
       --port 18305 > attn.log 2>&1 &
 fi
