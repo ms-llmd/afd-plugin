@@ -43,6 +43,10 @@ GLM_MOE_DSA_REPO_ID = "zai-org/GLM-5.2-FP8"
 GLM_MOE_DSA_MAX_MODEL_LEN = 4096
 GLM_MOE_DSA_SERVING_TIMEOUT_S = 7200
 GLM_MOE_DSA_AFD_PROCESS_GROUP_TIMEOUT_S = GLM_MOE_DSA_SERVING_TIMEOUT_S
+# A cold-cache pod can finish loading the checkpoint more than 30 minutes after
+# its DP peers, and the first DP batch sync runs on a gloo CPU group whose
+# PyTorch default timeout is 1800 s. Match the serving timeout instead.
+GLM_MOE_DSA_CPU_DISTRIBUTED_TIMEOUT_S = GLM_MOE_DSA_SERVING_TIMEOUT_S
 MAX_RANKS_PER_POD = 4
 
 # The layout is a second axis, orthogonal to the scenario id, so accuracy
@@ -102,6 +106,8 @@ def build_runner_command(scenario: str, layout_name: str) -> list[str]:
         "--afd-process-group-timeout-s",
         str(GLM_MOE_DSA_AFD_PROCESS_GROUP_TIMEOUT_S),
         f"--common-vllm-arg=--max-model-len={GLM_MOE_DSA_MAX_MODEL_LEN}",
+        "--common-vllm-arg=--cpu-distributed-timeout-seconds="
+        f"{GLM_MOE_DSA_CPU_DISTRIBUTED_TIMEOUT_S}",
     ]
     store_port = os.environ.get("AFD_E2E_STORE_PORT")
     if store_port:
