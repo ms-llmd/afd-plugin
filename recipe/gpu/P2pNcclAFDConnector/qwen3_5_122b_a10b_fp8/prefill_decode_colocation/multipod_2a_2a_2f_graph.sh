@@ -37,6 +37,7 @@ if [[ "$POD" == ATTENTION_* ]]; then
           "afd": {
               "role": "attention",
               "connector": "P2pNcclAFDConnector",
+              "afd_process_group_timeout_s": 120,
               "host": "'"${AFD_CONNECTOR_HOST}"'",
               "port": '"${AFD_CONNECTOR_PORT}"',
               "num_attention_ranks": 4,
@@ -69,6 +70,7 @@ if [[ "$POD" == FFN_* ]]; then
           "afd": {
               "role": "ffn",
               "connector": "P2pNcclAFDConnector",
+              "afd_process_group_timeout_s": 120,
               "host": "'"${AFD_CONNECTOR_HOST}"'",
               "port": '"${AFD_CONNECTOR_PORT}"',
               "num_attention_ranks": 4,
