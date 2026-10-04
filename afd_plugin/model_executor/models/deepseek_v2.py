@@ -807,6 +807,17 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
     ) -> AFDExpertRoutingSpec:
         return self.model.get_experts_routing_spec(layer_idx)
 
+    def should_load_checkpoint_weight(self, name: str) -> bool:
+        """Return whether this role owns a checkpoint tensor, before reading it."""
+        return self.afd_role in _checkpoint_weight_roles(
+            name,
+            self.config,
+            compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+        )
+
+    # The post-read filter stays for load paths that do not apply
+    # should_load_checkpoint_weight before reading (eager, runai, pt, ...).
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(
             _iter_role_weights(
