@@ -833,7 +833,8 @@ class AFDGlmMoeDsaForCausalLM(AFDDeepseekV2ForCausalLM):
 
     GLM-5.2 reuses DeepSeek V3.2's DeepSeek Sparse Attention and DeepSeek's MoE
     block unchanged, so the DeepSeek V2-derived role-aware construction, the
-    remote-experts boundary, and role-filtered weight loading all apply as-is.
+    shared ``build_attention_moe_runner`` remote-experts boundary, and
+    role-filtered weight loading all apply as-is.
     Two GLM-specific config properties are load-bearing for AFD:
 
     * ``index_topk`` is always present, so the Attention role always allocates
@@ -841,7 +842,8 @@ class AFDGlmMoeDsaForCausalLM(AFDDeepseekV2ForCausalLM):
     * ``native._get_moe_router_dtype`` forces fp32 routing for ``glm_moe_dsa``
       even though the checkpoint does not set ``moe_router_dtype``, so the
       router logits crossing the AFD connector are fp32 rather than the
-      activation dtype.
+      activation dtype. The same dtype is recorded as the remote runner's
+      ``router_logits_dtype`` for both gate placements.
 
     vLLM 0.26.0 resolves the native ``GlmMoeDsaForCausalLM`` to
     ``vllm.model_executor.models.deepseek_v2``; the NVIDIA-fused

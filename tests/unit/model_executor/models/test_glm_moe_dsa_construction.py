@@ -30,10 +30,16 @@ else:
     nn = torch.nn
     GlmMoeDsaConfig = pytest.importorskip("transformers").GlmMoeDsaConfig
 
-from vllm.config import CompilationMode  # noqa: E402
+from vllm.config import (  # noqa: E402
+    CompilationMode,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 
 from afd_plugin import _MODEL_REGISTRATIONS  # noqa: E402
 from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.model_executor import remote_moe  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 
 # The GLM-5.2 checkpoint shape, as reported by the pinned transformers config.
@@ -146,27 +152,41 @@ def _make_layer(
     layer_idx: int,
     device_type: str,
     attention_gate: bool = False,
-    config: GlmMoeDsaConfig | None = None,
+    vllm_config: VllmConfig | None = None,
 ):
-    if config is None:
-        config = _glm_config()
-    monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type=device_type),
-    )
+    if vllm_config is None:
+        vllm_config = _vllm_config(_glm_config())
+    platform = SimpleNamespace(device_type=device_type)
+    afd_config = AFDConfig(role=role, compute_gate_on_attention=attention_gate)
+    monkeypatch.setattr(adapter.native, "current_platform", platform)
     monkeypatch.setattr(
         adapter,
         "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(
-            role=role,
-            compute_gate_on_attention=attention_gate,
-        ),
+        lambda *_args, **_kwargs: afd_config,
     )
+    # CUDA remote experts are built by the shared remote MoE factory, which
+    # resolves the AFD config and platform through its own module globals.
+    monkeypatch.setattr(
+        remote_moe,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: afd_config,
+    )
+    monkeypatch.setattr(remote_moe, "current_platform", platform)
     return adapter.AFDDeepseekV2DecoderLayer(
-        _vllm_config(config),
+        vllm_config,
         f"model.layers.{layer_idx}",
     )
+
+
+@pytest.fixture
+def cuda_construction_env(construction_env):
+    """A live vLLM config for the native ``FusedMoE`` factory to register in."""
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.model_config = _vllm_config(_glm_config()).model_config
+    config.model_config.dtype = torch.bfloat16
+    config.model_config.enable_return_routed_experts = False
+    with set_current_vllm_config(config):
+        yield config
 
 
 def test_registration_resolves_to_the_glm_afd_wrapper():
@@ -209,6 +229,7 @@ def test_glm_config_reports_the_expected_checkpoint_shape():
 def test_cuda_remote_experts_gate_uses_fp32_router_dtype(
     monkeypatch,
     construction_env,
+    cuda_construction_env,
 ):
     moe = _make_layer(
         monkeypatch,
@@ -216,19 +237,81 @@ def test_cuda_remote_experts_gate_uses_fp32_router_dtype(
         layer_idx=GLM_FIRST_K_DENSE_REPLACE,
         device_type="cuda",
         attention_gate=True,
+        vllm_config=cuda_construction_env,
     )
 
     assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
-    assert isinstance(moe.mlp.experts, adapter.AFDAttentionFusedMoE)
+    assert type(moe.mlp.experts) is remote_moe.AFDExternalRoutingMoERunner
     assert construction_env["gate"] == [
         (
             f"model.layers.{GLM_FIRST_K_DENSE_REPLACE}.mlp.gate",
             {"out_dtype": torch.float32},
         ),
     ]
-    # The remote-experts proxy stays parameter-free on the Attention role.
+    assert moe.mlp.experts.moe_config.router_logits_dtype is torch.float32
+    # GLM-5.2 has no ``noaux_tc`` correction bias, unlike DeepSeek V3, so the
+    # gate weight is the only Attention-owned MoE parameter.
+    assert {name for name, _ in moe.mlp.named_parameters()} == {"gate.weight"}
     assert list(moe.mlp.experts.parameters()) == []
     assert list(moe.mlp.experts.buffers()) == []
+
+
+@pytest.mark.parametrize("attention_gate", [False, True])
+def test_cuda_remote_moe_runner_carries_glm_routing(
+    monkeypatch,
+    construction_env,
+    cuda_construction_env,
+    attention_gate: bool,
+):
+    """The shared factory receives GLM routing and keeps fp32 router logits.
+
+    With the gate on FFN no Attention gate exists, so the runner's
+    ``FusedMoEConfig`` is the only place the forced fp32 dtype is recorded.
+    """
+    config = cuda_construction_env
+    hf_config = config.model_config.hf_config
+    factory_calls = []
+    native_factory = remote_moe.fused_moe.FusedMoE
+
+    def record_factory(**kwargs):
+        factory_calls.append(kwargs)
+        return native_factory(**kwargs)
+
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", record_factory)
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=GLM_FIRST_K_DENSE_REPLACE,
+        device_type="cuda",
+        attention_gate=attention_gate,
+        vllm_config=config,
+    )
+    runner = layer.mlp.experts
+    expected_runner = (
+        remote_moe.AFDExternalRoutingMoERunner
+        if attention_gate
+        else remote_moe.AFDRemoteMoERunner
+    )
+
+    assert type(runner) is expected_runner
+    assert runner.is_internal_router is not attention_gate
+    assert (layer.mlp.gate is None) is not attention_gate
+    assert runner.moe_config.router_logits_dtype is torch.float32
+    prefix = f"model.layers.{GLM_FIRST_K_DENSE_REPLACE}.mlp.experts"
+    assert config.compilation_config.static_forward_context == {prefix: runner}
+    assert len(factory_calls) == 1
+    expected_kwargs = {
+        "num_experts": GLM_ROUTED_EXPERTS,
+        "top_k": hf_config.num_experts_per_tok,
+        "renormalize": hf_config.norm_topk_prob,
+        "num_expert_group": getattr(hf_config, "n_group", 1),
+        "topk_group": getattr(hf_config, "topk_group", 1),
+        "scoring_func": getattr(hf_config, "scoring_func", "softmax"),
+        "routed_scaling_factor": getattr(hf_config, "routed_scaling_factor", 1.0),
+        "router_logits_dtype": torch.float32,
+    }
+    factory_kwargs = factory_calls[0]
+    assert {name: factory_kwargs[name] for name in expected_kwargs} == expected_kwargs
 
 
 def test_attention_side_gate_proxy_uses_fp32_router_dtype(
@@ -262,6 +345,7 @@ def test_attention_side_gate_proxy_uses_fp32_router_dtype(
 def test_routing_spec_reports_fp32_logits_of_routed_expert_width(
     monkeypatch,
     construction_env,
+    cuda_construction_env,
 ):
     """The connector sizes its router-logits buffer from this spec."""
     moe = _make_layer(
@@ -270,6 +354,7 @@ def test_routing_spec_reports_fp32_logits_of_routed_expert_width(
         layer_idx=GLM_FIRST_K_DENSE_REPLACE,
         device_type="cuda",
         attention_gate=True,
+        vllm_config=cuda_construction_env,
     )
     model = SimpleNamespace(layers=[moe])
 
@@ -283,9 +368,9 @@ def test_routing_spec_reports_fp32_logits_of_routed_expert_width(
 def test_dense_and_moe_split_follows_first_k_dense_replace(
     monkeypatch,
     construction_env,
+    cuda_construction_env,
     attention_gate: bool,
 ):
-    config = _glm_config()
 
     for layer_idx in range(GLM_FIRST_K_DENSE_REPLACE):
         layer = _make_layer(
@@ -294,7 +379,7 @@ def test_dense_and_moe_split_follows_first_k_dense_replace(
             layer_idx=layer_idx,
             device_type="cuda",
             attention_gate=attention_gate,
-            config=config,
+            vllm_config=cuda_construction_env,
         )
         assert not layer.is_moe_layer
         assert not layer.uses_remote_experts
@@ -305,7 +390,7 @@ def test_dense_and_moe_split_follows_first_k_dense_replace(
             layer_idx=layer_idx,
             device_type="cuda",
             attention_gate=attention_gate,
-            config=config,
+            vllm_config=cuda_construction_env,
         )
         assert layer.is_moe_layer
         assert layer.uses_remote_experts

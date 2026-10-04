@@ -102,9 +102,11 @@ native default implementation rather than the NVIDIA-fused
 are load-bearing and carry focused unit coverage: `index_topk` is always
 present, so the Attention role always allocates the DSA indexer buffer, and
 `_get_moe_router_dtype` forces fp32 routing for `glm_moe_dsa`, so router logits
-cross the connector as fp32. The alias rewrite changes `architectures` only,
-leaving the `model_type`-keyed fp32 routing intact. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
-separate wrapper around their matching native architecture. These aliases
+cross the connector as fp32. On CUDA, GLM MoE layers use the shared
+`build_attention_moe_runner`, which records the same fp32 dtype as the runner's
+`router_logits_dtype` for both gate placements. The alias rewrite changes
+`architectures` only, leaving the `model_type`-keyed fp32 routing intact.
+DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a separate wrapper around their matching native architecture. These aliases
 express known compatible architecture families; they do not make any wrapper
 a generic MoE model API.
 
