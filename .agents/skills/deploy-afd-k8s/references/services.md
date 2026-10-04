@@ -34,7 +34,7 @@ constants off the recipe's own defaults/assignments):
 FFN_PORT_START="$(grep -oE 'AFD_CONNECTOR_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
 NUM_FFN_RANKS="$(grep -oE 'NUM_FFN_RANKS=[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$' | head -1)"
 PORT_ENTRIES="$(for p in $(seq "$FFN_PORT_START" "$((FFN_PORT_START + NUM_FFN_RANKS))"); do
-  printf '    - {name: p%s, port: %s, targetPort: %s}\n' "$p" "$p" "$p"
+  printf '\n    - {name: p%s, port: %s, targetPort: %s}' "$p" "$p" "$p"
 done)"
 PORT_ENTRIES="$PORT_ENTRIES" envsubst '${PORT_ENTRIES}' \
   < templates/service-ffn-p2p.yaml | kubectl apply -f -

@@ -138,10 +138,13 @@ deploy_pod() {
   # extra_env_pairs: space-separated VAR=value tokens straight off this
   # plan entry's header line (including POD=... itself), empty for a plain
   # recipe. Build the spliced env-entries block for templates/pod.yaml.
+  # Leading (not trailing) newlines keep the `# ${TEMPLATE_EXTRA_ENV}`
+  # placeholder line a harmless comment when this is empty, and valid
+  # sibling list items when it isn't.
   local extra_env=""
   for pair in $extra_env_pairs; do
-    extra_env="$extra_env        - {name: ${pair%%=*}, value: \"${pair#*=}\"}
-"
+    extra_env="$extra_env
+        - {name: ${pair%%=*}, value: \"${pair#*=}\"}"
   done
 
   kubectl delete pod "$pod_name" --ignore-not-found

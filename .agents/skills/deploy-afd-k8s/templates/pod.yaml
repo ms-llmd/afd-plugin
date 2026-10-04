@@ -163,7 +163,7 @@ spec:
           value: "${TEMPLATE_ATTN_ROLE}"
         - name: AFD_FFN_NODE_ROLE
           value: "${TEMPLATE_FFN_ROLE}"
-${TEMPLATE_EXTRA_ENV}
+        # ${TEMPLATE_EXTRA_ENV}
         - name: HF_TOKEN
           valueFrom:
             secretKeyRef:
