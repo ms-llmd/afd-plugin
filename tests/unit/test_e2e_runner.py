@@ -230,7 +230,11 @@ def test_glm_moe_dsa_multi_pod_entrypoint(monkeypatch, scenario, layout_name):
     assert args.model == "/models/glm"
     assert args.gsm8k_output_path == "/work/gsm8k"
     assert args.served_model_name_prefix == "glm-moe-dsa-afd"
-    assert args.common_vllm_arg == ["--max-model-len=4096"]
+    # A cold-cache pod can lag its DP peers past the 1800 s gloo default.
+    assert args.common_vllm_arg == [
+        "--max-model-len=4096",
+        "--cpu-distributed-timeout-seconds=7200",
+    ]
     # GLM-5.2 is text-only; there is no multimodal shell to disable.
     assert "--language-model-only" not in args.common_vllm_arg
     layout = glm_moe_dsa_e2e.POD_LAYOUTS[layout_name]
