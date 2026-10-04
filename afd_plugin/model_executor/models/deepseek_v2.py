@@ -778,6 +778,11 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         self.afd_role = self.afd_config.role
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
+    @property
+    def afd_loads_routed_experts(self) -> bool:
+        """Only FFN owns routed experts; Attention runs parameter-free proxies."""
+        return self.afd_role == "ffn"
+
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
