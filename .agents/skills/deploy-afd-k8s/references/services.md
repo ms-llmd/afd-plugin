@@ -24,15 +24,16 @@ CLIENT_PORT="$CLIENT_PORT" envsubst '${CLIENT_PORT}' \
 
 Internal only, carries AFD rendezvous traffic to whichever pod holds
 `afd-ffn-node-role: head`. Must exist before any multi-pod deploy, since the
-recipe's own `AFD_CONNECTOR_HOST` default now points at this name directly
-(fixed at the recipe level -- this skill no longer computes that value).
+recipe's own `AFD_CONNECTOR_HOST` default now points at this name directly.
 Exposes the control-plane port plus one derived port per FFN rank
-(`[AFD_CONNECTOR_PORT, AFD_CONNECTOR_PORT + NUM_FFN_RANKS]` -- read both
-constants off the recipe's own defaults/assignments):
+(`[AFD_CONNECTOR_PORT, AFD_CONNECTOR_PORT + NUM_FFN_RANKS]` -- read
+`AFD_CONNECTOR_PORT` off the recipe's own shell default and `NUM_FFN_RANKS`
+off its `"num_ffn_ranks"` JSON config key, the *total* rank count for the
+FFN role across all pods, not a per-pod count):
 
 ```bash
 FFN_PORT_START="$(grep -oE 'AFD_CONNECTOR_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
-NUM_FFN_RANKS="$(grep -oE 'NUM_FFN_RANKS=[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$' | head -1)"
+NUM_FFN_RANKS="$(grep -oE '"num_ffn_ranks":[[:space:]]*[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$' | head -1)"
 PORT_ENTRIES="$(for p in $(seq "$FFN_PORT_START" "$((FFN_PORT_START + NUM_FFN_RANKS))"); do
   printf '\n    - {name: p%s, port: %s, targetPort: %s}' "$p" "$p" "$p"
 done)"
