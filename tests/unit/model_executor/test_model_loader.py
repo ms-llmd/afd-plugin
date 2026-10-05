@@ -53,7 +53,7 @@ def target_model_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return model_config
 
 
-@pytest.mark.parametrize("strategy", [None, "lazy", "eager"])
+@pytest.mark.parametrize("strategy", [None, "lazy", "eager", "prefetch"])
 def test_enabled_filter_skips_all_routed_experts(
     target_model_config: SimpleNamespace, strategy: str | None
 ) -> None:
@@ -71,16 +71,6 @@ def test_disabled_filter_loads_natively(
     parallel_config = afd_model_loader.get_current_vllm_config().parallel_config
     monkeypatch.setattr(parallel_config, "enable_ep_weight_filter", False)
     loader = AFDAttentionModelLoader(LoadConfig())
-
-    loader._init_ep_weight_filter(target_model_config)
-
-    assert loader.local_expert_ids == UPSTREAM_LOCAL_EXPERTS
-
-
-def test_prefetch_strategy_loads_natively(
-    target_model_config: SimpleNamespace,
-) -> None:
-    loader = AFDAttentionModelLoader(LoadConfig(safetensors_load_strategy="prefetch"))
 
     loader._init_ep_weight_filter(target_model_config)
 

@@ -23,18 +23,14 @@ logger = init_logger(__name__)
 # Load formats vLLM maps to DefaultModelLoader whose default safetensors path
 # honors ``local_expert_ids`` before ``get_tensor``.
 AFD_ATTENTION_LOAD_FORMATS = ("auto", "hf", "safetensors")
-# Reads whole checkpoint files, routed experts included, so skipping them
-# after the read saves no load time.
-PREFETCH_SAFETENSORS_LOAD_STRATEGY = "prefetch"
 
 
 class AFDAttentionModelLoader(DefaultModelLoader):
     """DefaultModelLoader for the Attention role, which owns no routed experts.
 
     Bypassed, loading exactly as ``DefaultModelLoader``, unless
-    ``--enable-ep-weight-filter`` is set and the safetensors load strategy is
-    not ``prefetch``. Models other than the target, such as a speculative
-    draft, always load natively.
+    ``--enable-ep-weight-filter`` is set. Models other than the target, such
+    as a speculative draft, always load natively.
     """
 
     # Override reason: upstream derives local experts from the EP layout only
@@ -48,8 +44,6 @@ class AFDAttentionModelLoader(DefaultModelLoader):
         if (
             model_config is vllm_config.model_config
             and vllm_config.parallel_config.enable_ep_weight_filter
-            and self.load_config.safetensors_load_strategy
-            != PREFETCH_SAFETENSORS_LOAD_STRATEGY
         ):
             self.local_expert_ids = set[int]()
             logger.info_once("AFD Attention: skipping routed experts before read")
