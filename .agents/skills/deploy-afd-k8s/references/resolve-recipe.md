@@ -20,9 +20,22 @@ caps how much prefill work a single step can absorb.
 Resolve `MODEL_ID`: read the script's `MODEL_PATH` default. It is either a
 HF Hub id (map the recipe's model directory name to one, e.g.
 `deepseek_v2_lite` -> `deepseek-ai/DeepSeek-V2-Lite`; ask if the mapping
-isn't obvious) or a literal in-container path (e.g.
-`/path/model_weights/Qwen3.5-122B-A10B-FP8`) when weights are staged on the
-PVC. Tell the caller which form it is.
+isn't obvious) or a **placeholder** path of the form
+`/path/model_weights/<name>` -- every colocation recipe uses exactly this
+literal `/path/` stand-in today, regardless of what's actually staged on any
+given cluster's PVC. Never pass this through verbatim: it names only the
+model directory (`<name>`), not a real in-container path. Derive the real
+`MODEL_ID` as `<MOUNT_PATH>/<name>`, where `<MOUNT_PATH>` is the PVC mount
+point fixed by `templates/pod.yaml` (`/models`) -- e.g.
+`/path/model_weights/Qwen3.5-122B-A10B-FP8` resolves to
+`/models/Qwen3.5-122B-A10B-FP8`. Before deploying, confirm that directory
+actually exists on the target `PVC_NAME` (if it already exists, `kubectl
+exec` into any pod already mounting it, e.g. `ls /models`, or spin up a
+short-lived busybox pod mounting the PVC) -- don't rely on the recipe's
+claim; a mismatch here fails fast inside the pod with a confusing
+HF-repo-id validation error instead of a clear message.
+
+Tell the caller which form it is, and the resolved value if derived.
 
 Set `CLIENT_PORT` to the `--port` value on the attention (or sole, for a
 single-pod recipe) `vllm serve` block -- `templates/pod.yaml` rebinds this
