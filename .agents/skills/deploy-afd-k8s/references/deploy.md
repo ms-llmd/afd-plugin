@@ -43,7 +43,6 @@ MODEL_ID=<model-id>
 PVC_NAME=<pvc-name>
 CLIENT_PORT=<n>   # from the script's --port; default 18305
 RECIPE_SCRIPT_PATH=<local-recipe-script-path>
-VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
 ```
 
 **Node placement is left to the scheduler by default.** Only add
@@ -66,9 +65,8 @@ asks to exercise cross-node placement -- add this to every Pod's
 
 ## 4a. Model PVC
 
-Size for the model (e.g. Qwen3.5-122B-A10B-FP8 needs `200Gi` minimum). An
-existing undersized PVC is reused silently and fails mid-download, so set
-`MODEL_PVC_SIZE` deliberately. `PVC_ACCESS_MODE` is derived, not asked:
+Size for the model being served. An existing undersized PVC is reused
+silently and fails mid-download, so set `MODEL_PVC_SIZE` deliberately. `PVC_ACCESS_MODE` is derived, not asked:
 `ReadWriteMany` whenever the plan (if any) has more than one pod -- an RWO
 volume can only attach from one node, and the second Pod deadlocks
 `Pending` with `Multi-Attach error` otherwise.
@@ -118,14 +116,11 @@ FS_GROUP="${FS_GROUP:-1000}"
 
 ## 4d. Services
 
-Create every Service that applies -- see [services.md](services.md) --
-**before** deploying any Pod in 4e below. Everything a Service needs
-(ports, selectors, which of the four apply) comes from the plan parsed in
-resolve-recipe.md, so none of this waits on a Pod existing. Creating
-Services late is the actual failure mode this guards against: a role's
-head Pod binds its own rendezvous/DP-RPC server to its Service's DNS name
-within seconds of starting, and with `restartPolicy: Never` a bind that
-fails because the Service doesn't exist yet never gets retried.
+Create every Service that applies -- see [services.md](services.md) for
+which, and why this must happen **before** deploying any Pod in 4e below.
+Everything a Service needs (ports, selectors, which of the four apply)
+comes from the plan parsed in resolve-recipe.md, so none of this waits on a
+Pod existing.
 
 ## 4e. Deploy pod(s)
 
@@ -153,7 +148,7 @@ deploy_pod() {
   TEMPLATE_GPU="$gpu" TEMPLATE_PVC="$PVC_NAME" TEMPLATE_FSGROUP="$FS_GROUP" \
   TEMPLATE_CLIENT_PORT="$CLIENT_PORT" TEMPLATE_ATTN_ROLE="$attn_role" TEMPLATE_FFN_ROLE="$ffn_role" \
   TEMPLATE_EXTRA_ENV="$extra_env" \
-  envsubst '${TEMPLATE_IMAGE} ${TEMPLATE_MODEL} ${TEMPLATE_POD} ${TEMPLATE_GPU} ${TEMPLATE_PVC} ${TEMPLATE_FSGROUP} ${TEMPLATE_CLIENT_PORT} ${TEMPLATE_ATTN_ROLE} ${TEMPLATE_FFN_ROLE} ${TEMPLATE_EXTRA_ENV} ${VLLM_USE_V2_MODEL_RUNNER}' \
+  envsubst '${TEMPLATE_IMAGE} ${TEMPLATE_MODEL} ${TEMPLATE_POD} ${TEMPLATE_GPU} ${TEMPLATE_PVC} ${TEMPLATE_FSGROUP} ${TEMPLATE_CLIENT_PORT} ${TEMPLATE_ATTN_ROLE} ${TEMPLATE_FFN_ROLE} ${TEMPLATE_EXTRA_ENV}' \
     < templates/pod.yaml | kubectl apply -f -
 }
 ```
@@ -182,13 +177,8 @@ capture dominate):
 
 ```bash
 for pod_name in <every deployed pod_name>; do
-  deadline=$(( $(date +%s) + 900 ))
-  until [ "$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; do
-    phase="$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    [ "$phase" = "Failed" ] && { kubectl logs "$pod_name" --tail=50; exit 1; }
-    [ "$(date +%s)" -ge "$deadline" ] && { kubectl describe pod "$pod_name" | tail -40; exit 1; }
-    sleep 10
-  done
+  kubectl wait pod "$pod_name" --for=jsonpath='{.status.phase}'=Running --timeout=15m \
+    || { kubectl describe pod "$pod_name" | tail -40; exit 1; }
 done
 
 for pod_name in <every deployed pod_name>; do
@@ -197,7 +187,6 @@ for pod_name in <every deployed pod_name>; do
     logs="$(kubectl logs "pod/$pod_name" 2>/dev/null || true)"
     echo "$logs" | grep -q "pod ${pod_name} READY" && break
     echo "$logs" | grep -q "ERROR:" && { kubectl logs "$pod_name" --tail=200; exit 1; }
-    [ "$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Failed" ] && { kubectl logs "$pod_name" --tail=200; exit 1; }
     [ "$(date +%s)" -ge "$deadline" ] && { kubectl logs "$pod_name" --tail=200; exit 1; }
     sleep 10
   done
@@ -208,7 +197,5 @@ Only report the endpoint ready once every pod in the plan has printed its
 own `READY` line -- one pod becoming ready doesn't imply the others did.
 
 Startup markers are keyed on the fixed log names every colocation recipe
-uses today (`attn.log` -> `Application startup complete`, or, for a worker
-shard, the EngineCore init-complete line; `ffn.log` -> `AFD FFN EngineCore
-started`). A recipe using different log names needs `templates/pod.yaml`
-updated.
+uses today -- see `templates/pod.yaml`'s `ready_marker()` for the exact
+lines. A recipe using different log names needs that template updated.

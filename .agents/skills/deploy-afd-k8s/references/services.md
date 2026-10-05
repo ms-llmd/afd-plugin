@@ -25,19 +25,13 @@ CLIENT_PORT="$CLIENT_PORT" envsubst '${CLIENT_PORT}' \
 Internal only, carries AFD rendezvous traffic to whichever pod holds
 `afd-ffn-node-role: head`. Must exist before any multi-pod deploy, since the
 recipe's own `AFD_CONNECTOR_HOST` default now points at this name directly.
-Exposes the control-plane port plus one derived port per FFN rank
-(`[AFD_CONNECTOR_PORT, AFD_CONNECTOR_PORT + NUM_FFN_RANKS]` -- read
-`AFD_CONNECTOR_PORT` off the recipe's own shell default and `NUM_FFN_RANKS`
-off its `"num_ffn_ranks"` JSON config key, the *total* rank count for the
-FFN role across all pods, not a per-pod count):
+Traffic to a headless Service goes straight to the pod IP, and there's one
+rendezvous port, so a single static port entry is enough -- read
+`AFD_CONNECTOR_PORT` off the recipe's own shell default:
 
 ```bash
-FFN_PORT_START="$(grep -oE 'AFD_CONNECTOR_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
-NUM_FFN_RANKS="$(grep -oE '"num_ffn_ranks":[[:space:]]*[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$' | head -1)"
-PORT_ENTRIES="$(for p in $(seq "$FFN_PORT_START" "$((FFN_PORT_START + NUM_FFN_RANKS))"); do
-  printf '\n    - {name: p%s, port: %s, targetPort: %s}' "$p" "$p" "$p"
-done)"
-PORT_ENTRIES="$PORT_ENTRIES" envsubst '${PORT_ENTRIES}' \
+AFD_CONNECTOR_PORT="$(grep -oE 'AFD_CONNECTOR_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
+AFD_CONNECTOR_PORT="$AFD_CONNECTOR_PORT" envsubst '${AFD_CONNECTOR_PORT}' \
   < templates/service-ffn-p2p.yaml | kubectl apply -f -
 ```
 
@@ -49,17 +43,12 @@ Carries that role's DP-RPC coordination traffic to its head pod. One per
 split role, generic over role via `templates/service-dp-coord.yaml`:
 
 ```bash
-TEMPLATE_ROLE=attn TEMPLATE_PORT=13345 \
+TEMPLATE_ROLE=attn
+TEMPLATE_PORT="$(grep -oE 'ATTENTION_DP_RPC_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
+TEMPLATE_ROLE="$TEMPLATE_ROLE" TEMPLATE_PORT="$TEMPLATE_PORT" \
   envsubst '${TEMPLATE_ROLE} ${TEMPLATE_PORT}' < templates/service-dp-coord.yaml | kubectl apply -f -
-# symmetrically: TEMPLATE_ROLE=ffn TEMPLATE_PORT=13346, if FFN is ever split
 ```
 
 All three internal Services (`vllm-ffn-p2p-service`, `vllm-attn-dp-service`,
-`vllm-ffn-dp-service`) are headless (`clusterIP: None`) -- the role's head
-pod *binds* its rendezvous/DP-RPC server to that name, and a normal
-ClusterIP has no real interface to bind to, only to connect through. Their
-templates also set `publishNotReadyAddresses: true`: headless-Service DNS
-by default only lists Pods that have already passed readiness, but a head
-pod resolving its own Service name to bind is inherently not-yet-ready at
-that moment -- without this flag, any future readinessProbe added to
-`templates/pod.yaml` would deadlock every head pod at startup.
+`vllm-ffn-dp-service`) are headless with `publishNotReadyAddresses: true` --
+see the comments in their own templates for why.

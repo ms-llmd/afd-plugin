@@ -35,32 +35,21 @@ spec:
           set -euo pipefail
           RECIPE_SCRIPT=/recipe/recipe.sh
           mkdir -p /work/bin
-          # Resolve the real uv BEFORE putting the shim on PATH (afterwards
-          # `command -v uv` would find the shim and recurse).
-          REAL_UV="$(command -v uv || true)"
-          printf '#!/bin/bash\nif [ "$1" = "run" ]; then\n  shift\n  exec "$@"\nfi\nREAL_UV="%s"\n[ -n "$REAL_UV" ] || { echo "uv not found in image" >&2; exit 127; }\nexec "$REAL_UV" "$@"\n' "$REAL_UV" > /work/bin/uv
+          # Recipes only ever call `uv run <cmd>`; drop the `run` and exec
+          # the rest directly instead of invoking uv at all.
+          printf '#!/bin/bash\nshift\nexec "$@"\n' > /work/bin/uv
           chmod +x /work/bin/uv
           export PATH="/work/bin:$PATH"
 
           echo "=== launching $(basename "$RECIPE_SCRIPT") (POD=${POD:-<none>} attn=${AFD_ATTN_NODE_ROLE} ffn=${AFD_FFN_NODE_ROLE}) ==="
 
-          # Rebind the client-facing port off loopback: the recipe binds
-          # :${TEMPLATE_CLIENT_PORT} on 127.0.0.1 (normally driven from the
-          # same host), but the Service needs 0.0.0.0. Every internal worker
-          # port stays on loopback.
+          # Rebind the client-facing port off loopback: every `--host
+          # 127.0.0.1` on the branch is an API-server flag (the recipe binds
+          # :${TEMPLATE_CLIENT_PORT} on 127.0.0.1), but the Service needs
+          # 0.0.0.0.
           RECIPE_BASENAME="$(basename "$RECIPE_SCRIPT" .sh)"
           PATCHED_SCRIPT="/work/${RECIPE_BASENAME}.patched.sh"
-          awk '
-            { line[NR] = $0 }
-            END {
-              for (i = 1; i <= NR; i++) {
-                l = line[i]
-                if (l ~ /--host 127\.0\.0\.1/ && i < NR && line[i+1] ~ /--port ${TEMPLATE_CLIENT_PORT}/) {
-                  gsub(/127\.0\.0\.1/, "0.0.0.0", l)
-                }
-                print l
-              }
-            }' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
+          sed 's/--host 127\.0\.0\.1/--host 0.0.0.0/' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
 
           cd /work
           bash "$PATCHED_SCRIPT" &
@@ -145,20 +134,8 @@ spec:
           value: "${TEMPLATE_MODEL}"
         - name: HF_HOME
           value: "/models/.hf_home"
-        - name: XDG_CACHE_HOME
-          value: "/work/xdg"
         - name: TORCHINDUCTOR_CACHE_DIR
           value: "/work/inductor"
-        - name: TRITON_CACHE_DIR
-          value: "/work/triton"
-        - name: VLLM_CACHE_ROOT
-          value: "/work/vllm"
-        - name: UV_CACHE_DIR
-          value: "/work/uv"
-        - name: VLLM_LOGGING_LEVEL
-          value: "INFO"
-        - name: VLLM_USE_V2_MODEL_RUNNER
-          value: "${VLLM_USE_V2_MODEL_RUNNER}"
         - name: AFD_ATTN_NODE_ROLE
           value: "${TEMPLATE_ATTN_ROLE}"
         - name: AFD_FFN_NODE_ROLE
@@ -169,6 +146,7 @@ spec:
             secretKeyRef:
               name: hf-token-secret
               key: token
+              optional: true
       resources:
         requests:
           nvidia.com/gpu: "${TEMPLATE_GPU}"

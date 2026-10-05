@@ -6,16 +6,15 @@ Tell the caller: the endpoint `http://vllm-service:${CLIENT_PORT}`,
 its `--max-num-batched-tokens`, and the node(s) it landed on:
 
 ```bash
-kubectl get pod <pod_name...> -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+kubectl get pods -l app=afd-recipe -o wide
 ```
 
 Every node matters if a follow-up pod needs to attach the same
 `ReadWriteOnce` PVC -- it can only attach from that node.
 
-If the plan spans more than one pod, repeat the experimental caveat from
-[resolve-recipe.md](resolve-recipe.md): correct AFD/DP flags and port
-exposure, but cross-pod `P2pNcclAFDConnector` throughput is not
-upstream-validated.
+If the plan spans more than one pod, repeat the verification caveat from
+[resolve-recipe.md](resolve-recipe.md): verified for DeepSeek-V2-Lite
+`2A2F` only, every other cross-pod topology is still unverified.
 
 # 6. Teardown
 

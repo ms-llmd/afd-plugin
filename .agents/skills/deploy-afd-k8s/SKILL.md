@@ -1,6 +1,6 @@
 ---
 name: deploy-afd-k8s
-description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. Placement across pods is never asked for or assumed -- it is read directly off the recipe's own top-of-file comment block (however that block describes it, strict or prose): a recipe whose comment describes a per-pod placement deploys exactly that many pods with exactly that per-pod setup; a recipe without one deploys as a single pod. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e). To drive load against what this deploys, see run-vllm-bench-k8s.
+description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. Placement across pods is never asked for or assumed -- it is read directly off the recipe's own top-of-file comment block (however that block describes it, strict or prose): a recipe whose comment describes a per-pod placement deploys exactly that many pods with exactly that per-pod setup; a recipe without one deploys as a single pod. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e).
 ---
 
 # Deploy an AFD GPU recipe on Kubernetes
@@ -31,7 +31,7 @@ than one pod) -- callers never talk to these directly. See
 
 - Recipes under `recipe/gpu/P2pNcclAFDConnector/**` (GPU only, not NPU),
   **`prefill_decode_colocation` only** (attention + FFN workers, no prefill
-  split) and their `baseline*.sh` counterparts.
+  split).
   `prefill_decode_disaggregation` recipes are **out of scope**: they need a
   NIXL-enabled image plus a proxy, and resolve a `SCRIPT_DIR`-relative path
   that this skill's flat script mount (step 4b) breaks. Ask the user for a
@@ -64,7 +64,8 @@ than one pod) -- callers never talk to these directly. See
   The image supplies only the `afd-plugin` install. The recipe script is
   mounted fresh from local disk on every run (step 4b), so editing or adding
   a recipe never requires a rebuild.
-- An `hf-token-secret` Secret with a `token` key:
+- An `hf-token-secret` Secret with a `token` key, needed when `MODEL_ID` is
+  a HF Hub repo id (not needed when weights are already staged on the PVC):
   ```bash
   kubectl create secret generic hf-token-secret --from-literal=token=<hf_token>
   ```
@@ -72,19 +73,14 @@ than one pod) -- callers never talk to these directly. See
 
 ## Workflow
 
-Load these in order; each covers one phase and nothing else. `deploy.md`
-hands off to `services.md` partway through (its own step 4d) and back --
-Services must exist **before** any Pod is deployed (step 4e), since a
-role's head Pod binds its own rendezvous/DP-RPC server to its Service's
-name within seconds of starting, and `restartPolicy: Never` means a bind
-that fails because the Service doesn't exist yet never retries:
+Load these in order; each covers one phase and nothing else. Services must
+exist **before** any Pod is deployed -- see
+[services.md](references/services.md) for why:
 
 | Reference | Covers |
 |---|---|
 | [resolve-recipe.md](references/resolve-recipe.md) | Step 1: read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](references/deploy.md) | Steps 2-4c: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup. |
-| [services.md](references/services.md) | Step 4d: which of the four Services to create, derived from the parsed plan -- before any Pod. |
-| [deploy.md](references/deploy.md) (resume) | Steps 4e-4f: pod(s) via `templates/pod.yaml`, wait for Running and for each pod's own readiness line. |
+| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), pod(s) via `templates/pod.yaml`, wait for Running and for each pod's own readiness line. |
 | [report-and-teardown.md](references/report-and-teardown.md) | Step 5: report the endpoint/model/nodes. Step 6: teardown (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl

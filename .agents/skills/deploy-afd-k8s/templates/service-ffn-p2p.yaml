@@ -17,4 +17,6 @@ spec:
     app: afd-recipe
     afd-ffn-node-role: head
   ports:
-  # ${PORT_ENTRIES}
+    - name: rendezvous
+      port: ${AFD_CONNECTOR_PORT}
+      targetPort: ${AFD_CONNECTOR_PORT}

@@ -25,8 +25,9 @@ isn't obvious) or a literal in-container path (e.g.
 PVC. Tell the caller which form it is.
 
 Set `CLIENT_PORT` to the `--port` value on the attention (or sole, for a
-single-pod recipe) `vllm serve` block -- step 2 must rebind and expose
-whatever value is actually there.
+single-pod recipe) `vllm serve` block -- `templates/pod.yaml` rebinds this
+port off loopback and `vllm-service` (step 4d, see
+[services.md](services.md)) exposes it, whatever value is actually there.
 
 ## Read the placement plan -- never ask
 
@@ -72,8 +73,10 @@ For each entry, derive (used by [deploy.md](deploy.md) and
   else `head`.
 - **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
 
-Treat any placement spanning more than one Pod as **experimental**: upstream
-documents cross-node `P2pNcclAFDConnector` use as "not established by the
-current recipes ... treated as unverified"
-(`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`). Deploy it as written, but
-don't present throughput as validated.
+Upstream verifies cross-node `P2pNcclAFDConnector` placement specifically for
+DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts, over TCP (ENA)
+and over EFA; every other topology -- including the qwen3.5 3-pod plan above
+-- is still **unverified**
+(`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`). Deploy any placement as
+written, but only present throughput as validated for that one verified
+case.
