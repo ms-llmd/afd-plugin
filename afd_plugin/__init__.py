@@ -187,14 +187,6 @@ def register_afd() -> None:
 
     register_afd_balanced_routing_strategy()
 
-    # CUDA only: vLLM-Ascend's loader registrations are not audited for this.
-    from vllm.platforms import current_platform
-
-    if current_platform.is_cuda():
-        from afd_plugin.model_executor.model_loader import register_afd_model_loader
-
-        register_afd_model_loader()
-
     try:
         from afd_plugin.v1.worker.dbo import register_dbo_yield_custom_op
 
