@@ -47,6 +47,7 @@ TILING_DATA_FIELD_DEF(int64_t, isSingleTensor);
 TILING_DATA_FIELD_DEF(int64_t, groupListType);
 TILING_DATA_FIELD_DEF(int64_t, smoothScaleDimNum);
 TILING_DATA_FIELD_DEF(int64_t, singleN);
+TILING_DATA_FIELD_DEF(uint32_t, layerNum);  // layered: all_* list length, bounds-checks the device layer index
 END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(GMMSwigluQuantV2BaseParamsOp, GMMSwigluQuantV2BaseParams)
 
@@ -78,6 +79,7 @@ TILING_DATA_FIELD_DEF(int64_t, ubFactorDimy);
 TILING_DATA_FIELD_DEF(int64_t, actRight);
 TILING_DATA_FIELD_DEF(int64_t, groupListType);
 TILING_DATA_FIELD_DEF(int8_t, isSingleTensor);
+TILING_DATA_FIELD_DEF(uint32_t, layerNum);  // layered: all_* list length, bounds-checks the device layer index
 TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, matmulTiling);
 END_TILING_DATA_DEF;
 

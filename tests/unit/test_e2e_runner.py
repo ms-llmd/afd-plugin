@@ -12,6 +12,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -82,6 +83,37 @@ def test_deepseek_v2_lite_entrypoint_limits_context(
     command = deepseek_v2_lite_e2e.build_runner_command(scenario, tmp_path)
 
     assert "--common-vllm-arg=--max-model-len=4096" in command
+
+
+@pytest.mark.parametrize(
+    ("backend", "scenario", "limit", "override", "expected"),
+    [
+        ("gpu", "afd-graph-dbo-2a2f", None, None, "0.25"),
+        ("gpu", "afd-graph-dbo-2a2f", "24", "0.30", "0.30"),
+        ("gpu", "afd-graph-dbo-2a2f", "256", None, None),
+        ("npu", "afd-graph-dbo-2a2f", "24", None, "0.25"),
+        ("gpu", "afd-v2-graph-dp2", None, None, "0.25"),
+        ("gpu", "afd-graph-dbo-2a2f", "all", None, None),
+    ],
+)
+def test_deepseek_smoke_threshold_preserves_large_runs_and_overrides(
+    monkeypatch, tmp_path, backend, scenario, limit, override, expected
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", backend)
+    monkeypatch.setenv(f"AFD_{backend.upper()}_E2E_MODEL", "model")
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("AFD_GSM8K_LIMIT", limit)
+    monkeypatch.delenv("AFD_GSM8K_THRESHOLD", raising=False)
+    if override is not None:
+        monkeypatch.setenv("AFD_GSM8K_THRESHOLD", override)
+
+    def check_runner_env(command, env):
+        assert env.get("AFD_GSM8K_THRESHOLD") == expected
+
+    monkeypatch.setattr(deepseek_v2_lite_e2e, "run_runner", check_runner_env)
+    deepseek_v2_lite_e2e.test_deepseek_v2_lite(scenario, tmp_path)
+    assert os.environ.get("AFD_GSM8K_THRESHOLD") == override
 
 
 def test_qwen3_moe_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
@@ -871,6 +903,31 @@ def test_run_lm_eval_passes_max_gen_toks_to_local_completions(
     assert "max_gen_toks=321" in model_args.split(",")
 
 
+def test_run_lm_eval_passes_num_concurrent_to_local_completions(
+    monkeypatch,
+    tmp_path,
+):
+    popen_calls = []
+
+    def fake_popen(command, **_kwargs):
+        popen_calls.append(command)
+        raise RuntimeError("stop after inspecting lm-eval invocation")
+
+    monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="stop after inspecting"):
+        helpers_gsm8k._run_lm_eval(
+            "http://127.0.0.1:8000",
+            "model",
+            output_path=str(tmp_path / "results"),
+            num_concurrent=12,
+        )
+
+    command = popen_calls[0]
+    model_args = command[command.index("--model_args") + 1]
+    assert "num_concurrent=12" in model_args.split(",")
+
+
 def test_run_lm_eval_reads_timestamped_results_file(monkeypatch, tmp_path):
     output_path = tmp_path / "results"
     model_output_path = output_path / "deepseek-v2-lite-afd-attention"
@@ -1297,6 +1354,29 @@ def test_run_gsm8k_evaluation_uses_batch_two_for_async_token_split(
     assert calls[0][2]["batch_size"] == 2
 
 
+def test_run_gsm8k_evaluation_concurrency_and_sample_floor_for_dbo(monkeypatch):
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a1f"
+    args.device_backend = "gpu"
+    runner.configure_scenario(args)
+    calls = []
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+
+    def fake_run_lm_eval(base_url, model_name, **kwargs):
+        calls.append((base_url, model_name, kwargs))
+        return {
+            "n-samples": {"gsm8k": {"effective": runner.DBO_EVAL_MIN_SAMPLES}},
+            "results": {"gsm8k": {"exact_match": 0.27}},
+        }
+
+    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
+
+    runner.run_gsm8k_evaluation(args)
+
+    assert calls[0][2]["num_concurrent"] == runner.DBO_EVAL_NUM_CONCURRENT
+    assert calls[0][2]["limit"] == runner.DBO_EVAL_MIN_SAMPLES
+
+
 def test_run_gsm8k_evaluation_rejects_an_incomplete_full_dataset(
     monkeypatch,
 ):
@@ -1619,3 +1699,81 @@ def test_v2_model_entry_builds_runner_command_with_exact_devices(
 
     assert command[command.index("--attention-devices") + 1] == attention_devices
     assert command[command.index("--ffn-devices") + 1] == ffn_devices
+
+
+@pytest.mark.parametrize(
+    "common_args",
+    [
+        ["--unrelated-arg"],
+        ["--enable-chunked-prefill"],
+        ["--no-enable-chunked-prefill"],
+    ],
+)
+def test_configure_dbo_preserves_chunked_prefill_choice(common_args):
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a2f"
+    args.common_vllm_arg = list(common_args)
+    runner.configure_scenario(args)
+
+    assert args.common_vllm_arg == common_args
+
+
+def test_build_env_enables_debug_logging_for_dbo_scenarios(monkeypatch):
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a1f"
+    runner.configure_scenario(args)
+    dbo_env = runner.build_env("0,1", args, role="attention")
+
+    assert dbo_env["VLLM_LOGGING_LEVEL"] == "DEBUG"
+
+    args.scenario = "afd-graph-2a1f"
+    runner.configure_scenario(args)
+    plain_env = runner.build_env("0,1", args, role="attention")
+
+    assert "VLLM_LOGGING_LEVEL" not in plain_env
+
+
+def test_stream_output_records_attention_split_steps(monkeypatch):
+    split_steps: list[float] = []
+    process: Any = argparse.Namespace(
+        stdout=io.StringIO(
+            "DEBUG [gpu_model_runner.py] ubatch_slices: [UBatchSlice(...)], ...\n"
+            "DEBUG [gpu_model_runner.py] ubatch_slices: None, ...\n"
+            "INFO serving\n",
+        ),
+    )
+    timestamps = iter([101.0, 102.0])
+    monkeypatch.setattr(runner.time, "time", lambda: next(timestamps))
+
+    thread = runner.stream_output("attention", process, split_steps)
+    thread.join(timeout=5)
+
+    assert split_steps == [101.0]
+
+
+def test_assert_dbo_live_split_coverage_passes_when_steps_in_window(monkeypatch):
+    args = _args()
+    args.device_backend = "gpu"
+    monkeypatch.setattr(runner.time, "time", lambda: 102.0)
+
+    runner.assert_dbo_live_split_coverage([101.0, 101.4], 100.0, args)
+
+
+def test_assert_dbo_live_split_coverage_fails_on_warmup_only(monkeypatch):
+    args = _args()
+    args.device_backend = "gpu"
+    monkeypatch.setattr(runner.time, "time", lambda: 102.0)
+
+    with pytest.raises(RuntimeError, match="no live request was ever split"):
+        runner.assert_dbo_live_split_coverage([99.0], 100.0, args)
+
+
+def test_assert_dbo_live_split_coverage_fails_without_evidence(monkeypatch):
+    args = _args()
+    args.device_backend = "gpu"
+    monkeypatch.setattr(runner.time, "time", lambda: 102.0)
+
+    with pytest.raises(RuntimeError, match="no live request was ever split"):
+        runner.assert_dbo_live_split_coverage([], 100.0, args)

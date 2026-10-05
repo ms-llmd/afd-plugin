@@ -191,6 +191,7 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::ParseInputAndAttr()
 
     // layered: every layer element carries all experts (single-tensor semantics per layer)
     isSingleTensor_ = 1;
+    layerNum_ = weightListLen;
 
     auto attr = context_->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context_, attr); // check attr is not null
@@ -463,6 +464,7 @@ void GroupedMatmulSwigluQuantV2LayeredBaseTiling::FillTilingData()
     tilingData_.gmmSwigluQuantV2BaseParams.set_isSingleTensor(isSingleTensor_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_groupListType(groupListType_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_smoothScaleDimNum(smoothScaleDimNum_);
+    tilingData_.gmmSwigluQuantV2BaseParams.set_layerNum(layerNum_);
     tilingData_.gmmSwigluQuantV2.set_maxProcessRowNum(maxProcessRowNum_);
     tilingData_.gmmSwigluQuantV2.set_groupListLen(groupNum_);
     tilingData_.gmmSwigluQuantV2.set_tokenLen(n_);

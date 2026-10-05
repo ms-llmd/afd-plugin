@@ -128,7 +128,7 @@ __aicore__ inline void GMMA8W4PostProcess::InitMmOutGmTensors(const GMAddrParams
 __aicore__ inline void GMMA8W4PostProcess::InitLayerGmTensor(const GMAddrParams &gmAddrParams)
 {
     weightAuxiliaryMatrixGM.SetGlobalBuffer(
-        GetLayerTensorAddr<float>(gmAddrParams.curLayer, gmAddrParams.weightAuxiliaryMatrixGM));
+        GetLayerTensorAddr<float>(gmAddrParams.curLayer, gmAddrParams.layerNum, gmAddrParams.weightAuxiliaryMatrixGM));
 }
 
 __aicore__ inline void GMMA8W4PostProcess::Init(
@@ -190,7 +190,7 @@ __aicore__ inline void GMMA8W4PostProcess::VectorCompute(uint32_t loopIdx, VecCo
 
 __aicore__ inline void GMMA8W4PostProcess::MergeAuxiliaryMatrix(uint32_t loopIdx, VecConfig &vecConfig)
 {
-    // perChanelScale * perTokenScale
+    // perChannelScale * perTokenScale
     LocalTensor<float> mmLocal = mmOutQueue.DeQue<float>();
     LocalTensor<float> weightAuxiliaryMatrixLocal = weightAuxiliaryMatrixInQueue.DeQue<float>();
     Add(mmLocal[loopIdx * gmmSwigluQuantV2->tokenLen], mmLocal[loopIdx * gmmSwigluQuantV2->tokenLen],

@@ -87,6 +87,7 @@ __aicore__ inline void GMMSwigluQuantPipelineSchedule<mmType>::Init(GM_ADDR x, G
     gmAddrParams.weightAuxiliaryMatrixGM = weightAssistanceMatrix;
     gmAddrParams.groupListGM = groupList;
     gmAddrParams.curLayer = curLayer;
+    gmAddrParams.layerNum = static_cast<uint32_t>(gmmSwigluQuantV2BaseParams->layerNum);
     gmAddrParams.yGM = y;
     gmAddrParams.yScaleGM = yScale;
     gmAddrParams.workSpaceGM = workspace;

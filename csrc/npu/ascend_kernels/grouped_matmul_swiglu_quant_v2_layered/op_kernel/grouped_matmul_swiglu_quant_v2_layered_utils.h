@@ -153,6 +153,8 @@ struct GMAddrParams {
     GM_ADDR smoothScaleGM;           // smooth scaling factor
     // layered: current layer index (read from layer_index at Init, selects the layer slot)
     int64_t curLayer = 0;
+    // layered: all_* list length, bounds-checks curLayer
+    uint32_t layerNum = 1;
     // output GM tensors
     GM_ADDR yGM;      // quantized output matrix
     GM_ADDR yScaleGM; // output scale vector

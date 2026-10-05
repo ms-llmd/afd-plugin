@@ -68,6 +68,11 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredFusionTiling::ParseInputAndAttr
     groupNum_ = groupListTensor->GetStorageShape().GetDim(0);
     // layered: every layer element carries all experts (single-tensor semantics per layer)
     isSingleTensor_ = 1;
+    uint32_t weightListLen = 0;
+    while (context_->GetDynamicInputTensor(WEIGHT_INDEX, weightListLen) != nullptr) {
+        weightListLen++;
+    }
+    layerNum_ = weightListLen;
     auto attr = context_->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context_, attr); // check attr is not null
     const int64_t *groupListTypePtr = attr->GetAttrPointer<int64_t>(ATTR_INDEX_GROUPLIST_TYPE);
@@ -163,6 +168,7 @@ void GroupedMatmulSwigluQuantV2LayeredFusionTiling::FillTilingData()
     tilingData_.set_ubFactorDimy(n_ / UB_Y_FACTOR);
     tilingData_.set_groupListType(groupListType_);
     tilingData_.set_isSingleTensor(isSingleTensor_);
+    tilingData_.set_layerNum(layerNum_);
 
     blockDim_ = aicCoreNum_;
     tilingData_.matmulTiling.set_usedCoreNum(aicCoreNum_);

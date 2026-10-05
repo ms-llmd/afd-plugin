@@ -25,11 +25,19 @@ extern "C" __global__ __aicore__ void afd_async_combine_recv(
     int32_t isCamComm = 1;
     GET_TILING_DATA_WITH_STRUCT(AfdAsyncCombineRecvTilingData, tilingData, tilingGM);
     if (TILING_KEY_IS(100)) {
-        AfdAsyncCombineRecv<bfloat16_t> op;
+        AfdAsyncCombineRecv<bfloat16_t, false> op;
         op.Init(expandX, expertIds, expertScales, xOut, workspaceGM, &pipe, &tilingData, commArgs, isCamComm);
         op.Process();
     } else if (TILING_KEY_IS(101)) {
-        AfdAsyncCombineRecv<float16_t> op;
+        AfdAsyncCombineRecv<float16_t, false> op;
+        op.Init(expandX, expertIds, expertScales, xOut, workspaceGM, &pipe, &tilingData, commArgs, isCamComm);
+        op.Process();
+    } else if (TILING_KEY_IS(102)) {
+        AfdAsyncCombineRecv<bfloat16_t, true> op;
+        op.Init(expandX, expertIds, expertScales, xOut, workspaceGM, &pipe, &tilingData, commArgs, isCamComm);
+        op.Process();
+    } else if (TILING_KEY_IS(103)) {
+        AfdAsyncCombineRecv<float16_t, true> op;
         op.Init(expandX, expertIds, expertScales, xOut, workspaceGM, &pipe, &tilingData, commArgs, isCamComm);
         op.Process();
     }

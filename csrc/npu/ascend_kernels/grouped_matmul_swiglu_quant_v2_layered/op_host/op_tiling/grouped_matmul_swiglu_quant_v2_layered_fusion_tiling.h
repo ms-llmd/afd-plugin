@@ -63,6 +63,7 @@ class GroupedMatmulSwigluQuantV2LayeredFusionTiling : public GroupedMatmulSwiglu
     int64_t ubFactorDimx_;
     int64_t groupListType_ = 0;
     int8_t isSingleTensor_;
+    uint32_t layerNum_ = 1;  // layered: all_* list length, bounds-checks the device layer index
 };
 
 } // namespace GroupedMatmulSwigluQuantV2LayeredTiling

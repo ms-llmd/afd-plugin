@@ -41,10 +41,8 @@ grouped_matmul_swiglu_quant_v2_layered(GM_ADDR x, GM_ADDR xScale, GM_ADDR groupL
     TPipe tPipe;
     GM_ADDR userWorkspace = GetUserWorkspace(workspace);
 
-    // layered: consume layer_index at Init stage (one 8B GM read per core)
-    GlobalTensor<int64_t> layerIndexGM;
-    layerIndexGM.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(layerIndex));
-    int64_t curLayer = layerIndexGM.GetValue(0);
+    // layered: consume layer_index at Init stage (one 8B GM read per core).
+    int64_t curLayer = LayeredReadLayerIndex(layerIndex);
 
 #if defined(GMM_SWIGLU_QUANT_V2_A8W4_MSD)
     if (TILING_KEY_IS(2)) {

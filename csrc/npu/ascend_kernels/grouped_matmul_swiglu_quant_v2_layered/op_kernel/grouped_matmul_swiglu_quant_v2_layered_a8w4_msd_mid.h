@@ -130,8 +130,8 @@ GMMA8W4MidProcess<mmType>::Init(const GMAddrParams gmAddrParams,
         xGM1.SetGlobalBuffer((__gm__ int4b_t *)gmAddrParams.workSpaceGM); // The result obtained from the pre-processing
         xGM2.SetGlobalBuffer(
             (__gm__ int4b_t *)((__gm__ int8_t *)gmAddrParams.workSpaceGM + gmAddrParams.workSpaceOffset1));
-        weightGM.SetGlobalBuffer(GetLayerTensorAddr<int4b_t>(gmAddrParams.curLayer, gmAddrParams.weightGM));
-        weightScaleGM.SetGlobalBuffer(GetLayerTensorAddr<uint64_t>(gmAddrParams.curLayer, gmAddrParams.weightScaleGM));
+        weightGM.SetGlobalBuffer(GetLayerTensorAddr<int4b_t>(gmAddrParams.curLayer, gmAddrParams.layerNum, gmAddrParams.weightGM));
+        weightScaleGM.SetGlobalBuffer(GetLayerTensorAddr<uint64_t>(gmAddrParams.curLayer, gmAddrParams.layerNum, gmAddrParams.weightScaleGM));
         groupListGM.SetGlobalBuffer((__gm__ int64_t *)gmAddrParams.groupListGM);
         mmOutGM1.SetGlobalBuffer(
             (__gm__ half *)((__gm__ int8_t *)gmAddrParams.workSpaceGM + gmAddrParams.workSpaceOffset2));

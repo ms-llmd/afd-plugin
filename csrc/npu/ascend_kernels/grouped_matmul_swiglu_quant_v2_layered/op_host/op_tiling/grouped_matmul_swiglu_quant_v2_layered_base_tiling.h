@@ -71,6 +71,7 @@ class GroupedMatmulSwigluQuantV2LayeredBaseTiling : public GroupedMatmulSwigluQu
     int64_t isSingleTensor_ = 1;
     int64_t groupListType_ = 0;
     int64_t smoothScaleDimNum_ = 0;
+    uint32_t layerNum_ = 1;  // layered: all_* list length, bounds-checks the device layer index
     int64_t usrWorkspaceLimit_ = 0;
     uint64_t workspaceSize_ = 0;
     int64_t tuningConfig_ = 0;

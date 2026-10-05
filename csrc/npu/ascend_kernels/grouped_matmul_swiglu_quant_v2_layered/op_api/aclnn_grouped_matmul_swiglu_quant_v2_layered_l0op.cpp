@@ -20,6 +20,7 @@
 #include "opdev/op_log.h"
 #include "opdev/op_dfx.h"
 #include "opdev/make_op_executor.h"
+#include "opdev/op_def.h"
 #include "util/math_util.h"
 #include "grouped_matmul_swiglu_quant_utils.h"
 #include "grouped_matmul_swiglu_quant_v2_layered.h"
@@ -70,6 +71,12 @@ const std::tuple<aclTensor *, aclTensor *> GroupedMatmulSwigluQuantV2Layered(
     int64_t quantMode, int64_t quantDtype, bool transposeWeight, int64_t groupListType,
     const aclIntArray *tuningConfigOptional, aclOpExecutor *executor)
 {
+    [[maybe_unused]] static const bool configRegistered = []() {
+        op::BinConfigJsonDict::UpdateConfigJsonPath(
+            GroupedMatmulSwigluQuantV2LayeredOpTypeId(),
+            "grouped_matmul_swiglu_quant_v2_layered.json");
+        return true;
+    }();
     L0_DFX(GroupedMatmulSwigluQuantV2Layered, x, weight, weightScale, xScale, weightAssistanceMatrix, smoothScale,
            groupList, layerIndex, dequantMode, dequantDtype, quantMode, quantDtype, transposeWeight,
            tuningConfigOptional);

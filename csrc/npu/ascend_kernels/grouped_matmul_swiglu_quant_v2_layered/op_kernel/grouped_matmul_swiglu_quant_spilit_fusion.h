@@ -67,8 +67,8 @@ class GroupedMatmulDequantSwigluQuantFusion {
         xGm_.SetGlobalBuffer((__gm__ int8_t *)x);
         groupListGm_.SetGlobalBuffer((__gm__ int64_t *)group_list);
         // layered: bind to the current layer of the all-layer tensor list
-        weightGm_.SetGlobalBuffer(GetLayerTensorAddr<int8_t>(curLayer, weight));
-        weightScaleGm_.SetGlobalBuffer(GetLayerTensorAddr<float>(curLayer, weight_scale));
+        weightGm_.SetGlobalBuffer(GetLayerTensorAddr<int8_t>(curLayer, tilingData_->layerNum, weight));
+        weightScaleGm_.SetGlobalBuffer(GetLayerTensorAddr<float>(curLayer, tilingData_->layerNum, weight_scale));
         workspaceGm_.SetGlobalBuffer((__gm__ int32_t *)workspace);
         activateScaleGm_.SetGlobalBuffer((__gm__ float *)activation_scale);
         scaleGm_.SetGlobalBuffer((__gm__ float *)scale);

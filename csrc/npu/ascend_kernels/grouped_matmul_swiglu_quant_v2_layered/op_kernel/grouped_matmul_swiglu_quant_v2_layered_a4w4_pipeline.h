@@ -84,6 +84,7 @@ GMMSwigluQuantPipelineSchedule<mmType>::Init(GM_ADDR x, GM_ADDR weight, GM_ADDR 
     gmAddrParams.weightAuxiliaryMatrixGM = weightAssistanceMatrix;
     gmAddrParams.groupListGM = groupList;
     gmAddrParams.curLayer = curLayer;
+    gmAddrParams.layerNum = static_cast<uint32_t>(gmmSwigluQuantV2BaseParams->layerNum);
     gmAddrParams.smoothScaleGM = smoothScale;
     gmAddrParams.yGM = y;
     gmAddrParams.yScaleGM = yScale;

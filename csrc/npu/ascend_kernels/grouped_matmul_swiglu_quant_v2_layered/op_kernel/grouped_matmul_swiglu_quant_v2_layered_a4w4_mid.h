@@ -84,8 +84,8 @@ GMMA4W4MidProcess<mmType>::Init(const GMAddrParams gmAddrParams,
         gmmSwigluQuantV2BaseParams = gmmSwigluQuantV2BaseParamsIN;
         xRowSumCount = gmmSwigluQuantV2BaseParams->M;
         xGM.SetGlobalBuffer((__gm__ int4b_t *)gmAddrParams.xGM);
-        weightGM.SetGlobalBuffer(GetLayerTensorAddr<int4b_t>(gmAddrParams.curLayer, gmAddrParams.weightGM));
-        weightScaleGM.SetGlobalBuffer(GetLayerTensorAddr<uint64_t>(gmAddrParams.curLayer, gmAddrParams.weightScaleGM));
+        weightGM.SetGlobalBuffer(GetLayerTensorAddr<int4b_t>(gmAddrParams.curLayer, gmAddrParams.layerNum, gmAddrParams.weightGM));
+        weightScaleGM.SetGlobalBuffer(GetLayerTensorAddr<uint64_t>(gmAddrParams.curLayer, gmAddrParams.layerNum, gmAddrParams.weightScaleGM));
         groupListGM.SetGlobalBuffer((__gm__ int64_t *)gmAddrParams.groupListGM);
         mmOutGM1.SetGlobalBuffer((__gm__ half *)((__gm__ int8_t *)gmAddrParams.workSpaceGM));
         mmOutGM2.SetGlobalBuffer(
