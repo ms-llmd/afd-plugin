@@ -324,24 +324,33 @@ def test_qwen3_235b_multi_pod_entrypoint(monkeypatch, scenario, layout_name):
     assert pod_options[pod_options.index("--serving-timeout") + 1] == "7200"
 
 
-@pytest.mark.parametrize("layout_name", list(qwen3_235b_multi_pod_e2e.POD_LAYOUTS))
+@pytest.mark.parametrize(
+    ("scenario", "layout_name"),
+    qwen3_235b_multi_pod_e2e.MULTI_POD_CASES,
+)
 def test_qwen3_235b_layouts_give_each_ffn_rank_its_own_device(
     monkeypatch,
+    scenario,
     layout_name,
 ):
-    """Each layout places 2A2F and keeps one EP shard per FFN device."""
+    """Each case places its scenario and keeps one EP2 shard per FFN device."""
     _, args, _ = _qwen3_235b_multi_pod_arguments(
         monkeypatch,
-        "afd-graph-2a2f",
+        scenario,
         layout_name,
     )
     runner.configure_scenario(args)
     topology = Topology.from_args(args)
     layout = PodLayout.parse(qwen3_235b_multi_pod_e2e.POD_LAYOUTS[layout_name])
 
-    pods = plan(topology, layout, ["192.0.2.10", "192.0.2.11"])
+    pods = plan(
+        topology,
+        layout,
+        [f"192.0.2.{10 + index}" for index in range(layout.num_pods)],
+    )
 
-    assert (topology.attention.ranks, topology.ffn.ranks) == (2, 2)
+    # The FFN side is the 2A2F one in every case; only Attention DP scales.
+    assert topology.ffn.ranks == 2
     assert (topology.attention.tp_size, topology.ffn.tp_size) == (1, 1)
     ffn_devices = [
         (pod.index, device)
@@ -359,6 +368,31 @@ def test_qwen3_235b_layouts_give_each_ffn_rank_its_own_device(
                 _additional_config(command)["afd"]["afd_process_group_timeout_s"]
                 == 7200
             )
+
+
+def test_qwen3_235b_three_pod_layout_splits_attention_dp8_over_two_pods(
+    monkeypatch,
+):
+    _, args, _ = _qwen3_235b_multi_pod_arguments(
+        monkeypatch,
+        "afd-graph-8a2f",
+        "3pod-role-split",
+    )
+    runner.configure_scenario(args)
+    layout = PodLayout.parse(qwen3_235b_multi_pod_e2e.POD_LAYOUTS["3pod-role-split"])
+
+    pods = plan(Topology.from_args(args), layout, ["a", "b", "c"])
+
+    attention = [pod.slot("attention") for pod in pods[:2]]
+    assert [slot.dp_start_rank for slot in attention] == [0, 4]
+    assert [slot.headless for slot in attention] == [False, True]
+    assert {slot.dp_size for slot in attention} == {8}
+    assert pods[2].slot("attention") is None
+    ffn = pods[2].slot(FFN_ROLE)
+    assert ffn.devices == ("0", "1")
+    # P2pNcclAFDConnector rendezvous at the first FFN rank, on the third pod.
+    assert {slot.afd_host for slot in [*attention, ffn]} == {"c"}
+    assert [pod.is_evaluator for pod in pods] == [True, False, False]
 
 
 def test_afd_process_group_timeout_is_unset_by_default():
@@ -679,6 +713,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-2a2f", (False, False, False, 2, 2, 1, 1, 1, False)),
         ("afd-graph-2a2f", (False, True, False, 2, 2, 1, 1, 1, False)),
         ("afd-graph-dbo-2a2f", (False, True, True, 2, 2, 1, 1, 1, False)),
+        ("afd-eager-8a2f", (False, False, False, 8, 2, 1, 1, 1, False)),
+        ("afd-graph-8a2f", (False, True, False, 8, 2, 1, 1, 1, False)),
+        ("afd-graph-dbo-8a2f", (False, True, True, 8, 2, 1, 1, 1, False)),
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),

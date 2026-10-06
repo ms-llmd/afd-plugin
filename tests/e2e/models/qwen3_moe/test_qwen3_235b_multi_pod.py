@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""CUDA Qwen3-235B-A22B multi-pod 2A2F E2E cases.
+"""CUDA Qwen3-235B-A22B multi-pod 2A2F and 8A2F E2E cases.
 
 Like `tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite_multi_pod.py`,
 this test runs as *one pod's slice* of an already-provisioned deployment: the
@@ -25,16 +25,20 @@ from tests.e2e.models.qwen3_moe import qwen3_235b_config
 
 # The layout is a second axis, orthogonal to the scenario id, so accuracy
 # evidence stays comparable with the single-host rows. Every FFN rank owns a
-# whole device in either layout, so both fit the FP8 per-rank budget.
+# whole device in every layout, so all fit the FP8 per-rank budget. The
+# three-pod layout keeps the same two FFN ranks and scales Attention to DP8
+# across two pods, so its scenario is 8A2F rather than 2A2F.
 POD_LAYOUTS = {
     "2pod-role-split": "2A0F,0A2F",
     "2pod-interleaved": "1A1F,1A1F",
+    "3pod-role-split": "4A0F,4A0F,0A2F",
 }
 MULTI_POD_CASES = [
     ("afd-graph-2a2f", "2pod-role-split"),
     ("afd-graph-2a2f", "2pod-interleaved"),
     ("afd-eager-2a2f", "2pod-role-split"),
     ("afd-graph-dbo-2a2f", "2pod-role-split"),
+    ("afd-graph-8a2f", "3pod-role-split"),
 ]
 
 

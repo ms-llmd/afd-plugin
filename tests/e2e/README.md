@@ -119,9 +119,12 @@ AFD process-group join timeout, and vLLM's CPU distributed timeout to 7200 s.
 
 `tests/e2e/models/qwen3_moe/test_qwen3_235b_multi_pod.py` runs the same
 2A2F scenarios across two pods with two GPUs each: graph in the `2A0F,0A2F`
-and `1A1F,1A1F` layouts, plus eager and graph+DBO in `2A0F,0A2F`. It runs
-once inside each pod with the same environment as the DeepSeek-V2-Lite
-multi-pod test (`AFD_E2E_RUN_ID`, `AFD_GPU_E2E_MODEL`,
+and `1A1F,1A1F` layouts, plus eager and graph+DBO in `2A0F,0A2F`. It also
+runs `afd-graph-8a2f` in the three-pod `4A0F,4A0F,0A2F` layout, which keeps
+the same two FFN ranks and scales Attention to DP8 across two 4-GPU pods; the
+runner also accepts `afd-eager-8a2f` and `afd-graph-dbo-8a2f` directly. The
+test runs once inside each pod with the same environment as the
+DeepSeek-V2-Lite multi-pod test (`AFD_E2E_RUN_ID`, `AFD_GPU_E2E_MODEL`,
 `AFD_E2E_GSM8K_OUTPUT`, `AFD_E2E_STORE_HOST`).
 
 ### DeepSeek-V2-Lite local 2A1F cases
