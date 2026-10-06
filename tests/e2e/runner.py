@@ -707,6 +707,9 @@ def build_vllm_command(
         "--tensor-parallel-size",
         str(tp_size),
         "--enable-expert-parallel",
+        # Each role loads only its own weights: Attention skips routed experts
+        # (afd_plugin/model_executor/model_loader.py), FFN its non-local ones.
+        "--enable-ep-weight-filter",
         "--additional-config",
         json.dumps(afd_config, separators=(",", ":")),
     ]

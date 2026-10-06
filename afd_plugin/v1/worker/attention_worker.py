@@ -10,6 +10,9 @@ from vllm.v1.worker import gpu_model_runner as gpu_model_runner_v1
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 
+from afd_plugin.model_executor.model_loader import (
+    register_afd_attention_model_loader,
+)
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner import (
     AFDAttentionModelRunner,
@@ -44,6 +47,8 @@ class AFDAttentionWorker(Worker):
             distributed_init_method,
             is_driver_worker,
         )
+        # Only Attention worker processes load with the Attention loader.
+        register_afd_attention_model_loader()
 
     # Patch reason: vLLM 0.26.0 constructs its runner inside Worker.init_device
     # after an internal module import, with no injectable runner factory.
