@@ -268,7 +268,6 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
             "afd-eager-2a2f",
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
-            "afd-eager-8a2f",
             "afd-graph-8a2f",
             "afd-graph-dbo-8a2f",
             ASYNC_CAM_SCENARIO,
@@ -381,7 +380,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-eager-2a2f": (False, False, False, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
-        "afd-eager-8a2f": (False, False, False, 8, 2),
         "afd-graph-8a2f": (False, True, False, 8, 2),
         "afd-graph-dbo-8a2f": (False, True, True, 8, 2),
         ASYNC_CAM_SCENARIO: (

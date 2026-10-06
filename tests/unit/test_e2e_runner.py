@@ -514,7 +514,6 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-2a2f", (False, False, False, 2, 2, 1, 1, 1, False)),
         ("afd-graph-2a2f", (False, True, False, 2, 2, 1, 1, 1, False)),
         ("afd-graph-dbo-2a2f", (False, True, True, 2, 2, 1, 1, 1, False)),
-        ("afd-eager-8a2f", (False, False, False, 8, 2, 1, 1, 1, False)),
         ("afd-graph-8a2f", (False, True, False, 8, 2, 1, 1, 1, False)),
         ("afd-graph-dbo-8a2f", (False, True, True, 8, 2, 1, 1, 1, False)),
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
