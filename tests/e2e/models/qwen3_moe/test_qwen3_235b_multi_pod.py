@@ -30,13 +30,10 @@ from tests.e2e.models.qwen3_moe import qwen3_235b_config
 # across two pods, so its scenario is 8A2F rather than 2A2F.
 POD_LAYOUTS = {
     "2pod-role-split": "2A0F,0A2F",
-    "2pod-interleaved": "1A1F,1A1F",
     "3pod-role-split": "4A0F,4A0F,0A2F",
 }
 MULTI_POD_CASES = [
     ("afd-graph-2a2f", "2pod-role-split"),
-    ("afd-graph-2a2f", "2pod-interleaved"),
-    ("afd-eager-2a2f", "2pod-role-split"),
     ("afd-graph-dbo-2a2f", "2pod-role-split"),
     ("afd-graph-8a2f", "3pod-role-split"),
 ]

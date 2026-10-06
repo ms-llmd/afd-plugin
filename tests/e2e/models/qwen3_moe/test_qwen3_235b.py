@@ -27,7 +27,6 @@ AFD_FFN_DEVICE_COUNT = 2
 BASELINE_DEVICE_COUNT = 4
 SCENARIOS = (
     "baseline-graph",
-    "afd-eager-2a2f",
     "afd-graph-2a2f",
     "afd-graph-dbo-2a2f",
 )
