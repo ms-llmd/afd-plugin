@@ -1,0 +1,22 @@
+{
+  "run_id": "multipod_2a_2a_2f_graph-20261005-163453",
+  "harness": "vllm-bench-serve",
+  "recipe": "recipe/gpu/P2pNcclAFDConnector/qwen3_5_122b_a10b_fp8/prefill_decode_colocation/multipod_2a_2a_2f_graph.sh",
+  "model_id": "/models/Qwen3.5-122B-A10B-FP8",
+  "image": "ghcr.io/shlomitk1/afd-ci:latest",
+  "gpu_count": 6,
+  "max_num_batched_tokens": 8192,
+  "workload": "balanced",
+  "dataset": "random",
+  "workload_args": "",
+  "input_len": 1024,
+  "output_len": 256,
+  "num_prompts": 512,
+  "sweep": "2:64 4:64 8:64 16:64",
+  "nodes": {
+    "vllm-pod-attention-0": "pokprod-b93r44s2",
+    "vllm-pod-attention-1": "pokprod-b93r43s0",
+    "vllm-pod-ffn-0": "pokprod-b93r44s2"
+  },
+  "finished_utc": "2026-10-05T14:05:25Z"
+}
