@@ -95,6 +95,36 @@ by AFD scenarios. The suite uses the same GSM8K-7, eight-shot, 4096-token,
 `compute_gate_on_attention=true`, pipeline-parallel, asynchronous, and
 multi-node execution are not covered; quantization is unverified.
 
+### Qwen3-235B-A22B 2A2F profile
+
+`Qwen/Qwen3-235B-A22B-FP8` exercises the Qwen3 MoE adapter at full size. It
+is a manual profile, not a PR or merge gate, and never downloads the ~235 GB
+checkpoint: `AFD_GPU_E2E_MODEL` must name an existing local snapshot. Use
+FP8 on H200-class devices. Each of the two FFN ranks holds ~106 GiB of
+experts (EP2/TP1), and a BF16 checkpoint would double that.
+
+```bash
+export AFD_E2E_BACKEND=gpu
+export AFD_GPU_E2E_MODEL=/path/to/Qwen3-235B-A22B-FP8
+# Optional: export AFD_E2E_DEVICES=0,1,2,3
+python -m pytest -q -s tests/e2e/models/qwen3_moe/test_qwen3_235b.py
+```
+
+The three single-host cases are `baseline-graph` (native DP4/TP1/EP4),
+`afd-graph-2a2f`, and `afd-graph-dbo-2a2f`. The two AFD cases put Attention
+DP2/TP1 on the first two devices and FFN DP2/TP1/EP2 on the last two. A cold load takes tens of minutes, and FFN ranks finish loading well
+after Attention. Because of that, the profile raises the startup timeout, the
+AFD process-group join timeout, and vLLM's CPU distributed timeout to 7200 s.
+
+`tests/e2e/models/qwen3_moe/test_qwen3_235b_multi_pod.py` runs graph and
+graph+DBO 2A2F in the two-pod `2A0F,0A2F` layout, two GPUs per pod. It also
+runs `afd-graph-8a2f` in the three-pod `4A0F,4A0F,0A2F` layout, which keeps
+the same two FFN ranks and scales Attention to DP8 across two 4-GPU pods; the
+runner also accepts `afd-graph-dbo-8a2f` directly. The
+test runs once inside each pod with the same environment as the
+DeepSeek-V2-Lite multi-pod test (`AFD_E2E_RUN_ID`, `AFD_GPU_E2E_MODEL`,
+`AFD_E2E_GSM8K_OUTPUT`, `AFD_E2E_STORE_HOST`).
+
 ### DeepSeek-V2-Lite local 2A1F cases
 
 The DeepSeek-V2-Lite 2A1F scenarios are local-only; its CI gate selects the

@@ -195,6 +195,15 @@ def test_qwen3_6_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
         qwen3_6_e2e.build_runner_command("afd-eager-2a1f", tmp_path)
 
 
+def test_afd_process_group_timeout_is_unset_by_default():
+    args = _args()
+
+    for role in ("attention", "ffn"):
+        command = runner.build_vllm_command(args, role=role)
+        config = json.loads(command[command.index("--additional-config") + 1])
+        assert "afd_process_group_timeout_s" not in config["afd"]
+
+
 @pytest.mark.parametrize(
     ("first_suite", "first_model"),
     [
@@ -440,6 +449,7 @@ def _args() -> argparse.Namespace:
         afd_async=False,
         compute_gate_on_attention=False,
         afd_connector_extra_config=[],
+        afd_process_group_timeout_s=None,
         use_decode_bench_connector=False,
         common_vllm_arg=[],
         attention_vllm_arg=[],
@@ -504,6 +514,8 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-2a2f", (False, False, False, 2, 2, 1, 1, 1, False)),
         ("afd-graph-2a2f", (False, True, False, 2, 2, 1, 1, 1, False)),
         ("afd-graph-dbo-2a2f", (False, True, True, 2, 2, 1, 1, 1, False)),
+        ("afd-graph-8a2f", (False, True, False, 8, 2, 1, 1, 1, False)),
+        ("afd-graph-dbo-8a2f", (False, True, True, 8, 2, 1, 1, 1, False)),
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),

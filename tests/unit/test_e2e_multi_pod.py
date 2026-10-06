@@ -324,6 +324,7 @@ def _single_host_args(scenario: str = "afd-graph-2a2f") -> argparse.Namespace:
         afd_async=False,
         compute_gate_on_attention=False,
         afd_connector_extra_config=[],
+        afd_process_group_timeout_s=None,
         use_decode_bench_connector=False,
         common_vllm_arg=[],
         attention_vllm_arg=[],
