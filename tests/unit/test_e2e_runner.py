@@ -787,6 +787,26 @@ def test_build_vllm_command_configures_graceful_shutdown_timeout(role):
     assert command[shutdown_timeout_index + 1] == "10"
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_build_vllm_command_enables_ep_weight_filter(role):
+    args = _args()
+    runner.configure_scenario(args)
+
+    command = runner.build_vllm_command(args, role=role)
+
+    assert command.count("--enable-ep-weight-filter") == 1
+
+
+def test_build_baseline_command_leaves_ep_weight_filter_off():
+    args = _args()
+    args.scenario = "baseline-graph"
+    runner.configure_scenario(args)
+
+    command = runner.build_baseline_command(args)
+
+    assert "--enable-ep-weight-filter" not in command
+
+
 @pytest.mark.parametrize(
     "passthrough_arg",
     ["--additional-config", '--additional-config={"afd":{}}'],

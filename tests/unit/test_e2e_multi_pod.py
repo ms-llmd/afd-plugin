@@ -375,6 +375,18 @@ def test_a_split_role_adds_exactly_the_five_placement_flags():
     assert "--headless" in follower
 
 
+@pytest.mark.parametrize("role", [ATTENTION_ROLE, FFN_ROLE])
+def test_every_pod_of_a_split_role_enables_ep_weight_filter(role):
+    """Headless followers load their own weights, so they filter experts too."""
+    args = _single_host_args()
+    topology = Topology.from_args(args)
+    pods = plan(topology, PodLayout.parse("1A1F,1A1F"), ["pod-0.svc", "pod-1.svc"])
+
+    for pod in pods:
+        command = runner.build_vllm_command(args, role=role, slot=_slot(pod, role))
+        assert command.count("--enable-ep-weight-filter") == 1
+
+
 @pytest.mark.parametrize(
     ("layout", "pod_index"),
     [("1A1F,1A1F", 0), ("1A1F,1A1F", 1), ("2A0F,0A2F", 0)],

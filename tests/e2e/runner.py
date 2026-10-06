@@ -648,6 +648,9 @@ def build_vllm_command(
         "--tensor-parallel-size",
         str(tp_size),
         "--enable-expert-parallel",
+        # Skip non-local routed-expert weights before they are read; the
+        # Attention role discards routed experts, FFN keeps only its EP shard.
+        "--enable-ep-weight-filter",
         "--additional-config",
         json.dumps(afd_config, separators=(",", ":")),
     ]
