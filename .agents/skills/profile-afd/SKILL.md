@@ -78,9 +78,10 @@ the usual reason a run appears to produce nothing; set `_WAIT=0` and use
 **The two roles count steps differently**, so the same `_SKIP_FIRST` does not
 select the same forward passes:
 
-- FFN `execute_model` runs for every exchange the Attention side drives,
-  including startup warmup and CUDA-graph capture dummy runs, so its counter
-  starts ahead.
+- FFN `execute_model` runs for every exchange the Attention side drives. With
+  the FFN graph cache off (eager), that includes startup warmup dummy runs, so
+  its counter starts ahead. With it on, warmup and capture payloads go to
+  `capture_model` and are not counted.
 - Attention `execute_model` runs only for scheduled batches. Dummy runs
   (warmup, capture, and idle DP ranks padding a step) go through `_dummy_run`
   and are not counted, so DP ranks of the same role can drift apart.
