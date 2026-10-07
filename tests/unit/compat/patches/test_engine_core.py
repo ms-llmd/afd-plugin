@@ -482,3 +482,56 @@ def test_engine_core_ffn_start_rpc_failure_emits_no_readiness_log(monkeypatch, c
         engine.run_busy_loop()
 
     assert "AFD FFN EngineCore started; workers run connector loop." not in caplog.text
+
+
+def test_engine_core_ffn_loop_forwards_profile_trigger(monkeypatch, tmp_path):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    patch_module = _load_patch_module()
+    importlib.reload(patch_module)
+
+    trigger_path = tmp_path / "ffn"
+    trigger_path.write_text("stop:0")
+    monkeypatch.setenv("AFD_FFN_PROFILE_TRIGGER_FILE", str(trigger_path))
+
+    class Executor:
+        def __init__(self, vllm_config):
+            self.calls = []
+
+        def collective_rpc(self, method, args=()):
+            self.calls.append((method, args))
+            if method == "profile" and args == (False,):
+                raise RuntimeError("Profiling is not enabled.")
+
+        def shutdown(self):
+            self.calls.append(("shutdown", ()))
+
+    engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
+    engine.shutdown_state = _EngineShutdownState.RUNNING
+
+    from afd_plugin.compat.patches import engine_core as engine_core_patch
+
+    trigger_writes = iter(["start:1", "stop:1", None])
+
+    def advance(_seconds):
+        content = next(trigger_writes)
+        if content is None:
+            engine.shutdown_state = _EngineShutdownState.REQUESTED
+        else:
+            trigger_path.write_text(content)
+
+    monkeypatch.setattr(engine_core_patch.time, "sleep", advance)
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    # The pre-existing "stop:0" is the baseline and never fires; a failing
+    # profile RPC is logged and does not stop the FFN loop.
+    assert engine.model_executor.calls == [
+        ("start_ffn_server_loop", ()),
+        ("raise_ffn_loop_error_if_any", ()),
+        ("raise_ffn_loop_error_if_any", ()),
+        ("profile", (True,)),
+        ("raise_ffn_loop_error_if_any", ()),
+        ("profile", (False,)),
+        ("stop_ffn_server_loop", ()),
+    ]

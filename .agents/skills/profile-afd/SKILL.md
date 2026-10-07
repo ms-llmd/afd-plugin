@@ -19,7 +19,7 @@ Profiling answers *why* a configuration is slow; benchmarks measure *how* slow.
 | Question | Tool | Code change | Where |
 |---|---|---|---|
 | Which ops/kernels dominate one role, with shapes | plugin torch profiler | none | this file |
-| Timeline across ranks and roles, connector waits, DBO overlap, kernels inside CUDA graphs | Nsight Systems | none for a time window; a step-aligned window needs a proposed hook | [references/nsight-systems.md](references/nsight-systems.md) |
+| Timeline across ranks and roles, connector waits, DBO overlap, kernels inside CUDA graphs | Nsight Systems | none for a time window; a runtime range uses the FFN trigger file | [references/nsight-systems.md](references/nsight-systems.md) |
 | Why one specific kernel is slow (occupancy, bandwidth, roofline) | Nsight Compute | none | [references/nsight-compute.md](references/nsight-compute.md) |
 
 Use them in that order: the torch profiler or `nsys` to find the hot kernel,
@@ -48,8 +48,10 @@ The helpers live in `afd_plugin/compat/profiler.py` (CUDA) and
 with a TensorBoard trace handler. Do not add a second profiler to a runner.
 
 Attention and FFN are **separate `vllm serve` processes**, so vLLM's own
-`/start_profile` route reaches only the Attention server. The variables below
-are the only way to profile the FFN half with the torch profiler.
+`/start_profile` route reaches only the Attention server. The FFN has no API
+server, and its EngineCore never reads utility requests. To profile the FFN
+half, use the variables below (a step schedule fixed at launch) or the FFN
+trigger file (runtime start/stop, see below).
 
 ### Environment variables
 
@@ -130,6 +132,61 @@ the container `env:` or with `--pod-env`. GSM8K-7 is short, so use a
 `_DIR` at storage that outlives the pod: the multi-pod Job's `/work` is an
 `emptyDir`.
 
+## Runtime start/stop on both roles (vLLM profiler + FFN trigger)
+
+Use this when the window should be chosen while the server runs rather than
+fixed in steps at launch. Pass vLLM's own `--profiler-config` to **both** roles'
+`vllm serve` (with the E2E runners: `--common-vllm-arg=--profiler-config=...`):
+
+```bash
+--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/out/vllm_profile"}'
+# or {"profiler": "cuda"} to drive an nsys --capture-range=cudaProfilerApi window
+```
+
+- **Attention:** `curl -X POST http://<attn-host>:<port>/start_profile`, then
+  `/stop_profile`. This is vLLM's native route.
+- **FFN:** set `AFD_FFN_PROFILE_TRIGGER_FILE=<path>` in the FFN process
+  environment. The FFN EngineCore loop (`afd_plugin/compat/profile_trigger.py`)
+  polls that file every 0.5 s and forwards each change to the workers'
+  `profile` RPC. Write `start:<n>` to start and `stop:<n>` to stop. Bump `<n>` to
+  repeat. Only a change of content acts, and whatever the file holds when the
+  FFN starts serving is ignored. A missing file is treated as empty.
+
+Keep `delay_iterations`, `max_iterations`, `wait_iterations` and
+`warmup_iterations` at 0 on the FFN. vLLM advances those counters from
+`Worker.execute_model`, which the connector-driven FFN worker never calls.
+Without `--profiler-config` on the FFN, a trigger logs an error and the FFN
+keeps serving. Prefer `"cuda"` for the FFN. `profile()` runs on the worker's
+RPC thread while forwards run on the connector-loop thread, and the torch
+profiler's CPU-op capture of the other thread is unverified.
+
+On Kubernetes, use a ConfigMap **mounted as a volume** so you can edit it live.
+An env var sourced from a ConfigMap is fixed at container start, and a
+`subPath` mount never updates:
+
+```yaml
+volumes:
+  - name: afd-profile
+    configMap: {name: afd-profile-trigger}
+containers:
+  - volumeMounts:
+      - {name: afd-profile, mountPath: /etc/afd-profile, readOnly: true}
+    env:
+      - {name: AFD_FFN_PROFILE_TRIGGER_FILE, value: /etc/afd-profile/ffn}
+```
+
+```bash
+kubectl create configmap afd-profile-trigger --from-literal=ffn=stop:0
+kubectl patch configmap afd-profile-trigger -p '{"data":{"ffn":"start:1"}}'
+kubectl patch configmap afd-profile-trigger -p '{"data":{"ffn":"stop:1"}}'
+```
+
+The kubelet propagates an edit within seconds to about a minute, and each node
+syncs separately. One ConfigMap mounted in every pod therefore starts all FFN
+pods of a multi-pod run, but not on the same step. Outside Kubernetes,
+`echo start:1 > <path>` does the same. vLLM writes torch traces on stop, which
+can take minutes for long windows, so stop well before the E2E run ends.
+
 ### Reading the result
 
 - **Profile an eager recipe first.** Under `FULL_DECODE_ONLY`, decode kernels
@@ -155,3 +212,5 @@ the container `env:` or with `--pod-env`. GSM8K-7 is short, so use a
 | `ValueError: ... must be a boolean/integer value` at startup | a profiler variable holds an unparsable value; the helpers reject it rather than defaulting |
 | Trace too large to open | `_ACTIVE` too high, or `_REPEAT` > 1 |
 | Multi-pod traces gone after the Job | `_DIR` was on the pod's `emptyDir` |
+| FFN trigger edit has no effect | env-var or `subPath` ConfigMap (neither updates), same content as before (bump the token), or kubelet sync not yet done; check the FFN log for `AFD FFN profile trigger` |
+| `AFD FFN profile start failed` in FFN log | `--profiler-config` missing on the FFN `vllm serve` |

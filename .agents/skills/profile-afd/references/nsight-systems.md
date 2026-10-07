@@ -95,17 +95,25 @@ process group and SIGKILLs it after `PROCESS_TERMINATION_TIMEOUT_S` (20 s). A
 report still being finalized then is lost (only a `.qdstrm` remains — recover
 with `nsys import` if it is intact).
 
-**B. Step-aligned range — needs the proposed hook (§6).** With
-`--capture-range=cudaProfilerApi --capture-range-end=repeat:1:<sync|async>`
-nsys records exactly the steps the plugin's `AFD_GPU_*_PROFILER_*` schedule
-selects, on every rank of both roles, on every pod, and writes the report at
-range end. Without the hook nothing in an AFD process calls
-`cudaProfilerStart`, so this mode records nothing. Do not use the default
-`--capture-range-end` (`stop-shutdown`), which terminates the role.
+**B. Runtime range — works with the FFN trigger file.** Add
+`--capture-range=cudaProfilerApi --capture-range-end=repeat` to
+`AFD_NSYS_ARGS` (the default, `stop-shutdown`, terminates the role). Then give
+both roles `--profiler-config '{"profiler": "cuda"}'`. That makes vLLM's
+`profile()` call `cudaProfilerStart`/`cudaProfilerStop`. Open and close the
+range on each role:
 
-vLLM's own `--profiler-config '{"profiler": "cuda"}'` + `POST /start_profile`
-calls `cudaProfilerStart` only in processes behind an API server, so it reaches
-the Attention role and never the FFN role.
+- Attention: `POST /start_profile` and `POST /stop_profile`.
+- FFN: write `start:<n>` / `stop:<n>` to `AFD_FFN_PROFILE_TRIGGER_FILE`
+  ([SKILL.md](../SKILL.md#runtime-startstop-on-both-roles-vllm-profiler--ffn-trigger)).
+  On Kubernetes, use a volume-mounted ConfigMap.
+
+The range is chosen at runtime, so no `--delay` calibration is needed. Opening
+the two roles is not atomic, though: the Attention call lands immediately, and
+the FFN reacts within 0.5 s plus file or ConfigMap propagation. Open the FFN
+range first and close it last. Report timing depends on the repeat mode:
+`repeat` defers reports to process exit, which collides with the 20 s E2E
+teardown. `repeat:<N>:sync` or `repeat:<N>:async` writes each report when its
+range ends. Verify which of the two finalizes before teardown on first use.
 
 ## 4. Multi-node (multi-pod) E2E
 
@@ -162,10 +170,10 @@ nsys stats --report cuda_gpu_kern_sum --format csv --output . <report>.nsys-rep
   listed individually. `--cuda-graph-trace=graph` is cheaper if you only need
   replay duration.
 
-## 6. Proposed hook (not implemented)
+## 6. Proposed hook for step-aligned ranges (not implemented)
 
-A small change to `afd_plugin/compat/profiler.py` would make mode B work and
-keep one schedule for every tool:
+Mode B is timed by hand. A step-aligned range would need a small change to
+`afd_plugin/compat/profiler.py`:
 
 - New `AFD_GPU_{ATTENTION,FFN}_PROFILER_BACKEND=torch|cuda` (default `torch`,
   so behavior is unchanged).
@@ -177,7 +185,9 @@ keep one schedule for every tool:
 - It reuses the existing call sites (`execute_model` in all three GPU runners,
   `shutdown`), so no runner changes.
 
-The same range drives `ncu --profile-from-start off`. Until it lands, use mode A.
+The two roles count steps differently (see SKILL.md), so even this aligns each
+role to its own steps, not to the same forward pass. Exact cross-role alignment
+would need the start/stop to travel with the step metadata over the connector.
 
 ## 7. Troubleshooting
 
@@ -187,7 +197,7 @@ The same range drives `ncu --profile-from-start off`. Until it lands, use mode A
 | Scenario fails right after the window: role exited | `--kill` left at default `sigterm`; add `--kill=none` |
 | Only `.qdstrm`, no `.nsys-rep` | report finalization was killed at teardown; capture an earlier window, or `nsys import` |
 | Report has no CUDA kernels | window landed during load/startup (raise `--delay`), or driver too old for this nsys |
-| Empty report with `--capture-range=cudaProfilerApi` | nothing calls `cudaProfilerStart` in AFD processes (§3 B, §6) |
+| Empty report with `--capture-range=cudaProfilerApi` | no `--profiler-config '{"profiler": "cuda"}'` on that role, or the range was never opened (`/start_profile` for Attention, trigger file for FFN) |
 | Hang or crash at worker spawn | set `VLLM_WORKER_MULTIPROC_METHOD=spawn` (the wrapper sets it unless already set) |
 | Both plugin torch profiler and nsys enabled | both use CUPTI; keep `AFD_GPU_*_PROFILER_ENABLE` off while running nsys |
 | Multi-pod report missing for one pod | wrapper not at the same path in that pod, or output dir was an `emptyDir` |

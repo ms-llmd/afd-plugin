@@ -67,9 +67,11 @@ nodes inside a replayed graph are profiled individually and the name filter
 still matches them. Eager recipes are simpler to correlate and are the
 recommended starting point.
 
-Once the proposed cudaProfilerApi hook exists
-([nsight-systems.md §6](nsight-systems.md#6-proposed-hook-not-implemented)),
-add `--profile-from-start off` to collect only inside the plugin's step window.
+To collect only inside a window you open at runtime, add
+`--profile-from-start off` and give the role
+`--profiler-config '{"profiler": "cuda"}'`. Then open the range with the FFN
+trigger file or Attention's `/start_profile`
+([nsight-systems.md §3 B](nsight-systems.md#3-choose-a-capture-window)).
 
 ## 3. Single-host vs multi-node
 
