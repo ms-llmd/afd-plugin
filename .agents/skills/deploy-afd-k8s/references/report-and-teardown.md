@@ -12,10 +12,6 @@ kubectl get pods -l app=afd-recipe -o wide
 Every node matters if a follow-up pod needs to attach the same
 `ReadWriteOnce` PVC -- it can only attach from that node.
 
-If the plan spans more than one pod, repeat the verification caveat from
-[resolve-recipe.md](resolve-recipe.md): verified for DeepSeek-V2-Lite
-`2A2F` only, every other cross-pod topology is still unverified.
-
 # 6. Teardown
 
 Left running by design, so weights stay warm -- report what's up and how to
