@@ -1,0 +1,18 @@
+{
+  "run_id": "4a2f_graph_dp1-20261008-125432",
+  "harness": "vllm-bench-serve",
+  "recipe": "recipe/gpu/P2pNcclAFDConnector/qwen3-235b-a22b/prefill_decode_collocation/4a2f_graph_dp1.sh",
+  "model_id": "Qwen/Qwen3-235B-A22B-FP8",
+  "image": "ghcr.io/shlomitk1/afd-ci:latest",
+  "gpu_count": 6,
+  "max_num_batched_tokens": 8192,
+  "workload": "balanced",
+  "dataset": "random",
+  "input_len": 1024,
+  "output_len": 256,
+  "num_prompts": 512,
+  "sweep": "2:64 4:64 8:64 16:64",
+  "node": "gd91fda",
+  "notes": "AFD 4-attn + 2-FFN, no DBO",
+  "finished_utc": "2026-10-08T10:50:07Z"
+}

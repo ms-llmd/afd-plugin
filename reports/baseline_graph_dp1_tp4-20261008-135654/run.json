@@ -1,0 +1,14 @@
+{
+  "run_id": "baseline_graph_dp1_tp4-20261008-135654",
+  "harness": "vllm-bench-serve",
+  "recipe": "recipe/gpu/P2pNcclAFDConnector/qwen3-235b-a22b/prefill_decode_collocation/baseline_graph_dp1_tp4.sh",
+  "model_id": "Qwen/Qwen3-235B-A22B-FP8",
+  "image": "ghcr.io/shlomitk1/afd-ci:latest",
+  "gpu_count": 4,
+  "max_num_batched_tokens": 8192,
+  "workload": "balanced", "dataset": "random",
+  "input_len": 1024, "output_len": 256, "num_prompts": 512,
+  "sweep": "2:64 4:64 8:64 16:64", "node": "gd91fda",
+  "notes": "native TP=4, no AFD, no DBO; 4 GPUs vs AFD run's 6",
+  "finished_utc": "2026-10-08T11:08:55Z"
+}
