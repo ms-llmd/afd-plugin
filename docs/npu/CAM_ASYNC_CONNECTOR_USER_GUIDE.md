@@ -2,7 +2,7 @@
 
 `CAMAsyncAFDConnector` is the Ascend CAM-backed asynchronous connector for AFD
 Attention/FFN disaggregation. It lets Attention workers compute MoE routing and
-exchange routed and shared-expert activations with independent FFN expert ranks
+exchange routed-expert activations with independent FFN expert ranks
 through CAM async dispatch/combine operators.
 
 This guide describes the supported deployment shape, configuration contract,
@@ -50,11 +50,11 @@ One MoE layer follows this sequence:
 1. Attention computes top-k expert IDs and weights.
 2. `async_dispatch_send` sends hidden states and routing IDs into the CAM group.
 3. Each FFN rank calls `async_dispatch_recv` and receives its routed expert
-   tokens, shared-expert tokens, token counts, and optional dynamic-quant scales.
-4. The FFN worker executes its local routed and shared experts.
+   tokens, compact metadata, per-expert counts, and optional dynamic-quant scales.
+4. The FFN worker executes its local routed experts; Attention computes shared experts.
 5. `async_combine_send` returns those outputs with the dispatch metadata.
 6. Attention calls `async_combine_recv`; CAM routes, weights, and combines the
-   expert results for the original tokens.
+   expert results for the original tokens, then adds its local shared output.
 
 CAM dispatch payloads carry the token-count and routing metadata. Consequently,
 this connector does not use the separate Gloo DP-metadata control plane used by
@@ -251,8 +251,7 @@ The target CAM async v0.26 NPU validation baseline is:
 - runtime image build `nightly-main-a3-openeuler-20260801230444_aarch64`;
 - vLLM v0.26.0 at commit `568afb3a1`;
 - vLLM-Ascend branch `releases/v0.26.0rc` at commit `80d8c194f`;
-- the included `CAM_ascend910_93_openEuler_aarch64.run` installer;
-- `umdk_cam_op_lib-209.0.0b1-cp312-cp312-linux_aarch64.whl`.
+- plugin-owned source-built Ascend operators.
 
 The nightly image identifier records the intended validation environment; it
 is not a promise of a stable public pull tag. Some development package metadata
@@ -261,23 +260,19 @@ above are the compatibility baseline for this port. The recorded validation
 evidence is scoped to the topologies and sample counts stated above; other
 combinations require their own NPU validation.
 
-Install the CAM packages from the repository root inside the container:
+Build the AFD operators from the repository root inside the container:
 
 ```bash
-bash afd_plugin/connectors/npu/bin/CAM_ascend910_93_openEuler_aarch64.run
-pip install afd_plugin/connectors/npu/bin/umdk_cam_op_lib-209.0.0b1-cp312-cp312-linux_aarch64.whl
-```
-
-Every CAM async process needs the CAM operator library on its loader path and
-the Ascend plugin enabled. The complete recipe includes all tuning variables;
-the essential setup is:
-
-```bash
-export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM:${ASCEND_CUSTOM_OPP_PATH}
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM/op_api/lib:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM/op_api:${LD_LIBRARY_PATH}
+SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 pip install -e . -v --no-build-isolation
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 ```
+
+The loader configures the packaged `afd-plugin` vendor directory and loads
+`afd_plugin._C_ascend`. No external CAM wheel or vendor library is required.
+Async CAM sends routed experts only. Attention owns native shared MLP weights
+and computes shared outputs in the model's token layout. Shared weights use
+the native replicated SP contract, so TP ranks do not add partial shared
+outputs across different token shards. Their memory is included in profiling.
 
 Set `connector_extra_config.hccl_buffer_size` when the CAM domain needs a
 larger buffer than unrelated TP, DP, or EP process groups. `HCCL_BUFFSIZE`
@@ -288,10 +283,9 @@ For the experimental FlashComm1/SP cases, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention. Set it to `0` for plain TP
 Attention and on every FFN process.
 
-At initialization, the runtime verifies that `torch`, `torch_npu`,
-`umdk_cam_op_lib`, and the four real `torch.ops.umdk_cam_op_lib` operators are
-available: `async_dispatch_send`, `async_dispatch_recv`,
-`async_combine_send`, and `async_combine_recv`.
+At initialization, the runtime verifies all four
+`torch.ops.afd_ascend.afd_async_*` operators and logs the plugin version and
+actual vendor library path. Missing source operators fail startup.
 
 ## Current limitations
 
@@ -312,3 +306,58 @@ available: `async_dispatch_send`, `async_dispatch_recv`,
 
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
+
+## W4A8 layered GMM (experimental, disabled by default)
+
+Set `AFD_ASYNC_CAM_LAYERED_GMM=1` on every FFN rank to use the two layered GMM
+operators for compatible W4A8 routed experts. Leave it unset on Attention
+ranks; enabling it on another role or connector fails at startup. The startup
+log must show `actual=layered` to confirm that the new path is active.
+
+```bash
+# Use the same checkpoint, topology, capacity, and requests for both runs.
+AFD_ASYNC_CAM_LAYERED_GMM=0 bash <W4A8-FFN-launch-script>
+AFD_ASYNC_CAM_LAYERED_GMM=1 bash <W4A8-FFN-launch-script>
+```
+
+The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
+Attention-side gate, `dynamicQuant=1`, eager ModelRunnerV1, and static expert
+placement. This path applies only to Ascend DeepSeek V4; enabling the switch
+for another model fails at startup. All remote MoE layers must share geometry,
+SiLU activation, quantization layout, and scaling semantics. Both per-channel
+and per-group parameters can be extracted, but neither mode has been validated
+with a target checkpoint. Shared experts remain on Attention. DSV4 already
+applies routed scaling in top-k, so FFN does not apply it again.
+
+The existing fused operator does not apply a nonzero `swiglu_limit`. The
+layered path temporarily ignores the model's limit and logs
+`swiglu_limit=<value> ignored=True`; its output must not be treated as a
+precision-equivalent replacement until the fused operator implements the
+clamp. Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
+activation, or incompatible parameters fail before receiving work. Non-W4A8,
+mixed-quantization, and heterogeneous layers stay on the legacy path with a
+startup reason. Do not fill absent compensation parameters with zeros merely
+to enable this path.
+
+The new path uses the full dispatch-recv capacity and device expert counts. A
+slice of the original metadata, or a device mapping, selects the layer; the
+original metadata goes to combine-send. Empty ranks, chunks, and ubatches use
+the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the new
+path logs only Tensor shape, dtype, and device without reading metadata values.
+The existing synchronization after each work-item group remains. Measure peak
+memory for the capacity-sized intermediates, and set `BATCH_SIZE_FACTOR` high
+enough for every whole-expert chunk.
+
+CPU contract tests cover layer mapping, repeated layer IDs, capacity, zero
+counts, parameter rejection, startup selection, and the absence of explicit
+metadata D2H in the new Python path. They do not establish NPU numerical
+accuracy, empty-work completion, hidden synchronization, or a performance gain.
+Run the compiled Meta and NPU numerical tests described in the
+[testing guide](TESTING.md#layered-w4a8-validation). Multi-rank CAM completion,
+checkpoint accuracy, profiling, and A/B performance still need target-device
+validation.
+
+To revert, set `AFD_ASYNC_CAM_LAYERED_GMM=0` and restart the FFN processes.
+For performance runs, disable `AFD_CAM_OP_IO_LOG` and
+`AFD_FORCE_BALANCED_TOPK_IDS`, retain the actual-path startup log, and measure
+the existing group synchronization separately.

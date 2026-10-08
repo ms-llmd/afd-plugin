@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import importlib.util
@@ -82,6 +85,7 @@ class BuildAscendOps(build_ext):
             f"-DCMAKE_BUILD_TYPE={os.environ.get('CMAKE_BUILD_TYPE', 'Release')}",
             f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DAFD_SOC_VERSION={os.environ.get('SOC_VERSION', '910c')}",
         ]
         try:
             pybind11_cmake_dir = subprocess.check_output(
@@ -112,7 +116,7 @@ class BuildAscendOps(build_ext):
 ext_modules = []
 if _should_build_ascend_ops():
     ext_modules.append(
-        CMakeExtension("afd_plugin._C_ascend", "csrc/npu/torch_extension"),
+        CMakeExtension("afd_plugin._C_ascend", "csrc/npu/pybind"),
     )
 
 

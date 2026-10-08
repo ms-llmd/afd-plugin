@@ -1,6 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import importlib.metadata
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +36,13 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     assert registrations["DeepseekV32ForCausalLM"] == (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     )
+    # The DSV4 registration is host-dependent: the NPU class is selected
+    # whenever `torch_npu` is importable, so assert that rule instead of
+    # pinning the GPU path and failing on every Ascend host.
     assert registrations["DeepseekV4ForCausalLM"] == (
-        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+        "afd_plugin.model_executor.models.npu.deepseek_v4:AFDDeepseekV4ForCausalLM"
+        if importlib.util.find_spec("torch_npu") is not None
+        else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
     )
 
 

@@ -8,10 +8,12 @@ from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
 )
+from afd_plugin.envs import async_cam_layered_gmm_enabled
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -27,6 +29,17 @@ def fail_if_unsupported_npu_afd_features(
     """Fail fast for NPU AFD settings that are not currently supported."""
 
     afd_config = afd_config or parse_afd_config(vllm_config)
+    layered_gmm_requested = async_cam_layered_gmm_enabled()
+    if layered_gmm_requested and (
+        afd_config.role != "ffn" or afd_config.connector != AFD_ASYNC_CONNECTOR
+    ):
+        raise RuntimeError(
+            "AFD_ASYNC_CAM_LAYERED_GMM requires the async CAM FFN role; "
+            f"got role={afd_config.role!r}, connector={afd_config.connector!r}"
+        )
+    is_dsv4 = _is_dsv4_target(vllm_config)
+    if layered_gmm_requested and not is_dsv4:
+        raise RuntimeError("AFD_ASYNC_CAM_LAYERED_GMM supports only DeepSeek V4")
     from afd_plugin.connectors.factory import AFDConnectorFactory
 
     extra_info = AFDConnectorFactory.parse_connector_extra_info(
@@ -34,7 +47,6 @@ def fail_if_unsupported_npu_afd_features(
         vllm_config,
     )
 
-    is_dsv4 = _is_dsv4_target(vllm_config)
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
 
@@ -52,7 +64,7 @@ def fail_if_unsupported_npu_afd_features(
         raise RuntimeError(
             "AFD NPU runtime does not support compute_gate_on_attention=true yet",
         )
-    if afd_config.connector == "CAMP2pAFDConnector":
+    if afd_config.connector == CAMP2P_CONNECTOR:
         from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
 
         if not isinstance(extra_info, CAMP2PExtraInfo):
@@ -68,16 +80,19 @@ def fail_if_unsupported_npu_afd_features(
             "AFD NPU runtime supports exactly two ubatches when DBO is enabled",
         )
     model_config = vllm_config.model_config
-    # Match the pinned NPUModelRunner's sparse-attention backend selection.
-    uses_sparse_mla = hasattr(
-        model_config.hf_text_config,
-        "index_topk",
-    )
+    # Mirror the pinned NPUModelRunner's attention backend selection: a sparse
+    # (SFA) or compressor (DSA) configuration selects a backend whose
+    # graph-params update is a no-op, so only plain MLA takes the MLA DBO full
+    # graph path that owns the merged registry.
+    hf_text_config = model_config.hf_text_config
+    uses_sparse_mla = hasattr(hf_text_config, "index_topk")
+    uses_mla_compressor = hasattr(hf_text_config, "compress_ratios")
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     uses_mla_dbo_full_graph = (
         uses_ubatching
         and model_config.use_mla
         and not uses_sparse_mla
+        and not uses_mla_compressor
         and cudagraph_mode.has_full_cudagraphs()
     )
     if uses_mla_dbo_full_graph and vllm_config.speculative_config is not None:
@@ -130,8 +145,18 @@ def _fail_if_unsupported_dsv4_async_features(
 
 
 def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
-    if afd_config.connector != AFD_ASYNC_CONNECTOR:
-        raise RuntimeError("DSV4 NPU AFD supports only CAMAsyncAFDConnector")
+    """Reject DSV4 on connectors that cannot carry token ids.
+
+    A DSV4 Hash layer routes by token identity, so whichever role owns the gate
+    needs the tokens' ids. CAM async reads them from its dispatch metadata;
+    CAMP2P moves them over the A2E ids channel with the gate left on FFN.
+    """
+
+    if afd_config.connector not in (AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR):
+        raise RuntimeError(
+            "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
+            f"CAMP2pAFDConnector; got {afd_config.connector!r}",
+        )
 
 
 def _fail_if_unsupported_npu_afd_async_features(
@@ -145,6 +170,11 @@ def _fail_if_unsupported_npu_afd_async_features(
         raise TypeError(
             "CAMAsyncAFDConnector requires AFDAsyncExtraInfo, got "
             f"{type(extra_info).__name__}",
+        )
+
+    if vllm_config.additional_config.get("mix_placement", False):
+        raise RuntimeError(
+            "Async CAM uses routed-only expert IDs and does not support mix_placement"
         )
 
     parallel_config = vllm_config.parallel_config

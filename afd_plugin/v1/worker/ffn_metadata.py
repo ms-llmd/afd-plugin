@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from afd_plugin.distributed import subgroup_attention_block
+
 
 def aggregate_ffn_token_counts(
     attention_counts: tuple[int, ...],
@@ -14,14 +16,17 @@ def aggregate_ffn_token_counts(
 ) -> tuple[int, ...]:
     """Aggregate consecutive Attention-rank counts for each FFN rank.
 
-    For example, ``4A2F`` counts ``(0, 4, 5, 6)`` become ``(5, 11)`` because
-    every zero-token Attention peer contributes one placeholder row. Missing
-    peers use the same per-peer fallback, so empty counts become ``(2, 2)``.
+    The blocks are the ones the rank mapping builds: contiguous and differing
+    in size by at most one, so ``3A2F`` groups ``{A0, A1}`` onto ``F0`` and
+    ``{A2}`` onto ``F1``. For example, ``4A2F`` counts ``(0, 4, 5, 6)`` become
+    ``(5, 11)`` because every zero-token Attention peer contributes one
+    placeholder row. Missing peers use the same per-peer fallback, so empty
+    counts become ``(2, 2)``.
     """
 
     fallback_count = max(1, int(fallback))
     fallback_counts = tuple(fallback_count for _ in range(max(0, ffn_size)))
-    if ffn_size <= 0 or attention_size < ffn_size or attention_size % ffn_size != 0:
+    if ffn_size <= 0 or attention_size < ffn_size:
         return fallback_counts
 
     expanded_counts = attention_counts
@@ -36,15 +41,14 @@ def aggregate_ffn_token_counts(
             for rank in range(attention_size)
         )
 
-    group_size = attention_size // ffn_size
+    # Each FFN rank sums the block that ``build_rank_mapping`` assigns to it.
     return tuple(
         sum(
             max(1, int(expanded_counts[attention_rank]))
             if attention_rank < len(expanded_counts)
             else fallback_count
-            for attention_rank in range(
-                ffn_rank * group_size,
-                (ffn_rank + 1) * group_size,
+            for attention_rank in subgroup_attention_block(
+                ffn_rank, attention_size, ffn_size
             )
         )
         for ffn_rank in range(ffn_size)

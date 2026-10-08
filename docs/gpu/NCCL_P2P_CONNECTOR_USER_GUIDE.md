@@ -12,10 +12,9 @@ The MoE gate may run on Attention or FFN.
 
 It supports both prefill and decode which all support eager mode. CUDA graph support is currently limited to `FULL_DECODE_ONLY`, which is mainly used in decode instance. The checked-in DeepSeek V2 Lite recipes cover colocated and prefill/decode-disaggregated deployments.
 
-
 ## How it works
 
-Throughout this section, let `A = num_attention_ranks`, `F = num_ffn_ranks`, and `ratio = A / F`. The topology rules (`A >= F`, `A % F == 0`) guarantee `ratio` is a whole number and make `min_size = min(A, F) = F`. One physical process sits at up to three different rank numbers — an AFD world rank, a subgroup rank, and a control-plane (`p2p`) rank — all derived deterministically from the role, role rank, and topology counts.
+Throughout this section, let `A = num_attention_ranks` and `F = num_ffn_ranks`. The topology rule (`A >= F`) makes `min_size = min(A, F) = F`. Each subgroup's `ratio` is the number of Attention peers it holds; when `F` divides `A` every subgroup holds `A / F` of them, and otherwise the counts differ by one. One physical process sits at up to three different rank numbers — an AFD world rank, a subgroup rank, and a control-plane (`p2p`) rank — all derived deterministically from the role, role rank, and topology counts.
 
 ### AFD world (shared rendezvous)
 
@@ -30,9 +29,9 @@ FFN role rank `i` gets world rank `i`; Attention role rank `j` gets world rank `
 
 ### Data plane: one subgroup per FFN rank
 
-Each FFN rank `k` owns subgroup `k`, containing itself plus its `ratio` consecutive Attention peers `A(k*ratio) .. A(k*ratio + ratio - 1)`. Inside a subgroup the FFN rank is always subgroup rank `0` and the Attention peers occupy subgroup ranks `1..ratio`.
+Each FFN rank `k` owns subgroup `k`, containing itself plus the consecutive Attention peers assigned to it: Attention rank `a` joins subgroup `a * F // A`, which is `a // ratio` whenever `F` divides `A`. Inside a subgroup the FFN rank is always subgroup rank `0` and the Attention peers occupy subgroup ranks `1..ratio`.
 
-Each subgroup is its own process group rendezvoused on `port + subgroup_index + 1` (this is where the derived-port requirement comes from), carrying two NCCL communicators: Attention-to-FFN for hidden states and FFN-to-Attention for FFN outputs. Per layer/stage, each Attention peer sends its hidden states to subgroup rank `0`; the FFN rank receives from ranks `1..ratio` in order, concatenates along the token dimension, runs FFN work, splits the output by the recorded sequence lengths, and sends each slice back to the originating Attention rank. The data path uses vLLM `PyNcclCommunicator.send()` / `recv()` on the current CUDA stream.
+Each subgroup is its own process group, rendezvoused on the AFD world's store under a `PrefixStore` of its own so no extra port is needed, carrying two NCCL communicators: Attention-to-FFN for hidden states and FFN-to-Attention for FFN outputs. Per layer/stage, each Attention peer sends its hidden states to subgroup rank `0`; the FFN rank receives from ranks `1..ratio` in order, concatenates along the token dimension, runs FFN work, splits the output by the recorded sequence lengths, and sends each slice back to the originating Attention rank. The data path uses vLLM `PyNcclCommunicator.send()` / `recv()` on the current CUDA stream.
 
 ### Control plane: the DP metadata group
 
@@ -51,8 +50,8 @@ In code, the control plane is a pluggable module rather than part of the connect
 AFD world (port):        F0=0  F1=1  A0=2  A1=3  A2=4  A3=5
 
 Data plane:
-  subgroup 0 (port+1):   F0(rank 0) <-> A0(rank 1), A1(rank 2)
-  subgroup 1 (port+2):   F1(rank 0) <-> A2(rank 1), A3(rank 2)
+  subgroup 0 (prefix afd_subgroup_0):   F0(rank 0) <-> A0(rank 1), A1(rank 2)
+  subgroup 1 (prefix afd_subgroup_1):   F1(rank 0) <-> A2(rank 1), A3(rank 2)
 
 Control plane "p2p" group (port, size 4):
   p2p ranks:             F0=0  F1=1  A0=2  A1=3      (A2, A3 excluded)
@@ -75,6 +74,7 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
     "num_attention_ranks": 1,
     "num_ffn_ranks": 1,
     "compute_gate_on_attention": false,
+    "afd_process_group_timeout_s": 120,
     "connector_extra_config": {}
   }
 }
@@ -86,11 +86,12 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
 | --- | --- | --- | --- |
 | `role` | `"attention" \| "ffn"` | `"attention"` | Role owned by this process. Attention sends hidden states; FFN receives and returns FFN outputs. |
 | `connector` | `str` | `"P2pNcclAFDConnector"` | Must be `P2pNcclAFDConnector` for this GPU path. |
-| `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous/control-plane host. All participating ranks must use a reachable, identical value. Host must be the first rank of FFN.|
-| `port` | `int` | `1239` | Base rendezvous port, valid range `1..65535`. The connector also uses `port + subgroup_index + 1`, so those ports must be free and reachable. |
+| `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous/control-plane host. All participating ranks must use a reachable, identical value. Host must be the first rank of FFN. |
+| `port` | `int` | `1239` | Rendezvous port on `host`, valid range `1..65535`. It must be free and reachable. Subgroups share this rendezvous and need no ports of their own. |
 | `num_attention_ranks` | `int` | `1` | Total number of AFD Attention ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `num_ffn_ranks` | `int` | `1` | Total number of AFD FFN ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `compute_gate_on_attention` | `bool` | `false` | When `false`, FFN owns the native gate and experts. When `true`, Attention owns the native gate and transfers router logits to the FFN external-router expert path. |
+| `afd_process_group_timeout_s` | `int` | `120` | Rendezvous timeout, in seconds, for the AFD world process group join. Must be positive. The right value depends on rank count, placement, and model size; deployment tooling should compute it and pass it in. |
 | `connector_extra_config` | `dict` | `{}` | Must remain empty; `P2pNcclAFDConnector` does not currently support connector-specific options. |
 | `async` / `async_dp` | `bool` | `false` | Must remain `false` for `P2pNcclAFDConnector`; AFD async mode requires `CAMAsyncAFDConnector`. |
 
@@ -106,10 +107,9 @@ role rank.
 
 ```text
 num_attention_ranks >= num_ffn_ranks
-num_attention_ranks % num_ffn_ranks == 0
 ```
 
-Therefore, every FFN rank maps to the same integer number of consecutive Attention ranks.
+The Attention ranks are then spread over the FFN ranks in consecutive blocks that differ in size by at most one: Attention rank `a` joins the subgroup of FFN rank `a * F // A`. When `F` divides `A` every FFN rank maps to the same number of Attention ranks, as before.
 
 Examples:
 
@@ -119,7 +119,7 @@ Examples:
 | `2A2F` | Yes | `F0 <-> A0`, `F1 <-> A1` |
 | `4A2F` | Yes | `F0 <-> A0,A1`, `F1 <-> A2,A3` |
 | `1A2F` | No | Attention rank count is smaller than FFN rank count. |
-| `3A2F` | No | Attention rank count is not divisible by FFN rank count. |
+| `3A2F` | Yes | `F0 <-> A0,A1`, `F1 <-> A2` |
 
 ## Minimal launch shape
 
@@ -170,10 +170,10 @@ For complete `1A1F`, `2A2F`, `4A4F`, eager, DBO, and CUDA graph examples, see `r
 - CUDA-capable PyTorch/vLLM environment with NCCL and vLLM's `PyNcclCommunicator` available.
 - Hidden-state tensors must reside on CUDA devices; CPU tensors are rejected.
 - All ranks must agree on `host`, `port`, rank counts, model hidden size/dtype, and role-rank assignment.
-- The rendezvous base port and derived subgroup ports must be free and reachable.
+- The rendezvous port on `host` must be free and reachable.
 - Initialization is collective: missing ranks, mismatched counts, or duplicate role ranks can cause initialization failure or timeout.
 - Current GPU CUDA graph support is `FULL_DECODE_ONLY`; GPU DBO plus CUDA graph is limited to exactly two ubatches.
 - CUDA remote experts do not currently support EPLB on the Attention role.
 - To enable DBO, set `--enable-dbo`, and configure the threshold with `--dbo-decode-token-threshold` and `--dbo-prefill-token-threshold`. See `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite` for examples.
-- The repository recipes currently validate specific GPU layouts (including DeepSeek V2 Lite and tested A/H-class hardware). Cross-node use depends on NCCL/network configuration and is not established by the current recipes; document it as unverified rather than promising transparent fallback.
+- The repository recipes currently validate specific GPU layouts (including DeepSeek V2 Lite and tested A/H-class hardware). Cross-node placement is verified for DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts, over TCP (ENA) and over EFA; other topologies and hardware should be treated as unverified.
 - There is no automatic fallback from this connector to another transport. Select an NPU connector explicitly on Ascend.

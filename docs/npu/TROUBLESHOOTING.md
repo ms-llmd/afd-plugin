@@ -21,30 +21,20 @@ PTA call acl api failed
 missing async CAM operator
 ```
 
-Confirm that the CAM package is installed on every node and make its operator
-libraries visible before starting vLLM:
+Build the plugin-owned operators on every node and restart AFD:
 
 ```bash
-CAM_VENDOR_PATH=/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM
-export ASCEND_CUSTOM_OPP_PATH="${CAM_VENDOR_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
-export LD_LIBRARY_PATH="${CAM_VENDOR_PATH}/op_api:${CAM_VENDOR_PATH}/op_api/lib:${LD_LIBRARY_PATH:-}"
+SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 pip install -e . -v --no-build-isolation
 ```
 
-The CAM `op_api/lib` directory must contain `libopapi.so`. If the package only
-contains `libcust_opapi.so`, create the expected link from that directory:
-
-```bash
-cd "${CAM_VENDOR_PATH}/op_api/lib"
-ln -s libcust_opapi.so libopapi.so
-```
-
-Restart every AFD process after changing the loader environment.
+The loader logs the `afd-plugin` vendor library path and requires all four
+`afd_ascend.afd_async_*` registrations. It does not fall back to external CAM.
 
 ## Runtime libraries cannot be loaded
 
 If `libhccl.so` cannot be found, make sure the Ascend toolkit environment is
-loaded before adding the CAM paths. Always prepend to `LD_LIBRARY_PATH` as
-shown above; replacing it removes the CANN library paths.
+loaded before starting AFD. The plugin loader prepends its vendor paths and
+preserves the existing CANN library paths.
 
 The toolkit environment does not include the NNAL ATB library. If startup
 reports that `libatb.so` cannot be found, load the ATB environment after the

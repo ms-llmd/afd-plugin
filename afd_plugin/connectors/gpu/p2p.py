@@ -15,7 +15,9 @@ Topology:
     consecutive Attention ranks, which requires::
 
         num_attention_ranks >= num_ffn_ranks
-        num_attention_ranks % num_ffn_ranks == 0
+
+    The Attention ranks are spread over the FFN ranks in blocks that differ
+    in size by at most one, so the counts need not divide evenly.
 
     Attention sends hidden states to its mapped FFN rank; the FFN rank
     concatenates inputs from its Attention peers, runs FFN work, splits the
@@ -47,12 +49,13 @@ Requirements and limitations:
       size/dtype, and role-rank assignment. Initialization is collective:
       missing ranks, mismatched counts, or duplicate role ranks can cause
       initialization failure or timeout.
-    - The rendezvous base ``port`` and the derived subgroup ports
-      (``port + subgroup_index + 1``) must be free and reachable.
+    - The rendezvous ``port`` on ``host`` must be free and reachable. Subgroups
+      share that rendezvous and do not need ports of their own.
     - AFD async mode (``async`` / ``async_dp``) is not supported; GPU DBO
       combined with CUDA graphs is limited to exactly two ubatches.
-    - Cross-node use is not established by the checked-in recipes and should
-      be treated as unverified.
+    - Cross-node placement is verified for DeepSeek-V2-Lite ``2A2F`` with the
+      FFN ranks on separate hosts, over TCP (ENA) and over EFA. Other
+      topologies and hardware should be treated as unverified.
 
 See ``docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`` for the configuration
 contract and launch examples, and ``recipe/gpu/p2p_nccl/`` for complete
@@ -66,7 +69,11 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
-from torch.distributed.distributed_c10d import ProcessGroup, _get_default_group
+from torch.distributed.distributed_c10d import (
+    PrefixStore,
+    ProcessGroup,
+    _get_default_group,
+)
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import DPMetadata
@@ -179,7 +186,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         self.attn_size = self.mapping.attention_size
         self.ffn_size = self.mapping.ffn_size
         self.min_size = self.mapping.min_size
-        self.ratio = self.mapping.ratio
+        self.ratio = len(self.mapping.subgroup_ranks) - 1
         self.group_size = len(self.mapping.subgroup_ranks)
         self.dst_list = list(self.mapping.dp_metadata_destinations)
         text_config = vllm_config.model_config.hf_text_config
@@ -241,10 +248,10 @@ class P2pNcclAFDConnector(AFDConnectorBase):
 
         1. Joins the AFD world process group (FFN ranks first, then Attention
            ranks) rendezvoused at ``tcp://host:port``.
-        2. Creates this rank's subgroup ``StatelessProcessGroup`` on
-           ``port + subgroup_index + 1`` and two ``PyNcclCommunicator``
-           instances over it (Attention-to-FFN and FFN-to-Attention), each
-           registered for use by the P2P custom ops.
+        2. Creates this rank's subgroup ``StatelessProcessGroup`` over a
+           ``PrefixStore`` on the AFD world's rendezvous store, and two
+           ``PyNcclCommunicator`` instances over it (Attention-to-FFN and
+           FFN-to-Attention), each registered for use by the P2P custom ops.
         3. On ranks that participate in the DP metadata control plane, joins
            the ``p2p`` process group that ``control_plane`` uses to
            distribute per-stage token counts.
@@ -262,16 +269,24 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             world_size=self.ffn_size + self.attn_size,
             rank=self.world_rank,
             group_name="afd",
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
         )
 
         with DefaultProcessGroupSwitcher(_get_default_group(), afd_pg):
-            base_port = self.afd_config.port
-            self.a2e_group = StatelessProcessGroup.create(
-                host=self.afd_config.host,
-                port=base_port + self.mapping.subgroup_index + 1,
+            # The subgroup only has to hand rank 0's ncclUniqueId to its
+            # members, so it reuses the store the AFD world already
+            # rendezvoused on. StatelessProcessGroup.create would stand up a
+            # second store bound to ``host``, which is only correct while
+            # every subgroup's rank 0 sits on that host.
+            subgroup_store = PrefixStore(
+                f"afd_subgroup_{self.mapping.subgroup_index}",
+                afd_pg.get_group_store(),
+            )
+            subgroup_store.set_timeout(timedelta(seconds=300))
+            self.a2e_group = StatelessProcessGroup(
                 rank=self.mapping.rank_in_subgroup,
                 world_size=len(self.mapping.subgroup_ranks),
+                store=subgroup_store,
             )
             self.e2a_group = self.a2e_group
             self.a2e_pynccl = PyNcclCommunicator(
@@ -738,10 +753,10 @@ class P2pNcclAFDControlPlane(AFDControlPlane):
                 for src_rank in range(1, connector.group_size):
                     if src_rank <= 0 or src_rank >= connector.group_size:
                         raise ValueError(f"invalid Attention subgroup rank {src_rank}")
+                    # Subgroups need not be the same size, so read the peer
+                    # from the roster instead of assuming a uniform ratio.
                     attention_rank = (
-                        connector.mapping.subgroup_index * connector.ratio
-                        + src_rank
-                        - 1
+                        connector.mapping.subgroup_ranks[src_rank] - connector.ffn_size
                     )
 
                     tensor_metadata = _TensorMetadata(

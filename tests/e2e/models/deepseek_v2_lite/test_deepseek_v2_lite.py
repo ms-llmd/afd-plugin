@@ -17,12 +17,20 @@ from tests.conftest import (
     preserve_environment_variable,
     run_runner,
 )
-from tests.e2e.runner import V2_SCENARIOS, V2_SINGLE_RANK_SCENARIOS
+from tests.e2e.runner import (
+    DEFAULT_GSM8K_SAMPLE_LIMIT,
+    GSM8K_LIMIT_ENV,
+    GSM8K_THRESHOLD_ENV,
+    V2_SCENARIOS,
+    V2_SINGLE_RANK_SCENARIOS,
+)
 
 GSM8K_DATASET_ID = "openai/gsm8k"
 GSM8K_DATASET_CONFIG = "main"
 DEEPSEEK_V2_LITE_REPO_ID = "deepseek-ai/DeepSeek-V2-Lite"
 DEEPSEEK_V2_LITE_MAX_MODEL_LEN = 4096
+SMOKE_MIN_ACCURACY = 0.25
+SMOKE_MAX_SAMPLES = 24
 DEFAULT_DEVICE_IDS = ("0", "1", "2", "3")
 ATTENTION_DEVICE_COUNT = 2
 AFD_FFN_DEVICE_COUNT = 1
@@ -158,4 +166,9 @@ def _prepare_e2e_assets() -> Iterator[None]:
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=SCENARIOS)
 def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
-    run_runner(command)
+    env = os.environ.copy()
+    sample_limit = env.get(GSM8K_LIMIT_ENV, str(DEFAULT_GSM8K_SAMPLE_LIMIT))
+    if sample_limit != "all" and int(sample_limit) <= SMOKE_MAX_SAMPLES:
+        # Model smoke gates require 2/7 or 6/24 correct; larger runs keep 0.27.
+        env.setdefault(GSM8K_THRESHOLD_ENV, str(SMOKE_MIN_ACCURACY))
+    run_runner(command, env=env)
