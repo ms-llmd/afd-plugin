@@ -9,6 +9,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 """
 
 from collections.abc import Iterable, Iterator
+from copy import copy
 from typing import Any, TypeAlias
 
 import torch
@@ -71,6 +72,7 @@ def _checkpoint_weight_roles(
     config: _DeepseekAdapterConfig,
     *,
     compute_gate_on_attention: bool,
+    attention_shared_experts: bool = False,
 ) -> frozenset[str]:
     """Classify one native checkpoint path by its AFD execution owner."""
     layer_path = _weight_layer_path(name)
@@ -86,6 +88,8 @@ def _checkpoint_weight_roles(
     if not _is_moe_layer(config, layer_idx):
         return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
 
+    if attention_shared_experts and remainder and remainder[0] == "shared_experts":
+        return _ATTENTION_ROLE
     is_moe_gate = bool(remainder) and remainder[0] == "gate"
     if is_moe_gate and compute_gate_on_attention:
         return _BOTH_ROLES
@@ -98,6 +102,7 @@ def _iter_role_weights(
     role: str,
     config: _DeepseekAdapterConfig,
     compute_gate_on_attention: bool,
+    attention_shared_experts: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain this role's paths."""
     for name, loaded_weight in weights:
@@ -105,6 +110,7 @@ def _iter_role_weights(
             name,
             config,
             compute_gate_on_attention=compute_gate_on_attention,
+            attention_shared_experts=attention_shared_experts,
         ):
             yield name, loaded_weight
 
@@ -165,7 +171,9 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         super().__init__(layer_idx=layer_idx)
         self.is_internal_router = is_internal_router
 
-    def forward(
+    # Native FusedMoE passes router_logits at this boundary; only the proxy's
+    # transport is reused, not its hidden-states-only forward contract.
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -199,6 +207,26 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
         self.vllm_config = vllm_config
         self.config = config
         self.top_k = int(config.num_experts_per_tok)
+        # Use the native SP contract: shared weights are replicated and each
+        # rank computes its model-local tokens without TP collectives. This
+        # also supports FlashComm1 switching token layouts at runtime.
+        self.shared_experts = (
+            native.DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                hidden_act=config.hidden_act,
+                quant_config=vllm_config.quant_config,
+                is_sequence_parallel=True,
+                prefix=f"{prefix}.shared_experts",
+            )
+            if (
+                config.n_shared_experts
+                and parse_afd_config(vllm_config, validate=False).connector
+                == AFD_ASYNC_CONNECTOR
+            )
+            else None
+        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -437,8 +465,16 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 # constructing the NPU FFN MoE.
                 if device_type == "npu":
                     native.FusedMoE = fused_moe.FusedMoE
+                moe_config = config
+                if afd_config.connector == AFD_ASYNC_CONNECTOR:
+                    moe_config = copy(config)
+                    # HF validates this public field as int, but pinned native
+                    # MoE uses only None to omit shared construction (0 builds
+                    # a zero-width MLP). Apply its sentinel to this private
+                    # construction copy; preserve the real model config.
+                    object.__setattr__(moe_config, "n_shared_experts", None)
                 self.mlp = native.DeepseekV2MoE(
-                    config=config,
+                    config=moe_config,
                     parallel_config=parallel_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.mlp",
@@ -826,6 +862,8 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 role=self.afd_role,
                 config=self.config,
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+                attention_shared_experts=self.afd_config.connector
+                == AFD_ASYNC_CONNECTOR,
             )
         )
 

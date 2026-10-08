@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
@@ -25,6 +28,7 @@ from afd_plugin.v1.worker.attention_model_runner import (
     fail_if_cuda_graph_enabled,
     fail_if_unsupported_ubatching,
 )
+from afd_plugin.v1.worker.cuda_graph import validate_cuda_graph_mode
 from afd_plugin.v1.worker.ubatch_wrapper import (
     AFDUBatchWrapper,
     build_ubatch_additional_kwargs,
@@ -402,9 +406,10 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
     wrapper._install_missing_afd_metadata(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
-    assert metadata is runner._afd_pending_metadata
+    assert metadata is not None
     assert metadata.transaction_id == "afd-0"
     assert metadata.tokens_lens == [3, 5]
+    assert metadata is runner._afd_pending_metadata
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0, 1}
 
 
@@ -710,6 +715,50 @@ def test_attention_metadata_restores_cache_when_builder_lookup_fails() -> None:
 
 def test_attention_runner_inherits_native_dummy_run_microbatching():
     assert "_dummy_run" in AFDAttentionModelRunner.__dict__
+
+
+@pytest.mark.parametrize("use_ubatching", [False, True])
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_attention_profile_preserves_native_and_warms_unsplit_dbo(
+    monkeypatch, use_ubatching, enforce_eager
+):
+    runner = object.__new__(AFDAttentionModelRunner)
+    runner.parallel_config = _parallel_config(
+        use_ubatching=use_ubatching, num_ubatches=2 if use_ubatching else 1
+    )
+    runner.afd_cudagraph_policy = validate_cuda_graph_mode(
+        SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=enforce_eager),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+            ),
+            parallel_config=runner.parallel_config,
+        ),
+        role="attention",
+    )
+    runner.max_num_tokens = 8192
+    calls: list[str] = []
+
+    def native_profile(self):
+        assert self is runner
+        calls.append("native")
+
+    def dummy_run(*args, **kwargs):
+        assert args == (8192,)
+        assert kwargs == {"allow_microbatching": False, "is_profile": True}
+        calls.append("dummy")
+
+    monkeypatch.setattr(GPUModelRunner, "profile_run", native_profile)
+    runner._dummy_run = dummy_run
+    runner._sync_device = lambda: calls.append("sync")
+
+    runner.profile_run()
+
+    assert calls == (
+        ["native", "dummy", "sync"]
+        if use_ubatching and not enforce_eager
+        else ["native"]
+    )
 
 
 def test_attention_runner_steps_gpu_profiler(monkeypatch):
@@ -1119,7 +1168,7 @@ def _fake_connector_factory(monkeypatch, connector):
 def test_attention_runner_constructor_does_not_initialize_connector(monkeypatch):
     import afd_plugin.v1.worker.attention_model_runner as attention_model_runner
 
-    events = []
+    events: list[str] = []
     connector = _LifecycleConnector(events)
 
     def fake_native_init(self, vllm_config, device):
@@ -1163,7 +1212,7 @@ def test_attention_runner_load_model_initializes_connector_after_weights(
     monkeypatch,
     use_ubatching,
 ):
-    events = []
+    events: list[str] = []
     connector = _LifecycleConnector(events)
     runner = object.__new__(AFDAttentionModelRunner)
     runner.connector = connector

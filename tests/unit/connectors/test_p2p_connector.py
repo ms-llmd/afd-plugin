@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import importlib
 import sys
 import types
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +16,7 @@ pytest.importorskip("vllm")
 
 from afd_plugin.config import AFDConfig, afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
+    AFDConnectorBase,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDDPMetadata,
@@ -179,7 +184,6 @@ def test_p2p_topology_supports_equal_and_integer_multiple_attention_counts(
         role_rank,
     )
 
-    assert mapping.ratio == attention_size // ffn_size
     assert mapping.subgroup_ranks == subgroup_ranks
     assert mapping.dp_metadata_destinations == dsts
 
@@ -193,8 +197,8 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
         is_warmup=False,
     )
 
-    attention_connectors = []
-    ffn_connectors = []
+    attention_connectors: list[AFDConnectorBase] = []
+    ffn_connectors: list[AFDConnectorBase] = []
     for role, connectors in (
         ("attention", attention_connectors),
         ("ffn", ffn_connectors),
@@ -249,10 +253,15 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
         connector.control_plane.send_dp_metadata_list(payload)
 
     received_sources = []
+
+    def receive_payload(**kwargs):
+        received_sources.append(kwargs["src"])
+        return payload
+
     monkeypatch.setattr(
         p2p_module,
         "recv_control_payload",
-        lambda **kwargs: received_sources.append(kwargs["src"]) or payload,
+        receive_payload,
     )
     for connector in ffn_connectors:
         connector.p2p_pg = object()
@@ -333,6 +342,9 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
         (4, 2, 0, [3, 5, 7, 11], [3, 5]),
         (4, 2, 1, [3, 5, 7, 0], [7, 1]),
         (6, 3, 2, [2, 3, 5, 7, 11, 13], [11, 13]),
+        # A % F != 0: subgroup 0 holds A0 and A1, subgroup 1 holds A2 alone.
+        (3, 2, 0, [3, 5, 7], [3, 5]),
+        (3, 2, 1, [3, 5, 7], [7]),
     ],
 )
 def test_p2p_ffn_metadata_tracks_each_attention_peer_in_xayf(
@@ -430,14 +442,6 @@ def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token():
             },
             "num_attention_ranks >= num_ffn_ranks",
         ),
-        (
-            {
-                "connector": "P2pNcclAFDConnector",
-                "num_attention_ranks": 3,
-                "num_ffn_ranks": 2,
-            },
-            "multiple of num_ffn_ranks",
-        ),
     ],
 )
 def test_p2p_topology_validation_errors_are_clear(raw, message):
@@ -513,11 +517,11 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     calls = []
 
-    torch_module = types.ModuleType("torch")
-    torch_module.Tensor = object
     # Empty ops namespace: the registration helper skips ops that already
     # exist on torch.ops.vllm, so the fake must report none registered.
-    torch_module.ops = SimpleNamespace(vllm=SimpleNamespace())
+    torch_module = SimpleNamespace(
+        Tensor=object, ops=SimpleNamespace(vllm=SimpleNamespace())
+    )
 
     vllm_module = types.ModuleType("vllm")
     utils_module = types.ModuleType("vllm.utils")
@@ -526,9 +530,14 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     def direct_register_custom_op(**kwargs):
         calls.append(kwargs)
 
-    torch_utils_module.direct_register_custom_op = direct_register_custom_op
-    utils_module.torch_utils = torch_utils_module
-    vllm_module.utils = utils_module
+    monkeypatch.setattr(
+        torch_utils_module,
+        "direct_register_custom_op",
+        direct_register_custom_op,
+        raising=False,
+    )
+    monkeypatch.setattr(utils_module, "torch_utils", torch_utils_module, raising=False)
+    monkeypatch.setattr(vllm_module, "utils", utils_module, raising=False)
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.utils", utils_module)
@@ -565,11 +574,13 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
     connector.a2e_comm_id = 17
 
     calls = []
-    torch_module = types.ModuleType("torch")
-    torch_module.ops = SimpleNamespace(
-        vllm=SimpleNamespace(
-            afd_p2p_send=lambda tensor, dst, comm_id: (
-                calls.append((tensor, dst, comm_id)) or None
+
+    torch_module = SimpleNamespace(
+        ops=SimpleNamespace(
+            vllm=SimpleNamespace(
+                afd_p2p_send=lambda tensor, dst, comm_id: calls.append(
+                    (tensor, dst, comm_id),
+                ),
             ),
         ),
     )
@@ -608,16 +619,18 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
     connector.e2a_comm_id = 23
 
     calls = []
-    torch_module = types.ModuleType("torch")
-    torch_module.ops = SimpleNamespace(
-        vllm=SimpleNamespace(
-            afd_p2p_recv=lambda tensor, src, comm_id: (
-                calls.append((tensor, src, comm_id)) or None
+
+    torch_module = SimpleNamespace(
+        ops=SimpleNamespace(
+            vllm=SimpleNamespace(
+                afd_p2p_recv=lambda tensor, src, comm_id: calls.append(
+                    (tensor, src, comm_id),
+                ),
             ),
         ),
-    )
-    torch_module.empty = lambda *_args, **_kwargs: pytest.fail(
-        "recv should reuse the dynamic ref tensor",
+        empty=lambda *_args, **_kwargs: pytest.fail(
+            "recv should reuse the dynamic ref tensor",
+        ),
     )
     monkeypatch.setattr(module, "torch", torch_module)
 
@@ -671,3 +684,60 @@ def test_p2p_recv_single_rank_requires_ref_tensor():
             connector.e2a_comm_id,
             tensor_metadata,
         )
+
+
+@pytest.mark.parametrize(
+    ("role", "role_rank", "expected_subgroup"),
+    [("ffn", 0, 0), ("ffn", 1, 1), ("attention", 0, 0), ("attention", 3, 1)],
+)
+def test_p2p_subgroup_rendezvous_reuses_the_afd_world_store(
+    monkeypatch, role, role_rank, expected_subgroup
+):
+    """Subgroups share the AFD world's store under a per-subgroup prefix.
+
+    Creating a store of their own would bind ``afd.host``, which only the rank
+    that lives on that host can do, so FFN ranks on other nodes could not come
+    up. Keys must stay separated per subgroup or the two subgroups overwrite
+    each other's ncclUniqueId.
+    """
+    from torch.distributed import HashStore
+
+    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
+
+    root_store = HashStore()
+    afd_pg = SimpleNamespace(get_group_store=lambda: root_store)
+
+    monkeypatch.setattr(module, "init_afd_process_group", lambda **kwargs: afd_pg)
+    monkeypatch.setattr(module, "_get_default_group", lambda: None)
+    monkeypatch.setattr(
+        module, "DefaultProcessGroupSwitcher", lambda *a, **k: nullcontext()
+    )
+    monkeypatch.setattr(module, "PyNcclCommunicator", lambda **kwargs: object())
+    monkeypatch.setattr(module, "_register_comm", lambda communicator: 0)
+    monkeypatch.setattr(module, "_register_p2p_custom_ops", lambda: None)
+
+    connector = AFDConnectorFactory.create_connector(
+        role_rank,
+        0,
+        _fake_vllm_config(
+            data_parallel_size=4 if role == "attention" else 2,
+            data_parallel_rank=role_rank,
+        ),
+        AFDConfig(
+            role=role,
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=4,
+            num_ffn_ranks=2,
+            host="10.0.0.1",
+            port=6269,
+        ),
+    )
+    connector.init_afd_connector()
+
+    assert connector.mapping.subgroup_index == expected_subgroup
+
+    # A write through the subgroup store lands under that subgroup's prefix
+    # only, so the sibling subgroup never sees the key.
+    connector.a2e_group.store.set("probe", b"value")
+    assert root_store.get(f"afd_subgroup_{expected_subgroup}/probe") == b"value"
+    assert root_store.check([f"afd_subgroup_{1 - expected_subgroup}/probe"]) is False

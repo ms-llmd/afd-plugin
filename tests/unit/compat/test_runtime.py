@@ -47,7 +47,13 @@ def test_fix_all2all_backend_skips_when_already_flashinfer():
     assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
 
 
-def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
+@pytest.mark.parametrize("skip_mc2_mask", [False, True])
+@pytest.mark.parametrize("input_ids", [(11, 22, 33), None])
+def test_ascend_forward_context_installs_afd_metadata(
+    monkeypatch,
+    skip_mc2_mask,
+    input_ids,
+):
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
     fake_config = ModuleType("vllm.config")
@@ -57,7 +63,8 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
     fake_ascend_forward_context = ModuleType(
         "vllm_ascend.ascend_forward_context",
     )
-    forward_context = SimpleNamespace(additional_kwargs=None)
+    original_mask = object()
+    forward_context = SimpleNamespace(additional_kwargs=None, mc2_mask=original_mask)
     calls = []
 
     class CUDAGraphMode:
@@ -89,9 +96,13 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
         )
         yield
 
-    fake_config.CUDAGraphMode = CUDAGraphMode
-    fake_forward_context_module.get_forward_context = lambda: forward_context
-    fake_ascend_forward_context.set_ascend_forward_context = set_ascend_forward_context
+    fake_config.__dict__["CUDAGraphMode"] = CUDAGraphMode
+    fake_forward_context_module.__dict__["get_forward_context"] = lambda: (
+        forward_context
+    )
+    fake_ascend_forward_context.__dict__["set_ascend_forward_context"] = (
+        set_ascend_forward_context
+    )
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.config", fake_config)
     monkeypatch.setitem(
@@ -115,9 +126,16 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
         model_instance=model_instance,
         num_tokens=3,
         in_profile_run=True,
+        skip_mc2_mask=skip_mc2_mask,
+        input_ids=input_ids,
     ) as current_forward_context:
         assert current_forward_context is forward_context
         assert forward_context.additional_kwargs["afd_metadata"] is afd_metadata
+        assert forward_context.mc2_mask is (None if skip_mc2_mask else original_mask)
+        if input_ids is None:
+            assert not hasattr(forward_context, "input_ids")
+        else:
+            assert forward_context.input_ids is input_ids
 
     assert calls == [
         {
@@ -182,13 +200,17 @@ def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
     def unexpected_legacy_context(*args, **kwargs):
         raise AssertionError("MRv2 must not use set_ascend_forward_context")
 
-    fake_config.CUDAGraphMode = CUDAGraphMode
-    fake_forward_context_module.get_forward_context = lambda: forward_context
-    fake_forward_context_module.set_forward_context = set_forward_context
-    fake_ascend_forward_context.override_mrv2_in_profile_run = (
+    fake_config.__dict__["CUDAGraphMode"] = CUDAGraphMode
+    fake_forward_context_module.__dict__["get_forward_context"] = lambda: (
+        forward_context
+    )
+    fake_forward_context_module.__dict__["set_forward_context"] = set_forward_context
+    fake_ascend_forward_context.__dict__["override_mrv2_in_profile_run"] = (
         override_mrv2_in_profile_run
     )
-    fake_ascend_forward_context.set_ascend_forward_context = unexpected_legacy_context
+    fake_ascend_forward_context.__dict__["set_ascend_forward_context"] = (
+        unexpected_legacy_context
+    )
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.config", fake_config)
     monkeypatch.setitem(
@@ -207,6 +229,7 @@ def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
     afd_metadata = SimpleNamespace()
     model_instance = SimpleNamespace()
     num_tokens_across_dp = SimpleNamespace()
+    input_ids = (11, 22, 33)
     with ascend_runtime.ascend_forward_context(
         vllm_config=vllm_config,
         afd_metadata=afd_metadata,
@@ -214,10 +237,13 @@ def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
         num_tokens=7,
         num_tokens_across_dp=num_tokens_across_dp,
         in_profile_run=True,
+        skip_mc2_mask=True,
+        input_ids=input_ids,
     ) as current_forward_context:
         assert current_forward_context is forward_context
         assert forward_context.additional_kwargs["afd_metadata"] is afd_metadata
         assert forward_context.additional_kwargs["model_instance"] is model_instance
+        assert forward_context.input_ids is input_ids
 
     assert profile_calls == [True]
     assert context_calls == [
@@ -280,7 +306,7 @@ def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
         config.fail_update = False
         return config
 
-    fake_platform.NPUPlatform = NPUPlatform
+    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
     monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
@@ -332,7 +358,7 @@ def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch)
         def check_and_update_config(cls, vllm_config):
             del cls, vllm_config
 
-    fake_platform.NPUPlatform = NPUPlatform
+    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
 
     ascend_runtime.apply_afd_ascend_patches_if_needed()
@@ -345,8 +371,8 @@ def test_npu_patches_reject_missing_mla_resolver(monkeypatch):
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
     fake_forward_context = ModuleType("vllm.forward_context")
-    fake_forward_context.get_forward_context = lambda: None
-    fake_forward_context.is_forward_context_available = lambda: False
+    fake_forward_context.__dict__["get_forward_context"] = lambda: None
+    fake_forward_context.__dict__["is_forward_context_available"] = lambda: False
     fake_ascend = ModuleType("vllm_ascend")
     fake_ascend.__path__ = []
     fake_platform = ModuleType("vllm_ascend.platform")
@@ -358,7 +384,7 @@ def test_npu_patches_reject_missing_mla_resolver(monkeypatch):
         def check_and_update_config(cls, vllm_config):
             del cls, vllm_config
 
-    fake_platform.NPUPlatform = NPUPlatform
+    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.forward_context", fake_forward_context)
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_ascend)
@@ -408,9 +434,11 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
     def get_graph_params():
         return upstream_registry
 
-    fake_forward_context.get_forward_context = get_forward_context
-    fake_forward_context.is_forward_context_available = is_forward_context_available
-    fake_platform.NPUPlatform = NPUPlatform
+    fake_forward_context.__dict__["get_forward_context"] = get_forward_context
+    fake_forward_context.__dict__["is_forward_context_available"] = (
+        is_forward_context_available
+    )
+    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(
         sys.modules,
@@ -431,7 +459,7 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
         ascend_runtime.apply_afd_ascend_patches_if_needed()
     assert ascend_runtime._PATCHES_APPLIED is False
 
-    fake_mla.get_graph_params = get_graph_params
+    fake_mla.__dict__["get_graph_params"] = get_graph_params
     ascend_runtime.apply_afd_ascend_patches_if_needed()
     patched_get_graph_params = fake_mla.get_graph_params
 

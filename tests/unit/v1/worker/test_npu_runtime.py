@@ -11,6 +11,7 @@ import threading
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
@@ -236,6 +237,8 @@ def _vllm_config(
     compute_gate_on_attention = bool(
         parallel_overrides.pop("compute_gate_on_attention", False),
     )
+    num_attention_ranks = int(parallel_overrides.pop("num_attention_ranks", 1))
+    num_ffn_ranks = int(parallel_overrides.pop("num_ffn_ranks", 1))
     return SimpleNamespace(
         additional_config={
             "afd": {
@@ -243,6 +246,8 @@ def _vllm_config(
                 "connector": connector,
                 "async": async_dp,
                 "compute_gate_on_attention": compute_gate_on_attention,
+                "num_attention_ranks": num_attention_ranks,
+                "num_ffn_ranks": num_ffn_ranks,
                 "connector_extra_config": extra_config or {},
             },
         },
@@ -269,6 +274,8 @@ def _async_moe_config(
     *,
     role="attention",
     compute_gate_on_attention=True,
+    num_attention_ranks=1,
+    num_ffn_ranks=1,
     tensor_parallel_size=1,
     prefill_context_parallel_size=1,
     decode_context_parallel_size=1,
@@ -279,6 +286,8 @@ def _async_moe_config(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         compute_gate_on_attention=compute_gate_on_attention,
+        num_attention_ranks=num_attention_ranks,
+        num_ffn_ranks=num_ffn_ranks,
         tensor_parallel_size=tensor_parallel_size,
         prefill_context_parallel_size=prefill_context_parallel_size,
         decode_context_parallel_size=decode_context_parallel_size,
@@ -435,6 +444,8 @@ def _new_ffn_runner():
     # object.__new__ bypasses __init__, which is where the runner would set up
     # the profiler and device; provide inert defaults the runtime paths expect.
     runner = object.__new__(AFDNPUFFNModelRunner)
+    runner._layered_executor = None
+    runner._layered_gmm_requested = False
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
@@ -457,6 +468,9 @@ def _new_ffn_worker():
 
     worker = object.__new__(AFDNPUFFNWorker)
     worker._ffn_loop_error = None
+    # Most tests exercise the daemon loop rather than CPU placement. Tests for
+    # the startup binding path explicitly reset this guard.
+    worker._cpu_binding_attempted = True
     return worker
 
 
@@ -548,6 +562,7 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
     )
     runner.use_sparse = False
+    runner.use_compress = False
     runner.enable_enpu = False
 
     runner._install_ascend_ubatch_wrapper()
@@ -559,6 +574,45 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
     updater = kwargs["full_graph_params_updater"]
     assert isinstance(updater, MethodType)
     assert updater.__self__ is runner
+
+
+def test_npu_attention_runner_keeps_compressor_models_off_the_mla_path(monkeypatch):
+    """DeepSeek V4 selects the DSA backend, whose graph params are a no-op."""
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    captured_kwargs: list[dict[str, object]] = []
+
+    class RecordingUBatchWrapper:
+        def __init__(self, *args: object, **kwargs: object):
+            captured_kwargs.append(kwargs)
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendUBatchWrapper",
+        RecordingUBatchWrapper,
+    )
+    runner = object.__new__(
+        attention_model_runner.AFDNPUAttentionModelRunner,
+    )
+    runner.model = "model"
+    runner.device = "npu"
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+    )
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
+    )
+    runner.use_sparse = False
+    runner.use_compress = True
+    runner.enable_enpu = False
+
+    runner._install_ascend_ubatch_wrapper()
+
+    # The MLA DBO full graph path requires a single-batch FIA workspace that a
+    # compressor model never registers, so those models stay on the generic
+    # two-stage path.
+    assert captured_kwargs[0]["mla_full_graph_enabled"] is False
 
 
 def test_npu_attention_runner_builds_and_sets_metadata():
@@ -577,6 +631,7 @@ def test_npu_attention_runner_builds_and_sets_metadata():
         dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([1])),
         ubatch_slices=None,
         batch_descriptor=SimpleNamespace(num_tokens=5),
+        cudagraph_runtime_mode=None,
     )
 
     runner._install_afd_metadata_on_forward_context(forward_context)
@@ -916,6 +971,7 @@ def test_npu_attention_runner_builds_stage_metadata(monkeypatch):
     runner._afd_is_graph_capturing = False
     runner._afd_pending_metadata = None
     runner._afd_transaction_counter = 0
+    runner.ubatch_slices = None
     runner.afd_async_extra_info = AFDAsyncExtraInfo(
         async_moe_ubatching=True,
         async_moe_split="token",
@@ -1478,8 +1534,6 @@ def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monke
             states=AFDAsyncTransferState(
                 group_list="groups",
                 dynamic_scales="scales",
-                expand_x_shared="shared-hidden",
-                dynamic_scales_shared="shared-scales",
             ),
         ),
     )
@@ -1489,13 +1543,16 @@ def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monke
     assert runner.model.calls == [("hidden", 0, {})]
 
 
-def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch):
+@pytest.mark.parametrize("layer_sequence", [(7,), (7, 7, 7, 8)])
+def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
+    monkeypatch, layer_sequence
+):
     _require_npu_runtime()
     from afd_plugin.connectors.npu.async_cam import (
         AFDAsyncFFNWorkItem,
         AFDAsyncTransferState,
     )
-    from afd_plugin.v1.worker.npu import ffn_model_runner
+    from afd_plugin.v1.worker.npu import ffn_model_runner, ffn_worker
 
     context_calls = []
     sent_outputs = []
@@ -1516,9 +1573,10 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
     )
     runner = _new_ffn_runner()
     runner.vllm_config = _vllm_config(role="ffn")
-    runner.connector = SimpleNamespace(control_plane=None)
+    runner.connector = SimpleNamespace(control_plane=None, expert_per_rank=2)
     runner.model = _RecordingFakeModel()
-    runner.num_layers = 1
+    runner.num_layers = len(set(layer_sequence))
+    runner.prof = None
     runner.max_num_tokens = 16
     metadata = AFDTransferMetadata.create_ffn_metadata(
         layer_idx=7,
@@ -1532,8 +1590,6 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
         layer_idx=7,
         group_list="groups",
         dynamic_scales="scales[:5]",
-        expand_x_shared="shared-hidden[:2]",
-        dynamic_scales_shared="shared-scales[:2]",
     )
     context = AFDTransferContext(metadata=metadata, states=states)
     recv_output = AFDA2FTransferPayload(
@@ -1548,37 +1604,67 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
         stage_idx=0,
         num_tokens=5,
         total_num_tokens=7,
-        shared_num_tokens=2,
     )
+
+    # Three chunks for layer 7 cross the two-item runner-call boundary.
+    # The real daemon must continue receiving rather than treat that boundary
+    # as completion of the layer or of the request.
+    work_items = [
+        replace(
+            work_item,
+            layer_idx=layer_idx,
+            hidden_states=f"chunk-{index}",
+            context=AFDTransferContext(
+                metadata=replace(metadata, layer_idx=layer_idx),
+                states=replace(states, layer_idx=layer_idx),
+            ),
+        )
+        for index, layer_idx in enumerate(layer_sequence)
+    ]
+    pending = iter(work_items)
+    event = threading.Event()
+    step_boundaries = []
 
     def recv_ffn_work_item(*, stage_idx, max_num_tokens):
         assert stage_idx == 0
         assert max_num_tokens == 16
-        return work_item
+        return next(pending)
 
     def send_ffn_work_item_output(sent_work_item, ffn_output):
         sent_outputs.append((sent_work_item, ffn_output))
+        if len(sent_outputs) == len(work_items):
+            event.set()
         return ffn_output
 
     runner.connector.recv_ffn_work_item = recv_ffn_work_item
     runner.connector.send_ffn_work_item_output = send_ffn_work_item_output
 
-    runner._ffn_forward_connector_driven()
+    worker = _new_ffn_worker()
+    worker.model_runner = runner
+    worker.device = SimpleNamespace(type="cpu")
+    worker._ffn_shutdown_event = event
+    monkeypatch.setattr(
+        ffn_worker.torch.npu,
+        "synchronize",
+        lambda: step_boundaries.append(len(sent_outputs)),
+    )
+    worker._run_ffn_server_loop()
 
     assert runner.model.calls == [
         (
-            "hidden[:5]",
-            7,
-            {
-                "group_list": "groups",
-                "dynamic_scales": "scales[:5]",
-                "expand_x_shared": "shared-hidden[:2]",
-                "dynamic_scales_shared": "shared-scales[:2]",
-            },
-        ),
+            item.hidden_states,
+            item.layer_idx,
+            {"group_list": "groups", "dynamic_scales": "scales[:5]"},
+        )
+        for item in work_items
     ]
-    assert sent_outputs == [(work_item, "npu-ffn(hidden[:5], layer=7)")]
+    assert sent_outputs == [
+        (item, f"npu-ffn({item.hidden_states}, layer={item.layer_idx})")
+        for item in work_items
+    ]
+    assert step_boundaries == ([1] if len(layer_sequence) == 1 else [2, 4])
     assert context_calls[0]["num_tokens"] == 5
+    assert context_calls[0]["skip_mc2_mask"] is True
     assert context_calls[0]["afd_metadata"].tokens_lens == [5]
 
 
@@ -1891,6 +1977,123 @@ def test_npu_ffn_worker_reports_zero_compilation_times():
     assert compilation_times.encoder == 0.0
 
 
+@pytest.mark.parametrize("enable_cpu_binding", [False, True])
+def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
+    monkeypatch,
+    enable_cpu_binding,
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker
+
+    worker = _new_ffn_worker()
+    worker._cpu_binding_attempted = False
+    worker._ffn_thread = None
+    worker.local_rank = 3
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(is_initialized=True),
+    )
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        ffn_worker,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_cpu_binding=enable_cpu_binding),
+    )
+
+    def map_physical_npu(rank):
+        events.append(("map", rank))
+        return 11
+
+    monkeypatch.setattr(
+        ffn_worker,
+        "current_platform",
+        SimpleNamespace(
+            device_id_to_physical_device_id=map_physical_npu,
+        ),
+    )
+
+    def record_binding(rank, *, npu_id):
+        events.append(("bind", (rank, npu_id)))
+
+    class _NonRunningThread:
+        def __init__(self, *, target, name, daemon):
+            events.append(("thread", (target, name, daemon)))
+
+        def start(self):
+            events.append(("start", None))
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(ffn_worker, "bind_cpus", record_binding)
+    monkeypatch.setattr(ffn_worker.threading, "Thread", _NonRunningThread)
+
+    worker.start_ffn_server_loop()
+    worker.start_ffn_server_loop()
+
+    binding_events = [event for event in events if event[0] in ("map", "bind")]
+    expected_binding_events = (
+        [("map", 3), ("bind", (3, 11))] if enable_cpu_binding else []
+    )
+    assert binding_events == expected_binding_events
+    first_thread_index = next(
+        i for i, event in enumerate(events) if event[0] == "thread"
+    )
+    if enable_cpu_binding:
+        assert events.index(("bind", (3, 11))) < first_thread_index
+    assert sum(event[0] == "start" for event in events) == 2
+
+
+def test_npu_ffn_worker_cpu_binding_failure_does_not_abort_daemon_start(
+    monkeypatch,
+    caplog,
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker
+
+    worker = _new_ffn_worker()
+    worker._cpu_binding_attempted = False
+    worker._ffn_thread = None
+    worker.local_rank = 5
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(is_initialized=True),
+    )
+    thread_starts: list[bool] = []
+    monkeypatch.setattr(
+        ffn_worker,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_cpu_binding=True),
+    )
+    monkeypatch.setattr(
+        ffn_worker,
+        "current_platform",
+        SimpleNamespace(device_id_to_physical_device_id=lambda _rank: 13),
+    )
+
+    def fail_binding(_local_rank, *, npu_id):
+        raise RuntimeError("binding unavailable")
+
+    class _NonRunningThread:
+        def __init__(self, *, target, name, daemon):
+            pass
+
+        def start(self):
+            thread_starts.append(True)
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(ffn_worker, "bind_cpus", fail_binding)
+    monkeypatch.setattr(ffn_worker.threading, "Thread", _NonRunningThread)
+
+    with caplog.at_level(logging.WARNING, logger=ffn_worker.__name__):
+        worker.start_ffn_server_loop()
+        worker.start_ffn_server_loop()
+
+    assert thread_starts == [True, True]
+    assert "Bind cpus failed in rank5: binding unavailable" in caplog.text
+    assert caplog.text.count("Bind cpus failed") == 1
+
+
 def test_npu_ffn_worker_loop_error_is_propagated(caplog):
     worker = _new_ffn_worker()
     worker._ffn_thread = None
@@ -2196,6 +2399,23 @@ def test_npu_feature_validation_requires_decode_only_full_graph_for_mla_dbo(
     sparse_config.model_config.hf_text_config = SimpleNamespace(index_topk=8)
     fail_if_unsupported_npu_afd_features(sparse_config)
 
+    # A compressor model such as DeepSeek V4 selects the DSA backend, whose
+    # graph-params update is a no-op, so the MLA DBO full graph rules do not
+    # apply to it either.
+    compressor_config = _vllm_config(
+        use_mla=True,
+        cudagraph_mode="FULL",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=4,
+    )
+    compressor_config.model_config.hf_text_config = SimpleNamespace(
+        index_topk=512,
+        compress_ratios=[0, 4, 128],
+    )
+    fail_if_unsupported_npu_afd_features(compressor_config)
+
 
 def test_npu_feature_validation_rejects_speculative_mla_dbo_full_graph():
     config = _vllm_config(
@@ -2271,6 +2491,7 @@ def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
         pytest.param(
             _async_moe_config(
                 tensor_parallel_size=2,
+                num_attention_ranks=2,
                 async_moe_split="token",
             ),
             id="token-attention-tp2",
@@ -2452,6 +2673,57 @@ def _fake_npu_connector_factory(monkeypatch, connector):
         "create_connector",
         lambda rank, local_rank, vllm_config, afd_config: connector,
     )
+
+
+@pytest.mark.parametrize(
+    ("is_cam", "compute_gate", "use_mrv2"),
+    [
+        (True, True, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_npu_ffn_runner_disables_mask_only_for_cam_mrv1(
+    monkeypatch, is_cam, compute_gate, use_mrv2
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner as module
+
+    mask = object()
+    monkeypatch.setattr(module.ascend_context, "_reserved_mc2_mask", mask)
+
+    def fake_native_init(self, vllm_config, device):
+        self.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=1)
+        )
+        module.ascend_context._reserved_mc2_mask = mask
+
+    connector = object.__new__(module.CAMAsyncAFDConnector) if is_cam else object()
+    monkeypatch.setattr(module.NPUModelRunner, "__init__", fake_native_init)
+    monkeypatch.setattr(
+        module, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
+    )
+    monkeypatch.setattr(module, "_resolve_world_ranks", lambda: (0, 0))
+    monkeypatch.setattr(module, "_use_npu_aclgraph", lambda *a: False)
+    monkeypatch.setattr(module, "create_afd_npu_profiler", lambda *a: None)
+    monkeypatch.setattr(
+        module.AFDConnectorFactory, "create_connector", lambda *a: connector
+    )
+    monkeypatch.setattr(
+        module.AFDNPUFFNModelRunner,
+        "parse_config",
+        staticmethod(
+            lambda config: SimpleNamespace(compute_gate_on_attention=compute_gate)
+        ),
+    )
+
+    module.AFDNPUFFNModelRunner(
+        SimpleNamespace(use_v2_model_runner=use_mrv2), SimpleNamespace(index=0)
+    )
+
+    expected = None if is_cam and compute_gate and not use_mrv2 else mask
+    assert module.ascend_context._reserved_mc2_mask is expected
 
 
 def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypatch):

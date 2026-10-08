@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -84,7 +85,7 @@ def test_async_model_forward_preserves_pp_boundaries(
         ),
     )
     forward_context = SimpleNamespace()
-    afd_metadata = object()
+    afd_metadata = SimpleNamespace()
     monkeypatch.setattr(async_forward, "get_forward_context", lambda: forward_context)
     monkeypatch.setattr(
         async_forward,
@@ -193,8 +194,49 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         flash_comm_v1_enabled=True,
     )
     monkeypatch.setattr(async_forward, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(
+        async_forward,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, **_kwargs: hidden_states,
+    )
 
     connector_calls: list[str] = []
+    dispatch_layouts: list[object] = []
+    restored_layouts: list[object] = []
+
+    def prepare_dispatch_payload(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        router_logits,
+        *,
+        use_sequence_parallel,
+    ):
+        assert use_sequence_parallel is True
+        layout = object()
+        dispatch_layouts.append(layout)
+        return SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+            layout=layout,
+        )
+
+    def restore_dispatch_output(local_output, layout):
+        restored_layouts.append(layout)
+        return local_output
+
+    monkeypatch.setattr(
+        async_forward,
+        "prepare_cam_dispatch_payload",
+        prepare_dispatch_payload,
+    )
+    monkeypatch.setattr(
+        async_forward,
+        "restore_cam_dispatch_output",
+        restore_dispatch_output,
+    )
 
     def send_attn_output(*args, **kwargs):
         connector_calls.append("send")
@@ -213,6 +255,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         is_moe_layer = True
 
         layer_idx = 0
+        mlp = SimpleNamespace(shared_experts=lambda x: 2 * x)
 
         def compute_attn_output(
             self,
@@ -244,9 +287,10 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         afd_metadata,
     )
 
-    assert torch.equal(output, hidden_states + 2)
+    assert torch.equal(output, (hidden_states + 1) * 9 + 3)
     assert residual is None
     assert connector_calls == ["send", "recv", "send", "recv"]
+    assert restored_layouts == dispatch_layouts
 
 
 def test_deepseek_afd_wrapper_keeps_full_model_compile_enabled():
@@ -490,6 +534,9 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
                 SimpleNamespace(
                     is_moe_layer=True,
                     layer_idx=layer_idx,
+                    mlp=SimpleNamespace(
+                        shared_experts=lambda x, offset=layer_idx + 1: x + offset,
+                    ),
                     compute_attn_output=compute_attn_output,
                 )
                 for layer_idx in range(2)
@@ -526,6 +573,8 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
         restored is expected
         for restored, expected in zip(output, stage_hidden_states, strict=True)
     )
+    torch.testing.assert_close(output[0], torch.full((1, 8), 4.0))
+    torch.testing.assert_close(output[1], torch.full((2, 8), 8.0))
     assert residual is None
     assert forward_context.attn_metadata == {"layer": "full"}
     assert forward_context.num_tokens == 4
@@ -561,7 +610,27 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "w13_weight_scale_fp32" in compute_moe
     assert "w13_weight_scale_fp32_list" in compute_moe
     assert "w2_weight_scale_list" in compute_moe
-    assert "MoEQuantParams(quant_type=quant_type)" in compute_moe
+    compute_moe_function = next(
+        node
+        for node in ast.parse(gate_source).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "compute_attention_gate_moe_ffn"
+    )
+    quant_params_calls = [
+        node
+        for node in ast.walk(compute_moe_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "MoEQuantParams"
+    ]
+    assert len(quant_params_calls) == 1
+    # Check the contract without pinning formatting or optional quant fields.
+    assert any(
+        keyword.arg == "quant_type"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "quant_type"
+        for keyword in quant_params_calls[0].keywords
+    )
     assert "_gmmswigluquant_fusion_enabled()" in compute_moe
     assert "fusion=use_gmmswigluquant_fusion" in compute_moe
     assert "_compute_w8a8_shared_experts_from_int8(" in compute_moe
@@ -577,16 +646,23 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     ("num_routed_tokens", "num_shared_tokens"),
     [(2, 2), (2, 0), (0, 2), (0, 0)],
 )
+@pytest.mark.parametrize(
+    ("routed_scale_applied_in_topk", "expected_routed_value"),
+    [(False, 2.0), (True, 1.0)],
+)
 def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     monkeypatch,
     num_routed_tokens,
     num_shared_tokens,
+    routed_scale_applied_in_topk,
+    expected_routed_value,
 ):
     from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
 
     class FakeQuantType:
         NONE = "none"
         W8A8 = "w8a8"
+        W4A8 = "w4a8"
 
     class KeywordArguments:
         def __init__(self, **kwargs):
@@ -595,9 +671,11 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     routed_calls = []
 
     def fake_unified_apply_mlp(*, mlp_compute_input):
+        assert mlp_compute_input.quant.quant_type == FakeQuantType.W8A8
+        assert mlp_compute_input.quant.is_per_channel_weight is False
         routed_calls.append(mlp_compute_input.hidden_states)
         return (
-            torch.zeros_like(
+            torch.ones_like(
                 mlp_compute_input.hidden_states,
                 dtype=torch.bfloat16,
             ),
@@ -675,7 +753,7 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     layer = SimpleNamespace(
         mlp=SimpleNamespace(
             experts=experts,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=2.0,
         ),
     )
     hidden_states = torch.zeros((num_routed_tokens, 4), dtype=torch.int8)
@@ -690,11 +768,17 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         dynamic_scales_shared=torch.ones(num_shared_tokens),
         topk_scales=None,
         group_list_type=1,
+        routed_scale_applied_in_topk=routed_scale_applied_in_topk,
     )
 
     assert len(routed_calls) == int(num_routed_tokens > 0)
     assert output.routed_output.shape == hidden_states.shape
     assert output.routed_output.dtype == torch.bfloat16
+    if num_routed_tokens > 0:
+        assert torch.equal(
+            output.routed_output,
+            torch.full_like(output.routed_output, expected_routed_value),
+        )
     assert len(shared_calls) == int(num_shared_tokens > 0)
     if num_shared_tokens > 0:
         assert output.shared_output is not None

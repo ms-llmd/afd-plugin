@@ -29,7 +29,6 @@ class AFDRankMapping:
     attention_size: int
     ffn_size: int
     min_size: int
-    ratio: int
     subgroup_index: int
     rank_in_subgroup: int
     subgroup_ranks: tuple[int, ...]
@@ -56,12 +55,6 @@ def validate_p2p_topology(config: AFDConfig) -> None:
         raise ValueError(
             "P2pNcclAFDConnector currently requires num_attention_ranks >= "
             f"num_ffn_ranks, got {attention_size} < {ffn_size}",
-        )
-    if attention_size % ffn_size != 0:
-        raise ValueError(
-            "P2pNcclAFDConnector currently requires num_attention_ranks to be a "
-            "multiple of num_ffn_ranks, got "
-            f"{attention_size} and {ffn_size}",
         )
 
 
@@ -112,6 +105,16 @@ def resolve_role_rank(vllm_config: VllmConfig, config: AFDConfig) -> int:
     return role_rank
 
 
+def subgroup_attention_block(
+    subgroup_index: int, attention_size: int, ffn_size: int
+) -> range:
+    """Attention role ranks owned by one FFN rank: contiguous, sizes within one."""
+    return range(
+        (subgroup_index * attention_size + ffn_size - 1) // ffn_size,
+        ((subgroup_index + 1) * attention_size + ffn_size - 1) // ffn_size,
+    )
+
+
 def build_rank_mapping(
     config: AFDConfig,
     role_rank: int,
@@ -130,7 +133,7 @@ def build_rank_mapping(
                 f"(rank={role_rank}, size={attention_size})",
             )
         world_rank = ffn_size + role_rank
-        subgroup_index = role_rank // (attention_size // ffn_size)
+        subgroup_index = role_rank * ffn_size // attention_size
     elif config.role == "ffn":
         if role_rank >= ffn_size:
             raise ValueError(
@@ -142,14 +145,19 @@ def build_rank_mapping(
     else:
         raise ValueError(f"unknown AFD role {config.role!r}")
 
-    ratio = attention_size // ffn_size
+    # Balanced block distribution: Attention rank ``a`` joins the subgroup of
+    # FFN rank ``a * F // A``, and ``subgroup_attention_block`` is the reverse
+    # lookup that lists a subgroup's Attention ranks. The blocks are contiguous and
+    # differ in size by at most one, so an integral ratio is no longer
+    # required; when A is a multiple of F this is the same grouping as before.
     min_size = min(ffn_size, attention_size)
-    ffn_ranks = list(range(ffn_size))
-    attention_ranks = list(range(ffn_size, ffn_size + attention_size))
-    subgroup_ranks = tuple(
-        [ffn_ranks[subgroup_index]]
-        + [attention_ranks[subgroup_index * ratio + offset] for offset in range(ratio)],
-    )
+    subgroup_attention_ranks = [
+        ffn_size + attention_rank
+        for attention_rank in subgroup_attention_block(
+            subgroup_index, attention_size, ffn_size
+        )
+    ]
+    subgroup_ranks = tuple([subgroup_index] + subgroup_attention_ranks)
     rank_in_subgroup = subgroup_ranks.index(world_rank)
     p2p_rank = role_rank + min_size if config.role == "attention" else role_rank
 
@@ -169,7 +177,6 @@ def build_rank_mapping(
         attention_size=attention_size,
         ffn_size=ffn_size,
         min_size=min_size,
-        ratio=ratio,
         subgroup_index=subgroup_index,
         rank_in_subgroup=rank_in_subgroup,
         subgroup_ranks=subgroup_ranks,

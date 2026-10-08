@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
-import builtins
 import sys
 from types import SimpleNamespace
 
@@ -86,40 +88,42 @@ def test_ascend_ops_namespace_check_allows_vllm_ascend_coexistence():
     ops._assert_afd_namespace_registered(_Torch)
 
 
-def test_cam_ops_namespace_check_requires_real_async_ops(monkeypatch):
-    fake_torch = SimpleNamespace(ops=SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
-
-    with pytest.raises(RuntimeError, match="umdk_cam_op_lib"):
-        ensure_cam_async_ops_available()
-
-
-def test_cam_ops_namespace_check_imports_runtime_modules_in_order(
-    monkeypatch,
-):
-    cam_namespace = SimpleNamespace(
-        async_dispatch_send=object(),
-        async_dispatch_recv=object(),
-        async_combine_send=object(),
-        async_combine_recv=object(),
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "afd_async_dispatch_send",
+        "afd_async_dispatch_recv",
+        "afd_async_combine_send",
+        "afd_async_combine_recv",
+        None,
+    ],
+)
+def test_async_loader_requires_all_source_ops(monkeypatch, missing):
+    names = (
+        "afd_async_dispatch_send",
+        "afd_async_dispatch_recv",
+        "afd_async_combine_send",
+        "afd_async_combine_recv",
     )
-    fake_torch = SimpleNamespace(
-        ops=SimpleNamespace(umdk_cam_op_lib=cam_namespace),
+    namespace = SimpleNamespace(**{name: object() for name in names if name != missing})
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(afd_ascend=namespace),
+        ),
     )
-    imports = []
-    original_import = builtins.__import__
-
-    def record_import(name, *args, **kwargs):
-        if name in {"torch", "torch_npu", "umdk_cam_op_lib"}:
-            imports.append(name)
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", record_import)
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "umdk_cam_op_lib", SimpleNamespace())
-
-    ensure_cam_async_ops_available()
-
-    assert imports[:3] == ["torch", "torch_npu", "umdk_cam_op_lib"]
+    loaded = []
+    monkeypatch.setattr(
+        ops, "ensure_cam_p2p_ops_available", lambda: loaded.append(True)
+    )
+    ensure_cam_async_ops_available.cache_clear()
+    try:
+        if missing:
+            with pytest.raises(RuntimeError, match="afd_ascend"):
+                ensure_cam_async_ops_available()
+        else:
+            ensure_cam_async_ops_available()
+        assert loaded == [True]
+    finally:
+        ensure_cam_async_ops_available.cache_clear()
