@@ -25,6 +25,10 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.v1.engine.core as core_module
 
+from afd_plugin.compat.profile_trigger import (
+    ProfileTrigger,
+    create_ffn_profile_trigger,
+)
 from afd_plugin.config import AFDConfig, is_afd_async_dp, parse_optional_afd_config
 
 if TYPE_CHECKING:
@@ -629,8 +633,11 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         core_module.logger.info(
             "AFD FFN EngineCore started; workers run connector loop."
         )
+        profile_trigger = create_ffn_profile_trigger()
         while _is_running(self, core_module):
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
+            if profile_trigger is not None:
+                _apply_ffn_profile_trigger(self, profile_trigger)
             time.sleep(0.5)
     except KeyboardInterrupt:
         core_module.logger.info(
@@ -644,6 +651,26 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             _stop_ffn_worker_loop(self)
 
     raise SystemExit
+
+
+def _apply_ffn_profile_trigger(self, trigger: ProfileTrigger) -> None:
+    """Forward a changed trigger file to the FFN workers' native profiler."""
+
+    is_start = trigger.poll()
+    if is_start is None:
+        return
+    action = "start" if is_start else "stop"
+    core_module.logger.info("AFD FFN profile trigger: %s profiler", action)
+    try:
+        self.model_executor.collective_rpc("profile", args=(is_start,))
+    except Exception:
+        # A missing --profiler-config raises in Worker.profile; profiling is
+        # diagnostic, so it must never take the FFN role down.
+        core_module.logger.exception(
+            "AFD FFN profile %s failed; is --profiler-config set on the FFN "
+            "vllm serve?",
+            action,
+        )
 
 
 def _stop_ffn_worker_loop(self) -> None:
