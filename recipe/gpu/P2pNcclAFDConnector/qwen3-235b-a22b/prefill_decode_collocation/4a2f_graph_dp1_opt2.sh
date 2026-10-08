@@ -1,7 +1,5 @@
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-235B-A22B-FP8}
 export VLLM_USE_V2_MODEL_RUNNER=0
-# FFN GPUs hold ~117 GB of TP2 expert weights; avoid fragmentation OOM under mixed batches.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve "$MODEL_PATH" \
     --data-parallel-size 1 \
