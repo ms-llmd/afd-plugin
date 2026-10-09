@@ -33,6 +33,10 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ATTENTION_TP_SIZE,
     DSV4_FFN_RANKS,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+    DSV4_SCENARIOS,
+    DSV4_SYNC_CAMP2P_SCENARIOS,
+    DSV4_SYNC_SHAPES,
+    sync_shape,
 )
 from tests.e2e.multi_pod.layout import RoleSlot
 from tests.e2e.process_utils import (
@@ -53,6 +57,9 @@ ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
 ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
 V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
+# Graph capture default for the scenarios that do not carry their own launch
+# profile; the DSV4 synchronous profiles override it.
+DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
     "afd-v2-eager-dp2",
@@ -215,7 +222,11 @@ def main() -> int:
             dbo_eval_started_at = time.time()
         run_scenario_evaluation(args)
         if args.enable_dbo:
-            assert_dbo_live_split_coverage(dbo_split_steps, dbo_eval_started_at, args)
+            assert_dbo_live_split_coverage(
+                dbo_split_steps,
+                dbo_eval_started_at,
+                args,
+            )
 
         ensure_processes_alive(processes)
 
@@ -270,7 +281,7 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
             "afd-graph-dbo-2a2f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
+            *DSV4_SCENARIOS,
             *V2_SCENARIOS,
         ],
         required=True,
@@ -361,7 +372,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
     is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
     is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
-    is_dsv4 = args.scenario == DSV4_ASYNC_CAM_SCENARIO
+    is_dsv4 = args.scenario in DSV4_SCENARIOS
     scenario_settings = {
         "baseline-graph": (True, True, False, 4, 0),
         "afd-eager-2a1f": (False, False, False, 2, 1),
@@ -398,6 +409,17 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
     }
+    for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
+        # The A5 script's native DBO stays off for these scenarios: a split batch
+        # is the current suspect for the DSA operator tiling failure on that
+        # host.
+        scenario_settings[sync_scenario] = (
+            False,
+            dsv4_config.sync_use_graph(sync_profile),
+            False,
+            sync_profile.attention_ranks,
+            sync_profile.ffn_ranks,
+        )
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
     ]
@@ -408,8 +430,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_ffn_ranks = ffn_ranks
     args.attention_data_parallel_address = None
     args.tp_size = 1
-    if is_dsv4:
+    active_sync_profile = sync_shape(args.scenario)
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
+    elif active_sync_profile is not None:
+        args.attention_tp_size = active_sync_profile.attention_tp_size
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -418,7 +443,15 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.attention_tp_size = 2
     else:
         args.attention_tp_size = 1
-    args.ffn_tp_size = 2 if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS else 1
+    if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
+        args.ffn_tp_size = 2
+    elif active_sync_profile is not None:
+        # A synchronous DSV4 profile sizes the FFN side exactly like its
+        # Attention side: A5 shards by data parallel with expert parallelism,
+        # A3 by tensor parallel.
+        args.ffn_tp_size = active_sync_profile.ffn_tp_size
+    else:
+        args.ffn_tp_size = 1
     args.use_v2_model_runner = args.scenario in V2_SCENARIOS
     if args.use_v2_model_runner:
         if args.afd_async or args.afd_connector == ASYNC_AFD_CONNECTOR:
@@ -477,10 +510,16 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
-    if is_dsv4:
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
+    elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
+        dsv4_config.configure_sync_camp2p_scenario(args)
     if use_graph:
-        args.cudagraph_capture_size = 8
+        args.cudagraph_capture_size = (
+            active_sync_profile.cudagraph_capture_size
+            if active_sync_profile is not None
+            else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
     if enable_dbo:
         args.dbo_decode_token_threshold = 1
         args.dbo_prefill_token_threshold = 8
@@ -521,15 +560,12 @@ def validate_topology(
     if args.use_v2_model_runner and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
     if (
-        args.scenario
-        in (
-            ASYNC_CAM_SCENARIO,
-            ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
-        )
+        args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
         and args.device_backend != "npu"
     ):
         raise ValueError("async CAM scenarios require NPU")
+    if args.scenario in DSV4_SCENARIOS and args.device_backend != "npu":
+        raise ValueError("DSV4 scenarios require NPU")
     for role, rank_count in (
         ("attention", args.num_attention_ranks),
         ("ffn", args.num_ffn_ranks),
@@ -610,6 +646,7 @@ def build_vllm_command(
     )
     role_dp_size = max(1, role_total_ranks // tp_size)
     is_npu = args.device_backend == "npu"
+    sync_profile = sync_shape(args.scenario)
     connector = args.afd_connector or (
         "CAMP2pAFDConnector" if is_npu else "P2pNcclAFDConnector"
     )
@@ -633,7 +670,7 @@ def build_vllm_command(
     )
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_SCENARIOS:
         afd_config.update(dsv4_config.additional_config())
     cmd = [
         args.vllm_bin,
@@ -647,13 +684,27 @@ def build_vllm_command(
         str(role_dp_size),
         "--tensor-parallel-size",
         str(tp_size),
-        "--enable-expert-parallel",
-        # Skip non-local routed-expert weights before they are read; the
-        # Attention role discards routed experts, FFN keeps only its EP shard.
-        "--enable-ep-weight-filter",
-        "--additional-config",
-        json.dumps(afd_config, separators=(",", ":")),
     ]
+    if sync_profile is None or sync_profile.enable_expert_parallel:
+        # Non-DSV4 AFD scenarios always run expert parallel. The A5 DSV4 sync
+        # profile follows its launch script, which runs Attention DP2/TP1 and
+        # FFN DP2/TP1 with expert parallelism; the A3 profile shards by tensor
+        # parallel and keeps the expert-parallel world at one.
+        cmd.extend(
+            [
+                "--enable-expert-parallel",
+                # Skip non-local routed-expert weights before they are read; the
+                # Attention role discards routed experts, FFN keeps only its EP
+                # shard.
+                "--enable-ep-weight-filter",
+            ],
+        )
+    cmd.extend(
+        [
+            "--additional-config",
+            json.dumps(afd_config, separators=(",", ":")),
+        ],
+    )
     if slot is not None and slot.spans_pods:
         cmd.extend(
             [
@@ -690,12 +741,32 @@ def build_vllm_command(
                 "--no-async-scheduling",
             ],
         )
-    if args.cuda_graph_full_decode_only:
-        capture_size = str(args.cudagraph_capture_size)
+    profile_compilation_config = (
+        None
+        if sync_profile is None
+        else dsv4_config.sync_compilation_config(sync_profile)
+    )
+    if profile_compilation_config is not None:
+        # A profile that carries its host script's compilation config passes it
+        # verbatim, so the runner adds none of its own capture-size flags.
         cmd.extend(
             [
-                "--max-num-seqs",
-                capture_size,
+                "--compilation-config",
+                json.dumps(profile_compilation_config, separators=(",", ":")),
+            ],
+        )
+    elif args.cuda_graph_full_decode_only:
+        capture_size = str(args.cudagraph_capture_size)
+        # A scenario that fixes its own `--max-num-seqs` (the DSV4 launch
+        # profiles do) keeps it: the capture size only has to cover it.
+        max_num_seqs_args = (
+            []
+            if any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
+            else ["--max-num-seqs", capture_size]
+        )
+        cmd.extend(
+            [
+                *max_num_seqs_args,
                 "--max-cudagraph-capture-size",
                 capture_size,
                 "--cudagraph-capture-sizes",
@@ -780,7 +851,7 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
 
 def process_termination_timeout(args: argparse.Namespace) -> float:
     """Return the scenario's teardown budget, shared by every runner."""
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_SCENARIOS:
         return DSV4_PROCESS_TERMINATION_TIMEOUT_S
     return PROCESS_TERMINATION_TIMEOUT_S
 
@@ -789,7 +860,7 @@ def run_scenario_evaluation(args: argparse.Namespace) -> None:
     """Run the scenario's acceptance check, shared by every runner."""
     if args.scenario == ASYNC_CAM_SCENARIO:
         run_completion_evaluation(args)
-    elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    elif args.scenario in DSV4_SCENARIOS:
         run_concurrent_completion_evaluation(args)
     else:
         run_gsm8k_evaluation(args)
@@ -944,10 +1015,14 @@ def run_completion_evaluation(args: argparse.Namespace) -> None:
 
 
 def run_concurrent_completion_evaluation(args: argparse.Namespace) -> None:
+    profile = sync_shape(args.scenario)
     evaluate_completions(
         url=f"http://{args.api_host}:{attention_api_port(args)}/v1/chat/completions",
         model=served_model_name(args, "attention"),
         output_path=Path(args.completion_output_path),
+        # A synchronous profile may state that its host does not answer reliably
+        # yet, and then the oracle checks the concurrent plumbing only.
+        check_answer=True if profile is None else profile.check_answer,
     )
 
 
