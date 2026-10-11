@@ -1,0 +1,21 @@
+{
+  "run_id": "4a2f_graph_dp1_opt1-v030-isl1024-osl512-memcheck-20261011-153512",
+  "harness": "vllm-bench-serve",
+  "recipe": "recipe/gpu/P2pNcclAFDConnector/qwen3-235b-a22b/prefill_decode_collocation/4a2f_graph_dp1_opt1.sh",
+  "model_id": "Qwen/Qwen3-235B-A22B-FP8",
+  "image": "ghcr.io/ronenkat/afd-plugin-e2e:e2e-f82ab8a",
+  "gpu_count": 6,
+  "max_num_batched_tokens": 8192,
+  "workload": "custom",
+  "dataset": "random",
+  "workload_args": "",
+  "input_len": 1024,
+  "output_len": 512,
+  "num_prompts": 8192,
+  "sweep": "inf:512",
+  "cluster": "waldorf_US-EAST-04A/ronenkat-afd",
+  "node": "gd91fda",
+  "notes": "FFN OOM validation: upstream/main 913c9d3 overlay + AFD-DEBUG recv-buffer log on e2e-f82ab8a (vLLM 0.30), opt1, ISL 1024 / OSL 512, inf only",
+  "exit_code": 0,
+  "finished_utc": "2026-10-11T13:39:38Z"
+}
