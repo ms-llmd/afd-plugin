@@ -513,6 +513,11 @@ def test_graph_state_adds_input_ids_buffer_when_hidden_buffer_exists(monkeypatch
     assert (0, 1, (2,)) in connector._recv_attn_input_ids_buffers
 
 
+# Eager FFN steps (prefill/mixed batches during serving) carry arbitrary token
+# counts. Hidden-state receive buffers must be cached only during graph capture,
+# otherwise every distinct count leaks a buffer for the rest of the run. Feed
+# three eager payloads with different counts and check that no hidden-state
+# buffer is kept, while the input_ids buffer cache still gets one per count.
 def test_eager_state_does_not_cache_hidden_buffers(monkeypatch):
     connector = AFDConnectorFactory.create_connector(
         0,
