@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
 import importlib
@@ -24,18 +26,20 @@ from afd_plugin.validation import (
 
 def _install_fake_vllm_config(monkeypatch):
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.26.0"
+    vllm_module.__dict__["__version__"] = "0.30.0"
     config_package = types.ModuleType("vllm.config")
     config_module = types.ModuleType("vllm.config.vllm")
     engine_package = types.ModuleType("vllm.engine")
     arg_utils_module = types.ModuleType("vllm.engine.arg_utils")
     platforms_module = types.ModuleType("vllm.platforms")
-    platforms_module.current_platform = SimpleNamespace(
+    platforms_module.__dict__["current_platform"] = SimpleNamespace(
         is_cuda=lambda: True,
         device_type="cuda",
     )
 
     class VllmConfig:
+        parallel_config: SimpleNamespace
+        additional_config: dict
         platform_worker_cls = VLLM_GPU_WORKER_FQCN
 
         def __post_init__(self):
@@ -49,9 +53,18 @@ def _install_fake_vllm_config(monkeypatch):
             self.post_init_backend = self.parallel_config.all2all_backend
 
     class EngineArgs:
+        enable_dbo: bool
+        ubatch_size: int
+        all2all_backend: str
+        worker_cls: str
+        additional_config: dict
+
         def create_engine_config(self, usage_context=None, headless=False):
             del usage_context, headless
-            if self.enable_dbo:
+            if (
+                self.enable_dbo
+                and platforms_module.__dict__["current_platform"].device_type != "npu"
+            ):
                 assert self.all2all_backend in {
                     "deepep_low_latency",
                     "deepep_high_throughput",
@@ -66,16 +79,26 @@ def _install_fake_vllm_config(monkeypatch):
             cfg.__post_init__()
             return cfg
 
-    config_module.VllmConfig = VllmConfig
-    config_module.logger = SimpleNamespace(debug=lambda *args, **kwargs: None)
-    arg_utils_module.EngineArgs = EngineArgs
-    arg_utils_module.logger = SimpleNamespace(debug=lambda *args, **kwargs: None)
+    config_module.__dict__["VllmConfig"] = VllmConfig
+    config_module.__dict__["logger"] = SimpleNamespace(
+        debug=lambda *args, **kwargs: None
+    )
+    arg_utils_module.__dict__["EngineArgs"] = EngineArgs
+    arg_utils_module.__dict__["logger"] = SimpleNamespace(
+        debug=lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.config", config_package)
     monkeypatch.setitem(sys.modules, "vllm.config.vllm", config_module)
     monkeypatch.setitem(sys.modules, "vllm.engine", engine_package)
     monkeypatch.setitem(sys.modules, "vllm.engine.arg_utils", arg_utils_module)
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
+    monkeypatch.setattr(npu_compat, "fix_all2all_backend_for_afd", lambda config: None)
+    monkeypatch.setattr(
+        npu_compat,
+        "apply_afd_ascend_engine_core_config_patch_if_needed",
+        lambda config: False,
+    )
     return arg_utils_module, config_module
 
 
@@ -97,7 +120,7 @@ def _engine_args(*, active, role="attention", worker_cls="auto"):
 
 
 def _set_fake_platform(*, is_cuda, device_type):
-    sys.modules["vllm.platforms"].current_platform = SimpleNamespace(
+    sys.modules["vllm.platforms"].__dict__["current_platform"] = SimpleNamespace(
         is_cuda=lambda: is_cuda,
         device_type=device_type,
     )
@@ -105,7 +128,7 @@ def _set_fake_platform(*, is_cuda, device_type):
 
 def _install_fake_npu_config(monkeypatch):
     arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    events = []
+    events: list[tuple[str, str] | tuple[str, str, str]] = []
 
     class FakeParallelConfig:
         def __init__(
@@ -120,6 +143,24 @@ def _install_fake_npu_config(monkeypatch):
             self.ubatch_size = ubatch_size
             self.all2all_backend = all2all_backend
             self.worker_cls = worker_cls
+            self.enable_expert_parallel = False
+            self.tensor_parallel_size = 1
+            self.data_parallel_size = 1
+
+        @property
+        def use_sequence_parallel_moe(self):
+            return (
+                self.all2all_backend
+                in {
+                    "allgather_reducescatter",
+                    "deepep_low_latency",
+                    "deepep_high_throughput",
+                    "nixl_ep",
+                }
+                and self.enable_expert_parallel
+                and self.tensor_parallel_size > 1
+                and self.data_parallel_size > 1
+            )
 
         @property
         def use_ubatching(self):
@@ -203,10 +244,18 @@ def _install_fake_npu_config(monkeypatch):
     fake_package = types.ModuleType("vllm_ascend")
     fake_package.__path__ = []
     fake_platform = types.ModuleType("vllm_ascend.platform")
-    fake_platform.NPUPlatform = NPUPlatform
+    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
+    factory_patch = types.ModuleType("afd_plugin.compat.patches.npu.ascend_config")
+    factory_patch.__dict__["apply_afd_ascend_config_patch"] = lambda: None
+    monkeypatch.setitem(sys.modules, factory_patch.__name__, factory_patch)
+    monkeypatch.setattr(
+        npu_compat,
+        "fix_all2all_backend_for_afd",
+        ascend_runtime.fix_all2all_backend_for_afd,
+    )
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
-    sys.modules["vllm.platforms"].current_platform = NPUPlatform
+    sys.modules["vllm.platforms"].__dict__["current_platform"] = NPUPlatform
     monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
     monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
     return arg_utils_module, NPUPlatform, events
@@ -239,7 +288,7 @@ def test_config_validation_patch_preserves_non_afd_validation(monkeypatch):
 
 def test_config_validation_patch_allows_vllm_dev_checkout(monkeypatch):
     arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    sys.modules["vllm"].__version__ = "0.1.dev14230+g68b0c3135"
+    sys.modules["vllm"].__dict__["__version__"] = "0.1.dev14230+g68b0c3135"
     _load_patch_module()
     args = _engine_args(active=True)
 
@@ -300,7 +349,7 @@ def test_config_validation_preserves_npu_dbo_through_auto_worker_normalization(
     assert ("native_dbo_validation", "deepep_low_latency") in events
     assert cfg.post_init_backend == "deepep_low_latency"
     assert args.all2all_backend == "allgather_reducescatter"
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
     assert cfg.parallel_config.enable_dbo is True
     assert cfg.parallel_config.ubatch_size == 2
     assert cfg.parallel_config.use_ubatching is True
@@ -321,7 +370,7 @@ def test_config_validation_revalidates_npu_dbo_and_restores_backend(monkeypatch)
 
     assert ("native_dbo_validation", "deepep_low_latency") in events
     assert cfg.post_init_backend == "deepep_low_latency"
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
     assert cfg.parallel_config.enable_dbo is True
     assert cfg.parallel_config.ubatch_size == 2
     assert cfg.parallel_config.worker_cls == NPU_ATTENTION_WORKER_FQCN
@@ -343,7 +392,7 @@ def test_config_validation_restores_npu_snapshot_when_platform_update_fails(
     cfg = npu_platform.last_config
     assert cfg.parallel_config.enable_dbo is True
     assert cfg.parallel_config.ubatch_size == 2
-    assert cfg.parallel_config.all2all_backend == "deepep_low_latency"
+    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
     assert args.all2all_backend == "allgather_reducescatter"
 
 
@@ -364,7 +413,7 @@ def test_config_validation_preserves_explicit_npu_worker(monkeypatch):
     assert cfg.parallel_config.worker_cls == NPU_ATTENTION_WORKER_FQCN
     assert cfg.parallel_config.enable_dbo is True
     assert cfg.parallel_config.ubatch_size == 2
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
 
 
 def test_config_validation_preserves_non_afd_npu_upstream_behavior(monkeypatch):
@@ -507,7 +556,7 @@ def test_config_validation_installs_ascend_patch_only_on_npu(monkeypatch):
     _set_fake_platform(is_cuda=False, device_type="npu")
     npu_args = _engine_args(active=True)
     arg_utils_module.EngineArgs.create_engine_config(npu_args)
-    assert calls == ["npu"]
+    assert calls == ["npu", "npu"]
 
 
 def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypatch):
@@ -516,7 +565,7 @@ def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypa
     _set_fake_platform(is_cuda=False, device_type="npu")
 
     config_patch_calls = []
-    engine_patch_configs = []
+    engine_patch_configs: list[SimpleNamespace] = []
     monkeypatch.setattr(
         npu_compat,
         "apply_afd_ascend_config_patch_if_needed",
@@ -537,7 +586,7 @@ def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypa
 
     config = arg_utils_module.EngineArgs.create_engine_config(args)
 
-    assert config_patch_calls == ["config"]
+    assert config_patch_calls == ["config", "config"]
     assert engine_patch_configs == [config]
 
 

@@ -54,6 +54,7 @@ spec:
           cd /work
           bash "$PATCHED_SCRIPT" &
           RECIPE_PID=$!
+          echo "$RECIPE_PID" > /work/recipe.pid
 
           # Which log(s) this pod will actually produce, and this pod's own
           # readiness marker per log -- both keyed on this pod's node-role
@@ -65,20 +66,19 @@ spec:
 
           fail() {
             echo "ERROR: $*"
+            rm -f /work/ready
             for log in $LOGS; do
               echo "----- tail $log -----"
               tail -n 100 "/work/$log" 2>/dev/null || echo "(missing)"
             done
-            sleep infinity
+            exit 1
           }
 
           [ -n "$LOGS" ] || fail "this pod's node-role labels are both 'none' -- nothing to run"
 
           # A worker (headless) shard of a split role never starts an API
           # server, so it never logs "Application startup complete" -- fall
-          # back to the EngineCore's own init-complete line instead. This
-          # fallback marker is unverified: not yet observed on a live headless
-          # run, only inferred from the vLLM startup sequence.
+          # back to the EngineCore's own init-complete line instead.
           ready_marker() {
             case "$1" in
               ffn.log) echo "AFD FFN EngineCore started" ;;
@@ -124,7 +124,17 @@ spec:
           fi
 
           echo "=== pod ${TEMPLATE_POD} READY ==="
-          sleep infinity
+          touch /work/ready
+
+          echo "=== monitoring serving process (pid $RECIPE_PID) ==="
+          while true; do
+            sleep 10
+            kill -0 "$RECIPE_PID" 2>/dev/null || fail "serving process exited unexpectedly"
+            if [ "$AFD_ATTN_NODE_ROLE" = "head" ]; then
+              curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1 \
+                || fail "attention server health check failed"
+            fi
+          done
       env:
         - name: USER
           value: "vllm"
@@ -147,6 +157,21 @@ spec:
               name: hf-token-secret
               key: token
               optional: true
+      readinessProbe:
+        exec:
+          command:
+            - /bin/bash
+            - -c
+            - |
+              [ -f /work/ready ] || exit 1
+              kill -0 "$(cat /work/recipe.pid)" 2>/dev/null || exit 1
+              if [ "$AFD_ATTN_NODE_ROLE" = "head" ]; then
+                curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1
+              fi
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
       resources:
         requests:
           nvidia.com/gpu: "${TEMPLATE_GPU}"

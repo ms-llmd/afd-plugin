@@ -50,19 +50,22 @@ single-pod recipe: one pod, `POD` unset, both roles run unconditionally --
 continue to [deploy.md](deploy.md) with no plan.
 
 If it does describe a placement across multiple pods, read and interpret
-that description directly -- don't assume one fixed grammar. Both recipes
-written so far happen to spell it the same way, one line per pod in file
-order:
+that description directly.
 
+Example of a placement description:
 ```
 # For pod 1: POD=ATTENTION_0
 # For pod 2: POD=ATTENTION_1, ATTENTION_HEADLESS=1, ATTENTION_DP_START_RANK=2
 # For pod 3: POD=FFN_0
 ```
 
-but a future recipe may instead describe the same plan in prose (e.g. "runs
+Or
+```
+"runs
 on 3 pods: the first two run ATTENTION_0 and ATTENTION_1 -- the second one
-headless, starting at data-parallel rank 2 -- and the third runs FFN_0").
+headless, starting at data-parallel rank 2 -- and the third runs FFN_0"
+```
+
 Whatever the phrasing, read it and extract, per pod, in the order the
 comment presents them:
 
@@ -85,11 +88,3 @@ For each entry, derive (used by [deploy.md](deploy.md) and
   which case `worker` if that line's `ATTENTION_HEADLESS` override is `1`,
   else `head`.
 - **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
-
-Upstream verifies cross-node `P2pNcclAFDConnector` placement specifically for
-DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts, over TCP (ENA)
-and over EFA; every other topology -- including the qwen3.5 3-pod plan above
--- is still **unverified**
-(`docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`). Deploy any placement as
-written, but only present throughput as validated for that one verified
-case.

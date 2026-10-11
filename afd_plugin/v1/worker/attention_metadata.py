@@ -116,6 +116,38 @@ class AFDMetadataProviderMixin:
         self.connector.control_plane.update_state_from_dp_metadata(payload)
         self.connector.control_plane.send_dp_metadata_list(payload)
 
+    def install_mrv2_ubatch_metadata(
+        self,
+        ubatch_slices: UBatchSlices,
+        forward_contexts: list[ForwardContext],
+        num_tokens_unpadded: int,
+    ) -> None:
+        """Attach isolated AFD sidecars to native MRV2's prepared stages.
+
+        The native slices include DP/graph padding. Preserve their transfer
+        lengths and full-batch offsets, but intersect them with the real input
+        extent for model code that must exclude padding. Native MRV2 owns the
+        input views, attention metadata and worker contexts; do not reslice them.
+        Control is published by the caller, outside the microbatch threads.
+        """
+        assert len(ubatch_slices) == len(forward_contexts)
+        metadata = self.build_afd_metadata(ubatch_slices, num_tokens_unpadded)
+        metadata.tokens_unpadded_lens = [
+            max(0, min(ub.token_slice.stop, num_tokens_unpadded) - ub.token_slice.start)
+            for ub in ubatch_slices
+        ]
+        for stage_idx, context in enumerate(forward_contexts):
+            stage = metadata.clone()
+            stage.stage_idx = stage_idx
+            stage.tokens_start_loc = [metadata.tokens_start_loc[stage_idx]]
+            stage.requests_start_loc = [metadata.requests_start_loc[stage_idx]]
+            stage.tokens_lens = [metadata.tokens_lens[stage_idx]]
+            stage.tokens_unpadded_lens = [metadata.tokens_unpadded_lens[stage_idx]]
+            context.additional_kwargs = dict(context.additional_kwargs or {})
+            context.additional_kwargs["afd_metadata"] = stage
+        self._afd_pending_metadata = metadata
+        self._afd_suppress_metadata_send = True
+
     def _ensure_dp_metadata(
         self,
         dp_metadata: DPMetadata | AFDDPMetadata | None,
@@ -181,7 +213,7 @@ class AFDMetadataProviderMixin:
         self,
         forward_context: ForwardContext,
     ) -> None:
-        """Install transaction metadata and publish its matching control.
+        """Install transaction metadata and publish control for synchronous connectors.
 
         On the ordinary eager path, the method creates a pending transaction from
         the current context, writes it to ``ForwardContext.additional_kwargs``,
@@ -214,6 +246,8 @@ class AFDMetadataProviderMixin:
             forward_context.additional_kwargs["afd_metadata"] = (
                 self._afd_pending_metadata
             )
+        if self.connector.control_plane is None:
+            return
         if getattr(self, "_afd_suppress_metadata_send", False):
             return
         dp_metadata = forward_context.dp_metadata
