@@ -1,0 +1,4 @@
+=== overlaying afd_plugin from /overlay/src.tgz ===
+AFD-DEBUG markers in p2p.py: 2
+=== vllm version 0.30.0 ===
+=== afd_plugin at /opt/afd-plugin/afd_plugin ===
