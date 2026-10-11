@@ -12,13 +12,19 @@ from afd_plugin.compat.npu import runtime as ascend_runtime
 from afd_plugin.compat.npu.runtime import fix_all2all_backend_for_afd
 
 
-def _vllm_config(*, enable_sp=False, all2all_backend="allgather_reducescatter"):
+def _vllm_config(
+    *,
+    enable_sp=False,
+    use_sequence_parallel_moe=False,
+    all2all_backend="allgather_reducescatter",
+):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             pass_config=SimpleNamespace(enable_sp=enable_sp),
         ),
         parallel_config=SimpleNamespace(
             all2all_backend=all2all_backend,
+            use_sequence_parallel_moe=use_sequence_parallel_moe,
         ),
     )
 
@@ -45,6 +51,12 @@ def test_fix_all2all_backend_skips_when_already_flashinfer():
     fix_all2all_backend_for_afd(config)
 
     assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
+
+
+def test_fix_all2all_backend_preserves_model_owned_sp():
+    config = _vllm_config(use_sequence_parallel_moe=True)
+    fix_all2all_backend_for_afd(config)
+    assert config.parallel_config.all2all_backend == "allgather_reducescatter"
 
 
 @pytest.mark.parametrize("skip_mc2_mask", [False, True])
@@ -258,6 +270,17 @@ def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
     ]
 
 
+@pytest.fixture
+def isolate_ascend_config_installer(monkeypatch):
+    # AscendConfig installation has dedicated lifecycle tests; these tests
+    # exercise the DBO platform and MLA patches with minimal Ascend modules.
+    module_name = "afd_plugin.compat.patches.npu.ascend_config"
+    config_patch = ModuleType(module_name)
+    config_patch.__dict__["apply_afd_ascend_config_patch"] = lambda: None
+    monkeypatch.setitem(sys.modules, module_name, config_patch)
+
+
+@pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
     from afd_plugin.compat.patches.npu import mla_graph
 
@@ -336,6 +359,7 @@ def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
     assert inactive_config.parallel_config.all2all_backend == "flashinfer_all2allv"
 
 
+@pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch):
     from afd_plugin.compat.patches.npu import mla_graph
 
@@ -367,6 +391,7 @@ def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch)
     assert hasattr(NPUPlatform, "_afd_plugin_ascend_platform_patch_state")
 
 
+@pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_patches_reject_missing_mla_resolver(monkeypatch):
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
@@ -402,6 +427,7 @@ def test_npu_patches_reject_missing_mla_resolver(monkeypatch):
     assert ascend_runtime._PATCHES_APPLIED is False
 
 
+@pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []

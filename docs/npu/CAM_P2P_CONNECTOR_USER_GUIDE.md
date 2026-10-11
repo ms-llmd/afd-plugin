@@ -11,13 +11,22 @@ Use this connector when Attention and FFN workers run as separate synchronous
 Ascend services. Use `P2pNcclAFDConnector` for CUDA deployments and
 `CAMAsyncAFDConnector` for the asynchronous Ascend path.
 
-`CAMP2pAFDConnector` supports prefill and decode in eager mode. ACL graph use
-is limited to `FULL_DECODE_ONLY`.
+`CAMP2pAFDConnector` supports prefill and decode in eager mode. V1 ACL graph
+uses `FULL_DECODE_ONLY`; the implemented V2 path also accepts `FULL`.
+V2-Lite V1/V2 has [representative v0.30 hardware evidence](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923),
+including 2A1F/2A2F functional checks with the separately reviewed MRV2 padding
+and FFN context repair applied. The integration alone retains the MRV2
+many-to-one correctness gap described in the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
+Legacy V1 DBO 2A1F/2A2F regressions are
+recorded with the [stage-padding repair](https://github.com/vllm-project/afd-plugin/pull/430#issuecomment-6063840311).
+V2 DBO remains unsupported; other models and topologies require their own evidence.
 
 ## Prerequisites
 
-- vLLM `0.26.0` and an Ascend PyTorch/vLLM-Ascend environment based on source
-  commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7).
+- vLLM `0.30.0` at `ced6857a` and an Ascend PyTorch/vLLM-Ascend environment
+  based on source commit
+  [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6).
+  Historical NPU results remain scoped to their original environment.
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,
@@ -31,14 +40,14 @@ For a `4A2F` deployment:
 ```text
 world rank:  0   1   2   3   4   5
 member:      F0  F1  A0  A1  A2  A3
-mapping:     F0 <-> A0,A1
-             F1 <-> A2,A3
+mapping:     F0 <-> A0,A2
+             F1 <-> A1,A3
 ```
 
 `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`. For
 the normal balanced mapping used by CAMP2p, the Attention rank count is an
-integer multiple of the FFN rank count. Each FFN rank handles the consecutive
-Attention ranks assigned to it.
+integer multiple of the FFN rank count. FFN rank `f` receives Attention ranks
+`f`, `f + num_ffn_ranks`, and so on. Transfer sizes follow this strided mapping.
 
 The connector creates these communication groups:
 

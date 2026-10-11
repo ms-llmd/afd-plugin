@@ -65,6 +65,7 @@ from afd_plugin.distributed import (
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.fused_moe import FusedMoERouter
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
@@ -85,6 +86,55 @@ _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 logger = init_logger(__name__)
+
+
+def select_cam_experts(
+    *,
+    hidden_states: Tensor,
+    router_logits: Tensor,
+    top_k: int,
+    use_grouped_topk: bool,
+    renormalize: bool,
+    scoring_func: str,
+    num_expert_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    e_score_correction_bias: Tensor | None,
+    mix_placement: bool,
+    num_logical_experts: int,
+    num_shared_experts: int,
+    num_experts: int,
+    router: FusedMoERouter | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Select routed-only CAM experts using Ascend's native router policy."""
+    if mix_placement:
+        raise RuntimeError(
+            "Async CAM uses routed-only expert IDs and does not support mix_placement"
+        )
+    # No EPLB state or fused shared experts: CAM dispatch consumes logical
+    # routed IDs. Ascend owns fused/fallback selection and weight scaling.
+    if router is None:
+        from vllm_ascend.ops.fused_moe.router.router_factory import (
+            create_ascend_fused_moe_router,
+        )
+
+        router = create_ascend_fused_moe_router(
+            top_k=top_k,
+            global_num_experts=router_logits.shape[-1],
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+    topk_weights, topk_ids = router.select_experts(
+        hidden_states,
+        router_logits,
+        topk_indices_dtype=torch.int32,
+    )
+    return topk_weights, topk_ids
 
 
 @dataclass(frozen=True)
@@ -329,10 +379,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self._initialized = False
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
-        """Run the pinned vLLM-Ascend expert selector on Attention."""
-        from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-
-        return select_experts(**kwargs)
+        """Run the target vLLM-Ascend router on Attention."""
+        return select_cam_experts(**kwargs)
 
     def recv_ffn_work_item(
         self,
@@ -372,6 +420,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             )
         )
         total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
+        if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
+            raise RuntimeError(
+                "AFD async CAM routed chunk count is outside dispatch-recv capacity"
+            )
 
         metadata.layer_idx = layer_idx
         metadata.stage_idx = stage_idx
@@ -555,50 +607,34 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     ) -> Tensor:
         """Receive and combine expert output on an Attention rank.
 
-        Routing tensors may be supplied explicitly via ``kwargs`` or recovered
-        FIFO from the matching stage's pending dispatch. ``ref_tensor``
-        selects the output device and dtype used to construct the CAM receive
-        placeholder.
+        The optional context must match the oldest pending dispatch for the
+        stage. Routing tensors always come from that dispatch. ``ref_tensor``
+        selects the output device and dtype for the CAM receive placeholder.
 
         Args:
             ref_tensor: Tensor from which device/dtype are taken for the CAM
                 combine-recv placeholder.
-            ubatch_idx: Stage/microbatch index used to pop the pending
-                Attention dispatch payload when routing tensors are not
-                supplied explicitly. Defaults to ``0``.
-            **kwargs: Optional CAM-specific arguments:
-
-                * ``context``: ``AFDTransferContext`` from the matching
-                  dispatch. Recovered from the pending queue when omitted.
-                * ``topk_ids``: Expert routing indices. Recovered from the
-                  pending queue when omitted.
-                * ``topk_weights``: Expert routing weights. Recovered from
-                  the pending queue when omitted.
+            ubatch_idx: Stage/microbatch index of the pending Attention
+                dispatch payload. Defaults to ``0``.
+            **kwargs: Optional ``context`` from the matching dispatch. Uses
+                FIFO order when omitted.
         """
         self._require_initialized()
         context = kwargs.get("context")
-        topk_ids = kwargs.get("topk_ids")
-        topk_weights = kwargs.get("topk_weights")
-        if context is None or topk_ids is None or topk_weights is None:
-            payloads = self._pending_attention_payloads.get(ubatch_idx)
-            if not payloads:
-                raise RuntimeError(
-                    "CAMAsyncAFDConnector recv_ffn_output is missing pending "
-                    "Attention metadata",
-                )
-            (
-                pending_context,
-                pending_topk_ids,
-                pending_topk_weights,
-            ) = payloads.pop(0)
-            if not payloads:
-                self._pending_attention_payloads.pop(ubatch_idx, None)
-            if context is None:
-                context = pending_context
-            if topk_ids is None:
-                topk_ids = pending_topk_ids
-            if topk_weights is None:
-                topk_weights = pending_topk_weights
+        payloads = self._pending_attention_payloads.get(ubatch_idx)
+        if not payloads:
+            raise RuntimeError(
+                "CAMAsyncAFDConnector recv_ffn_output is missing pending "
+                "Attention metadata",
+            )
+        if context is not None and context is not payloads[0][0]:
+            raise RuntimeError(
+                "CAMAsyncAFDConnector recv_ffn_output context does not match "
+                "the next pending Attention dispatch",
+            )
+        context, topk_ids, topk_weights = payloads.pop(0)
+        if not payloads:
+            self._pending_attention_payloads.pop(ubatch_idx, None)
 
         states = _require_async_transfer_state(context)
         _validate_topk_payload(
@@ -919,4 +955,5 @@ __all__ = [
     "ASYNC_MOE_TOKEN_SPLIT",
     "CAM_COMM_ID",
     "build_async_topology",
+    "select_cam_experts",
 ]

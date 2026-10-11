@@ -569,15 +569,17 @@ typedef void (*ReleaseHugeMem)(void *, bool);
     TORCH_CHECK(workspace_status == 0,                                        \
                 "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
     void *workspace_addr = nullptr;                                           \
+    /* Keep workspace alive until the queued handler submits the kernel. */  \
+    at::Tensor workspace_tensor;                                              \
     if (workspace_size != 0) {                                                \
       at::TensorOptions options =                                             \
           at::TensorOptions(torch_npu::utils::get_npu_device_type());         \
-      auto workspace_tensor =                                                 \
+      workspace_tensor =                                                      \
           at::empty({workspace_size}, options.dtype(kByte));                  \
       workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
     }                                                                         \
     auto acl_call = [converted_params, workspace_addr, workspace_size,        \
-                     acl_stream, executor]() -> int {                         \
+                     acl_stream, executor, workspace_tensor]() mutable -> int {       \
       typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,             \
                                const aclrtStream);                            \
       OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);       \
@@ -591,6 +593,8 @@ typedef void (*ReleaseHugeMem)(void *, bool);
       if (releaseMemFunc) {                                                   \
         releaseMemFunc(nullptr, false);                                       \
       }                                                                       \
+      /* The queue may retain its completed handler; release the capture. */  \
+      workspace_tensor.reset();                                              \
       return api_ret;                                                         \
     };                                                                        \
     at_npu::native::OpCommand cmd;                                            \

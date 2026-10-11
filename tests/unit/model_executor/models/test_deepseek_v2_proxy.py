@@ -155,12 +155,14 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     proxy.vllm_config = object()
     proxy.config = object()
     proxy.top_k = 2
+    proxy.gate_router = object()
     hidden_states = torch.ones(1, 4)
 
     output = proxy(hidden_states)
 
     assert len(gate_calls) == 1
     assert gate_calls[0]["gate"] is proxy.gate
+    assert gate_calls[0]["gate_router"] is proxy.gate_router
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     send_kwargs = events[0][3]
     assert send_kwargs["router_logits"] is router_logits
@@ -174,7 +176,7 @@ def test_remote_experts_proxy_sends_router_logits(monkeypatch):
     _install_fake_forward_context(monkeypatch, events, stage_idx=1)
     proxy = adapter.AFDAttentionFusedMoE(
         layer_idx=3,
-        is_internal_router=False,
+        external_routing=True,
     )
     hidden_states = torch.ones(1, 4)
     router_logits = torch.ones(1, 8)
@@ -187,6 +189,24 @@ def test_remote_experts_proxy_sends_router_logits(monkeypatch):
     assert context.metadata.stage_idx == 1
     assert context.states is None
     assert events[0][3]["router_logits"] is router_logits
+    assert torch.equal(output, hidden_states * 0.25)
+
+
+def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
+    monkeypatch,
+):
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    proxy = adapter.AFDAttentionFusedMoE(
+        layer_idx=2,
+        external_routing=False,
+    )
+    hidden_states = torch.ones(1, 4)
+
+    output = proxy(hidden_states, hidden_states)
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    assert events[0][3] == {}
     assert torch.equal(output, hidden_states * 0.25)
 
 
@@ -287,3 +307,56 @@ def test_decoder_inherits_native_forward_without_override():
         adapter.AFDDeepseekV2DecoderLayer.forward
         is adapter.native.DeepseekV2DecoderLayer.forward
     )
+
+
+def test_attention_gate_balances_only_profile_routing(monkeypatch):
+    pytest.importorskip("vllm_ascend")
+    from vllm.forward_context import override_forward_context
+
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v2_attention_gate as gate_module,
+    )
+
+    monkeypatch.delenv("AFD_FORCE_BALANCED_TOPK_IDS", raising=False)
+    logits = torch.zeros(3, 4)
+    weights = torch.full((3, 2), 0.5)
+    hot_ids = torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int32)
+
+    class Gate(nn.Module):
+        e_score_correction_bias = None
+
+        def forward(self, hidden_states):
+            return logits, None
+
+    connector = SimpleNamespace(
+        select_experts=lambda **kwargs: (weights.clone(), hot_ids.clone())
+    )
+    monkeypatch.setattr(
+        gate_module,
+        "get_afd_metadata_from_forward_context",
+        lambda: SimpleNamespace(connector=connector),
+    )
+    config = SimpleNamespace(n_routed_experts=4, n_shared_experts=0)
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+    )
+    for is_profile in (False, True, False):
+        context = SimpleNamespace(
+            in_profile_run=is_profile,
+            additional_kwargs={"in_profile_run": is_profile},
+        )
+        with override_forward_context(context):
+            actual_weights, actual_ids, actual_logits = gate_module.compute_gate_topk(
+                gate=Gate(),
+                vllm_config=vllm_config,
+                config=config,
+                top_k=2,
+                hidden_states=torch.zeros(3, 4),
+            )
+        expected_ids = torch.tensor([[0, 1], [2, 3], [0, 1]]) if is_profile else hot_ids
+        torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
+        torch.testing.assert_close(actual_weights, weights)
+        assert actual_logits is logits
