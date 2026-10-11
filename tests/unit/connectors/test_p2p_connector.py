@@ -513,6 +513,37 @@ def test_graph_state_adds_input_ids_buffer_when_hidden_buffer_exists(monkeypatch
     assert (0, 1, (2,)) in connector._recv_attn_input_ids_buffers
 
 
+def test_eager_state_does_not_cache_hidden_buffers(monkeypatch):
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        _fake_vllm_config(enforce_eager=False),
+        AFDConfig(
+            role="ffn",
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=1,
+            num_ffn_ranks=1,
+        ),
+    )
+    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: object())
+
+    for num_tokens in (2, 3, 5):
+        connector.control_plane.update_state_from_dp_metadata(
+            AFDControlPayload(
+                dp_metadata_list={0: AFDDPMetadata([num_tokens])},
+                is_graph_capturing=False,
+                is_warmup=False,
+            ),
+        )
+
+    assert connector._recv_attn_buffers == {}
+    assert set(connector._recv_attn_input_ids_buffers) == {
+        (0, 1, (2,)),
+        (0, 1, (3,)),
+        (0, 1, (5,)),
+    }
+
+
 def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     calls = []
