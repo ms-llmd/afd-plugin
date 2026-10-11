@@ -35,7 +35,7 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
-  - "vLLM 0.26.0 serving and shutdown interfaces"
+  - "vLLM 0.30.0 serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:
@@ -131,9 +131,8 @@ normal process-reaping failures, remain fatal. This test-scoped exception
 should be removed when the runtime supports graceful cancellation.
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
-W8A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
-It uses eager async CAM with two token-split MoE ubatches, MBT=8192, and
-`enable_dsv4_shared_compressor_workspace=false` on both roles. It validates
+W4A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
+It uses eager async CAM with two token-split MoE ubatches and MBT=8192. It validates
 ten simultaneous chat requests, records their outputs and overlapping
 request intervals, and checks service liveness and cleanup. Its cancellable
 async HTTP client saves per-request responses/errors even on failure or
@@ -143,21 +142,17 @@ GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
 FFN cleanup exception above and is not selected by the four-device PR gate.
 
 `afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-8a8f`
-(A3) are the synchronous siblings of that case: local-only DSV4 Flash runs over
-`CAMP2pAFDConnector`, each following its host's recorded launch profile — A5 on
-four devices as Attention DP2/TP1 with expert parallelism, ACL graph capture, and
-a 4096 context; A3 on sixteen as Attention DP2/TP4 and FFN DP8/TP1 with expert
-parallelism, eager, on the 8192/1024 budget. Neither needs a CAM vendor package: the plugin's
-own a2e/e2a operators carry the activations and, for the DSV4 Hash layers, the
-token ids the FFN-side gate routes with. Both keep the case's DSV4 model-path
-switches and the gate on FFN, and neither compares the answer: they are smoke
-cases over the ten-request concurrent oracle of the async case, which must be
-served together with a nonempty, finished answer each. A5 additionally drops the
-native DBO its script enables, because the DBO split path is the current suspect
-for the DSA operator tiling failure on that host, and pins the 128-token block
-with prefix caching off; its concurrent answers are still corrupted, which the
-e2e README records together with the A2E tile lead. The async case keeps the
-exact-answer check.
+(A3) are local synchronous DSV4 Flash profiles using `CAMP2pAFDConnector` and
+FFN-side gating. A5 uses four devices, Attention/FFN DP2/TP1, ACL graph, and
+4096 context; A3 uses sixteen devices, Attention DP2/TP4, FFN DP8/TP1, eager
+execution, and the 8192/1024 budget. Plugin a2e/e2a operators transfer
+activations and Hash-layer token IDs without a CAM vendor package. These
+profiles check ten concurrent, nonempty, finished responses and service
+liveness; they do not check answer correctness. A5 keeps DBO off and still
+produces incorrect concurrent answers. A3 answer correctness remains
+unverified. These smoke cases do not qualify synchronous DSV4 accuracy; see
+the [profile limits](../../../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
+The async case retains its exact-answer check.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,
@@ -165,15 +160,19 @@ one FFN rank) and run outside CI.
 
 The ModelRunnerV2 matrix is CUDA-only in the current E2E harness. Its local
 1A1F cases are `afd-v2-eager-1a1f` and `afd-v2-graph-1a1f`; CI selects the four
-DP2/TP2 cases listed above by exact node ID on `l4_4`. The Ascend
-ModelRunnerV2 implementation currently has focused unit evidence but no E2E
-case, so it is not included in the hardware gate.
+DP2/TP2 and two DBO cases by exact node ID on `l4_4`. Ascend ModelRunnerV2
+has separate V2-Lite hardware evidence recorded in [PR #425](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923);
+the generic V2 scenario entry points remain CUDA-only.
 
 The Qwen3.5/3.6 adapter family has text-only CUDA E2E evidence through
 `Qwen/Qwen3.6-35B-A3B`, using the native Qwen3.5/3.6 model boundary with
 `--language-model-only`. Its default suite uses native DP4/TP1/EP4 for
 `baseline-graph`, and
 synchronous AFD 2A1F for `afd-eager`, `afd-graph`, and `afd-graph-dbo`.
+The Qwen3.6 `afd-graph-dbo-2a1f` case remains excluded from hardware
+validation claims because a known FFN CUDA illegal memory access during a
+live two-ubatch decode split can crash FFN and hang Attention. This defect
+was recorded before v0.30; see the [weekly E2E exclusions](../../../tests/e2e/README.md#weekly-gsm8k).
 Multimodal, NPU, `compute_gate_on_attention=true`, pipeline-parallel,
 asynchronous, and multi-node execution are outside this case; quantization is
 unverified.
@@ -201,7 +200,12 @@ of 24 in DBO scenarios).
   DP-wide split agreement, so live requests would never run as two ubatches
   and only warmup/capture would exercise the split path. The gate asserts
   that at least one live two-ubatch step was recorded; `AFD_GSM8K_LIMIT=all`
-  still bypasses the floor.
+  still bypasses the floor. On vLLM 0.30 the runner sets the DBO decode token
+  threshold to 2 because upstream validates both DBO thresholds against the
+  two-microbatch count; the prefill threshold stays at 8. `AFD_E2E_API_PORT_BASE`
+  (default `8000`) offsets the API server ports on shared machines, and
+  Legacy and MRV2 preserve the upstream chunked-prefill default and explicit
+  caller choices. The MRV2 B/E/G comparison retains the native token budget.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.

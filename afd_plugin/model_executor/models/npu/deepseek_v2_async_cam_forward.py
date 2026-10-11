@@ -12,8 +12,10 @@ import torch
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import (
+    ForwardContext,
     get_forward_context,
     override_forward_context,
 )
@@ -120,12 +122,12 @@ def run_attention_gate_afd_forward(
     """Run the Attention-side gate AFD path used by async CAM."""
 
     afd_connector = afd_metadata.connector
-    forward_context = get_forward_context()
     stage_idx = afd_metadata.stage_idx
     pending_shared_output: torch.Tensor | None = None
     pending_ffn_recv = False
     pending_dispatch_layout: CAMDispatchLayout | None = None
     pending_dispatch_ref: torch.Tensor | None = None
+    input_is_sequence_parallel = False
 
     # Async CAM profile forwards are a distributed startup contract: every
     # Attention rank pairs CAM I/O with the FFN daemon to initialize resources.
@@ -151,6 +153,13 @@ def run_attention_gate_afd_forward(
             pending_dispatch_ref = None
 
         if not layer.is_moe_layer:
+            if input_is_sequence_parallel:
+                hidden_states, residual = _gather_sequence_parallel_state(
+                    hidden_states,
+                    residual,
+                    int(positions.shape[0]),
+                )
+                input_is_sequence_parallel = False
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -170,14 +179,16 @@ def run_attention_gate_afd_forward(
             hidden_states,
             residual,
             llama_4_scaling,
+            already_sequence_parallel=input_is_sequence_parallel,
         )
+        input_is_sequence_parallel = layer.use_sequence_parallel_moe
 
         dispatch_payload = prepare_cam_dispatch_payload(
             hidden_states,
             topk_weights,
             topk_ids,
             router_logits,
-            use_sequence_parallel=forward_context.flash_comm_v1_enabled,
+            use_sequence_parallel=layer.use_sequence_parallel_moe,
         )
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=layer.layer_idx,
@@ -214,7 +225,30 @@ def run_attention_gate_afd_forward(
         )
         if pending_shared_output is not None:
             hidden_states = hidden_states + pending_shared_output
+    if input_is_sequence_parallel:
+        hidden_states, residual = _gather_sequence_parallel_state(
+            hidden_states,
+            residual,
+            int(positions.shape[0]),
+        )
     return hidden_states, residual
+
+
+def _gather_sequence_parallel_state(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Restore both model streams with one collective at a full-token boundary."""
+    if residual is None:
+        return tensor_model_parallel_all_gather(hidden_states, 0)[:num_tokens], None
+    hidden_width = int(hidden_states.shape[-1])
+    combined = tensor_model_parallel_all_gather(
+        torch.cat((hidden_states, residual), dim=-1),
+        0,
+    )[:num_tokens]
+    hidden_states, residual = combined.split(hidden_width, dim=-1)
+    return hidden_states, residual.contiguous()
 
 
 def run_async_moe_ubatch_afd_forward(
@@ -229,14 +263,17 @@ def run_async_moe_ubatch_afd_forward(
     """Run the two-stage async MoE ubatch pipeline used by async CAM."""
 
     forward_context = get_forward_context()
-    runtime_sequence_parallel = bool(forward_context.flash_comm_v1_enabled)
+    runtime_sequence_parallel = bool(
+        model.vllm_config.parallel_config.use_sequence_parallel_moe
+        and model.vllm_config.parallel_config.pipeline_parallel_size == 1
+    )
     if runtime_sequence_parallel != async_moe_ubatch_metadata.use_sequence_parallel:
         raise RuntimeError(
-            "Async CAM stage layout does not match the current FlashComm1 "
+            "Async CAM stage layout does not match the configured sequence-parallel "
             "mode: "
             f"layout_sequence_parallel="
             f"{async_moe_ubatch_metadata.use_sequence_parallel}, "
-            f"flash_comm_v1_enabled={runtime_sequence_parallel}",
+            f"use_sequence_parallel_moe={runtime_sequence_parallel}",
         )
     afd_connector = afd_metadata.connector
     model_layers = list(islice(model.layers, model.start_layer, model.end_layer))
@@ -272,6 +309,7 @@ def run_async_moe_ubatch_afd_forward(
         positions,
         llama_4_scaling,
         async_moe_ubatch_metadata,
+        shard_hidden_states=False,
     )
     stage_hidden_states = stage_inputs.hidden_states
     stage_residual = stage_inputs.residuals
@@ -284,6 +322,25 @@ def run_async_moe_ubatch_afd_forward(
     stage_shared_outputs: list[torch.Tensor | None] = [
         None for _ in stage_hidden_states
     ]
+
+    def make_stage_forward_context(stage_idx: int) -> ForwardContext:
+        stage = async_moe_ubatch_metadata.stages[stage_idx]
+        stage_forward_context = copy(forward_context)
+        stage_forward_context.attn_metadata = async_moe_ubatch_metadata.attn_metadata[
+            stage_idx
+        ]
+        # Ascend MRV2 reads its token count from kwargs, while MRV1 uses the attribute.
+        stage_forward_context.additional_kwargs = dict(
+            forward_context.additional_kwargs or {},
+            num_tokens=stage.actual_tokens,
+        )
+        stage_forward_context.ubatch_idx = stage_idx
+        stage_forward_context.num_ubatches = len(
+            async_moe_ubatch_metadata.stages,
+        )
+        stage_forward_context.dbo_enabled = False
+        stage_forward_context.num_tokens = stage.actual_tokens
+        return stage_forward_context
 
     def compute_stage_attention(
         layer: AFDDeepseekV2DecoderLayer,
@@ -303,41 +360,27 @@ def run_async_moe_ubatch_afd_forward(
         expected_local_tokens = int(stage.input_tokens) // tp_size
         if not async_moe_ubatch_metadata.use_sequence_parallel:
             expected_local_tokens = int(stage.input_tokens)
+        already_sequence_parallel = (
+            runtime_sequence_parallel and layer is not moe_layers[0]
+        )
+        expected_input_tokens = (
+            expected_local_tokens
+            if already_sequence_parallel or not runtime_sequence_parallel
+            else stage.actual_tokens
+        )
         actual_local_tokens = int(stage_hidden_states[stage_idx].shape[0])
-        if actual_local_tokens != expected_local_tokens:
+        if actual_local_tokens != expected_input_tokens:
             raise RuntimeError(
                 "Async CAM stage input does not match its physical layout: "
                 f"stage={stage_idx}, actual_tokens={stage.actual_tokens}, "
                 f"input_tokens={int(stage.input_tokens)}, "
-                f"expected_local_tokens={expected_local_tokens}, "
+                f"expected_input_tokens={expected_input_tokens}, "
                 f"actual_local_tokens={actual_local_tokens}, "
                 f"sequence_parallel="
                 f"{async_moe_ubatch_metadata.use_sequence_parallel}",
             )
-        stage_forward_context = copy(forward_context)
-        stage_forward_context.attn_metadata = async_moe_ubatch_metadata.attn_metadata[
-            stage_idx
-        ]
-        stage_forward_context.additional_kwargs = dict(
-            forward_context.additional_kwargs or {},
-        )
-        stage_forward_context.ubatch_idx = stage_idx
-        stage_forward_context.num_ubatches = len(
-            async_moe_ubatch_metadata.stages,
-        )
-        stage_forward_context.dbo_enabled = False
-        if async_moe_ubatch_metadata.use_sequence_parallel:
-            # FlashComm gathers the physical TP-local stage, removes its
-            # trailing pad before attention, then restores that pad before
-            # reduce-scatter.
-            stage_forward_context.num_tokens = stage.actual_tokens
-            stage_forward_context.pad_size = (
-                int(stage.input_tokens) - stage.actual_tokens
-            )
-        else:
-            stage_forward_context.num_tokens = int(stage.input_tokens)
-            stage_forward_context.pad_size = 0
-        expected_tokens = int(stage_hidden_states[stage_idx].shape[0])
+        stage_forward_context = make_stage_forward_context(stage_idx)
+        expected_tokens = expected_local_tokens
         log_async_moe_stage_attention(
             stage_idx,
             stage,
@@ -356,6 +399,7 @@ def run_async_moe_ubatch_afd_forward(
                 stage_hidden_states[stage_idx],
                 stage_residual[stage_idx],
                 stage_llama_4_scaling[stage_idx],
+                already_sequence_parallel=already_sequence_parallel,
             )
         if topk_weights is None or topk_ids is None:
             raise RuntimeError(
@@ -396,9 +440,10 @@ def run_async_moe_ubatch_afd_forward(
             topk_ids=dispatch_payload.topk_ids,
             router_logits=dispatch_payload.router_logits,
         )
-        stage_shared_outputs[stage_idx] = compute_shared_output(
-            layer, stage_hidden_states[stage_idx]
-        )
+        with override_forward_context(make_stage_forward_context(stage_idx)):
+            stage_shared_outputs[stage_idx] = compute_shared_output(
+                layer, stage_hidden_states[stage_idx]
+            )
         stage_dispatch_layouts[stage_idx] = dispatch_payload.layout
         stage_dispatch_refs[stage_idx] = dispatch_payload.hidden_states
 
@@ -495,7 +540,7 @@ def compute_shared_output(
     layer: AFDDeepseekV2DecoderLayer,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Evaluate native replicated shared weights in the model token layout."""
+    """Evaluate shared experts on the model-local tokens."""
     if layer.mlp.shared_experts is None:
         return None
     output = layer.mlp.shared_experts(hidden_states)

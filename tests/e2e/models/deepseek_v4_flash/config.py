@@ -315,6 +315,8 @@ def _configure_dsv4_arguments(
             else []
         ),
         *(["--quantization", quantization] if quantization is not None else []),
+        "--attention_config.indexer_kv_dtype",
+        "int8",
         "--tokenizer-mode",
         "deepseek_v4",
         *(
@@ -359,6 +361,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         )
     ]
     _configure_dsv4_arguments(args, DSV4_ASCEND_QUANTIZATION)
+    args.ffn_vllm_arg = ["--all2all-backend", "flashinfer_all2allv"]
+    args.attention_vllm_arg[:0] = ["--all2all-backend", "allgather_reducescatter"]
 
 
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
@@ -397,24 +401,19 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     )
 
 
-def additional_config() -> dict[str, bool]:
+def additional_config(role: str, *, async_cam: bool) -> dict[str, bool]:
     """Return the DSV4 model-path switches every DSV4 case pins.
 
     These are not deployment preferences. The pinned Ascend runtime defaults
     `multistream_dsv4_dsa_overlap` to True (`vllm_ascend/ascend_config.py`), and
     that path drives the DSA RoPE through `inplace_partial_rotary_mul`, whose
     tiling function rejects the shapes A5 hands it. The case therefore keeps the
-    switch off, alongside the DSA context-parallel and shared-compressor paths
-    it does not cover.
+    switch off, alongside the DSA context-parallel path it does not cover.
     """
     return {
+        "enable_flashcomm1": async_cam and role == "attention",
         "enable_cpu_binding": True,
-        "enable_force_load_balance": False,
+        "enable_force_eplb": False,
         "enable_dsa_cp": False,
         "multistream_dsv4_dsa_overlap": False,
-        "enable_dsv4_shared_compressor_workspace": False,
     }
-
-
-def role_environment(role: str | None) -> dict[str, str]:
-    return {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "1" if role == "attention" else "0"}

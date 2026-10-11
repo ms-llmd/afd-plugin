@@ -8,11 +8,19 @@ through CAM async dispatch/combine operators.
 This guide describes the supported deployment shape, configuration contract,
 rank mapping, data flow, startup requirements, and current limitations. The
 [DeepSeek-V3.2 recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md)
-links the current v0.26 launch scripts and retains the historical v0.19
-multi-node commands and measurements for provenance.
+retains historical v0.26 launch scripts and v0.19 multi-node measurements
+for provenance. The current dependency pair is recorded in the
+[root installation instructions](../../README.md#ascend-npu-installation);
+v0.30 evidence covers V2-Lite ordinary Async CAM and DSV4 Flash W4A8 layered
+off/on, each with a representative 300-question comparison. See the
+[NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
+
+The linked upgrade record predates MRV2 Async CAM support and records a DSV2
+SP defect with TP-sharded shared experts. Its results retain that baseline
+scope; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
 
 > [!WARNING]
-> The vLLM 0.26 CAM async port remains experimental. The linked PCP8 recipe and
+> CAM async remains experimental. The following evidence is historical v0.26. The linked PCP8 recipe and
 > its measurements belong to the former vLLM/vLLM-Ascend 0.19.1 environment;
 > v0.26 model runner v1 uses the DP+TP/SP topology documented below. The
 > DP3TP2/EP2 matrix passed before the metadata-ownership fix. After that fix,
@@ -22,8 +30,8 @@ multi-node commands and measurements for provenance.
 ## When to use this connector
 
 The retained implementation describes an asynchronous Ascend NPU inference path
-with the following constraints. These are code-level constraints, not a v0.26
-hardware support claim:
+with the following code-level constraints. Hardware evidence is limited to
+the models and configurations recorded above:
 
 - CAM operator packages are installed on every node;
 - Attention performs MoE gating before dispatch to FFN ranks;
@@ -35,6 +43,40 @@ hardware support claim:
 CAM async currently does not support ACL graph execution or vLLM native DBO.
 When a decode batch cannot form two non-empty AFD stages, it runs through the
 normal unsplit attention path.
+
+## ModelRunnerV2 deployment
+
+Attention supports both ModelRunnerV1 and ModelRunnerV2. To select V2, set
+`VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,afd` on both roles.
+Only Attention uses the native V2 model runner; FFN keeps its connector-driven
+runner. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
+
+The V2 Async CAM contract is:
+
+- registered DeepSeek-V2/V3 MLA or DeepSeek-V4 models;
+- `--enforce-eager` and `--enable-expert-parallel` on both roles, with
+  `async=true` and `compute_gate_on_attention=true`;
+- PP=PCP=DCP=1, static expert placement, and each role's configured rank count
+  equal to its DP x TP size;
+- `attn_ranks_per_dp` equal to Attention TP, and Attention
+  `--max-num-batched-tokens` divisible by that TP size;
+- `dynamicQuant=1` for DeepSeek-V4 Flash W4A8.
+
+Attention-local FlashComm1/SP is supported. Set
+`VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN;
+shared-expert DP and finegrained TP are unsupported. For V2-Lite MLA Attention,
+explicitly set `--block-size=128`; do not apply this setting to V4.
+
+V2 reuses the existing model-local `async_moe_ubatching` pipeline: exactly two
+request or token stages, with Attention TP > 1 for token splitting. This is
+independent of native DBO, which remains unsupported. For DeepSeek-V2/V3 token
+splitting, pass `--enable-chunked-prefill` so a request crossing the stage
+boundary can attend to its prefix KV. Native draft-model/MTP paths are also
+unsupported.
+
+These are configuration and implementation limits, not accuracy or performance
+guarantees for every model and topology. Historical V1 and layered-GMM results
+above retain their original scope.
 
 ## CAM async data flow
 
@@ -216,14 +258,15 @@ through the checked-in
 [v0.26 accuracy recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/v0_26_accuracy/README.md),
 using the complete 61-layer checkpoint.
 
-Current hardware evidence is deliberately recorded at two scopes:
+Historical v0.26 hardware evidence is recorded at two scopes:
 
 - the six-case DP3TP2/EP2 matrix passed before the metadata-ownership fix;
 - after the fix, the full 61-layer DP2TP8+EP16 token-split deployment reached
   `0.9522` strict match on the complete GSM8K evaluation.
 
-The second result validates the corrected metadata path on the target full
-model and full evaluation dataset.
+The second result validates the corrected metadata path on that v0.26
+full-model deployment and dataset; it does not validate the integrated v0.30
+runtime.
 
 When `async_moe_ubatching=true`, all roles must set:
 
@@ -243,7 +286,9 @@ the current async MoE metadata path supports DP+TP/SP, not PCP/DCP.
 
 ## Requirements
 
-The target CAM async v0.26 NPU validation baseline is:
+Use the current target source pair from the
+[root installation instructions](../../README.md#ascend-npu-installation).
+The following list records the historical v0.26 validation environment:
 
 - Ascend 910C;
 - Python 3.12;
@@ -256,7 +301,7 @@ The target CAM async v0.26 NPU validation baseline is:
 The nightly image identifier records the intended validation environment; it
 is not a promise of a stable public pull tag. Some development package metadata
 in that image still reports a `0.19.1rc2.dev1327` version. The source commits
-above are the compatibility baseline for this port. The recorded validation
+above identify that historical port, not the current install target. The recorded validation
 evidence is scoped to the topologies and sample counts stated above; other
 combinations require their own NPU validation.
 
@@ -295,12 +340,11 @@ actual vendor library path. Missing source operators fail startup.
 - vLLM native DBO/ubatching is unsupported.
 - AFD-managed MoE ubatching supports exactly two request-boundary or
   token-balanced DP+TP/SP stages.
-- PCP is unsupported by vLLM-Ascend 0.26 model runner v1.
-- Prefill and decode context parallelism are unsupported with async MoE
-  ubatching.
+- ModelRunnerV2 rejects PP, PCP, and DCP; V1 PCP and async MoE context
+  parallelism remain unsupported.
 - Routed experts should divide evenly across FFN ranks.
-- Post-fix full-model token-split accuracy reached `0.9522` strict match on the
-  complete GSM8K evaluation. Other Ascend hardware, model families,
+- Historical v0.26 post-fix full-model token-split accuracy reached `0.9522`
+  strict match on the complete GSM8K evaluation. Other Ascend hardware, model families,
   CAM/CANN/container versions, cross-version combinations, and topologies
   outside the documented matrices should be treated as unverified.
 
@@ -321,13 +365,20 @@ AFD_ASYNC_CAM_LAYERED_GMM=1 bash <W4A8-FFN-launch-script>
 ```
 
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
-Attention-side gate, `dynamicQuant=1`, eager ModelRunnerV1, and static expert
-placement. This path applies only to Ascend DeepSeek V4; enabling the switch
-for another model fails at startup. All remote MoE layers must share geometry,
-SiLU activation, quantization layout, and scaling semantics. Both per-channel
-and per-group parameters can be extracted, but neither mode has been validated
-with a target checkpoint. Shared experts remain on Attention. DSV4 already
-applies routed scaling in top-k, so FFN does not apply it again.
+Attention-side gate, `dynamicQuant=1`, eager execution, and static expert
+placement. `VLLM_USE_V2_MODEL_RUNNER=1` may be set on both roles; FFN still uses
+its connector-driven runner. This path applies only to Ascend DeepSeek V4;
+enabling the switch for another model fails at startup. All remote MoE layers must share geometry,
+SiLU activation, quantization layout, and scaling semantics. The extractor
+can represent per-channel and per-group parameters, but the pinned Ascend
+loader rejects positive `group_size`; the current target is limited to
+per-channel W4A8. DSV4 Flash has layered off/on 300-question comparisons and
+real INT8-activation/INT4-weight operator traces in the validation record above.
+The [SwiGLU write-back synchronization fix](https://github.com/vllm-project/afd-plugin/issues/429)
+also passes the original per-group operator regression without changing its
+tolerance; this does not extend the checkpoint loader to per-group weights.
+Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
+FFN does not apply it again.
 
 The existing fused operator does not apply a nonzero `swiglu_limit`. The
 layered path temporarily ignores the model's limit and logs

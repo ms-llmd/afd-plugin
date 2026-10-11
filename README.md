@@ -18,7 +18,8 @@ tests for GPU and Ascend NPU deployments.
 > This project is still experimental and needs more large-scale testing across
 > different hardware backends.
 
-The target runtime is **vLLM `v0.26.0`**. The plugin does not modify the vLLM
+The target runtime is **vLLM `v0.30.0`** at commit `ced6857a`; the Ascend
+integration targets vLLM-Ascend `8d4409d6`. The plugin does not modify the vLLM
 source tree. AFD behavior is installed through the `vllm.general_plugins` entry
 point, `--additional-config`, automatically selected role workers, plugin-owned
 model wrappers, and narrow version-scoped compatibility shims.
@@ -36,7 +37,8 @@ Core runtime support:
   execution for CUDA and Ascend NPU.
 - Eager and `FULL_DECODE_ONLY` graph execution, plus backend-specific profiling
   support.
-- Native DBO with exactly two ubatches on CUDA and the synchronous Ascend path.
+- Native DBO with exactly two ubatches on CUDA V1/V2 and the synchronous
+  Ascend V1 path; Ascend V2 DBO remains unsupported.
 - DeepSeek MoE handoff at the remote-experts boundary on CUDA, with the gate
   placed on either Attention or FFN.
 
@@ -46,7 +48,7 @@ Model support:
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
-| Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | Qwen3.5/Qwen3.6 adapter family. Repository CUDA E2E evidence currently covers text-only Qwen3.6-35B-A3B with `--language-model-only`, synchronous `P2pNcclAFDConnector`, native DP4/TP1/EP4 baseline, and AFD 2A1F eager/graph/graph+DBO. |
+| Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F eager/graph. DBO remains excluded by a known FFN CUDA fault; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
 Connector support:
 
@@ -55,8 +57,8 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
-| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental v0.26 DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Post-fix DeepSeek-V3.2 DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
+| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. V2-Lite and DSV4 Flash W4A8 have [representative v0.30 validation](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923). The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
 
 Connector implementations are grouped by backend package:
 `afd_plugin.connectors.gpu` for GPU-only connectors,
@@ -64,8 +66,23 @@ Connector implementations are grouped by backend package:
 
 Known gaps:
 
-- vLLM versions other than `0.26.0` are not claimed as supported.
-- vLLM/vLLM-Ascend model runner v2 is not supported.
+- The GPU target is exactly vLLM `0.30.0`; other vLLM versions are not
+  claimed as supported on GPU.
+- NPU hardware evidence covers representative DeepSeek-V2-Lite and DSV4
+  Flash W4A8 deployments; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
+  Other models and topologies remain unverified. Historical v0.26 results retain
+  their recorded vLLM-Ascend `80d8c194f` environment.
+- NPU MRV2 many-to-one padding and DSV2 Async SP with TP-sharded shared
+  experts have known correctness defects deferred to separate fixes; see the
+  [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
+- Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
+  incorrect. See the [profile limits](tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
+- GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with
+  `compute_gate_on_attention=false`, including two-microbatch DBO and
+  `FULL_DECODE_ONLY`. H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
+  see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
+  Representative 300-question comparisons do not establish numerical
+  equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix). NPU MRV2 DBO is unsupported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by
@@ -79,7 +96,7 @@ Known gaps:
   multi-node execution are unsupported; quantization is unverified; no
   performance claim is made.
 - PCP-based NPU model-runner-v1 deployments from v0.19.1rc1 are not supported
-  on v0.26.
+  on v0.30.
 
 ## Install
 
@@ -103,28 +120,35 @@ command:
 uv sync --group dev --extra vllm
 ```
 
-The optional extra pins `vllm==0.26.0`.
+The optional extra pins `vllm==0.30.0`.
 
 ### Ascend NPU installation
 
-AFD's Ascend path is validated on openEuler 22.03 (aarch64) with
-Ascend 910C / Atlas A3. Install a compatible driver and firmware, and confirm
-the devices with `npu-smi info`. Use this source baseline:
+The Ascend target uses the source pair below. Representative v0.30 validation
+uses Ascend 910C / Atlas A3; see the [recorded environment and results](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
+Install a compatible driver and firmware, and confirm the devices with
+`npu-smi info`.
 
 | Component | Version |
 | --- | --- |
 | Python | `3.10` or `3.11` |
-| vLLM | `0.26.0` |
-| vLLM-Ascend | commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) |
+| vLLM | `0.30.0`, commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
+| vLLM-Ascend | commit [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6) |
 | CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
+
+> Hardware evidence is scoped to the recorded models, configurations, and
+> sample counts; it does not cover every NPU deployment or guarantee clean
+> device shutdown.
 
 #### Environment
 
-The v0.26 integration was refreshed against vLLM-Ascend commit `80d8c194f`;
-the repository does not currently claim a released v0.26 container tag. Use the
-[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/80d8c194f7584b17fe08065ea99a130916f6b0e7/docs/source/installation.md)
+The Ascend environment targets vLLM-Ascend commit `8d4409d6` and vLLM
+`0.30.0`. The recorded A3 environment uses CANN 9.1.0, torch 2.10.0+cpu,
+and torch-npu 2.10.0.post4. The repository does not claim a released container
+tag for either target. Use the
+[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6/docs/source/getting_started/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
-repository root. Do not reuse the former v0.19.1rc1 image as a v0.26 runtime.
+repository root. Do not reuse the former v0.19.1rc1 image as a v0.30 runtime.
 
 #### Install AFD
 
@@ -177,8 +201,11 @@ or standard Ascend NPU platform. Explicit AFD worker paths remain accepted for
 compatibility with existing commands, but are not required or stable launch
 interfaces.
 
-GPU model runner v2 is not supported. Select model runner v1 before starting
-either GPU role:
+The examples below use model runner v1. For GPU MRV2, set
+`VLLM_USE_V2_MODEL_RUNNER=1` on both roles and use the
+[dedicated E2E scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
+MRV2 DBO requires two microbatches and Attention DP > 1.
+For the MRV1 examples below, select:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0

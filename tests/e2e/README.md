@@ -110,16 +110,17 @@ python -m pytest -q -s \
 
 ### GPU ModelRunnerV2 evidence matrix
 
-The GPU-only ModelRunnerV2 regression matrix contains six representative
+The GPU-only ModelRunnerV2 regression matrix contains eight representative
 scenarios:
 
 - `afd-v2-eager-1a1f` and `afd-v2-graph-1a1f`
 - `afd-v2-eager-dp2` and `afd-v2-graph-dp2`
 - `afd-v2-eager-tp2` and `afd-v2-graph-tp2`
+- `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`
 
 The 1A1F scenarios use two devices and are local-only. DP2 and TP2 use four
-devices, split evenly between Attention and FFN, and run in the CI gate on
-`l4_4`. These rows record hardware-tested coverage; they are not a production
+devices, split evenly between Attention and FFN. CI selects those four cases
+and the two DP2 DBO cases on `l4_4`. These rows record hardware-tested coverage; they are not a production
 topology allowlist. Other valid DP/TP topologies use the same AFD and native
 vLLM topology contracts.
 
@@ -128,6 +129,26 @@ python -m pytest -q -s \
   "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py" \
   -k 'afd-v2'
 ```
+
+### GPU MRV2 DBO development comparison
+
+The `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2` scenarios cover
+the eager and graph DBO paths. Together with `afd-v2-eager-dp2`, these use the same
+2A2F DP2/TP1 topology, 128 GSM8K samples, 12 concurrent requests, eight-shot
+prompts, `max_num_seqs=8`, and `max_num_batched_tokens=4096`. Prefix caching,
+chunked prefill, and async scheduling are disabled in all three. Only DBO
+and graph mode change; the graph row uses `FULL_DECODE_ONLY` with capture size 8.
+`AFD_GSM8K_LIMIT` overrides the sample count consistently across the three rows
+(with a shared minimum of 24 for diagnostics).
+
+The GPU validator accepts exactly two microbatches and requires Attention
+DP > 1; FFN remains connector-driven. NPU MRV2 DBO remains rejected. The
+runner requires live two-stage execution and matching layouts on all
+Attention/FFN ranks, plus consecutive FULL replays on the graph row. MRV1
+`afd-graph-dbo-*` scenarios do not substitute for these checks.
+Representative 300-question results and their limits are recorded in
+[PR #425](https://github.com/vllm-project/afd-plugin/pull/425); these comparisons
+do not establish numerical equivalence or full-dataset qualification.
 
 ### Weekly GSM8K
 
@@ -153,12 +174,11 @@ samples.
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` runs Attention DP2/TP4 on the first
 eight devices and FFN DP8/TP1/EP8 on the last eight. This is a standalone
-Ascend 910C case, outside the four-device PR gate. Use DSV4 Flash W8A8
+Ascend 910C case, outside the four-device PR gate. Use DSV4 Flash W4A8
 weights and a DSV4-capable vLLM/vLLM-Ascend runtime with CAM operators.
 
 The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
 max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024.
-Both roles explicitly disable `enable_dsv4_shared_compressor_workspace`.
 CAM uses `dynamicQuant=1`, Attention-side gating, and two token-split async
 MoE ubatches. FlashComm1 is enabled only on Attention. CPU binding and
 128-thread weight loading follow the reference prefill scripts. Prefix
@@ -222,29 +242,24 @@ turns the exact check back on once its host is validated.
 
 Deployment differences worth knowing:
 
-- **A5** drops the native DBO its script enables (a split batch is the current
-  suspect for the DSA operator tiling failure there, so the recorded 2/12
-  thresholds stay on the profile unused), pins `--block-size 128` and
-  `--no-enable-prefix-caching` where its script leaves vLLM's defaults, keeps
-  `HCCL_BUFFSIZE=2048` with the plain allocator, and needs no NIC variable.
+- **A5** runs with DBO off, `--block-size 128`, and
+  `--no-enable-prefix-caching`; it uses `HCCL_BUFFSIZE=2048`, the plain
+  allocator, and no required NIC variable.
 - **A3** drops an inherited `HCCL_BUFFSIZE`, sizes its own CAMP2P domains through
   `connector_extra_config`, and requires `HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`.
 - `--quantization` is resolved from the checkpoint: A5's FP8/W4A8 checkpoint
   decides, A3's int8 W8A8 loads through `ascend`.
-- Both keep the case's DSV4 model-path switches (`multistream_dsv4_dsa_overlap`,
-  `enable_dsa_cp`, and `enable_dsv4_shared_compressor_workspace` off) and leave
+- Both disable `multistream_dsv4_dsa_overlap` and `enable_dsa_cp` and leave
   the gate on FFN; KV transfer is not enabled. Shutdown allows 60 seconds, and
   the async FFN cleanup exception does not apply because no CAM receive is
   pending.
 
-**Known blocker: A5 corrupted answers under concurrent load.** That profile has
-returned a repeated operand, a degenerate repetition loop, a refusal, and a quoted
-sentence that was never in the prompt, with a different failing request each run.
-Ruled out: DBO (already off), answer-check strictness, the 128-token block, prefix
-caching, and the operator tiling failures those changes cleared. The lead is the
-A2E tile bookkeeping for uneven Attention peers, which this branch does not carry
-(A5 runs Attention DP2, A3 DP1/TP4); those helpers live in
-`afd_plugin/a2e_layout.py`.
+**Known limitation: A5 produces incorrect answers under concurrent load even
+with DBO off.** A3 answer correctness remains unverified. Passing these smoke
+cases does not establish synchronous DSV4 correctness. Their profiles and
+limitations originate in [PR #359](https://github.com/vllm-project/afd-plugin/pull/359);
+they are separate from the V2-Lite and asynchronous DSV4 accuracy evidence
+recorded in [PR #425](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
 
 ```bash
 export AFD_E2E_BACKEND=npu

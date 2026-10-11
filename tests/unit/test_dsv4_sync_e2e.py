@@ -83,6 +83,7 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
         assert command[command.index("--data-parallel-size") + 1] == dp
         assert command[command.index("--tensor-parallel-size") + 1] == tp
         assert command[command.index("--max-model-len") + 1] == profile.max_model_len
+        assert _flag_value(command, "--attention_config.indexer_kv_dtype") == "int8"
         assert (
             _flag_value(command, "--max-num-batched-tokens")
             == profile.max_num_batched_tokens
@@ -147,7 +148,10 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
         # Every DSV4 case pins the model-path switches, because the pinned
         # runtime defaults the multistream DSA overlap to True and that RoPE
         # path fails to tile on A5.
-        assert config["enable_dsv4_shared_compressor_workspace"] is False
+        assert "enable_dsv4_shared_compressor_workspace" not in config
+        assert "enable_force_load_balance" not in config
+        assert config["enable_force_eplb"] is False
+        assert config["enable_flashcomm1"] is False
         assert config["multistream_dsv4_dsa_overlap"] is False
         assert config["enable_dsa_cp"] is False
         assert config["enable_cpu_binding"] is True

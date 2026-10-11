@@ -7,7 +7,12 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any, Final
 
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
+    AFDConfig,
+    parse_afd_config,
+)
 from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     validate_cuda_graph_mode,
@@ -31,6 +36,7 @@ VLLM_GPU_WORKER_FQCN: Final[str] = "vllm.v1.worker.gpu_worker.Worker"
 VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
+GPU_MRV2_NUM_UBATCHES: Final[int] = 2
 
 
 def validate_gpu_model_runner_v2_config(
@@ -86,7 +92,16 @@ def validate_gpu_model_runner_v2_config(
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:
-        raise RuntimeError("AFD ModelRunnerV2 does not support DBO or ubatching")
+        if parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 DBO/ubatching requires exactly two microbatches",
+            )
+        # Native maybe_build_ubatch_runner requires DP > 1. FFN does not
+        # construct it: its stage layout comes from Attention control messages.
+        if expected_role == "attention" and parallel.data_parallel_size <= 1:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 DBO/ubatching requires Attention DP > 1"
+            )
 
     # Keep importing this CPU-safe validation module independent of the vLLM
     # model-wrapper package; the validator itself runs only after vLLM config
@@ -110,14 +125,24 @@ def validate_npu_model_runner_v2_config(
     """Validate the supported Ascend NPU ModelRunnerV2 deployment."""
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if (
-        device_type != "npu"
-        or afd_config.connector != "CAMP2pAFDConnector"
-        or afd_config.compute_gate_on_attention
+    if device_type != "npu":
+        raise RuntimeError("AFD NPU ModelRunnerV2 requires NPU")
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
+            raise RuntimeError(
+                "AFD NPU ModelRunnerV2 Async CAM requires async DP and "
+                "compute_gate_on_attention=true",
+            )
+        if not vllm_config.model_config.enforce_eager:
+            raise RuntimeError(
+                "AFD NPU ModelRunnerV2 Async CAM requires eager execution"
+            )
+    elif (
+        afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
     ):
         raise RuntimeError(
-            "AFD NPU ModelRunnerV2 requires NPU, synchronous "
-            "CAMP2pAFDConnector, and compute_gate_on_attention=false",
+            "AFD NPU ModelRunnerV2 requires synchronous CAMP2pAFDConnector "
+            "with compute_gate_on_attention=false, or Async CAM",
         )
 
     parallel = vllm_config.parallel_config
@@ -143,8 +168,13 @@ def validate_npu_model_runner_v2_config(
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
         or parallel.enable_eplb
-        or parallel.use_sequence_parallel_moe
-        or vllm_config.compilation_config.pass_config.enable_sp
+        or (
+            afd_config.connector != AFD_ASYNC_CONNECTOR
+            and (
+                parallel.use_sequence_parallel_moe
+                or vllm_config.compilation_config.pass_config.enable_sp
+            )
+        )
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:

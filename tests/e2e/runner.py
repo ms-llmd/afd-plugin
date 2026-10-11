@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal  # noqa: F401  # re-exported: the patch point for cancellation
 import subprocess
 import sys
@@ -17,7 +18,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from tests.e2e.accuracy.gsm8k import (
     _extract_gsm8k_accuracy,
@@ -67,7 +68,14 @@ V2_SCENARIOS = (
     "afd-v2-graph-1a1f",
     "afd-v2-graph-dp2",
     "afd-v2-graph-tp2",
+    "afd-v2-eager-dbo-dp2",
+    "afd-v2-graph-dbo-dp2",
 )
+V2_DBO_COMPARISON_SCENARIOS = frozenset(
+    ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
+)
+V2_DBO_SAMPLE_LIMIT = 128
+V2_DBO_MAX_NUM_SEQS = 8
 V2_SINGLE_RANK_SCENARIOS = frozenset(
     ("afd-v2-eager-1a1f", "afd-v2-graph-1a1f"),
 )
@@ -101,6 +109,7 @@ DBO_EVAL_NUM_UBATCHES = 2
 # The engine logs one DEBUG line per executed step carrying its ubatch slice
 # list; a step line containing UBatchSlice entries is a live two-ubatch run.
 DBO_SPLIT_EVIDENCE_ENTRY = "UBatchSlice("
+NPU_DBO_CONTROL_ENTRY = "AFD NPU Attention send_dp_metadata decision;"
 ACCOUNTING_PROMPT = (
     "<|im_start|>system\n"
     "You are a professional accountant. Answer questions using accounting "
@@ -142,6 +151,7 @@ def main() -> int:
     processes_by_role: dict[str, subprocess.Popen[str]] = {}
     log_threads: list[threading.Thread] = []
     dbo_split_steps: list[float] = []
+    mrv2_execution_events: list[tuple[float, str, str]] = []
     dbo_eval_started_at: float | None = None
 
     def cleanup() -> None:
@@ -212,7 +222,9 @@ def main() -> int:
             )
             processes.append(process)
             processes_by_role[role] = process
-            log_threads.append(stream_output(role, process, dbo_split_steps))
+            log_threads.append(
+                stream_output(role, process, dbo_split_steps, mrv2_execution_events)
+            )
             ensure_alive(process, f"{label} process exited during startup")
 
         wait_for_openai_api(args, processes)
@@ -222,11 +234,14 @@ def main() -> int:
             dbo_eval_started_at = time.time()
         run_scenario_evaluation(args)
         if args.enable_dbo:
-            assert_dbo_live_split_coverage(
-                dbo_split_steps,
-                dbo_eval_started_at,
-                args,
-            )
+            if args.use_v2_model_runner:
+                assert_mrv2_dbo_execution(
+                    mrv2_execution_events, cast(float, dbo_eval_started_at), args
+                )
+            else:
+                assert_dbo_live_split_coverage(
+                    dbo_split_steps, dbo_eval_started_at, args
+                )
 
         ensure_processes_alive(processes)
 
@@ -301,7 +316,13 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
         help="vLLM executable to run. Defaults to 'vllm'.",
     )
     parser.add_argument("--api-host", default="127.0.0.1")
-    parser.add_argument("--api-port-base", type=int, default=8000)
+    parser.add_argument(
+        "--api-port-base",
+        type=int,
+        # Shared hosts often run unrelated services on the default vLLM
+        # port; E2E drivers can shift the whole port range via env.
+        default=int(os.environ.get("AFD_E2E_API_PORT_BASE", "8000")),
+    )
     parser.add_argument("--afd-host", default="127.0.0.1")
     parser.add_argument("--afd-port", type=int, default=1239)
     parser.add_argument("--startup-timeout", type=float, default=900)
@@ -408,6 +429,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-1a1f": (False, True, False, 1, 1),
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
+        "afd-v2-eager-dbo-dp2": (False, False, True, 2, 2),
+        "afd-v2-graph-dbo-dp2": (False, True, True, 2, 2),
     }
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         # The A5 script's native DBO stays off for these scenarios: a split batch
@@ -521,7 +544,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
             else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
         )
     if enable_dbo:
-        args.dbo_decode_token_threshold = 1
+        # vLLM 0.30 validates that both DBO thresholds are at least the
+        # microbatch count (2), so a decode threshold of 1 is rejected.
+        args.dbo_decode_token_threshold = 2
         args.dbo_prefill_token_threshold = 8
 
 
@@ -671,7 +696,11 @@ def build_vllm_command(
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
     if args.scenario in DSV4_SCENARIOS:
-        afd_config.update(dsv4_config.additional_config())
+        afd_config.update(
+            dsv4_config.additional_config(
+                role, async_cam=args.scenario == DSV4_ASYNC_CAM_SCENARIO
+            )
+        )
     cmd = [
         args.vllm_bin,
         "serve",
@@ -688,8 +717,8 @@ def build_vllm_command(
     if sync_profile is None or sync_profile.enable_expert_parallel:
         # Non-DSV4 AFD scenarios always run expert parallel. The A5 DSV4 sync
         # profile follows its launch script, which runs Attention DP2/TP1 and
-        # FFN DP2/TP1 with expert parallelism; the A3 profile shards by tensor
-        # parallel and keeps the expert-parallel world at one.
+        # FFN DP2/TP1 with expert parallelism; the A3 profile uses Attention
+        # DP2/TP4 and FFN DP8/TP1 with expert parallelism.
         cmd.append("--enable-expert-parallel")
         # Skip non-local routed-expert weights before they are read; the
         # Attention role discards routed experts, FFN keeps only its EP shard.
@@ -728,12 +757,22 @@ def build_vllm_command(
                 ),
             ],
         )
+    if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
+        cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
     if args.use_v2_model_runner:
         cmd.extend(
             [
                 "--no-enable-prefix-caching",
-                "--no-enable-chunked-prefill",
                 "--no-async-scheduling",
+            ],
+        )
+    if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
+        # Keep request concurrency identical across the no-DBO, eager DBO
+        # and graph DBO comparison; retain native chunked-prefill defaults.
+        cmd.extend(
+            [
+                "--max-num-seqs",
+                str(V2_DBO_MAX_NUM_SEQS),
             ],
         )
     profile_compilation_config = (
@@ -756,7 +795,8 @@ def build_vllm_command(
         # profiles do) keeps it: the capture size only has to cover it.
         max_num_seqs_args = (
             []
-            if any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
+            if args.scenario in V2_DBO_COMPARISON_SCENARIOS
+            or any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
             else ["--max-num-seqs", capture_size]
         )
         cmd.extend(
@@ -892,12 +932,15 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
     """Run the configured GSM8K workload against the scenario's public API."""
     if args.gsm8k_output_path is None:
         raise RuntimeError("--gsm8k-output-path is required for GSM8K scenarios")
+    is_v2_dbo_comparison = args.scenario in V2_DBO_COMPARISON_SCENARIOS
     configured_limit = os.environ.get(
         GSM8K_LIMIT_ENV,
-        str(DEFAULT_GSM8K_SAMPLE_LIMIT),
+        str(
+            V2_DBO_SAMPLE_LIMIT if is_v2_dbo_comparison else DEFAULT_GSM8K_SAMPLE_LIMIT
+        ),
     )
     sample_limit = None if configured_limit == "all" else int(configured_limit)
-    if args.enable_dbo and sample_limit is not None:
+    if (args.enable_dbo or is_v2_dbo_comparison) and sample_limit is not None:
         sample_limit = max(sample_limit, DBO_EVAL_MIN_SAMPLES)
     expected_sample_count = (
         GSM8K_FULL_SAMPLE_COUNT if sample_limit is None else sample_limit
@@ -910,7 +953,7 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         if args.scenario == ASYNC_UBATCH_SCENARIO
         else {}
     )
-    if args.enable_dbo:
+    if args.enable_dbo or is_v2_dbo_comparison:
         scenario_options["num_concurrent"] = DBO_EVAL_NUM_CONCURRENT
     role = "baseline" if args.baseline else "attention"
     results = _run_lm_eval(
@@ -966,6 +1009,86 @@ def assert_dbo_live_split_coverage(
         f"dbo_prefill_token_threshold={args.dbo_prefill_token_threshold}. "
         "Increase the client concurrency until both attention ranks hold "
         "enough real tokens for two non-empty ubatches.",
+    )
+
+
+def assert_mrv2_dbo_execution(
+    events: list[tuple[float, str, str]],
+    eval_started_at: float,
+    args: argparse.Namespace,
+) -> None:
+    """Require all-rank layout coverage in the window, not exact step pairing."""
+    attention_mode = "FULL" if args.cuda_graph_full_decode_only else "eager"
+    ffn_mode = "replay" if args.cuda_graph_full_decode_only else "eager"
+    attention_layouts: dict[
+        tuple[tuple[int, tuple[int, ...]], ...], set[tuple[int, int]]
+    ] = {}
+    previous_attention: dict[
+        tuple[int, int], tuple[int, tuple[tuple[int, tuple[int, ...]], ...]]
+    ] = {}
+    ffn_layouts: dict[
+        tuple[tuple[int, tuple[int, ...]], ...], set[tuple[int, int]]
+    ] = {}
+    for received_at, role, line in events:
+        if received_at < eval_started_at:
+            continue
+        worker = re.search(r"\(Worker_([^ ]+) pid=\d+\)", line)
+        if worker is None:
+            continue
+        ranks = dict(re.findall(r"(DP|TP)(\d+)", worker[1]))
+        rank = (int(ranks["DP"]), int(ranks.get("TP", "0")))
+        if role == "attention" and (
+            f"runner=MRV2 phase=live mode={attention_mode} stages=2 " in line
+        ):
+            real_match = re.search(r"real_tokens=(\[[^]]+\])", line)
+            tokens_match = re.search(r"\btokens=(\[[^]]+\])", line)
+            count_match = re.search(r"count=(\d+)", line)
+            if real_match is None or tokens_match is None or count_match is None:
+                continue
+            if not all(count > 0 for count in json.loads(real_match[1])):
+                continue
+            tokens = json.loads(tokens_match[1])
+            layout = tuple(
+                (stage, (count,) * args.num_attention_ranks)
+                for stage, count in enumerate(tokens)
+            )
+            count = int(count_match[1])
+            previous = previous_attention.get(rank)
+            previous_attention[rank] = (count, layout)
+            if args.cuda_graph_full_decode_only and previous != (count - 1, layout):
+                continue
+            attention_layouts.setdefault(layout, set()).add(rank)
+        if role == "ffn" and f"runner=FFN mode={ffn_mode} stages=2 " in line:
+            layout_match = re.search(r"layout=(\[.*\]) count=", line)
+            if layout_match is not None:
+                layout = tuple(
+                    (stage, tuple(counts))
+                    for stage, counts in json.loads(layout_match[1])
+                )
+                ffn_layouts.setdefault(layout, set()).add(rank)
+    expected_attention = {
+        (dp, tp)
+        for dp in range(args.num_attention_ranks // args.attention_tp_size)
+        for tp in range(args.attention_tp_size)
+    }
+    expected_ffn = {
+        (dp, tp)
+        for dp in range(args.num_ffn_ranks // args.ffn_tp_size)
+        for tp in range(args.ffn_tp_size)
+    }
+    if any(
+        expected_attention <= ranks and expected_ffn <= ffn_layouts.get(layout, set())
+        for layout, ranks in attention_layouts.items()
+    ):
+        print(
+            f"[dbo-coverage] MRV2 live two-stage {attention_mode} and FFN "
+            f"{ffn_mode} confirmed on all expected ranks with matching DP layouts"
+        )
+        return
+    raise RuntimeError(
+        f"MRV2 DBO lacks live two-stage {attention_mode} and matching FFN "
+        f"{ffn_mode} evidence in the evaluation window; FULL requires "
+        "all expected ranks, consecutive replays and two non-empty microbatches"
     )
 
 
@@ -1034,8 +1157,9 @@ def build_env(
         env.update(extra_env)
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
-    if args.device_backend != "npu":
-        env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.use_v2_model_runner else "0"
+    env["VLLM_USE_V2_MODEL_RUNNER"] = (
+        "1" if args.device_backend == "gpu" and args.use_v2_model_runner else "0"
+    )
     if args.baseline:
         env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
     else:
@@ -1048,15 +1172,9 @@ def build_env(
             raise ValueError("role is required when setting an E2E run id")
         env[E2E_RUN_ID_ENV] = e2e_run_id
         env[E2E_PROCESS_ROLE_ENV] = role
-    if (
-        args.device_backend == "npu"
-        and role in ("attention", "ffn")
-        and role_tp_size(args, role) <= 1
-    ):
+    if args.device_backend == "npu":
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
-        env.update(dsv4_config.role_environment(role))
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         str(REPO_ROOT)
@@ -1087,15 +1205,27 @@ def stream_output(
     name: str,
     process: subprocess.Popen[str],
     dbo_split_steps: list[float] | None = None,
+    mrv2_execution_events: list[tuple[float, str, str]] | None = None,
 ) -> threading.Thread:
     def worker() -> None:
         assert process.stdout is not None
         for line in process.stdout:
             print(f"[{name}] {line}", end="")
+            if mrv2_execution_events is not None and "AFD execution: " in line:
+                mrv2_execution_events.append((time.time(), name, line))
             if (
                 dbo_split_steps is not None
                 and name == "attention"
-                and DBO_SPLIT_EVIDENCE_ENTRY in line
+                and (
+                    DBO_SPLIT_EVIDENCE_ENTRY in line
+                    or (
+                        NPU_DBO_CONTROL_ENTRY in line
+                        and "key=((0," in line
+                        and ", (1, (" in line
+                        and "is_graph_capturing=False" in line
+                        and "is_warmup=False" in line
+                    )
+                )
             ):
                 dbo_split_steps.append(time.time())
 
