@@ -23,11 +23,16 @@ if [[ "$ATTENTION_HEADLESS" == "1" ]]; then
   HEADLESS_ARGS=(--headless)
 fi
 
+DP_START_RANK_ARGS=()
+if [[ "$ATTENTION_DP_START_RANK" != "0" ]]; then
+  DP_START_RANK_ARGS=(--data-parallel-start-rank "$ATTENTION_DP_START_RANK")
+fi
+
 if [[ "$POD" == ATTENTION_* ]]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 4 \
       --data-parallel-size-local 2 \
-      --data-parallel-start-rank "$ATTENTION_DP_START_RANK" \
+      "${DP_START_RANK_ARGS[@]}" \
       --data-parallel-address "$ATTENTION_DP_ADDRESS" \
       --data-parallel-rpc-port "$ATTENTION_DP_RPC_PORT" \
       --tensor-parallel-size 1 \
