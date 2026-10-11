@@ -126,6 +126,7 @@ class Topology:
     ffn: RoleTopology
     connector: str
     baseline: bool = False
+    dbo: bool = False
 
     def role(self, role_kind: str) -> RoleTopology:
         if role_kind == ATTENTION_ROLE:
@@ -165,6 +166,7 @@ class Topology:
             ),
             connector=connector,
             baseline=args.baseline,
+            dbo=args.enable_dbo,
         )
 
 
@@ -246,6 +248,12 @@ def validate_layout(topology: Topology, layout: PodLayout) -> None:
         raise ValueError(
             f"baseline scenarios must run on one pod, got layout {layout.canonical()}",
         )
+    # TODO: support DBO across pods. Its acceptance check reads two-ubatch
+    # evidence from every role process's logs, which no single pod sees; the
+    # pods would have to publish their evidence through the rendezvous store.
+    # Until then a DBO scenario would pass on accuracy alone, so reject it.
+    if topology.dbo:
+        raise ValueError("DBO scenarios are not supported by the multi-pod runner")
 
 
 def plan(

@@ -37,12 +37,14 @@ def _topology(
     ffn_tp: int = 1,
     connector: str = P2P_CONNECTOR,
     baseline: bool = False,
+    dbo: bool = False,
 ) -> Topology:
     return Topology(
         attention=RoleTopology(ranks=attention_ranks, tp_size=attention_tp),
         ffn=RoleTopology(ranks=ffn_ranks, tp_size=ffn_tp),
         connector=connector,
         baseline=baseline,
+        dbo=dbo,
     )
 
 
@@ -140,6 +142,13 @@ def test_validate_layout_rejects_a_baseline_split_over_pods():
 def test_validate_layout_accepts_a_one_pod_baseline():
     """The one-pod baseline remains the control case."""
     validate_layout(_topology(4, 0, baseline=True), PodLayout.parse("4A0F"))
+
+
+@pytest.mark.parametrize("text", ["2A2F", "2A0F,0A2F", "1A1F,1A1F"])
+def test_validate_layout_rejects_dbo(text):
+    """DBO has no cross-pod evidence check yet, so no layout accepts it."""
+    with pytest.raises(ValueError, match="DBO scenarios are not supported"):
+        validate_layout(_topology(dbo=True), PodLayout.parse(text))
 
 
 # -- placement -----------------------------------------------------------
@@ -444,6 +453,13 @@ def test_topology_from_args_tracks_the_scenario():
     assert topology.attention == RoleTopology(ranks=2, tp_size=2)
     assert topology.ffn == RoleTopology(ranks=2, tp_size=2)
     assert topology.rendezvous_role == FFN_ROLE
+    assert topology.dbo is False
+
+
+@pytest.mark.parametrize("scenario", ["afd-graph-dbo-2a2f", "afd-v2-eager-dbo-dp2"])
+def test_topology_from_args_marks_dbo_scenarios(scenario):
+    """MRV1 and MRV2 DBO scenarios both reach validate_layout as DBO."""
+    assert Topology.from_args(_single_host_args(scenario)).dbo is True
 
 
 def test_build_env_merges_cluster_specific_variables():

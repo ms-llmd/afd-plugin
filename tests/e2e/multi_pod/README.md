@@ -108,7 +108,12 @@ line 442). Reading it top to bottom:
    laid out across pods. `validate_layout()` cross-checks the two: the
    layout's total per-role rank counts must match the topology's, and no
    role's local rank count within a pod may violate that role's TP size
-   (a TP group cannot span pods).
+   (a TP group cannot span pods). It also rejects DBO scenarios (MRV1
+   `afd-graph-dbo-*` and MRV2 `afd-v2-*-dbo-*`): the single-host runner
+   accepts a DBO run only after finding two-ubatch execution evidence in the
+   role processes' logs, and no single pod sees every role's logs. **TODO:**
+   support multi-pod DBO by having each pod publish its evidence through the
+   rendezvous store and checking the merged result before the verdict.
 
 2. **Resolve this pod's index.** `resolve_pod_index(layout.num_pods)` (from
    `identity.py`) checks, in order: an explicit `AFD_E2E_POD_INDEX`
