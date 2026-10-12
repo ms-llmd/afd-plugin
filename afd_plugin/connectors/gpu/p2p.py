@@ -732,7 +732,8 @@ class P2pNcclAFDControlPlane(AFDControlPlane):
         - On FFN ranks, one entry per Attention peer in the subgroup plus the
           concatenated total, and (when CUDA graphs are enabled) preallocated
           receive buffers so graph capture and replay reuse stable
-          allocations.
+          allocations. Hidden-state receive buffers are cached only while
+          capturing; eager steps allocate them per receive.
 
         Args:
             payload: DP metadata control-plane payload with per-stage token
@@ -801,7 +802,13 @@ class P2pNcclAFDControlPlane(AFDControlPlane):
                 src_rank,
             ), tensor_metadata in connector._recv_attn_tensor_metadata_list.items():
                 buffer_key = (stage_idx, src_rank, tuple(tensor_metadata.size))
-                if buffer_key not in connector._recv_attn_buffers:
+                # Only captured graphs need a stable receive address. Eager
+                # steps (prefill/mixed batches) see arbitrary token counts, so
+                # caching their buffers would grow FFN memory without bound.
+                if (
+                    connector.is_graph_capturing
+                    and buffer_key not in connector._recv_attn_buffers
+                ):
                     connector._recv_attn_buffers[buffer_key] = torch.empty(
                         tuple(tensor_metadata.size),
                         dtype=tensor_metadata.dtype,
