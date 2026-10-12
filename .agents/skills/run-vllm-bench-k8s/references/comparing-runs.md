@@ -5,6 +5,12 @@ comparing several of them -- most often an AFD recipe against its
 GPU-equivalent non-AFD baseline, but equally two AFD configurations
 (eager vs graph, DP2TP1 vs DP1TP2) or the same recipe across images.
 
+**Both recipes must be named explicitly by the user up front.** Never
+derive, construct, or guess a counterpart recipe (e.g. a non-AFD baseline)
+on the AFD recipe's behalf -- if the user asks for a comparison but gives
+only one recipe, stop and ask them for the second `RECIPE_SCRIPT_PATH`
+rather than building one.
+
 ## 1. Confirm the runs are comparable
 
 Read every `run.json` first. A comparison is only meaningful when the runs
@@ -33,65 +39,19 @@ Also confirm each run's report directory is genuinely its own -- one
 sweep writes one file per point, so a shorter sweep leaves the earlier run's
 files in place and the delta is computed against stale data.
 
-## 2. Deriving a baseline recipe (for AFD-vs-native comparisons)
+## 2. Run the set
 
-A baseline is the non-AFD comparison point for an AFD recipe: same model,
-same total GPU count, same eager/graph mode, same `--tensor-parallel-size`,
-but with attention and FFN merged back into ordinary non-disaggregated vLLM
-data-parallel replicas and AFD/DBO removed.
-
-Look for an existing `baseline*.sh` in the same topology directory matching
-mode + TP + total GPU count before creating anything -- e.g. under
-`qwen3_5_122b_a10b_fp8/prefill_decode_colocation/`, `baseline_graph_dp4tp1.sh`
-covers `2a2f_graph_dp2tp1.sh`. Most topology directories have no baseline
-yet, so expect to derive one; a `4a4f_..._dp2tp2` variant would need its own
-`baseline_graph_dp4tp2.sh` (8 GPUs).
-
-### The merge rule
-
-Every AFD colocation recipe has exactly one attention `vllm serve` block and
-one FFN block (identified by `"role": "attention"` / `"role": "ffn"` inside
-`--additional-config`). Replace both with a single block:
-
-| Field | Baseline value |
-|---|---|
-| `CUDA_VISIBLE_DEVICES` | union of the two device lists (same total, so `GPU_COUNT` is unchanged) |
-| `--data-parallel-size` | attention DP **+** FFN DP (equal in every existing recipe, but sum explicitly rather than assuming symmetry) |
-| `--tensor-parallel-size` | unchanged (must already match across roles; if it doesn't, stop and ask) |
-| `--additional-config` (`"afd": {...}`) | removed entirely |
-| `--enable-dbo`, `--dbo-decode-token-threshold`, `--dbo-prefill-token-threshold` | removed entirely |
-| `--enable-expert-parallel` | kept if either role had it |
-| `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len` | kept from attention (assert FFN agrees where it also sets them) |
-| eager / graph flags | kept, matching the source recipe -- never silently switch modes |
-| `--trust-remote-code`, `--host`, `--port` | kept from attention |
-| log redirect | reuse `attn.log`, or any name that is **not** `ffn.log` -- `deploy-afd-k8s` step 4c special-cases `ffn.log` to wait for `AFD FFN EngineCore started` and treats every other `*.log` as an HTTP server printing `Application startup complete` |
-
-The FFN block disappears completely: the merged worker executes both
-attention and FFN natively, which is the entire point of the comparison.
-
-### Before using a new baseline
-
-- `bash -n <script>` for syntax.
-- No leftover `"afd":`, `--enable-dbo`, `--dbo-*-token-threshold`.
-- `diff` against the source recipe's attention block: every flag that is not
-  AFD/DBO-specific and not `--data-parallel-size`/`CUDA_VISIBLE_DEVICES`
-  should be unchanged.
-
-Save beside the source recipe as `baseline_<mode>_dp<N>tp<T>.sh` and add it
-to the topology `README.md` if one tabulates baselines.
-
-## 3. Run the set
-
-Run the main skill once per recipe, **sequentially** -- every run reuses
-`vllm-pod`, `vllm-service`, and the same GPUs, so they cannot overlap. Keep
-`MODEL_ID`, `PVC_NAME`, `GPU_COUNT`, the image, and the whole workload
+Run the main skill once per recipe, **sequentially** -- each run tears down
+`vllm-pod`/`vllm-service` in its own step 9, so a second run cannot start
+until the first has finished and the previous recipe's pod/service are gone.
+Keep `MODEL_ID`, `PVC_NAME`, `GPU_COUNT`, the image, and the whole workload
 (dataset, ISL/OSL, `NUM_PROMPTS`, `SWEEP`) fixed; change only
 `RECIPE_SCRIPT_PATH` (and therefore `RUN_ID`).
 
 Reuse the same model PVC throughout so weights download once. Prefer running
 back to back on the same node: a node change between runs is a confound.
 
-## 4. Compare
+## 3. Compare
 
 Compare **per sweep point**. At low offered rate variants usually look
 alike; the interesting result is the rate at which one starts queueing and

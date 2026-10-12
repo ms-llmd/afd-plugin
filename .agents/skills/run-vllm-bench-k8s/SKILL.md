@@ -390,19 +390,21 @@ was offered.
 ### 8. Comparing several runs
 
 See [references/comparing-runs.md](references/comparing-runs.md) --
-confirming two runs are comparable, deriving the non-AFD baseline recipe to
-compare against, and reporting per-point deltas.
+confirming two runs are comparable and reporting per-point deltas. Both
+recipes being compared (e.g. an AFD recipe and its non-AFD baseline) must be
+given explicitly by the user; never derive one from the other.
 
-### 9. Leave the cluster in a known state
+### 9. Tear down the cluster
 
-`deploy-afd-k8s` leaves `vllm-pod`/`vllm-service` running on purpose so the
-next run skips the model download and graph capture. Report what is still
-up; do not delete unless asked:
+`deploy-afd-k8s` leaves `vllm-pod`/`vllm-service` running by default so a
+*follow-up* run can skip the model download and graph capture, but this
+skill's own run is done once the report is produced -- tear both down at the
+end, every time, without waiting to be asked:
 
 ```bash
 kubectl delete pod vllm-bench --ignore-not-found   # already deleted in step 5 on the happy path
-kubectl delete pod vllm-pod
-kubectl delete svc vllm-service
+kubectl delete pod vllm-pod --ignore-not-found
+kubectl delete svc vllm-service --ignore-not-found
 ```
 
 Keep `vllm-bench-reports` until every run of interest has been copied out.
