@@ -34,7 +34,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # Model integration
@@ -62,9 +62,9 @@ make a backend-specific worker class the shared model API.
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
-| NPU Async CAM stage planning | [`npu/async_cam_ubatching.py`](../../../afd_plugin/model_executor/npu/async_cam_ubatching.py) | [`test_async_cam_ubatching.py`](../../../tests/unit/model_executor/test_async_cam_ubatching.py) |
+| NPU Async CAM native DBO handoff | [`npu/async_cam_dbo.py`](../../../afd_plugin/model_executor/models/npu/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | Attention-gate unit cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
-| Ascend CAM layout and execution sidecar | [`npu/async_cam_layout.py`](../../../afd_plugin/model_executor/models/npu/async_cam_layout.py) | [`test_async_cam_layout.py`](../../../tests/unit/model_executor/test_async_cam_layout.py) |
+| Ascend CAM dispatch layout | [`npu/async_cam_layout.py`](../../../afd_plugin/model_executor/models/npu/async_cam_layout.py) | [`test_async_cam_layout.py`](../../../tests/unit/model_executor/test_async_cam_layout.py) |
 | DeepSeek Ascend stage metadata ownership | [`npu/deepseek_attention_metadata.py`](../../../afd_plugin/model_executor/models/npu/deepseek_attention_metadata.py) | [`test_deepseek_attention_metadata.py`](../../../tests/unit/model_executor/test_deepseek_attention_metadata.py) |
 | Ascend CAM orchestration | [`npu/deepseek_v2_async_cam_forward.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py) | Async/ubatch unit cases and [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
 
@@ -142,6 +142,31 @@ connector validates one-dimensional `torch.int32` input IDs and preallocates
 their receive buffers for graph execution. This boundary currently has
 focused unit coverage but no repository model or accuracy E2E case.
 
+### DeepSeek V4 Ascend boundary
+
+[`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py)
+wraps the native Ascend model independently of the CUDA adapter. Attention
+owns attention, mHC, normalization and finalization. Synchronous CAMP2P sends
+normalized hidden states and Hash-layer token IDs to FFN, which owns the
+native gate and MoE. Async CAM keeps the Hash/top-k router and shared experts
+on Attention and sends only routed-expert work; `dynamicQuant=1` is required.
+
+Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
+replicated shared weights when effective model SP is enabled. DeepSeek-V4
+instead uses `AFDDeepseekV4SharedExperts` to preserve the native policy:
+TP-sharded weights need all-gather/reduce-scatter around SP computation, or
+all-reduce without SP; replicated shared weights compute local SP tokens,
+or split/gather replicated input tokens without SP. The W8A8 fused arithmetic
+adapter preserves the shared MLP's clamp and activation parameters. This is
+separate from the optional routed W4A8 layered executor's unresolved nonzero
+`swiglu_limit` behavior.
+
+The synchronous DSV4 E2E profiles check concurrent serving but disable answer
+checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
+an exact-answer smoke case; current native DBO still requires model accuracy
+qualification. See
+[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+
 ### Qwen3 MoE CUDA boundary
 
 `AFDQwen3MoeModel` uses the native `decoder_layer_type` injection hook. The
@@ -188,15 +213,13 @@ runner install the same `additional_kwargs` entry, and restores the original
 function in `finally`. This is a scoped compatibility adapter, not a permanent
 global provider.
 
-Async MoE ubatching uses a second sidecar key,
-`afd_async_moe_ubatch_metadata`, containing upstream Attention metadata and
-plugin-owned stage descriptions. The generic adapter owns only `afd_metadata`;
-the NPU sidecar and layout conversion live in `models/npu/async_cam_layout.py`,
-while `model_executor/npu/async_cam_ubatching.py` contains the pure NPU execution
-planner. Both the sidecar shape and the live connector reference are
-**draft** while metadata ownership is discussed in
-[#88](https://github.com/JiusiServe/afd-plugin/issues/88) and payload state is
-split under [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
+Async CAM reuses native DBO child slices, attention metadata and execution. The generic adapter
+installs `afd_metadata` on the native child context; CAM transfer metadata and
+TP/SP layout conversion remain necessary for the communication boundary in
+`models/npu/async_cam_layout.py`. The single-window receive hook lives in
+`models/npu/async_cam_dbo.py`. Metadata ownership and the live connector reference
+remain **draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88)
+and [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 
 ## Model execution flow
 
@@ -211,8 +234,8 @@ dispatches to the selected decoder layer. Normal mode executes that layer's
 MLP. Attention-side-gate mode requires connector-produced group/routing and
 quantization metadata and executes the Ascend routed-expert path. Async CAM
 returns only routed output in `AFDF2ATransferPayload`; Attention owns the
-native shared MLP, uses replicated weights on its local tokens, and adds
-the shared result after restoring the routed token layout. Pending stages
+shared MLP with the model-specific TP/SP policy above and adds its result
+after restoring the routed token layout. Pending stages
 retain separate shared tensors; failed forwards discard pending routing references.
 
 ```mermaid
@@ -240,15 +263,12 @@ sequenceDiagram
     AttentionLayer->>AttentionLayer: Continue residual/layer pipeline
 ```
 
-CAM async has two model-side variants:
-
-- the standard gate path keeps dense layers on Attention, sends only MoE
-  layers with top-k payloads, and delays the matching FFN receive until it is
-  needed;
-- the experimental two-stage request-boundary path runs dense layers once,
-  slices the MoE region by request, installs stage-specific forward context,
-  pipelines send/receive across the two stages, and restores parent context
-  state on exit.
+CAM async uses the same model forward for unsplit execution and native DBO
+children. Dense layers remain local to Attention and run on each child's
+tokens. MoE sends top-k payloads through `send_async_cam_remote_call()`;
+native peer receive hooks reclaim the single CAM window before another send.
+Only the resumed owner restores layout, performs TP collectives, and adds its
+shared output. Native DBO owns all microbatch boundaries.
 
 Connector ordering, work items, and transport buffers remain owned by
 [connector contracts](connector_contracts.md); graph and DBO mechanics remain
@@ -279,7 +299,7 @@ the other role can be omitted from model/accuracy E2E coverage.
 
 - Missing `afd_metadata` on an AFD path fails explicitly; an AFD model alias is
   not an implicit local-forward fallback.
-- AFD paths that require a connector, top-k payload, group list, or async stage
+- AFD paths that require a connector, top-k payload, group list, or native child
   metadata fail when that input is missing.
 - DeepSeek V4 fails when its remote boundary lacks token-aligned input IDs or
   when those IDs have the wrong shape/dtype for P2P transfer.
@@ -312,7 +332,7 @@ forward-context contract. Run model unit tests and the affected GPU/NPU model
 and accuracy E2E paths; weight-loading changes require role-specific evidence.
 Forward-context mutations require restoration/error-path tests, and an
 architecture registration change requires package registration plus checkpoint
-load evidence. A unit-only architecture such as the current DeepSeek V4 path
+load evidence. A unit-only boundary such as the current CUDA DeepSeek V4 path
 must not be described as hardware-validated without new E2E evidence.
 
 ## Limitations and open issues
@@ -324,7 +344,7 @@ remain linked to
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and
 [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 
-The current `AFDForwardContextMetadata` shape, connector reference, async MoE
-sidecar, and architecture aliases remain **draft**. They describe the working
+The current `AFDForwardContextMetadata` shape, connector reference, native
+child-context adapters, and architecture aliases remain **draft**. They describe the working
 pinned implementation and must not be used as an independent extension promise
 until the linked issues and owner review are complete.

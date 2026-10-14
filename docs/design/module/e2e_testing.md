@@ -7,6 +7,8 @@ owners:
 primary_code_paths:
   - "tests/e2e/runner.py"
   - "tests/e2e/process_utils.py"
+  - "tests/e2e/environment.py"
+  - "tests/e2e/mrv2_evidence.py"
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/**"
 related_code_paths:
@@ -44,7 +46,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
 related_issues: []
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # E2E testing
@@ -64,6 +66,8 @@ operator tests, benchmarks, and performance tests are outside this scope.
 tests/e2e/
 ├── models/<model>/test_*.py  # Test entries and case lists
 ├── accuracy/<task>.py       # Accuracy tool and result parsing
+├── environment.py           # Backend and role launch environment
+├── mrv2_evidence.py          # Live native two-stage execution evidence
 ├── runner.py                # Service startup, evaluation, and cleanup
 └── process_utils.py         # Process-group termination and reaping
 ```
@@ -108,6 +112,8 @@ cleanup. Production code does not depend on the E2E harness.
 | `afd-v2-graph-dp2` | CUDA ModelRunnerV2 graph, Attention DP2 + FFN DP2 | 4 | V2 data-parallel full-decode graph path. |
 | `afd-v2-eager-tp2` | CUDA ModelRunnerV2 eager, Attention TP2 + FFN TP2 | 4 | V2 tensor-parallel lifecycle and accuracy. |
 | `afd-v2-graph-tp2` | CUDA ModelRunnerV2 graph, Attention TP2 + FFN TP2 | 4 | V2 tensor-parallel full-decode graph path. |
+| `afd-v2-eager-dbo-dp2` | CUDA ModelRunnerV2 eager DBO, Attention DP2 + FFN DP2 | 4 | Live two-stage execution with matching A/F layouts. |
+| `afd-v2-graph-dbo-dp2` | CUDA ModelRunnerV2 graph DBO, Attention DP2 + FFN DP2 | 4 | Live two-stage execution and consecutive FULL graph replays. |
 
 CUDA CI runs the legacy and ModelRunnerV2 matrices as separate jobs with a
 40-minute timeout each. Put slower coverage in a scheduled job.
@@ -132,7 +138,9 @@ should be removed when the runtime supports graceful cancellation.
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
 W4A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
-It uses eager async CAM with two token-split MoE ubatches and MBT=8192. It validates
+It uses eager async CAM and MBT=8192. Its checked-in legacy ubatching flag
+enables two native DBO children on Attention; `async_moe_split="token"` is
+accepted but ignored. Native DBO requires target-device validation. It validates
 ten simultaneous chat requests, records their outputs and overlapping
 request intervals, and checks service liveness and cleanup. Its cancellable
 async HTTP client saves per-request responses/errors even on failure or
@@ -184,13 +192,19 @@ unverified.
 | Task | GSM8K | GSM8K |
 | Few-shot examples | 8 | 8 |
 | Generated-token limit | 512 | 512 |
-| Samples | first 7; DBO gates floor at 24 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
+| Samples | first 7 for ordinary cases; legacy DBO floors at 24; MRV2 DP2 eager/DBO comparison defaults to 128 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
-| Cases | four legacy cases plus four CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
+| Cases | four legacy cases plus six CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
-An accuracy of `0.27` requires at least 2 correct answers out of 7 (7 out
-of 24 in DBO scenarios).
+An accuracy of `0.27` requires at least 2 correct answers out of 7, 7 out of
+24, or 35 out of 128. The DeepSeek smoke threshold of `0.25` requires 6 out
+of 24; the lower threshold applies only at sample counts up to 24.
+
+`afd-v2-eager-dp2`, `afd-v2-eager-dbo-dp2`, and
+`afd-v2-graph-dbo-dp2` form the baseline/eager-DBO/graph-DBO comparison.
+`V2_DBO_SAMPLE_LIMIT=128` and 12 concurrent requests are selected by
+`runner.py`; the explicit local sample override still floors at 24.
 
 - PR and weekly CI leave `AFD_GSM8K_LIMIT` unset.
 - Set `AFD_GSM8K_LIMIT=all` locally for a full 1319-sample run.

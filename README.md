@@ -57,8 +57,8 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
-| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. V2-Lite and DSV4 Flash W4A8 have [representative v0.30 validation](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923). The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. V2 DBO is eager-only with two ubatches and Attention DP > 1. See the [CAMP2P guide](docs/npu/CAM_P2P_CONNECTOR_USER_GUIDE.md). |
+| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental eager DP+TP/SP path with native two-microbatch DBO on Attention, including DP1. FFN remains connector-driven; PCP/DCP are unsupported. See the [Async CAM guide](docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md) for configuration and validation limits. |
 
 Connector implementations are grouped by backend package:
 `afd_plugin.connectors.gpu` for GPU-only connectors,
@@ -70,11 +70,7 @@ Known gaps:
   claimed as supported on GPU.
 - NPU hardware evidence covers representative DeepSeek-V2-Lite and DSV4
   Flash W4A8 deployments; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
-  Other models and topologies remain unverified. Historical v0.26 results retain
-  their recorded vLLM-Ascend `80d8c194f` environment.
-- NPU MRV2 many-to-one padding and DSV2 Async SP with TP-sharded shared
-  experts have known correctness defects deferred to separate fixes; see the
-  [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
+  Other models and topologies remain unverified.
 - Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
   incorrect. See the [profile limits](tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 - GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with
@@ -82,11 +78,12 @@ Known gaps:
   `FULL_DECODE_ONLY`. H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
   see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
   Representative 300-question comparisons do not establish numerical
-  equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix). NPU MRV2 DBO is unsupported.
+  equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
-- Native DBO is limited to exactly two ubatches and is not supported by
-  `CAMAsyncAFDConnector`.
+- Native DBO is limited to exactly two ubatches. NPU MRV2 DBO requires eager
+  execution; Async CAM enables DBO only on Attention. Its current native DBO
+  path still needs target-device model qualification.
 - Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
   MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
 - Qwen3.5/Qwen3.6 MoE adapter-family support is limited to the CUDA text-only
@@ -95,8 +92,6 @@ Known gaps:
   `compute_gate_on_attention=true`, pipeline parallelism, asynchronous and
   multi-node execution are unsupported; quantization is unverified; no
   performance claim is made.
-- PCP-based NPU model-runner-v1 deployments from v0.19.1rc1 are not supported
-  on v0.30.
 
 ## Install
 
@@ -148,7 +143,7 @@ and torch-npu 2.10.0.post4. The repository does not claim a released container
 tag for either target. Use the
 [installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6/docs/source/getting_started/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
-repository root. Do not reuse the former v0.19.1rc1 image as a v0.30 runtime.
+repository root.
 
 #### Install AFD
 

@@ -123,7 +123,7 @@ Examples:
 
 ## Minimal launch shape
 
-Select the supported vLLM model runner before starting either GPU role:
+The following DP1 + DBO example selects ModelRunnerV1 on both GPU roles:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -164,6 +164,38 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /path/to/model \
 The HTTP ports (`18000` / `18001` above) are vLLM service ports and are separate from the AFD NCCL rendezvous base port (`6239`). Use distinct CUDA devices for the two roles.
 
 For complete `1A1F`, `2A2F`, `4A4F`, eager, DBO, and CUDA graph examples, see `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite`.
+
+## ModelRunnerV2
+
+Set `VLLM_USE_V2_MODEL_RUNNER=1` on both roles to select the V2 pairing.
+Only Attention uses the native V2 runner; FFN remains connector-driven.
+Current validation requires FFN-side gating, static EP, PP=PCP=DCP=1,
+role-rank totals equal to DP x TP, and a registered AFD architecture. Elastic
+EP, EPLB, sequence-parallel MoE and compile SP are rejected.
+
+Eager and `FULL_DECODE_ONLY` graph execution are accepted. V2 DBO requires
+exactly two microbatches and Attention DP > 1, so the DP1 + DBO launch above
+cannot be converted by changing only the environment variable. Use the DP2
+cases in [the E2E runner](../../tests/e2e/runner.py):
+`afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`. The generic V2 gate also
+covers eager/graph DP2 and TP2 without DBO. Model-specific exclusions still
+apply; a registered model is not evidence that every topology is qualified.
+
+## Receive buffers and memory
+
+FFN retains hidden-state receive buffers only for graph-capture shapes.
+Eager prefill/mixed steps allocate these buffers per receive, preventing a
+persistent hidden-state allocation for every observed token count. Captured
+buffers keep stable addresses for replay and are released on connector close.
+This is not a general cache-size limit: the smaller input-ID receive cache
+still retains per-shape entries when graphs are enabled, and graph storage
+is owned separately by the FFN runner.
+
+FFN replays a cached graph only when Attention's control payload explicitly
+sets `is_graph_replaying` and the graph key matches. A matching token shape
+alone does not authorize replay. These behaviors are covered by the
+[connector tests](../../tests/unit/connectors/test_p2p_connector.py) and
+[FFN graph-policy tests](../../tests/unit/v1/worker/test_cuda_graph.py).
 
 ## Requirements and limitations to document in code
 

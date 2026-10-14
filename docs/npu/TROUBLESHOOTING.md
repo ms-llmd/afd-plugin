@@ -93,6 +93,11 @@ export HCCL_CONNECT_TIMEOUT=3600
 
 Apply the same timeout to every process.
 
+AFD group rendezvous also has its own `afd_process_group_timeout_s` setting
+(default 120 seconds) inside `additional_config["afd"]`. It does not inherit
+`HCCL_CONNECT_TIMEOUT`; neither setting is a guaranteed deadline for a device
+kernel polling CAM completion flags.
+
 ## The first CAM async request hangs
 
 `CAMAsyncAFDConnector` requires AFD async-DP on every role:
@@ -119,6 +124,12 @@ Do not reduce `HCCL_BUFFSIZE` below the value used by the validated recipe. CAM
 dispatch uses capacity-sized buffers, so a small request can still require the
 full communication buffer.
 
+If `connector_extra_config.hccl_buffer_size` is set, align `HCCL_BUFFSIZE`
+with it on every rank. The former sizes the HCCL domain; the latter is read by
+AFD host tiling for capacity and window-tail addresses. A mismatch can affect
+correctness even when HCCL allocation succeeds. After changing native
+operators, rebuild both the extension and vendor package on every node.
+
 Sequence parallel deployments can also fail intermittently when asynchronous
 kernel launch is enabled. Use:
 
@@ -140,7 +151,7 @@ procedure.
 
 ## Inspect async MoE split shapes
 
-For request- or token-split ubatching, enable the shape-only diagnostic on the
+For native DBO ubatching, enable the shape-only diagnostic on the
 Attention process:
 
 ```bash
@@ -149,3 +160,16 @@ export AFD_ASYNC_MOE_LAYOUT_LOG=1
 
 The log reports token extents, padding, CAM-local slices, and FFN result
 gathering. Disable it after diagnosis to keep normal service logs concise.
+
+`async_moe_split="request"` or `"token"` no longer selects a split policy; the
+legacy field logs a warning and native DBO owns boundaries. Enable DBO only on
+Attention, with exactly two ubatches and both token thresholds at least two.
+For DeepSeek-V2/V3, enable chunked prefill to handle requests crossing the
+child boundary. NPU MRV2 DBO requires eager execution; synchronous CAMP2P
+additionally requires Attention DP > 1, while Async CAM permits DP1.
+
+An `NPU DBO peer failed` or `Async CAM receive failed` error means the
+host-side handoff was aborted. Restart the A/F worker group; waking the peer
+does not recover a partially used device window. Use the
+[executor tests](TESTING.md#native-dbo-contracts-and-device-execution) to
+separate thread/stream failures from communication and model correctness.

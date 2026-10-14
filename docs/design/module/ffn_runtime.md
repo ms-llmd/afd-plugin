@@ -6,6 +6,7 @@ owners:
   - "@hsliuustc0106"
   - "@jiangkuaixue123"
 primary_code_paths:
+  - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
@@ -21,6 +22,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_device_contract.py"
@@ -44,7 +46,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # FFN runtime
@@ -85,14 +87,14 @@ cross-device inheritance chain.
 CUDA launch shape:
 
 ```bash
-vllm serve <model> \
+vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"ffn","connector":"P2pNcclAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
 Ascend launch shape:
 
 ```bash
-VLLM_PLUGINS=ascend,afd vllm serve <model> \
+VLLM_PLUGINS=ascend,afd vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"ffn","connector":"CAMP2pAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
@@ -142,11 +144,14 @@ execution:
 - Both workers run the same V2 topology and feature validator as the paired
   Attention role before constructing communication resources.
 
-The V2 pair therefore requires the synchronous platform connector,
-`compute_gate_on_attention=false`, PP/PCP/DCP size 1, configured role ranks
-equal to DP x TP, static EP, and a registered AFD model. CUDA supports exactly
-two native microbatches with Attention DP > 1; Ascend V2 rejects DBO and
-ubatching. CUDA uses `P2pNcclAFDConnector`; Ascend uses `CAMP2pAFDConnector`. These limits
+The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
+static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
+FFN-side gating and supports two native microbatches with Attention DP > 1.
+Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
+with Attention-side gating. Ascend V2 DBO is eager-only: CAMP2P requires
+Attention DP > 1 and matching two-stage FFN control metadata; Async CAM also
+supports Attention DP1 but rejects native DBO flags on FFN. Async FFN continues
+to receive work items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
 ## Daemon step selection
@@ -221,6 +226,15 @@ control-plane receive. For each layer, the runner:
 CAM async is eager-only and does not use the FFN graph-control path; the graph
 cache is keyed by DP metadata, which does not exist without a control plane.
 
+With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 layers instead
+use `AsyncCAMW4A8Executor`: the runner passes capacity-sized payloads, device
+expert counts, and device layer IDs directly from receive through the layered
+GMMs to combine-send. The ordinary path above materializes the work item's
+layer/count information on the host. Both paths retain worker-level
+synchronization after a work-item group. MRV2 pairing does not prohibit the
+layered path. Its nonzero `swiglu_limit` limitation and validation scope are
+documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+
 ## Control-plane-driven forward
 
 The current runner contract for one control payload is:
@@ -281,8 +295,8 @@ capture, and replay:
 - warmup runs FFN compute after applying control state;
 - capture applies connector control state before entering the formal device
   graph so control-plane work is not replayed;
-- replay runs an existing graph for the matching key;
-- a missing graph falls back to eager execution.
+- replay requires `is_graph_replaying=true` and an existing matching key;
+- a missing graph or an eager Attention payload runs eagerly.
 
 The Attention control payload is the source of warmup/capture flags. Device
 graph objects, pools, supported modes, and exact cache behavior are specified
@@ -339,9 +353,10 @@ and registered role-aware model integrations. V1 native DBO accepts exactly
 two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
 V2-compatible construction and forward-context seam. CUDA FFN consumes the
 two-stage control layout and replays the matching graph when requested;
-Ascend V2 rejects DBO/ubatching. CAM async
-instead uses eager connector work items and may enable its distinct two-stage
-MoE pipeline. Platform-specific limits are centralized in
+Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
+CAM async instead uses eager connector work items; native DBO runs only on
+Attention and does not create a separate FFN stage scheduler.
+Platform-specific limits are centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the

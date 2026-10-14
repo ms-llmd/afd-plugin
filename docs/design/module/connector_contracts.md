@@ -20,7 +20,7 @@ validation_paths:
   - "tests/unit/connectors/**"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/unit/distributed/**"
 upstream_refs:
   - "vLLM vllm.forward_context.DPMetadata"
   - "vLLM vllm.distributed.parallel_state"
@@ -34,7 +34,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # Connector contracts
@@ -92,8 +92,14 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | Connector | Accepted connector-specific fields |
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
-| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, and `quant_mode`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
-| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, `async_moe_ubatching`, `async_moe_num_ubatches`, and `async_moe_split`. Runtime validation further limits dynamic quantization and the optional request/token stage pipeline. |
+| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
+| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and legacy `async_moe_ubatching`, `async_moe_num_ubatches`, `async_moe_split`. The enable flag aliases native Attention DBO, only two ubatches are accepted, and the request/token split selector is ignored with a warning. |
+
+The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
+AFD rendezvous. `hccl_buffer_size` sizes connector-owned HCCL domains in MB;
+it does not resize unrelated vLLM groups. For Async CAM, also set
+`HCCL_BUFFSIZE` to the same size because native host tiling reads the process
+environment rather than querying the allocated domain.
 
 The common `compute_gate_on_attention` field remains on `AFDConfig` and is the
 model-routing selector. CUDA P2P supports both values. CAMP2P also parses a
@@ -134,10 +140,10 @@ construction, while CAM async leaves it as `None`.
 | `init_afd_connector()` | Owning worker/runner creates backend groups, communicators, operator registrations, and topology-derived state after the device runtime is ready. |
 | `is_initialized` | Reports whether backend communication resources are usable. |
 | `close()` | Owning runtime releases connector-owned resources during shutdown; cleanup is expected to be safe after partial initialization. |
-| `send_attn_output(hidden_states, metadata, **kwargs)` | Attention sends one layer/stage tensor and transfer description, plus model-owned optional routing logits or token-aligned input IDs. |
-| `recv_ffn_output(**kwargs)` | Attention receives the matching FFN result. |
-| `recv_attn_output(ubatch_idx=None, **kwargs)` | FFN receives an `AFDA2FTransferPayload`. |
-| `send_ffn_output(ffn_output, metadata, **kwargs)` | FFN returns a result using metadata/state from the matching receive. |
+| `send_attn_output(hidden_states, context, **kwargs)` | Attention sends one layer/stage tensor and `AFDTransferContext`, plus model-owned optional routing logits or token-aligned input IDs. |
+| `recv_ffn_output(ref_tensor, ubatch_idx=0, **kwargs)` | Attention receives the matching FFN result using the reference tensor and stage identity. |
+| `recv_attn_output(ubatch_idx=0, **kwargs)` | FFN receives an `AFDA2FTransferPayload`. |
+| `send_ffn_output(ffn_output, context, **kwargs)` | FFN returns a result using the `AFDTransferContext` from the matching receive. |
 
 `AFDControlPlane` is a separate abstract surface reached through
 `connector.control_plane`:
@@ -161,21 +167,22 @@ The current plugin-owned objects are:
 | Object | Current responsibility | Stability |
 | --- | --- | --- |
 | `AFDDPMetadata` | CPU token counts plus DP/SP-compatible sizing helpers. It adapts upstream-like metadata into a plugin-owned representation. | Wire representation is the candidate contract; helper surface is draft. |
-| `AFDControlPayload` | Stage-to-DP-metadata mapping plus graph-capture, warmup, and profile flags. | Candidate control envelope. |
-| `AFDTransferMetadata` | Layer, stage, positive split lengths, total-token validation, and optional backend state. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88). |
+| `AFDControlPayload` | Stage-to-DP-metadata mapping plus graph-capture, replay, warmup, and profile flags. | Candidate control envelope. |
+| `AFDTransferMetadata` | Layer, stage, positive split lengths, and total-token validation; backend state is paired separately in `AFDTransferContext`. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88). |
+| `AFDTransferContext` | Pairs common `metadata` with the backend `states` retained from receive through the matching send. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and [#105](https://github.com/JiusiServe/afd-plugin/issues/105). |
 | `AFDTransferState` | Empty base for backend-specific state such as CAMP2P handles or async CAM state. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88). |
 | `AFDA2FTransferPayload` | Attention-to-FFN hidden states, common metadata, and optional router logits or token-aligned input IDs. | **Draft** and scheduled for state splitting in [#105](https://github.com/JiusiServe/afd-plugin/issues/105). |
 | `AFDF2ATransferPayload` | Structured routed/shared FFN outputs where the backend needs both. | **Draft** with the transfer-state work. |
 | `AFDForwardContextMetadata` | Stage/slice information and a live connector reference used by model execution. | **Draft**; model-facing ownership is unresolved. |
 
 The control-plane codec serializes only plugin-owned primitive data: integer
-stage keys, token-count lists, max counts, and graph/warmup/profile boolean
+stage keys, token-count lists, max counts, and graph-capture/replay/warmup/profile boolean
 flags. It encodes JSON,
 sends a size followed by a `uint8` tensor, and reconstructs
 `AFDControlPayload`; it does not serialize a vLLM `DPMetadata` object. Tensor
 data-path layout remains connector-specific.
 
-`AFDTransferMetadata` is passed from receive through compute to the matching
+`AFDTransferContext` is passed from receive through compute to the matching
 send. The caller must not discard or substitute the matching
 `AFDTransferContext.states` value while a backend operation still depends on
 it. The concrete contents and ownership of
@@ -278,6 +285,15 @@ the control plane does not have an independent lifetime. Model code may invoke
 connector data-path methods through forward metadata but does not own those
 resources.
 
+CUDA FFN hidden-state receive buffers are retained only for graph-capture
+shapes, keyed by stage, peer, and tensor shape. Eager prefill/mixed batches
+allocate receive buffers per call rather than adding every token count to a
+persistent cache. Graph-owned addresses remain valid until connector cleanup.
+The input-ID cache still records shapes when graphs are enabled, including
+eager fallback shapes; it does not yet share the hidden-state retention policy.
+See [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py)
+for capture-address reuse and eager-cache regression coverage.
+
 ## Failure behavior
 
 - Invalid connector names, subclasses, role ranks, or topology fail before
@@ -329,9 +345,7 @@ metadata/state ownership is divided remain open. See
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and
 [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 
-The `AFDControlPlane` split removes control-plane methods from
-`AFDConnectorBase`, so CAM async no longer implements semantic no-ops. Its
-connector-driven work-item methods still live outside the abstract base. The
+Connector-driven work-item methods still live outside the abstract base. The
 configuration allow-list is not derived from the factory registry, and
 `AFDA2FTransferPayload` combines common data with backend state.
 Connector-owned typed configuration implements the decision from

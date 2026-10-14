@@ -29,6 +29,9 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_device_contract.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
+  - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
+  - "tests/unit/model_executor/test_async_cam_dbo.py"
+  - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
@@ -49,7 +52,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # Attention runtime
@@ -84,14 +87,14 @@ worker for the active platform when `worker_cls="auto"`.
 CUDA launch shape:
 
 ```bash
-vllm serve <model> \
+vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"attention","connector":"P2pNcclAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
 Ascend launch shape:
 
 ```bash
-VLLM_PLUGINS=ascend,afd vllm serve <model> \
+VLLM_PLUGINS=ascend,afd vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"attention","connector":"CAMP2pAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
@@ -153,11 +156,11 @@ The supported V2 deployment is deliberately narrower than V1:
 | Connector | Synchronous `P2pNcclAFDConnector` | Synchronous `CAMP2pAFDConnector` | `CAMAsyncAFDConnector`; `async=true` |
 | Gate placement | `compute_gate_on_attention=false` | `compute_gate_on_attention=false` | `compute_gate_on_attention=true` |
 | Parallelism | PP=PCP=DCP=1; configured role ranks equal DP x TP; static EP enabled | Same | Same; `attn_ranks_per_dp` equals Attention TP |
-| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Same, plus native DBO and ubatching | Elastic EP, EPLB, native DBO/ubatching, native draft models/MTP, finegrained TP, and shared-expert DP |
+| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Same | Elastic EP, EPLB, native draft models/MTP, finegrained TP, and shared-expert DP |
 | Sequence parallelism | Unsupported | Unsupported | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
-| Native DBO | Exactly two microbatches, Attention DP > 1 | Unsupported | Unsupported |
-| AFD async MoE ubatching | Not applicable | Not applicable | Optional; exactly two request or token stages; token mode requires Attention TP > 1 |
-| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY` | Eager only on both roles |
+| Native DBO | Exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
+| AFD async MoE ubatching | Not applicable | Not applicable | Legacy alias for native DBO; split selector is ignored |
+| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; graphs require a single batch | Eager only on both roles |
 | Model | Must resolve to a registered AFD architecture | Same | Registered DeepSeek-V2/V3 MLA or DeepSeek-V4; V4 requires `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
@@ -169,8 +172,7 @@ The generic V2 E2E harness remains CUDA-only.
 
 For Ascend V2 Async CAM, the supported contract and launch settings are in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
-The synchronous and historical V1 validation records above do not validate
-every V2 Async CAM model or SP topology.
+V2 Async CAM model and SP topology qualification requires dedicated device tests.
 
 ## Request and forward flow
 
@@ -244,25 +246,22 @@ sidecar to the context created by the upstream runner. The shared metadata
 mixin supplies the ordinary single-stage and graph-control behavior. V1
 native ubatching still gives each child context stage-local metadata.
 
-Ascend V2 Async CAM uses `async_cam_metadata_v2.py` to build stage-local
-attention metadata with native builders and vLLM slicing, then reuses the
-model's existing two-stage CAM pipeline. Each stage context carries its real
-token count separately from TP/SP padding. This does not enable native DBO.
+Ascend V2 Async CAM uses `NPUUBatchRunner` to adapt native DBO child inputs to
+Ascend attention builders. Native slicing, execution threads and output merge
+are reused at DP1 and DP > 1. Each child context carries its real token count
+separately from TP/SP padding and starts with `dp_metadata=None`.
 
 When vLLM does not produce `DPMetadata` for DP size 1, the shared provider
 creates `AFDDPMetadata` from the pending stage token count. DP greater than 1
-requires native DP metadata on the ordinary request path.
-
-The previous NPU design described a separate forward-context metadata mirror.
-That is no longer the contract: current CUDA and Ascend model paths read the
-canonical `additional_kwargs` entry.
+requires native DP metadata for synchronous control-plane connectors. Async
+CAM children skip model-side DP coordination; FFN consumes connector work items.
 
 ## Control-plane coordination
 
 When `connector.control_plane` is not `None`, the runner sends an
 `AFDControlPayload` through that `AFDControlPlane` before model/data-plane
 transfer. The payload contains a stage-indexed DP metadata map plus
-`is_warmup`, `is_graph_capturing`, and `is_profile` flags.
+`is_warmup`, `is_graph_capturing`, `is_graph_replaying`, and `is_profile` flags.
 
 - A non-ubatched request sends stage `0` and uses native or fallback DP
   metadata.
@@ -295,28 +294,32 @@ without loading FFN expert/MLP components on this role.
 The documented `CAMAsyncAFDConnector` configuration uses
 `compute_gate_on_attention=true`. Attention computes MoE routing data and sends
 hidden states together with `topk_weights`, `topk_ids`, and optional
-`router_logits`. FFN receive is delayed until the next layer when possible,
-which permits CAM dispatch/combine overlap. Dense layers remain local to the
+`router_logits`. Native DBO receive hooks reclaim CAM's single window before a
+peer dispatch and let the resumed owner consume its result. Dense layers remain local to the
 Attention model path.
 
-The optional `async_moe_ubatching` mode is distinct from vLLM native DBO. It:
+The legacy `async_moe_ubatching` option is an alias for vLLM native DBO. It:
 
 - requires `compute_gate_on_attention=true`;
-- uses exactly two request-boundary or token-balanced stages;
-- keeps real token ranges separate from stage-local TP/SP padding;
-- runs the dense prefix before the split;
-- pipelines stage Attention send and FFN receive through the MoE layers;
-- rejoins stage outputs after the pipeline;
+- uses exactly two native microbatches, including Attention DP1;
+- keeps real token ranges separate from child-local TP/SP padding;
+- runs ordinary model forwards, including dense layers, on native children;
+- coordinates CAM send/receive through native peer receive hooks;
+- merges child outputs through the existing DBO runner;
 - does not synchronize stage eligibility across asynchronous DP replicas;
 - does not support prefill or decode context parallel metadata.
 
-The Attention runner calls the device-independent planner in
-`model_executor/npu/async_cam_ubatching.py`; the NPU model path applies the plan
-through `models/npu/async_cam_layout.py`. FlashComm1/SP is Attention-local and
+Native DBO owns request/token boundaries; `async_moe_split` is deprecated and
+ignored. Enable DBO on Attention only; Async FFN rejects native DBO flags and
+continues its work-item loop. For DeepSeek-V2/V3, enable chunked prefill so a
+request crossing a native microbatch boundary can attend to its prefix KV.
+`models/npu/async_cam_layout.py` retains only communication layout
+conversion, and `models/npu/async_cam_dbo.py` supplies the single-window receive
+hook. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.
 
-CAM async requires eager execution and rejects vLLM native ubatching. Its
+CAM async requires eager execution. Its
 feature limits are recorded in the
 [platform matrix](execution_platforms.md#tested-runtime-matrix).
 
@@ -335,9 +338,12 @@ the platform wrapper send the exact per-stage shape. CUDA Graph, ACL Graph,
 stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
-CUDA V2 supports exactly two native microbatches with Attention DP > 1;
-Ascend V2 rejects native DBO and ubatching but allows model-local async MoE
-ubatching with Async CAM. For full-graph capture, the V2 runner
+CUDA V2 supports exactly two native microbatches with Attention DP > 1.
+Ascend V2 supports exactly two native microbatches in eager execution:
+synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports
+Attention DP1. Ascend V2 DBO graph capture and replay remain unsupported.
+
+For full-graph capture, the V2 runner
 wraps native input preparation and publishes one warmup and one capture
 payload per descriptor. CUDA two-stage preparation installs separate AFD
 metadata on both native stage contexts and sends their complete layout before
@@ -386,12 +392,18 @@ the matching platform and connector tests as well.
 Current shared limits are the supported vLLM release and registered role-aware
 model integrations. V1 native ubatching accepts exactly two ubatches. V2
 requires static EP and no PP/CP. CUDA V2 requires a synchronous control-plane
-connector and supports the two-microbatch path above. Ascend V2 also supports
-eager Async CAM with optional model-local MoE stages; native DBO/ubatching
-remains excluded. Hardware evidence remains limited to the recorded model and
+connector and supports the two-microbatch path above. Ascend V2 supports eager
+native DBO with exactly two microbatches: synchronous CAMP2P requires Attention
+DP > 1, while Async CAM supports Attention DP1 or DP > 1. Ascend V2 DBO graphs
+remain unsupported. Hardware evidence remains limited to the recorded model and
 configuration cells.
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
+
+Async CAM DBO has local contract coverage. The next hardware gate needs
+DP1/DP > 1, plain TP/model SP, uneven
+prefill lengths, and requests crossing a child boundary, with live two-child
+execution evidence and baseline output comparison.
 
 This document does not decide the runtime refactor, connector metadata
 ownership, or transfer metadata/state shape. See

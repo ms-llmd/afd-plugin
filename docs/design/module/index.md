@@ -24,7 +24,7 @@ verified_platform_refs:
   - "Ascend: current target in root installation instructions; V2-Lite and DSV4 Flash W4A8 evidence in the execution-platform matrix; older environments remain historical"
 related_issues:
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # AFD module design
@@ -34,6 +34,12 @@ document declares its own status. A document remains `draft` until its owners
 verify boundaries, invariants, and validation evidence. The documents record
 plugin, role runtime, connector, model, platform, compatibility, and E2E
 testing contracts; open interfaces remain explicitly draft.
+
+The 2026-10-13 source review is based on AFD `36dadb4`, vLLM `0.30.0`
+(`ced6857a`), and the documented Ascend target `8d4409d6`. It refreshes current
+code paths and checked-in test contracts, not hardware qualification or owner
+approval. Existing document statuses and historical measurements retain their
+scope. Each module records its remaining limitations and validation gaps.
 
 ## Reading order
 
@@ -94,10 +100,10 @@ contract. File-level entries deliberately resolve mixed directories.
 | --- | --- |
 | [Plugin boundary](plugin_boundary.md) | `afd_plugin/__init__.py`, `afd_plugin/config.py`, `afd_plugin/config_utils.py`, `afd_plugin/envs.py`, `afd_plugin/validation.py`, `afd_plugin/py.typed`, `afd_plugin/v1/__init__.py`, `afd_plugin/v1/worker/__init__.py`, `afd_plugin/v1/worker/npu/__init__.py`, `pyproject.toml` |
 | [Attention runtime](attention_runtime.md) | `afd_plugin/v1/worker/attention_metadata.py`, `afd_plugin/v1/worker/attention_model_runner.py`, `afd_plugin/v1/worker/attention_model_runner_v2.py`, `afd_plugin/v1/worker/attention_worker.py`, `afd_plugin/v1/worker/ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/attention_model_runner.py`, `afd_plugin/v1/worker/npu/attention_model_runner_v2.py`, `afd_plugin/v1/worker/npu/attention_worker.py` |
-| [FFN runtime](ffn_runtime.md) | `afd_plugin/v1/worker/ffn_model_runner.py`, `afd_plugin/v1/worker/ffn_worker.py`, `afd_plugin/v1/worker/npu/ffn_model_runner.py`, `afd_plugin/v1/worker/npu/ffn_worker.py` |
+| [FFN runtime](ffn_runtime.md) | `afd_plugin/v1/worker/ffn_metadata.py`, `afd_plugin/v1/worker/ffn_model_runner.py`, `afd_plugin/v1/worker/ffn_worker.py`, `afd_plugin/v1/worker/npu/ffn_model_runner.py`, `afd_plugin/v1/worker/npu/ffn_worker.py` |
 | [Connector contracts](connector_contracts.md) | `afd_plugin/connectors/**/*.py`, `afd_plugin/connectors/npu/bin/**`, `afd_plugin/distributed/**/*.py` |
 | [Model integration](model_integration.md) | `afd_plugin/model_executor/**/*.py` |
-| [Execution platforms](execution_platforms.md) | `afd_plugin/compat/profiler.py`, `afd_plugin/compat/npu/forward_context.py`, `afd_plugin/compat/npu/ops.py`, `afd_plugin/compat/npu/profiler.py`, `afd_plugin/v1/worker/cuda_graph.py`, `afd_plugin/v1/worker/dbo.py`, `afd_plugin/v1/worker/npu/forward_context.py`, `afd_plugin/v1/worker/npu/mla_graph.py`, `afd_plugin/v1/worker/npu/npu_ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/ubatch_utils.py`, `afd_plugin/v1/worker/npu/ubatching.py`, `csrc/**`, `setup.py`, `MANIFEST.in` |
+| [Execution platforms](execution_platforms.md) | `afd_plugin/compat/profiler.py`, `afd_plugin/compat/npu/forward_context.py`, `afd_plugin/compat/npu/ops.py`, `afd_plugin/compat/npu/profiler.py`, `afd_plugin/v1/worker/cuda_graph.py`, `afd_plugin/v1/worker/dbo.py`, `afd_plugin/v1/worker/npu/forward_context.py`, `afd_plugin/v1/worker/npu/mla_graph.py`, `afd_plugin/v1/worker/npu/npu_ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/ubatch_utils.py`, `afd_plugin/v1/worker/npu/ubatching.py`, `afd_plugin/v1/worker/npu/ubatch_runner.py`, `csrc/**`, `setup.py`, `MANIFEST.in` |
 | [Compatibility and patches](compatibility_and_patches.md) | `afd_plugin/compat/__init__.py`, `afd_plugin/compat/vllm.py`, `afd_plugin/compat/npu/__init__.py`, `afd_plugin/compat/npu/feature_validation.py`, `afd_plugin/compat/npu/runtime.py`, `afd_plugin/compat/npu/runtime_config.py`, `afd_plugin/compat/patches/**/*.py` |
 
 The routing inventory covers runtime and package code under `afd_plugin/**`,
@@ -124,6 +130,8 @@ Operational guides remain separate from normative module design:
 - [NCCL P2P connector guide](../../gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md)
 - [CAM P2P connector guide](../../npu/CAM_P2P_CONNECTOR_USER_GUIDE.md)
 - [CAM async connector guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md)
+- [CAM routed operators](../../npu/CAM_ASYNC_ROUTED_OPS.md)
+- [NPU validation](../../npu/TESTING.md) and [troubleshooting](../../npu/TROUBLESHOOTING.md)
 - [Ascend NPU installation](../../../README.md#ascend-npu-installation)
 - [Connector overview](../../../afd_plugin/connectors/README.md)
 - [Deployment recipes](../../../recipe/README.md)
