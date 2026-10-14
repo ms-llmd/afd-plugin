@@ -1,0 +1,55 @@
+# Phase 0 spike pod: one 4xH100 node, long-lived so the spike can be iterated
+# with `kubectl cp` + `kubectl exec` (see ../README.md).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: deepep-m2n-spike
+  labels:
+    app: deepep-m2n-spike
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              # H100 nodes with >= 4 free GPUs on 2026-10-14 (image-cached b93r38s0/s3 were full).
+              - key: kubernetes.io/hostname
+                operator: In
+                values: ["pokprod-b93r43s3", "pokprod-b93r43s0", "pokprod-b93r44s3"]
+  containers:
+    - name: spike
+      image: ghcr.io/ronenkat/afd-plugin-e2e:e2e-f82ab8a
+      command: ["bash", "-c", "sleep 86400"]
+      env:
+        - name: HOME
+          value: /work
+        - name: EP_JIT_CACHE_DIR
+          value: /work/ep_jit
+        - name: AFD_DEEPEP_BUILD_DIR
+          value: /work/deepep_build
+        - name: AFD_DEEPEP_PER_BUFFER_COMM_STREAM
+          value: "1"
+        - name: PYTHONPATH
+          value: /work/spike
+      resources:
+        requests:
+          nvidia.com/gpu: 4
+          cpu: "16"
+          memory: 128Gi
+        limits:
+          nvidia.com/gpu: 4
+          cpu: "16"
+          memory: 128Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: work
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
