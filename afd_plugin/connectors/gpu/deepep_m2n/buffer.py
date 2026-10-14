@@ -183,6 +183,7 @@ class DeepEPElasticBuffer:
         num_experts: int,
         top_k: int,
         allow_hybrid_mode: bool,
+        use_fp8_dispatch: bool = False,
         num_sms: int = 0,
     ) -> None:
         self._module = load_deepep()
@@ -209,7 +210,7 @@ class DeepEPElasticBuffer:
                 self._allocated_tokens_per_rank,
                 hidden_size,
                 top_k,
-                False,
+                use_fp8_dispatch,
                 allow_hybrid_mode,
                 allow_multiple_reduction,
             )

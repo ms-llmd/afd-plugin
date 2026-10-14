@@ -31,8 +31,8 @@ Control plane:
     per-layer control traffic exists. Attention rank 0 sends each step's
     payload to every FFN rank over the AFD world's NCCL group.
 
-Phase 1 scope: BF16 payload, eager, single stage, single node (multi-node
-needs RDMA pods, see ``docs/design/fastafd/``).
+Scope: BF16 or FP8 (block-128, fp32 scales) payload, eager, single stage,
+single node (multi-node needs RDMA pods, see ``docs/design/fastafd/``).
 """
 
 from __future__ import annotations
@@ -46,6 +46,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8,
+)
 
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import (
@@ -64,6 +67,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     ExpertBackend,
     LocalExpertWeights,
 )
+from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import FP8_DTYPE
 from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
@@ -81,7 +85,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 PROTOCOL_VERSION = "deepep_m2n/1"
-PAYLOAD_FORMATS = ("bf16",)
+BF16_PAYLOAD = "bf16"
+# FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
+FP8_PAYLOAD = "fp8_block128_fp32"
+PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
+FP8_GROUP_SIZE = 128
 DISABLE_GIN_MODES = ("auto", "always", "never")
 # DeepEP V2 needs Hopper (SM90) or newer.
 MIN_SM_MAJOR = 9
@@ -106,6 +114,9 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             (data then moves over NVLink only); ``always``/``never`` force it.
         bucket_granularity: Dispatch bucket is rounded up to this multiple.
         num_sms: SMs DeepEP kernels use; ``0`` picks DeepEP's default.
+        cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
+            host sync that reads receive counts; they allocate the worst-case
+            receive size instead. ``0`` always syncs in eager mode.
     """
 
     capacity_tokens_per_rank: int | None = None
@@ -116,6 +127,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     disable_gin: str = "auto"
     bucket_granularity: int = 1
     num_sms: int = 0
+    cpu_sync_min_tokens: int = 0
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -146,6 +158,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("bucket_granularity must be positive")
         if self.num_sms < 0:
             raise ValueError("num_sms must be non-negative")
+        if self.cpu_sync_min_tokens < 0:
+            raise ValueError("cpu_sync_min_tokens must be non-negative")
 
     def to_mapping(self) -> dict[str, Any]:
         return asdict(self)
@@ -187,6 +201,7 @@ def plan_stage(
     capacity_tokens_per_rank: int,
     bucket_granularity: int,
     graph_mode: bool,
+    cpu_sync_min_tokens: int = 0,
 ) -> StagePlan:
     tokens = tokens_per_attention_rank(dp_metadata, attn_size)
     max_tokens = max(1, max(tokens))
@@ -196,12 +211,13 @@ def plan_stage(
             f"dispatch bucket {bucket} exceeds capacity_tokens_per_rank="
             f"{capacity_tokens_per_rank}"
         )
-    # Graph capture/replay cannot block on the host; eager steps read the real
-    # receive counts so DeepEP allocates by actual rather than worst-case size.
+    # Graph capture/replay cannot block on the host. Eager steps read the real
+    # receive counts so DeepEP allocates by actual rather than worst-case size,
+    # unless the bucket is small enough that skipping the host round trip wins.
     return StagePlan(
         tokens_per_attn_rank=tokens,
         bucket=bucket,
-        do_cpu_sync=not graph_mode,
+        do_cpu_sync=not graph_mode and bucket >= cpu_sync_min_tokens,
         graph_mode=graph_mode,
     )
 
@@ -336,6 +352,10 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         self.attn_size = self.layout.attn_size
         self.ffn_size = self.layout.ffn_size
         self.is_ffn = afd_config.role == "ffn"
+        self.is_fp8_payload = self.config.payload_format == FP8_PAYLOAD
+        self.payload_dtype = FP8_DTYPE if self.is_fp8_payload else self.dtype
+        if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
+            raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
         self.world_rank = self.layout.world_rank(afd_config.role, role_rank)
         self.capacity_tokens_per_rank: int = (
             self.config.capacity_tokens_per_rank
@@ -413,6 +433,7 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
                         num_experts=self.layout.deepep_num_experts,
                         top_k=self.top_k,
                         allow_hybrid_mode=self.config.allow_hybrid_mode,
+                        use_fp8_dispatch=self.is_fp8_payload,
                         num_sms=self.config.num_sms,
                     )
                 )
@@ -471,7 +492,14 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         stage_idx = context.metadata.stage_idx
         if stage_idx in self._pending_combines:
             raise RuntimeError(f"stage {stage_idx} dispatched twice without combine")
-        result = self._dispatch(stage_idx, hidden_states, topk_ids, topk_weights)
+        x_scale = None
+        if self.is_fp8_payload:
+            hidden_states, x_scale = per_token_group_quant_fp8(
+                hidden_states, FP8_GROUP_SIZE, use_ue8m0=False
+            )
+        result = self._dispatch(
+            stage_idx, hidden_states, x_scale, topk_ids, topk_weights
+        )
         self._pending_combines[stage_idx] = result.handle
 
     def recv_ffn_output(
@@ -505,9 +533,22 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
     ) -> AFDA2FTransferPayload:
         """Dispatch with no tokens; return the rows routed to local experts."""
         self._check_initialized()
-        empty = torch.empty((0, self.hidden_size), dtype=self.dtype, device=self.device)
+        empty = torch.empty(
+            (0, self.hidden_size), dtype=self.payload_dtype, device=self.device
+        )
+        empty_scale = (
+            torch.empty(
+                (0, self.hidden_size // FP8_GROUP_SIZE),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if self.is_fp8_payload
+            else None
+        )
         no_routes = torch.empty((0, self.top_k), dtype=torch.int64, device=self.device)
-        result = self._dispatch(ubatch_idx, empty, no_routes, no_routes.float())
+        result = self._dispatch(
+            ubatch_idx, empty, empty_scale, no_routes, no_routes.float()
+        )
         state = DeepEPM2NTransferState(
             handle=result.handle,
             recv_topk_weights=result.recv_topk_weights,
@@ -536,6 +577,7 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         state = self._transfer_state(payload.context)
         return self.experts(
             payload.hidden_states,
+            state.recv_scale,
             state.recv_topk_weights,
             state.recv_count_psum,
             weights,
@@ -560,6 +602,7 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         self,
         stage_idx: int,
         x: torch.Tensor,
+        x_scale: torch.Tensor | None,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> DeepEPDispatchResult:
@@ -571,7 +614,7 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
             )
         return self._lane(stage_idx).dispatch(
             x,
-            None,
+            x_scale,
             topk_ids,
             topk_weights,
             bucket=plan.bucket,
@@ -623,6 +666,7 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
                 capacity_tokens_per_rank=connector.capacity_tokens_per_rank,
                 bucket_granularity=connector.config.bucket_granularity,
                 graph_mode=graph_mode,
+                cpu_sync_min_tokens=connector.config.cpu_sync_min_tokens,
             )
             for stage_idx, dp_metadata in payload.dp_metadata_list.items()
         }

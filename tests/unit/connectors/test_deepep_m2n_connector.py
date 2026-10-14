@@ -25,7 +25,12 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     validate_handshake,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
+    LocalExpertWeights,
     expert_row_ranges,
+)
+from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
+    dequantize_fp8_block128,
+    quantize_fp8_block128,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa: E402
 from tests.unit.connectors.deepep_m2n_harness import (  # noqa: E402
@@ -98,11 +103,58 @@ def test_config_defaults_and_round_trip():
         ({"num_lanes": 2}, "num_lanes"),
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
         ({"bucket_granularity": 0}, "bucket_granularity"),
+        ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
     with pytest.raises(ValueError, match=message):
         DeepEPM2NConfig.from_mapping(raw)
+
+
+def test_config_accepts_fp8_payload_and_sync_threshold():
+    config = DeepEPM2NConfig.from_mapping(
+        {"payload_format": "fp8_block128_fp32", "cpu_sync_min_tokens": 512}
+    )
+
+    assert config.payload_format == "fp8_block128_fp32"
+    assert config.cpu_sync_min_tokens == 512
+
+
+def test_plan_stage_skips_host_sync_below_threshold():
+    def plan(tokens: int):
+        return plan_stage(
+            _dp(tokens),
+            attn_size=1,
+            capacity_tokens_per_rank=1024,
+            bucket_granularity=1,
+            graph_mode=False,
+            cpu_sync_min_tokens=256,
+        )
+
+    assert not plan(255).do_cpu_sync
+    assert plan(256).do_cpu_sync
+
+
+def test_fp8_block128_round_trip():
+    w = torch.randn(2, 256, 384)
+
+    w_q, scale = quantize_fp8_block128(w)
+
+    assert w_q.dtype == torch.float8_e4m3fn
+    assert scale.shape == (2, 2, 3)
+    error = (dequantize_fp8_block128(w_q, scale) - w).norm() / w.norm()
+    assert error < 5e-2
+
+
+def test_expert_weights_require_matching_fp8_scales():
+    w13, w2 = torch.zeros(1, 256, 128), torch.zeros(1, 128, 128)
+    w13_q, w13_s = quantize_fp8_block128(w13)
+    w2_q, w2_s = quantize_fp8_block128(w2)
+
+    assert LocalExpertWeights(w13_q, w2_q, w13_s, w2_s).is_fp8
+    assert not LocalExpertWeights(w13, w2).is_fp8
+    with pytest.raises(ValueError, match="block scales"):
+        LocalExpertWeights(w13_q, w2_q)
 
 
 def test_layout_is_ffn_first_with_identity_expert_ids():

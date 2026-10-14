@@ -51,14 +51,32 @@ def _run(topology: Topology, extra_config: dict, tmp_path) -> None:
         print(f"rank {result.world_rank} {result.role}: {result.metrics}")
 
 
+PAYLOADS = ["bf16", "fp8_block128_fp32"]
+
+
+@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
 @pytest.mark.parametrize(
     ("ffn_size", "attn_size"),
     [(1, 1), (2, 2), (1, 3)],
     ids=["1F1A", "2F2A", "1F3A"],
 )
-def test_transport_and_deepgemm_experts(ffn_size, attn_size, tmp_path):
-    _run(Topology(ffn_size, attn_size), {}, tmp_path)
+def test_transport_and_deepgemm_experts(ffn_size, attn_size, payload_format, tmp_path):
+    _run(Topology(ffn_size, attn_size), {"payload_format": payload_format}, tmp_path)
 
 
-def test_transport_with_fused_experts_backend(tmp_path):
-    _run(Topology(2, 2), {"expert_backend": "fused_experts"}, tmp_path)
+@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
+def test_transport_with_fused_experts_backend(payload_format, tmp_path):
+    _run(
+        Topology(2, 2),
+        {"expert_backend": "fused_experts", "payload_format": payload_format},
+        tmp_path,
+    )
+
+
+def test_fp8_without_host_sync_for_small_buckets(tmp_path):
+    # Every standard case is below the threshold, so eager steps skip the sync.
+    _run(
+        Topology(2, 2),
+        {"payload_format": "fp8_block128_fp32", "cpu_sync_min_tokens": CAPACITY + 1},
+        tmp_path,
+    )

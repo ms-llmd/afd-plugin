@@ -107,11 +107,17 @@ gathers/scatters rows; it is a correctness reference, not a serving path.
 
 ### Findings
 
-1. **Experts dominate, and small batches pay for padding.** DeepEP pads each
-   expert's rows to the DeepGEMM alignment (128), so an FFN rank with 64 local
-   experts always computes at least 64×128 rows: the experts step is ~360 µs
-   (2F2A) and ~660 µs (1F3A, 128 local experts) from 1 to 512 tokens per
-   Attention rank. This is the main Phase 2 target.
+1. **Experts dominate, and small batches are bound by reading expert weights.**
+   From about 32 tokens per Attention rank every local expert is hit, so each
+   layer streams all of the FFN rank's expert weights: 9.4 MB per expert in
+   BF16, i.e. ~600 MB for 64 experts (2F2A, ~360 µs, ~1.7 TB/s) and ~1.2 GB for
+   128 experts (1F3A, ~660 µs). The local baseline reads the same 1.2 GB, which
+   is why it also sits near 440 µs. At 1 token per rank only ~16 experts are
+   hit and the step drops to 127 µs. The 128-row alignment padding adds little
+   compute next to the weight reads. *(Corrected: an earlier version of this
+   report blamed the padding, and proposed DeepGEMM's masked layout, which
+   reads the same weights and was dropped.)* Levers: FP8 weights (half the
+   bytes, Phase 2) and more FFN ranks (fewer experts per rank).
 2. **Dispatch has a ~130–180 µs floor in eager mode**, mostly the host sync
    that reads receive counts. Phase 2's `cpu_sync_min_tokens` (skip the sync
    for small buckets) and Phase 3's graphs remove it for decode.
@@ -129,7 +135,6 @@ gathers/scatters rows; it is a correctness reference, not a serving path.
 ## Next (Phase 2)
 
 - FP8 dispatch (`fp8_block128_fp32`) with the DeepGEMM FP8 psum GEMM.
-- Reduce the padding cost at small batches (finding 1): measure a smaller
-  alignment, and DeepGEMM's masked layout for decode.
+- FP8 expert weights to halve the weight bytes per layer (finding 1).
 - `cpu_sync_min_tokens` (finding 2).
 - Re-run this benchmark and add the FP8 rows.

@@ -109,3 +109,29 @@ def m_grouped_bf16_gemm_nt_psum(
         use_psum_layout=True,
         expected_m_for_psum_layout=expected_m,
     )
+
+
+def m_grouped_fp8_gemm_nt_psum(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    psum_rows_per_expert: torch.Tensor,
+    expected_m: int,
+) -> None:
+    """FP8 version of ``m_grouped_bf16_gemm_nt_psum`` (SM90 "1d2d" recipe).
+
+    ``a``: ``[M, K]`` FP8 with ``a_scale`` ``[M, K/128]`` fp32 (one scale per row
+    and 128 channels; MN-major TMA-aligned avoids a transpose). ``b``:
+    ``[E, N, K]`` FP8 with ``b_scale`` ``[E, N/128, K/128]`` fp32 block scales
+    (vLLM's block-FP8 layout). ``out``: ``[M, N]`` BF16.
+    """
+    load_deepgemm().m_grouped_fp8_gemm_nt_contiguous(
+        (a, a_scale),
+        (b, b_scale),
+        out,
+        psum_rows_per_expert,
+        use_psum_layout=True,
+        expected_m_for_psum_layout=expected_m,
+    )

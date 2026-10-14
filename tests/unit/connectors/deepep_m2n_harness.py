@@ -36,8 +36,24 @@ TOP_K = 8
 INTERMEDIATE_SIZE = 768
 INPUT_SEED_STRIDE = 1_000_003
 WEIGHT_SEED_OFFSET = 7_777
-BF16_REL_TOL = 2e-2
 CHECKSUM_REL_TOL = 1e-3
+BF16_TOLERANCES = {
+    "dispatch_rows_rel_err": CHECKSUM_REL_TOL,
+    "dispatch_weights_rel_err": CHECKSUM_REL_TOL,
+    "experts_rel_err": 2e-2,
+    "experts_vs_fused_rel_err": 2e-2,
+    "combine_rel_err": 2e-2,
+}
+# FP8: the experts' references use the same FP8 inputs and weights, so they
+# only see the requantized intermediate; combine is checked end to end against
+# the BF16 model and also sees activation and weight quantization.
+FP8_TOLERANCES = {
+    "dispatch_rows_rel_err": CHECKSUM_REL_TOL,
+    "dispatch_weights_rel_err": CHECKSUM_REL_TOL,
+    "experts_rel_err": 6e-2,
+    "experts_vs_fused_rel_err": 6e-2,
+    "combine_rel_err": 1e-1,
+}
 RANK_TIMEOUT_S = 900
 BENCH_WARMUP_ITERS = 5
 
@@ -347,6 +363,44 @@ def run_ranks(
 # ---------------------------------------------------------------------------
 
 
+def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
+    """Expert weights for ``experts`` plus fp32 references ``(w13, w2)``.
+
+    FP8 payloads use FP8 block-128 weights; the references are then the
+    dequantized weights, so kernel checks isolate the kernels' own error.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n.experts import LocalExpertWeights
+    from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
+        dequantize_fp8_block128,
+        quantize_fp8_block128,
+    )
+
+    w13, w2 = make_expert_weights(experts)
+    if payload_format == "bf16":
+        return LocalExpertWeights(w13=w13, w2=w2), w13.float(), w2.float()
+    w13_q, w13_s = quantize_fp8_block128(w13)
+    w2_q, w2_s = quantize_fp8_block128(w2)
+    return (
+        LocalExpertWeights(w13=w13_q, w2=w2_q, w13_scale=w13_s, w2_scale=w2_s),
+        dequantize_fp8_block128(w13_q, w13_s),
+        dequantize_fp8_block128(w2_q, w2_s),
+    )
+
+
+def as_sent(x: torch.Tensor, payload_format: str) -> torch.Tensor:
+    """What the FFN side receives for ``x`` (dequantized when FP8), in fp32."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import dequantize_fp8_rows
+
+    if payload_format == "bf16" or x.shape[0] == 0:
+        return x.float()
+    x_q, x_s = per_token_group_quant_fp8(x, 128, use_ue8m0=False)
+    return dequantize_fp8_rows(x_q, x_s)
+
+
 def correctness_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -354,11 +408,13 @@ def correctness_scenario(
     from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
     from afd_plugin.connectors.gpu.deepep_m2n.experts import (
         DeepEPM2NExperts,
-        LocalExpertWeights,
         align_up,
         expert_row_ranges,
     )
+    from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import dequantize_fp8_rows
 
+    payload_format = connector.config.payload_format
+    tolerances = FP8_TOLERANCES if payload_format != "bf16" else BF16_TOLERANCES
     worst: dict[str, float] = {}
 
     def record(key: str, value: float) -> None:
@@ -366,13 +422,13 @@ def correctness_scenario(
 
     if connector.is_ffn:
         experts = connector.layout.expert_range(connector.role_rank)
-        w13, w2 = make_expert_weights(experts)
-        weights = LocalExpertWeights(w13=w13, w2=w2)
+        weights, w13_ref, w2_ref = local_weights(experts, payload_format)
         reference_executor = DeepEPM2NExperts(
             "fused_experts", connector.expert_alignment
         )
     else:
-        w13, w2 = make_expert_weights(range(NUM_EXPERTS))
+        # End to end, the Attention side compares against the BF16 model.
+        w13_ref, w2_ref = make_expert_weights(range(NUM_EXPERTS))
 
     cases = [Case(**case) for case in args["cases"]]
     seed = 0
@@ -385,6 +441,11 @@ def correctness_scenario(
                 state = payload.context.states
                 psum = state.recv_count_psum.to(torch.int64)
                 ranges = expert_row_ranges(psum, connector.expert_alignment)
+                received = (
+                    payload.hidden_states.float()
+                    if state.recv_scale is None
+                    else dequantize_fp8_rows(payload.hidden_states, state.recv_scale)
+                )
                 # Transport: exact per-expert counts and row/weight checksums.
                 expected_counts = torch.zeros(
                     len(experts), dtype=torch.int64, device="cuda"
@@ -393,11 +454,12 @@ def correctness_scenario(
                 expected_wsum = torch.zeros(len(experts), device="cuda")
                 for attn_rank, num_tokens in enumerate(case.tokens_per_attn_rank):
                     x, ids, w = make_inputs(seed, attn_rank, num_tokens)
+                    sent = as_sent(x, payload_format)
                     mask = (ids >= experts.start) & (ids < experts.stop)
                     rows, slots = mask.nonzero(as_tuple=True)
                     local = ids[rows, slots] - experts.start
                     expected_counts.index_add_(0, local, torch.ones_like(local))
-                    expected_xsum.index_add_(0, local, x[rows].float())
+                    expected_xsum.index_add_(0, local, sent[rows])
                     expected_wsum.index_add_(0, local, w[rows, slots])
                 got_counts = [end - start for start, end in ranges]
                 if got_counts != expected_counts.tolist():
@@ -409,14 +471,13 @@ def correctness_scenario(
                 padded_counts = [
                     align_up(count, connector.expert_alignment) for count in got_counts
                 ]
-                if not case.graph_mode and state.recv_counts_host != padded_counts:
+                synced = connector.stage_plans[0].do_cpu_sync
+                if synced and state.recv_counts_host != padded_counts:
                     raise AssertionError(
                         f"{case.name}: host counts {state.recv_counts_host} != "
                         f"padded psum counts {padded_counts}"
                     )
-                got_xsum = torch.stack(
-                    [payload.hidden_states[s:e].float().sum(0) for s, e in ranges]
-                )
+                got_xsum = torch.stack([received[s:e].sum(0) for s, e in ranges])
                 got_wsum = torch.stack(
                     [state.recv_topk_weights[s:e].sum() for s, e in ranges]
                 )
@@ -426,6 +487,7 @@ def correctness_scenario(
                 out = connector.run_experts(payload, weights)
                 reference = reference_executor(
                     payload.hidden_states,
+                    state.recv_scale,
                     state.recv_topk_weights,
                     state.recv_count_psum,
                     weights,
@@ -435,7 +497,7 @@ def correctness_scenario(
                         continue
                     exact = (
                         expert_mlp_fp32(
-                            payload.hidden_states[start:end], w13[expert], w2[expert]
+                            received[start:end], w13_ref[expert], w2_ref[expert]
                         )
                         * state.recv_topk_weights[start:end, None]
                     )
@@ -458,18 +520,10 @@ def correctness_scenario(
                 connector.send_attn_output(x, context, topk_ids=ids, topk_weights=w)
                 combined = connector.recv_ffn_output(torch.empty_like(x), 0)
                 if x.shape[0]:
-                    record(
-                        "combine_rel_err",
-                        rel_err(combined, dense_moe_reference(x, ids, w, w13, w2)),
-                    )
+                    expected = dense_moe_reference(x, ids, w, w13_ref, w2_ref)
+                    record("combine_rel_err", rel_err(combined, expected))
     torch.cuda.synchronize()
-    for key, limit in (
-        ("dispatch_rows_rel_err", CHECKSUM_REL_TOL),
-        ("dispatch_weights_rel_err", CHECKSUM_REL_TOL),
-        ("experts_rel_err", BF16_REL_TOL),
-        ("experts_vs_fused_rel_err", BF16_REL_TOL),
-        ("combine_rel_err", BF16_REL_TOL),
-    ):
+    for key, limit in tolerances.items():
         if worst.get(key, 0.0) > limit:
             raise AssertionError(f"{key}={worst[key]:.3e} exceeds {limit:.0e}")
     worst["expert_alignment"] = connector.expert_alignment
@@ -481,11 +535,10 @@ def benchmark_scenario(
 ) -> dict[str, Any]:
     """Per-layer dispatch / experts / combine times for each token count."""
     from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
-    from afd_plugin.connectors.gpu.deepep_m2n.experts import LocalExpertWeights
 
     if connector.is_ffn:
         experts = connector.layout.expert_range(connector.role_rank)
-        weights = LocalExpertWeights(*make_expert_weights(experts))
+        weights, _, _ = local_weights(experts, connector.config.payload_format)
     timings: dict[str, Any] = {}
     for tokens in args["tokens_per_attn_rank"]:
         per_iter: list[tuple[float, float, float]] = []
@@ -529,20 +582,44 @@ def benchmark_scenario(
     return timings
 
 
-def local_moe_baseline(tokens_list: list[int], iters: int) -> dict[str, Any]:
-    """Single-GPU MoE (vLLM fused_experts, all experts local, no communication)."""
+def local_moe_baseline(
+    tokens_list: list[int], iters: int, payload_format: str
+) -> dict[str, Any]:
+    """Single-GPU MoE: vLLM ``fused_experts``, all experts local, no communication.
+
+    FP8 uses vLLM's block-FP8 path (128x128 weight blocks, dynamic per-token
+    activation groups), the same recipe the connector's FP8 payload uses.
+    """
+    from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
-    w13, w2 = make_expert_weights(range(NUM_EXPERTS))
+    weights, _, _ = local_weights(range(NUM_EXPERTS), payload_format)
+    quant_config = (
+        fp8_w8a8_moe_quant_config(
+            w1_scale=weights.w13_scale,
+            w2_scale=weights.w2_scale,
+            block_shape=[128, 128],
+        )
+        if weights.is_fp8
+        else None
+    )
     timings: dict[str, Any] = {}
     for tokens in tokens_list:
         x, ids, w = make_inputs(0, 0, tokens)
+        call = {
+            "hidden_states": x,
+            "w1": weights.w13,
+            "w2": weights.w2,
+            "topk_weights": w,
+            "topk_ids": ids.to(torch.int32),
+            "quant_config": quant_config,
+        }
         for _ in range(BENCH_WARMUP_ITERS):
-            fused_experts(x, w13, w2, topk_weights=w, topk_ids=ids.to(torch.int32))
+            fused_experts(**call)
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(iters):
-            fused_experts(x, w13, w2, topk_weights=w, topk_ids=ids.to(torch.int32))
+            fused_experts(**call)
         torch.cuda.synchronize()
         timings[str(tokens)] = {"total_us": (time.perf_counter() - start) / iters * 1e6}
     return timings

@@ -192,4 +192,6 @@ extend-ignore-identifiers-re = [
     "DataCopyPad2DA8W4NDNew",
     ".*isND2NZ.*",
     ".*enVecND2NZ.*",
+    # UE8M0: the FP8 unsigned-exponent scale format (DeepEP/DeepGEMM docs).
+    ".*[Uu][Ee]8[Mm]0.*",
 ]
