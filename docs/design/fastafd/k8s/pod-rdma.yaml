@@ -1,0 +1,63 @@
+# DeepEP M2N connector dev/test pod on pokprod (namespace ronenkat-test1):
+# 4x H100 on one node plus RoCE (multi-nic-compute + rdma/roce_gdr), so NCCL
+# sees RDMA devices. Ship the working tree to /work/src and run pytest there.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: deepep-m2n-dev
+  labels:
+    app: deepep-m2n-dev
+  annotations:
+    k8s.v1.cni.cncf.io/networks: multi-nic-compute
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              # H100 nodes with >= 4 free GPUs when this was written; edit as needed.
+              - key: kubernetes.io/hostname
+                operator: In
+                values: ["pokprod-b93r43s2", "pokprod-b93r39s2", "pokprod-b93r43s1"]
+  containers:
+    - name: dev
+      image: ghcr.io/ronenkat/afd-plugin-e2e:e2e-f82ab8a
+      command: ["bash", "-c", "sleep 86400"]
+      env:
+        - name: HOME
+          value: /work
+        - name: PYTHONPATH
+          value: /work/src
+        # Extension builds and kernel JIT caches on the writable volume.
+        - name: AFD_DEEPEP_BUILD_DIR
+          value: /work/cache/deepep_build
+        - name: AFD_DEEPGEMM_BUILD_DIR
+          value: /work/cache/deepgemm_build
+        - name: EP_JIT_CACHE_DIR
+          value: /work/cache/deepep_jit
+        - name: DG_JIT_CACHE_DIR
+          value: /work/cache/deepgemm_jit
+      resources:
+        requests:
+          nvidia.com/gpu: 4
+          rdma/roce_gdr: 1
+          cpu: "16"
+          memory: 128Gi
+        limits:
+          nvidia.com/gpu: 4
+          rdma/roce_gdr: 1
+          cpu: "16"
+          memory: 128Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: work
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi

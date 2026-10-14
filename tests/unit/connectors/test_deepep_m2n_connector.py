@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+"""CPU-only tests for ``DeepEPM2NAFDConnector``: config, layout, plans, handshake."""
+
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
+from afd_plugin.config import afd_config_from_mapping  # noqa: E402
+from afd_plugin.connectors import (  # noqa: E402
+    AFDConnectorFactory,
+    AFDControlPayload,
+    AFDDPMetadata,
+    AFDTransferContext,
+    AFDTransferMetadata,
+)
+from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
+    DeepEPM2NConfig,
+    local_handshake_info,
+    plan_stage,
+    tokens_per_attention_rank,
+    validate_handshake,
+)
+from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
+    expert_row_ranges,
+)
+from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa: E402
+from tests.unit.connectors.deepep_m2n_harness import (  # noqa: E402
+    HIDDEN_SIZE,
+    Topology,
+    fake_vllm_config,
+)
+
+CONNECTOR = "DeepEPM2NAFDConnector"
+HOPPER = (9, 0)
+
+
+def _dp(*tokens: int) -> AFDDPMetadata:
+    return AFDDPMetadata(num_tokens_across_dp_cpu=torch.tensor(tokens))
+
+
+def _connector(
+    role: str, role_rank: int, topology: Topology, extra: dict | None = None
+):
+    vllm_config = fake_vllm_config(topology, role, role_rank, extra or {}, port=12345)
+    afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
+    return AFDConnectorFactory.create_connector(0, 0, vllm_config, afd_config)
+
+
+def _handshake(layout: DeepEPM2NLayout, overrides: dict | None = None) -> list[dict]:
+    infos = []
+    for world_rank in range(layout.union_size):
+        is_ffn = world_rank < layout.ffn_size
+        info = local_handshake_info(
+            role="ffn" if is_ffn else "attention",
+            role_rank=world_rank if is_ffn else world_rank - layout.ffn_size,
+            world_rank=world_rank,
+            config=DeepEPM2NConfig(),
+            hidden_size=HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            num_experts=layout.num_experts,
+            top_k=8,
+            capacity_tokens_per_rank=256,
+            expert_alignment=128 if is_ffn else None,
+            sm=HOPPER,
+        )
+        infos.append(info)
+    for (world_rank, key), value in (overrides or {}).items():
+        infos[world_rank][key] = value
+    return infos
+
+
+def test_connector_is_registered():
+    cls = AFDConnectorFactory.get_connector_class(CONNECTOR)
+
+    assert cls.__name__ == CONNECTOR
+    assert cls.__module__ == "afd_plugin.connectors.gpu.deepep_m2n.connector"
+
+
+def test_config_defaults_and_round_trip():
+    config = DeepEPM2NConfig.from_mapping(None)
+
+    assert config.expert_backend == "deepgemm"
+    assert config.payload_format == "bf16"
+    assert DeepEPM2NConfig.from_mapping(config.to_mapping()) == config
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ({"bogus": 1}, "unknown DeepEPM2NAFDConnector options"),
+        ({"expert_backend": "cutlass"}, "expert_backend"),
+        ({"payload_format": "fp4"}, "payload_format"),
+        ({"disable_gin": "maybe"}, "disable_gin"),
+        ({"num_lanes": 2}, "num_lanes"),
+        ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
+        ({"bucket_granularity": 0}, "bucket_granularity"),
+    ],
+)
+def test_config_rejects_invalid_options(raw, message):
+    with pytest.raises(ValueError, match=message):
+        DeepEPM2NConfig.from_mapping(raw)
+
+
+def test_layout_is_ffn_first_with_identity_expert_ids():
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=3, num_experts=128)
+
+    assert layout.experts_per_rank == 64
+    assert layout.deepep_num_experts == 5 * 64
+    assert layout.world_rank("ffn", 1) == 1
+    assert layout.world_rank("attention", 0) == 2
+    assert layout.expert_range(1) == range(64, 128)
+
+
+def test_layout_rejects_indivisible_experts():
+    with pytest.raises(ValueError, match="divisible"):
+        DeepEPM2NLayout(ffn_size=3, attn_size=1, num_experts=128)
+
+
+def test_tokens_per_attention_rank_expands_tp_peers():
+    assert tokens_per_attention_rank(_dp(3, 5), attn_size=2) == (3, 5)
+    assert tokens_per_attention_rank(_dp(3, 5), attn_size=4) == (3, 3, 5, 5)
+    with pytest.raises(ValueError, match="token counts"):
+        tokens_per_attention_rank(_dp(3, 5, 7), attn_size=2)
+
+
+def test_plan_stage_rounds_bucket_and_picks_host_sync():
+    eager = plan_stage(
+        _dp(17, 4),
+        attn_size=2,
+        capacity_tokens_per_rank=64,
+        bucket_granularity=16,
+        graph_mode=False,
+    )
+    graph = plan_stage(
+        _dp(0, 0),
+        attn_size=2,
+        capacity_tokens_per_rank=64,
+        bucket_granularity=1,
+        graph_mode=True,
+    )
+
+    assert (eager.bucket, eager.do_cpu_sync) == (32, True)
+    assert eager.tokens_per_attn_rank == (17, 4)
+    assert (graph.bucket, graph.do_cpu_sync) == (1, False)
+
+
+def test_plan_stage_rejects_bucket_above_capacity():
+    with pytest.raises(ValueError, match="exceeds capacity"):
+        plan_stage(
+            _dp(65),
+            attn_size=1,
+            capacity_tokens_per_rank=64,
+            bucket_granularity=1,
+            graph_mode=False,
+        )
+
+
+def test_handshake_accepts_consistent_ranks():
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+
+    result = validate_handshake(_handshake(layout), layout)
+
+    assert result.expert_alignment == 128
+    assert result.single_host
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({(3, "hidden_size"): 4096}, "disagree on hidden_size"),
+        ({(0, "payload_format"): "fp8"}, "disagree on payload_format"),
+        ({(1, "expert_alignment"): 64}, "expert_alignment"),
+        ({(0, "role"): "attention"}, "expected 'ffn'"),
+        ({(2, "sm"): [8, 0]}, "SM90 or newer"),
+    ],
+)
+def test_handshake_rejects_mismatches(overrides, message):
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+
+    with pytest.raises(RuntimeError, match=message):
+        validate_handshake(_handshake(layout, overrides), layout)
+
+
+def test_expert_row_ranges_follow_alignment():
+    psum = torch.tensor([3, 128 + 5, 256])
+
+    assert expert_row_ranges(psum, 1) == [(0, 3), (3, 133), (133, 256)]
+    assert expert_row_ranges(psum, 128) == [(0, 3), (128, 133), (256, 256)]
+
+
+def test_connector_constructs_without_initialization():
+    topology = Topology(ffn_size=2, attn_size=3)
+    attention = _connector("attention", 1, topology, {"capacity_tokens_per_rank": 64})
+    ffn = _connector("ffn", 1, topology)
+
+    assert attention.is_initialized is False
+    assert attention.world_rank == 3
+    assert attention.capacity_tokens_per_rank == 64
+    assert ffn.world_rank == 1
+    assert ffn.capacity_tokens_per_rank == 8192  # scheduler max_num_batched_tokens
+
+
+def test_connector_rejects_non_bf16_model():
+    topology = Topology(ffn_size=1, attn_size=1)
+    vllm_config = fake_vllm_config(topology, "ffn", 0, {}, port=12345)
+    vllm_config.model_config.dtype = torch.float16
+    afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
+
+    with pytest.raises(ValueError, match="bfloat16"):
+        AFDConnectorFactory.create_connector(0, 0, vllm_config, afd_config)
+
+
+def test_control_plane_derives_one_plan_per_stage():
+    connector = _connector(
+        "attention",
+        0,
+        Topology(ffn_size=1, attn_size=2),
+        {"capacity_tokens_per_rank": 64},
+    )
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _dp(5, 9)},
+        is_graph_capturing=False,
+        is_warmup=False,
+    )
+
+    connector.control_plane.update_state_from_dp_metadata(payload)
+
+    assert connector.stage_plans[0].bucket == 9
+    assert connector.stage_plans[0].do_cpu_sync
+
+
+def test_control_plane_rejects_more_stages_than_lanes():
+    connector = _connector("ffn", 0, Topology(ffn_size=1, attn_size=1))
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _dp(1), 1: _dp(1)},
+        is_graph_capturing=False,
+        is_warmup=False,
+    )
+
+    with pytest.raises(ValueError, match="num_lanes"):
+        connector.control_plane.update_state_from_dp_metadata(payload)
+
+
+def test_data_path_requires_initialization():
+    connector = _connector("attention", 0, Topology(ffn_size=1, attn_size=1))
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0, stage_idx=0, seq_len=1
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        connector.send_attn_output(
+            torch.zeros(1, HIDDEN_SIZE),
+            context,
+            topk_ids=torch.zeros(1, 8, dtype=torch.int64),
+            topk_weights=torch.zeros(1, 8),
+        )
