@@ -443,7 +443,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                 stored_num_tokens_recv[j] += static_cast<int>(stored_is_scaleup_rank_needed[j]);
-
+            
             if constexpr (not kAllowMultipleReduction) {
                 // Cases where multiple reduction is disabled. We need to forward all data from scaleup peers to scaleout peers
                 // TODO: Let scale-up warps directly put data into `send_buffer`?
@@ -501,7 +501,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                     stored_src_buffer_idx = stored_src_slot_idx == -1 ? -1 :
                         lane_idx * scaleup_buffer.num_max_tokens_per_rank + src_slot_idx;
                 }
-
+                
                 // Preprocess top-k indices
                 int topk_slot_idx[kNumTokensInScaleupLayout];
                 compute_topk_slots(

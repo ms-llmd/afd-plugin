@@ -81,7 +81,7 @@ do { \
 } while (0)
 #endif
 
-#ifndef NCCL_CHECK
+#ifndef NCCL_CHECK 
 #define NCCL_CHECK(cmd) \
 do { \
     const auto e = (cmd); \

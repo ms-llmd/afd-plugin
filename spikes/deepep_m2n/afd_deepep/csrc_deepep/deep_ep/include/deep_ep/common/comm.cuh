@@ -134,7 +134,7 @@ template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNum
           int kNumWarps = kNumThreads / 32>
 __forceinline__ __device__ void gin_barrier_wo_local_sync(
     const ncclDevComm_t& nccl_dev_comm,
-    const int& scaleout_rank_idx, const int& scaleup_rank_idx,
+    const int& scaleout_rank_idx, const int& scaleup_rank_idx, 
     const int& sm_idx, const int& thread_idx) {
     const auto global_warp_idx = sm_idx * kNumWarps + (thread_idx / 32);
     const int& rank_idx = (std::is_same_v<team_t, ncclTeamTagWorld>) ? scaleup_rank_idx : scaleout_rank_idx;
@@ -241,7 +241,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
 
             // We need an extra grid sync, as the scaleout barrier will do a sync after flush, before the barrier
             // NOTES: this is kind of hacky
-            if constexpr (kFlushStores)
+            if constexpr (kFlushStores) 
                 cooperative_groups::this_grid().sync();
         } else {
             // The remaining SMs do the scaleout barrier

@@ -86,12 +86,14 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     NCCL_CHECK(ncclCommQueryProperties(comm, &props));
     // ### PATCH START: allow NVLink-only nodes without NCCL GIN
     // Upstream asserts GIN even when every rank shares one NVLink (LSA) domain,
-    // which fails on nodes without RDMA devices. Without GIN, skip the GIN
+    // which fails in pods without RDMA devices. Without GIN, skip the GIN
     // requirements and check below that no rank needs the scale-out path.
     const bool gin_available =
         (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE;
-    if (not gin_available and get_env("EP_BUFFER_DEBUG", 0))
-        printf("NCCL GIN is unavailable: requiring a single NVLink domain\n");
+    if (get_env("EP_BUFFER_DEBUG", 0))
+        printf("NCCL GIN type: railed=%d full=%d (available for this mode: %d)\n",
+               static_cast<int>(props.railedGinType), static_cast<int>(props.ginType),
+               static_cast<int>(gin_available));
 
     // Initialize NCCL device communicator
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;

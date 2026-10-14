@@ -34,7 +34,7 @@ public:
     }
 
     int get_num_smem_bytes() {
-        return static_cast<int>(get_prop()->sharedMemPerBlockOption);
+        return static_cast<int>(get_prop()->sharedMemPerBlockOptin);
     }
 
     int get_num_sms() {

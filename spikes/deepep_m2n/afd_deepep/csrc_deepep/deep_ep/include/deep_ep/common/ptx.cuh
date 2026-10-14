@@ -160,7 +160,7 @@ __forceinline__ __device__ int4 ldg_with_gez_pred(const int4* ptr, const int& va
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
-        "  step.ge.s32 p, %5, 0;\n\t"
+        "  setp.ge.s32 p, %5, 0;\n\t"
         "  @p ld.L1::no_allocate.L2::cache_hint.global.nc.v4.s32 {%0, %1, %2, %3}, [%4], %6;\n\t"
         "}"
         : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
@@ -174,7 +174,7 @@ __forceinline__ __device__ int4 ldg_with_gtz_pred(const int4* ptr, const int& va
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
-        "  step.gt.s32 p, %5, 0;\n\t"
+        "  setp.gt.s32 p, %5, 0;\n\t"
         "  @p ld.L1::no_allocate.L2::cache_hint.global.nc.v4.s32 {%0, %1, %2, %3}, [%4], %6;\n\t"
         "}"
         : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
@@ -188,7 +188,7 @@ __forceinline__ __device__ int4 ld_with_gez_pred(const int4* ptr, const int& val
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
-        "  step.ge.s32 p, %5, 0;\n\t"
+        "  setp.ge.s32 p, %5, 0;\n\t"
         "  @p ld.L1::no_allocate.L2::cache_hint.global.v4.s32 {%0, %1, %2, %3}, [%4], %6;\n\t"
         "}"
         : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
@@ -203,7 +203,7 @@ __forceinline__ __device__ longlong4_t ldg_with_gez_pred(const longlong4_t* ptr,
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
-        "  step.ge.s32 p, %5, 0;\n\t"
+        "  setp.ge.s32 p, %5, 0;\n\t"
         "  @p ld.L1::no_allocate.L2::cache_hint.global.nc.v4.s64 {%0, %1, %2, %3}, [%4], %6;\n\t"
         "}"
         : "+l"(ret.x), "+l"(ret.y), "+l"(ret.z), "+l"(ret.w)
@@ -234,7 +234,7 @@ __forceinline__ __device__ void st_with_gez_pred(dtype_t* ptr, dtype_t value, co
     asm volatile(
         "{\n\t"
         "  .reg .pred p;\n\t"
-        "  step.ge.s32 p, %2, 0;\n\t"
+        "  setp.ge.s32 p, %2, 0;\n\t"
         "  @p st.global.s32 [%0], %1;\n\t"
         "}"
         :: "l"(ptr), "r"(view), "r"(condition)

@@ -185,7 +185,7 @@ static void* launch_combine(void* x,
     const bool is_scaleup_buffer_rank_layout =
         allow_multiple_reduction ? (num_scaleup_ranks <= num_topk) : false;
     const auto scaleup_buffer = layout::BufferLayout<false>(
-        token_layout,
+        token_layout, 
         is_scaleup_buffer_rank_layout ? num_scaleup_ranks : num_topk,
         num_scaleout_ranks * num_max_tokens_per_rank,
         buffer);

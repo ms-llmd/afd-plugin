@@ -67,15 +67,15 @@ class ElasticBuffer {
     int64_t num_max_pp_tensor_bytes = 0;
     int num_max_pp_inflight_tensors = 0;
 
-    // ARGS session settings
-    int64_t num_max_args_session_bytes = 0;
-    int num_max_args_per_session = 0;
-    int args_session_idx = 0;
-    bool args_in_session = false;
+    // AGRS session settings
+    int64_t num_max_agrs_session_bytes = 0;
+    int num_max_agrs_per_session = 0;
+    int agrs_session_idx = 0;
+    bool agrs_in_session = false;
 
-    // ARGS in-session settings
-    int64_t args_buffer_offset = 0;
-    int args_buffer_slot_idx = 0;
+    // AGRS in-session settings
+    int64_t agrs_buffer_offset = 0;
+    int agrs_buffer_slot_idx = 0;
 
 public:
     ElasticBuffer(const int& rank_idx, const int& num_ranks,
@@ -315,32 +315,32 @@ public:
         );
     }
 
-    void args_set_config(const int64_t& num_max_session_bytes,
-                         const int& new_num_max_args_per_session) {
+    void agrs_set_config(const int64_t& num_max_session_bytes,
+                         const int& new_num_max_agrs_per_session) {
         // Flush previous operations
         barrier(true, true);
 
         EP_HOST_ASSERT(nccl_context->num_ranks > 1);
-        EP_HOST_ASSERT(num_max_session_bytes > 0 and new_num_max_args_per_session > 0);
+        EP_HOST_ASSERT(num_max_session_bytes > 0 and new_num_max_agrs_per_session > 0);
         EP_HOST_ASSERT(num_max_session_bytes <= num_buffer_bytes);
-        EP_HOST_ASSERT(new_num_max_args_per_session <= layout::WorkspaceLayout::kNumMaxInflightARGS);
+        EP_HOST_ASSERT(new_num_max_agrs_per_session <= layout::WorkspaceLayout::kNumMaxInflightAGRS);
         EP_HOST_ASSERT(nccl_context->num_nvl_ranks == nccl_context->num_ranks);
-        this->num_max_args_session_bytes = math::align<int64_t>(num_max_session_bytes, 32);
-        this->num_max_args_per_session = new_num_max_args_per_session;
+        this->num_max_agrs_session_bytes = math::align<int64_t>(num_max_session_bytes, 32);
+        this->num_max_agrs_per_session = new_num_max_agrs_per_session;
     }
 
-    void create_args_session() {
-        EP_HOST_ASSERT(not args_in_session);
-        args_in_session = true;
-        args_buffer_offset = 0;
-        args_buffer_slot_idx = 0;
-        args_session_idx += 1;
+    void create_agrs_session() {
+        EP_HOST_ASSERT(not agrs_in_session);
+        agrs_in_session = true;
+        agrs_buffer_offset = 0;
+        agrs_buffer_slot_idx = 0;
+        agrs_session_idx += 1;
     }
 
-    void destroy_args_session() {
+    void destroy_agrs_session() {
         // Must be in a session
-        EP_HOST_ASSERT(args_in_session);
-        args_in_session = false;
+        EP_HOST_ASSERT(agrs_in_session);
+        agrs_in_session = false;
 
         // Wait compute stream
         stream_wait(comm_stream, at::cuda::getCurrentCUDAStream());
@@ -352,23 +352,23 @@ public:
         for (int i = 0; i < nccl_context->num_ranks - 1; ++ i) {
             const auto dst_rank_idx = (nccl_context->rank_idx + i + 1) % nccl_context->num_ranks;
             write_ptrs[i] = static_cast<int*>(
-                nccl_context->get_sym_ptr(workspace_layout_wo_expert->get_args_session_signal_ptr(nccl_context->rank_idx), dst_rank_idx));
-            wait_ptrs[i] = workspace_layout_wo_expert->get_args_session_signal_ptr(dst_rank_idx);
+                nccl_context->get_sym_ptr(workspace_layout_wo_expert->get_agrs_session_signal_ptr(nccl_context->rank_idx), dst_rank_idx));
+            wait_ptrs[i] = workspace_layout_wo_expert->get_agrs_session_signal_ptr(dst_rank_idx);
         }
-        cuda_driver::batched_write_and_wait(comm_stream, write_ptrs, wait_ptrs, args_session_idx);
+        cuda_driver::batched_write_and_wait(comm_stream, write_ptrs, wait_ptrs, agrs_session_idx);
     }
 
-    std::vector<torch::Tensor> args_get_inplace_tensor(const std::vector<int64_t>& num_bytes_list) const {
+    std::vector<torch::Tensor> agrs_get_inplace_tensor(const std::vector<int64_t>& num_bytes_list) const {
         EP_HOST_ASSERT(num_bytes_list.size() >= 1);
-        EP_HOST_ASSERT(num_max_args_session_bytes > 0 and num_max_args_per_session > 0 and args_in_session);
+        EP_HOST_ASSERT(num_max_agrs_session_bytes > 0 and num_max_agrs_per_session > 0 and agrs_in_session);
 
         std::vector<torch::Tensor> out;
         out.reserve(num_bytes_list.size());
-        int64_t offset = args_buffer_offset;
+        int64_t offset = agrs_buffer_offset;
         for (const auto& num_bytes: num_bytes_list) {
             EP_HOST_ASSERT(num_bytes % 32 == 0);
-            EP_HOST_ASSERT(offset + num_bytes * nccl_context->num_ranks <= num_max_args_session_bytes and
-                           args_buffer_slot_idx < num_max_args_per_session and
+            EP_HOST_ASSERT(offset + num_bytes * nccl_context->num_ranks <= num_max_agrs_session_bytes and
+                           agrs_buffer_slot_idx < num_max_agrs_per_session and
                            "Not enough session buffer size. Did you forget to flush session?");
             out.push_back(torch::from_blob(math::advance_ptr(buffer, offset + num_bytes * nccl_context->rank_idx),
                           {num_bytes}, torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA)));
@@ -380,7 +380,7 @@ public:
     std::pair<std::vector<torch::Tensor>, std::function<void()>>
     all_gather(const std::vector<torch::Tensor>& tensors) {
         const int num_tensors = tensors.size();
-        EP_HOST_ASSERT(num_max_args_session_bytes > 0 and num_max_args_per_session > 0 and args_in_session);
+        EP_HOST_ASSERT(num_max_agrs_session_bytes > 0 and num_max_agrs_per_session > 0 and agrs_in_session);
         EP_HOST_ASSERT(num_tensors >= 1);
 
         int num_copies = 0;
@@ -391,14 +391,14 @@ public:
             EP_HOST_ASSERT(x.is_cuda() and x.nbytes() % 32 == 0);
 
             const auto x_offset = math::ptr_diff(x.data_ptr(), buffer);
-            const bool is_inplace = 0 <= x_offset and x_offset < num_max_args_session_bytes;
-            offset[i] = args_buffer_offset;
+            const bool is_inplace = 0 <= x_offset and x_offset < num_max_agrs_session_bytes;
+            offset[i] = agrs_buffer_offset;
             num_copies += nccl_context->num_ranks - is_inplace;
-            args_buffer_offset += x.nbytes() * nccl_context->num_ranks;
+            agrs_buffer_offset += x.nbytes() * nccl_context->num_ranks;
             EP_HOST_ASSERT(not is_inplace or x.data_ptr() == math::advance_ptr(buffer, offset[i] + x.nbytes() * nccl_context->rank_idx));
         }
-        EP_HOST_ASSERT(args_buffer_offset <= num_max_args_session_bytes and
-                       args_buffer_slot_idx < num_max_args_per_session and
+        EP_HOST_ASSERT(agrs_buffer_offset <= num_max_agrs_session_bytes and
+                       agrs_buffer_slot_idx < num_max_agrs_per_session and
                        "Not enough session buffer size. Did you forget to flush session?");
 
         // Wait compute stream
@@ -435,16 +435,16 @@ public:
 #endif
 
         // Wait for data from other ranks
-        const int current_session = args_session_idx;
-        const int slot_idx = args_buffer_slot_idx;
-        args_buffer_slot_idx += 1;
+        const int current_session = agrs_session_idx;
+        const int slot_idx = agrs_buffer_slot_idx;
+        agrs_buffer_slot_idx += 1;
         std::vector<void*> write_ptrs(nccl_context->num_ranks - 1);
         std::vector<void*> wait_ptrs(nccl_context->num_ranks - 1);
         for (int i = 0; i < nccl_context->num_ranks - 1; ++ i) {
             const auto dst_rank_idx = (nccl_context->rank_idx + i + 1) % nccl_context->num_ranks;
             write_ptrs[i] = nccl_context->get_sym_ptr(
-                workspace_layout_wo_expert->get_args_recv_signal_ptr(slot_idx, nccl_context->rank_idx), dst_rank_idx);
-            wait_ptrs[i] = workspace_layout_wo_expert->get_args_recv_signal_ptr(slot_idx, dst_rank_idx);
+                workspace_layout_wo_expert->get_agrs_recv_signal_ptr(slot_idx, nccl_context->rank_idx), dst_rank_idx);
+            wait_ptrs[i] = workspace_layout_wo_expert->get_agrs_recv_signal_ptr(slot_idx, dst_rank_idx);
         }
         cuda_driver::batched_write_and_wait(comm_stream, write_ptrs, wait_ptrs, current_session);
 
@@ -460,7 +460,7 @@ public:
         const auto event = EventHandle(comm_stream);
         auto handle = [=, this]() {
             EP_HOST_ASSERT(compute_stream == at::cuda::getCurrentCUDAStream());
-            EP_HOST_ASSERT(args_in_session and current_session == this->args_session_idx);
+            EP_HOST_ASSERT(agrs_in_session and current_session == this->agrs_session_idx);
             stream_wait(compute_stream, event);
         };
         return {std::move(out), std::move(handle)};
@@ -1287,10 +1287,10 @@ static void register_apis(pybind11::module_& m) {
         .def("pp_set_config", &ElasticBuffer::pp_set_config)
         .def("pp_send", &ElasticBuffer::pp_send)
         .def("pp_recv", &ElasticBuffer::pp_recv)
-        .def("create_args_session", &ElasticBuffer::create_args_session)
-        .def("destroy_args_session", &ElasticBuffer::destroy_args_session)
-        .def("args_set_config", &ElasticBuffer::args_set_config)
-        .def("args_get_inplace_tensor", &ElasticBuffer::args_get_inplace_tensor)
+        .def("create_agrs_session", &ElasticBuffer::create_agrs_session)
+        .def("destroy_agrs_session", &ElasticBuffer::destroy_agrs_session)
+        .def("agrs_set_config", &ElasticBuffer::agrs_set_config)
+        .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine);

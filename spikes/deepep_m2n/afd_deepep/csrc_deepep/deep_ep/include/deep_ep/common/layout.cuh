@@ -19,7 +19,7 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxRanks = 1024;
     static constexpr int kNumMaxExperts = 2048;
     static constexpr int kNumMaxExpertsPerRank = 256;
-    static constexpr int kNumMaxInflightARGS = 32;
+    static constexpr int kNumMaxInflightAGRS = 32;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
 
@@ -73,8 +73,8 @@ struct WorkspaceLayout {
         // Rank send/recv count, for PP prev/next ranks
         num_bytes += 2 * 2 * sizeof(int64_t);
 
-        // ARGS signals
-        num_bytes += (kNumMaxInflightARGS + 1) * kNumMaxRanks * sizeof(int);
+        // AGRS signals
+        num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
         // Ensure LDG.256 work
         return math::align<int64_t>(num_bytes, 32);
@@ -164,15 +164,15 @@ struct WorkspaceLayout {
         return base_ptr + offset;
     }
 
-    __forceinline__ __device__ __host__ int* get_args_recv_signal_ptr(const int& slot, const int& rank_idx) const {
+    __forceinline__ __device__ __host__ int* get_agrs_recv_signal_ptr(const int& slot, const int& rank_idx) const {
         const auto base_ptr = math::advance_ptr<int>(
             get_pp_recv_count_ptr(0), 2 * sizeof(int64_t));
         return base_ptr + slot * kNumMaxRanks + rank_idx;
     }
 
-    __forceinline__ __device__ __host__ int* get_args_session_signal_ptr(const int& rank_idx) const {
+    __forceinline__ __device__ __host__ int* get_agrs_session_signal_ptr(const int& rank_idx) const {
         const auto base_ptr = math::advance_ptr<int>(
-            get_args_recv_signal_ptr(0, 0), kNumMaxInflightARGS * kNumMaxRanks * sizeof(int));
+            get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
     }
 };

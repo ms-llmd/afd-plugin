@@ -2,7 +2,9 @@
 default_install_hook_types:
   - pre-commit
   - commit-msg
-exclude: ^(afd_plugin/connectors/npu/bin/.*\.(run|whl))$
+# Vendored DeepEP stays byte-identical to its source apart from marked patches;
+# autofix hooks (typos, whitespace) would otherwise rewrite its identifiers.
+exclude: ^(afd_plugin/connectors/npu/bin/.*\.(run|whl)|spikes/deepep_m2n/afd_deepep/csrc_deepep/.*)$
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

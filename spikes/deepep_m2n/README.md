@@ -34,3 +34,11 @@ kubectl delete pod deepep-m2n-spike
 ```
 
 Results land in `/work/results/<F>f<A>a.{json,log}`.
+
+## Patches and hooks
+
+- Re-create the vendored tree: copy FastAFD `python/minisgl/kernel/csrc/deepep` to
+  `afd_deepep/csrc_deepep/`, then `python3 afd_deepep/apply_patches.py`.
+- The vendored tree is excluded from pre-commit: `typos` would rewrite its identifiers and break the build.
+- `k8s/pod-rdma.yaml` adds RoCE (`rdma/roce_gdr` + `multi-nic-compute`); run single-node tests there
+  with `EP_DISABLE_GIN=1` (see `PHASE0_REPORT.md`, "RDMA pod").
