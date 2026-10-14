@@ -3,14 +3,17 @@
 """Per-layer benchmark of ``DeepEPM2NAFDConnector`` against a local MoE.
 
 Opt-in: set ``AFD_DEEPEP_M2N_BENCH=1``. ``AFD_DEEPEP_M2N_BENCH_PHASE`` labels
-the run and ``AFD_DEEPEP_M2N_BENCH_OUT`` sets the JSON output path.
+the run, ``AFD_DEEPEP_M2N_BENCH_OUT`` sets the JSON output path and
+``AFD_DEEPEP_M2N_BENCH_VARIANTS`` (comma-separated labels) narrows the runs.
 
-For each topology, payload format and host-sync threshold it reports, per MoE
-layer and per-Attention-rank token count: dispatch, experts and combine time
-on FFN rank 0, the round trip seen by Attention rank 0, and throughput. The
-baseline is one GPU running the same MoE layer locally (vLLM ``fused_experts``,
-all experts, no communication, same precision) for one Attention rank's tokens
-and for the whole Attention side's tokens.
+Each variant fixes a payload format, a host-sync threshold, eager vs CUDA-graph
+replay, and 1 or 2 lanes. For every topology and per-Attention-rank token
+count ``T`` it reports the per-MoE-layer round trip seen by Attention rank 0
+(both lanes, each carrying ``T`` tokens per rank, for 2-lane variants) and
+throughput; eager 1-lane variants also break the round trip into dispatch,
+experts and combine on FFN rank 0. The baseline is one GPU running the same MoE
+layer locally (vLLM ``fused_experts``, all experts, no communication, same
+precision) for one rank's tokens and for all tokens of the layer.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from tests.unit.connectors.deepep_m2n_harness import (  # noqa: E402
     available_gpus,
     bench_output_path,
     benchmark_scenario,
+    graph_benchmark_scenario,
     local_moe_baseline,
     run_ranks,
 )
@@ -42,13 +46,15 @@ pytestmark = [
     ),
 ]
 
-TOKENS_PER_ATTN_RANK = [1, 8, 32, 128, 512, 2048, 8192]
-CAPACITY = max(TOKENS_PER_ATTN_RANK)
+EAGER_TOKENS = [1, 8, 32, 128, 512, 2048, 8192]
+# Graph capture uses worst-case receive shapes, so stop at prefill-sized 2048.
+GRAPH_TOKENS = [1, 8, 32, 128, 512, 2048]
+CAPACITY = max(EAGER_TOKENS)
 ITERS = 20
 TOPOLOGIES = [Topology(2, 2), Topology(1, 3)]
 BF16 = "bf16"
 FP8 = "fp8_block128_fp32"
-# Eager steps below this bucket skip the host sync in the "sync>=" runs.
+# Eager steps below this bucket skip the host sync.
 SYNC_THRESHOLD = 1024
 
 
@@ -56,33 +62,54 @@ SYNC_THRESHOLD = 1024
 class Variant:
     label: str
     payload_format: str
-    cpu_sync_min_tokens: int
+    cpu_sync_min_tokens: int = 0
+    graph: bool = False
+    num_lanes: int = 1
+
+    @property
+    def tokens(self) -> list[int]:
+        return GRAPH_TOKENS if self.graph else EAGER_TOKENS
 
 
 VARIANTS = [
-    Variant("bf16", BF16, 0),
-    Variant("fp8", FP8, 0),
-    Variant(f"fp8-sync>={SYNC_THRESHOLD}", FP8, SYNC_THRESHOLD),
+    Variant("bf16", BF16),
+    Variant("fp8", FP8),
+    Variant("fp8-nosync", FP8, SYNC_THRESHOLD),
+    Variant("fp8-nosync-2lanes", FP8, SYNC_THRESHOLD, num_lanes=2),
+    Variant("bf16-graph", BF16, graph=True),
+    Variant("fp8-graph", FP8, graph=True),
+    Variant("fp8-graph-2lanes", FP8, graph=True, num_lanes=2),
 ]
+
+
+def _selected_variants() -> list[Variant]:
+    wanted = os.environ.get("AFD_DEEPEP_M2N_BENCH_VARIANTS")
+    if not wanted:
+        return VARIANTS
+    labels = set(wanted.split(","))
+    return [variant for variant in VARIANTS if variant.label in labels]
 
 
 def _format_table(report: dict) -> str:
     lines = [
         f"phase={report['phase']}",
-        "run                          tokens/attn  dispatch_us  experts_us"
-        "  combine_us  round_trip_us     tok/s  local(T)_us  local(A*T)_us",
+        "run                      T/attn  dispatch_us  experts_us  combine_us"
+        "  round_trip_us     tok/s  local(T)_us  local(all)_us",
     ]
     for name, run in report["results"].items():
         baseline = report["baseline"][run["payload_format"]]
         for tokens, row in run["by_tokens"].items():
-            total_tokens = int(tokens) * run["attn_size"]
-            tok_per_s = total_tokens / (row["round_trip_us"] * 1e-6)
+            layer_tokens = int(tokens) * run["attn_size"] * run["num_lanes"]
+            tok_per_s = layer_tokens / (row["round_trip_us"] * 1e-6)
+            parts = [
+                f"{row[key]:11.1f}" if key in row else f"{'-':>11s}"
+                for key in ("dispatch_us", "experts_us", "combine_us")
+            ]
             lines.append(
-                f"{name:28s} {int(tokens):11d} {row['dispatch_us']:12.1f} "
-                f"{row['experts_us']:11.1f} {row['combine_us']:11.1f} "
+                f"{name:24s} {int(tokens):6d} {parts[0]} {parts[1]} {parts[2]} "
                 f"{row['round_trip_us']:14.1f} {tok_per_s:9.0f} "
                 f"{baseline[tokens]['total_us']:12.1f} "
-                f"{baseline[str(total_tokens)]['total_us']:14.1f}"
+                f"{baseline[str(layer_tokens)]['total_us']:14.1f}"
             )
     return "\n".join(lines)
 
@@ -92,24 +119,22 @@ def test_deepep_m2n_per_layer_benchmark(tmp_path):
     if available_gpus() < needed:
         pytest.skip(f"needs {needed} GPUs")
 
+    variants = _selected_variants()
     results: dict[str, dict] = {}
     for topology in TOPOLOGIES:
-        for variant in VARIANTS:
+        for variant in variants:
             name = f"{topology.ffn_size}F{topology.attn_size}A-{variant.label}"
             out_dir = tmp_path / name
             out_dir.mkdir()
             ranks = run_ranks(
                 topology,
-                benchmark_scenario,
-                {
-                    "tokens_per_attn_rank": TOKENS_PER_ATTN_RANK,
-                    "iters": ITERS,
-                    "graph_mode": False,
-                },
+                graph_benchmark_scenario if variant.graph else benchmark_scenario,
+                {"tokens_per_attn_rank": variant.tokens, "iters": ITERS},
                 {
                     "capacity_tokens_per_rank": CAPACITY,
                     "payload_format": variant.payload_format,
                     "cpu_sync_min_tokens": variant.cpu_sync_min_tokens,
+                    "num_lanes": variant.num_lanes,
                 },
                 out_dir,
             )
@@ -117,26 +142,31 @@ def test_deepep_m2n_per_layer_benchmark(tmp_path):
             assert not failures, "\n".join(failures)
             ffn0 = ranks[0].metrics
             attn0 = ranks[topology.ffn_size].metrics
+            by_tokens = {}
+            for tokens, row in attn0.items():
+                entry = {"round_trip_us": row["total_us"]}
+                for key in ("dispatch_us", "experts_us", "combine_us"):
+                    if key in ffn0[tokens]:
+                        entry[key] = ffn0[tokens][key]
+                by_tokens[tokens] = entry
             results[name] = {
                 "payload_format": variant.payload_format,
                 "attn_size": topology.attn_size,
-                "by_tokens": {
-                    tokens: {
-                        "dispatch_us": ffn0[tokens]["dispatch_us"],
-                        "experts_us": ffn0[tokens]["experts_us"],
-                        "combine_us": ffn0[tokens]["combine_us"],
-                        "round_trip_us": attn0[tokens]["total_us"],
-                    }
-                    for tokens in ffn0
-                },
+                "num_lanes": variant.num_lanes,
+                "graph": variant.graph,
+                "by_tokens": by_tokens,
             }
 
     baseline_tokens = sorted(
-        set(TOKENS_PER_ATTN_RANK)
-        | {
-            tokens * topology.attn_size
-            for topology in TOPOLOGIES
-            for tokens in TOKENS_PER_ATTN_RANK
+        {
+            tokens * multiplier
+            for tokens in EAGER_TOKENS
+            for multiplier in {1}
+            | {
+                topology.attn_size * lanes
+                for topology in TOPOLOGIES
+                for lanes in (1, 2)
+            }
         }
     )
     report = {
@@ -145,7 +175,7 @@ def test_deepep_m2n_per_layer_benchmark(tmp_path):
         "results": results,
         "baseline": {
             payload: local_moe_baseline(baseline_tokens, ITERS, payload)
-            for payload in (BF16, FP8)
+            for payload in {variant.payload_format for variant in variants}
         },
     }
     bench_output_path().write_text(json.dumps(report, indent=1), encoding="utf-8")

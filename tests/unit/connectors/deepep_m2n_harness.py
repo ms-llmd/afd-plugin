@@ -14,12 +14,14 @@ ranks compare the combined output against a dense MoE reference.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import socket
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +58,8 @@ FP8_TOLERANCES = {
 }
 RANK_TIMEOUT_S = 900
 BENCH_WARMUP_ITERS = 5
+# Seeds reserve room for this many stages (lanes) per step.
+MAX_STAGES = 2
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,13 @@ class Case:
     # Graph-mode payloads skip the host sync (worst-case receive allocation).
     graph_mode: bool = False
     num_layers: int = 2
+    # Second stage (lane 1) token counts for two-lane (DBO) cases.
+    second_stage: tuple[int, ...] | None = None
+
+    def stage_tokens(self) -> list[tuple[int, ...]]:
+        if self.second_stage is None:
+            return [self.tokens_per_attn_rank]
+        return [self.tokens_per_attn_rank, self.second_stage]
 
 
 @dataclass
@@ -103,6 +114,29 @@ def standard_cases(attn_size: int, capacity: int) -> list[Case]:
             Case(f"decode1_{tag}", (1,) * attn_size, graph_mode),
             Case(f"empty_{tag}", (0,) * attn_size, graph_mode),
             Case(f"mixed_{tag}", mixed, graph_mode),
+        ]
+    return cases
+
+
+def lane_cases(attn_size: int, capacity: int) -> list[Case]:
+    """Two-lane (DBO) cases: different token counts per lane, incl. empty lanes."""
+    cases: list[Case] = []
+    for graph_mode in (False, True):
+        tag = "nosync" if graph_mode else "sync"
+        cases += [
+            Case(
+                f"lanes_even_{tag}", (64,) * attn_size, graph_mode, 2, (32,) * attn_size
+            ),
+            Case(
+                f"lanes_uneven_{tag}",
+                (capacity,) + (0,) * (attn_size - 1),
+                graph_mode,
+                2,
+                (1,) * attn_size,
+            ),
+            Case(
+                f"lanes_empty_{tag}", (0,) * attn_size, graph_mode, 2, (17,) * attn_size
+            ),
         ]
     return cases
 
@@ -258,8 +292,18 @@ def build_connector(
     return connector
 
 
-def control_step(connector: Any, tokens: tuple[int, ...], graph_mode: bool) -> None:
-    """Deliver one step's control payload like the runtime does."""
+def control_step(
+    connector: Any,
+    tokens_by_stage: list[tuple[int, ...]],
+    *,
+    graph_mode: bool = False,
+) -> None:
+    """Deliver one step's control payload like the runtime does.
+
+    ``tokens_by_stage[s]`` holds every Attention rank's token count for stage
+    (lane) ``s``. ``graph_mode`` marks the step as graph capture/replay (no
+    host sync, fixed worst-case shapes).
+    """
     from afd_plugin.connectors import AFDControlPayload, AFDDPMetadata
 
     if connector.is_ffn:
@@ -267,7 +311,8 @@ def control_step(connector: Any, tokens: tuple[int, ...], graph_mode: bool) -> N
     else:
         payload = AFDControlPayload(
             dp_metadata_list={
-                0: AFDDPMetadata(num_tokens_across_dp_cpu=torch.tensor(tokens))
+                stage: AFDDPMetadata(num_tokens_across_dp_cpu=torch.tensor(tokens))
+                for stage, tokens in enumerate(tokens_by_stage)
             },
             is_graph_capturing=False,
             is_warmup=False,
@@ -401,157 +446,404 @@ def as_sent(x: torch.Tensor, payload_format: str) -> torch.Tensor:
     return dequantize_fp8_rows(x_q, x_s)
 
 
+def stage_seed(step: int, stage: int) -> int:
+    return step * MAX_STAGES + stage
+
+
+class Checker:
+    """Per-rank verification state: references and worst observed errors."""
+
+    def __init__(self, connector: Any) -> None:
+        from afd_plugin.connectors.gpu.deepep_m2n.experts import DeepEPM2NExperts
+
+        self.connector = connector
+        self.payload_format = connector.config.payload_format
+        self.tolerances = (
+            BF16_TOLERANCES if self.payload_format == "bf16" else FP8_TOLERANCES
+        )
+        self.worst: dict[str, float] = {}
+        if connector.is_ffn:
+            self.experts = connector.layout.expert_range(connector.role_rank)
+            self.weights, self.w13_ref, self.w2_ref = local_weights(
+                self.experts, self.payload_format
+            )
+            self.reference_executor = DeepEPM2NExperts(
+                "fused_experts", connector.expert_alignment
+            )
+        else:
+            # End to end, the Attention side compares against the BF16 model.
+            self.w13_ref, self.w2_ref = make_expert_weights(range(NUM_EXPERTS))
+
+    def record(self, key: str, value: float) -> None:
+        self.worst[key] = max(self.worst.get(key, 0.0), value)
+
+    def check_ffn_receive(
+        self, payload: Any, tokens_per_attn_rank: tuple[int, ...], seed: int, label: str
+    ) -> None:
+        """Exact per-expert counts, then row and weight checksums."""
+        from afd_plugin.connectors.gpu.deepep_m2n.experts import (
+            align_up,
+            expert_row_ranges,
+        )
+        from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
+            dequantize_fp8_rows,
+        )
+
+        connector, experts = self.connector, self.experts
+        state = payload.context.states
+        ranges = expert_row_ranges(
+            state.recv_count_psum.to(torch.int64), connector.expert_alignment
+        )
+        received = (
+            payload.hidden_states.float()
+            if state.recv_scale is None
+            else dequantize_fp8_rows(payload.hidden_states, state.recv_scale)
+        )
+        expected_counts = torch.zeros(len(experts), dtype=torch.int64, device="cuda")
+        expected_xsum = torch.zeros(len(experts), HIDDEN_SIZE, device="cuda")
+        expected_wsum = torch.zeros(len(experts), device="cuda")
+        for attn_rank, num_tokens in enumerate(tokens_per_attn_rank):
+            x, ids, w = make_inputs(seed, attn_rank, num_tokens)
+            sent = as_sent(x, self.payload_format)
+            mask = (ids >= experts.start) & (ids < experts.stop)
+            rows, slots = mask.nonzero(as_tuple=True)
+            local = ids[rows, slots] - experts.start
+            expected_counts.index_add_(0, local, torch.ones_like(local))
+            expected_xsum.index_add_(0, local, sent[rows])
+            expected_wsum.index_add_(0, local, w[rows, slots])
+        got_counts = [end - start for start, end in ranges]
+        if got_counts != expected_counts.tolist():
+            raise AssertionError(
+                f"{label}: counts {got_counts} != {expected_counts.tolist()}"
+            )
+        plan = connector.stage_plans[state.lane]
+        padded = [align_up(count, connector.expert_alignment) for count in got_counts]
+        if plan.do_cpu_sync and state.recv_counts_host != padded:
+            raise AssertionError(
+                f"{label}: host counts {state.recv_counts_host} != padded {padded}"
+            )
+        got_xsum = torch.stack([received[s:e].sum(0) for s, e in ranges])
+        got_wsum = torch.stack([state.recv_topk_weights[s:e].sum() for s, e in ranges])
+        self.record("dispatch_rows_rel_err", rel_err(got_xsum, expected_xsum))
+        self.record("dispatch_weights_rel_err", rel_err(got_wsum, expected_wsum))
+
+    def check_ffn_experts(self, payload: Any, out: torch.Tensor) -> None:
+        """Experts output vs fp32 math and vLLM ``fused_experts`` on the same rows."""
+        from afd_plugin.connectors.gpu.deepep_m2n.experts import expert_row_ranges
+        from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
+            dequantize_fp8_rows,
+        )
+
+        state = payload.context.states
+        ranges = expert_row_ranges(
+            state.recv_count_psum.to(torch.int64), self.connector.expert_alignment
+        )
+        received = (
+            payload.hidden_states.float()
+            if state.recv_scale is None
+            else dequantize_fp8_rows(payload.hidden_states, state.recv_scale)
+        )
+        reference = self.reference_executor(
+            payload.hidden_states,
+            state.recv_scale,
+            state.recv_topk_weights,
+            state.recv_count_psum,
+            self.weights,
+        )
+        for expert, (start, end) in enumerate(ranges):
+            if end == start:
+                continue
+            exact = (
+                expert_mlp_fp32(
+                    received[start:end], self.w13_ref[expert], self.w2_ref[expert]
+                )
+                * state.recv_topk_weights[start:end, None]
+            )
+            self.record("experts_rel_err", rel_err(out[start:end], exact))
+            self.record(
+                "experts_vs_fused_rel_err",
+                rel_err(out[start:end], reference[start:end]),
+            )
+
+    def check_combined(
+        self,
+        combined: torch.Tensor,
+        x: torch.Tensor,
+        ids: torch.Tensor,
+        w: torch.Tensor,
+    ) -> None:
+        if x.shape[0]:
+            expected = dense_moe_reference(x, ids, w, self.w13_ref, self.w2_ref)
+            self.record("combine_rel_err", rel_err(combined, expected))
+
+    def finish(self) -> dict[str, Any]:
+        torch.cuda.synchronize()
+        for key, limit in self.tolerances.items():
+            if self.worst.get(key, 0.0) > limit:
+                raise AssertionError(f"{key}={self.worst[key]:.3e} exceeds {limit:.0e}")
+        return {**self.worst, "expert_alignment": self.connector.expert_alignment}
+
+
+def attention_context(layer: int, stage: int, num_tokens: int) -> Any:
+    from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
+
+    return AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer, stage_idx=stage, seq_len=num_tokens
+        )
+    )
+
+
+def run_attention_step(
+    connector: Any,
+    inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    outs: list[torch.Tensor],
+    layer: int = 0,
+) -> None:
+    """DBO order: dispatch every stage, then combine every stage."""
+    for stage, (x, ids, w) in enumerate(inputs):
+        connector.send_attn_output(
+            x, attention_context(layer, stage, x.shape[0]), topk_ids=ids, topk_weights=w
+        )
+    for stage, out in enumerate(outs):
+        connector.recv_ffn_output(out, stage)
+
+
+def run_ffn_step(
+    connector: Any, weights: Any, num_stages: int
+) -> tuple[list[Any], list[torch.Tensor]]:
+    """Receive every stage, then experts + combine per stage, then join lanes."""
+    payloads = [connector.recv_attn_output(stage) for stage in range(num_stages)]
+    outs = []
+    for payload in payloads:
+        out = connector.run_experts(payload, weights)
+        connector.send_ffn_output(out, payload.context)
+        outs.append(out)
+    connector.synchronize_lanes()
+    return payloads, outs
+
+
 def correctness_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Transport, expert computation and combine checks for every case."""
-    from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
-    from afd_plugin.connectors.gpu.deepep_m2n.experts import (
-        DeepEPM2NExperts,
-        align_up,
-        expert_row_ranges,
-    )
-    from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import dequantize_fp8_rows
-
-    payload_format = connector.config.payload_format
-    tolerances = FP8_TOLERANCES if payload_format != "bf16" else BF16_TOLERANCES
-    worst: dict[str, float] = {}
-
-    def record(key: str, value: float) -> None:
-        worst[key] = max(worst.get(key, 0.0), value)
-
-    if connector.is_ffn:
-        experts = connector.layout.expert_range(connector.role_rank)
-        weights, w13_ref, w2_ref = local_weights(experts, payload_format)
-        reference_executor = DeepEPM2NExperts(
-            "fused_experts", connector.expert_alignment
-        )
-    else:
-        # End to end, the Attention side compares against the BF16 model.
-        w13_ref, w2_ref = make_expert_weights(range(NUM_EXPERTS))
-
-    cases = [Case(**case) for case in args["cases"]]
-    seed = 0
-    for case in cases:
+    """Eager steps over every case; each case lists per-stage token counts."""
+    checker = Checker(connector)
+    step = 0
+    for case in [Case(**case) for case in args["cases"]]:
+        stages = case.stage_tokens()
         for layer in range(case.num_layers):
-            seed += 1
-            control_step(connector, case.tokens_per_attn_rank, case.graph_mode)
+            step += 1
+            control_step(connector, stages, graph_mode=case.graph_mode)
             if connector.is_ffn:
-                payload = connector.recv_attn_output(0)
-                state = payload.context.states
-                psum = state.recv_count_psum.to(torch.int64)
-                ranges = expert_row_ranges(psum, connector.expert_alignment)
-                received = (
-                    payload.hidden_states.float()
-                    if state.recv_scale is None
-                    else dequantize_fp8_rows(payload.hidden_states, state.recv_scale)
-                )
-                # Transport: exact per-expert counts and row/weight checksums.
-                expected_counts = torch.zeros(
-                    len(experts), dtype=torch.int64, device="cuda"
-                )
-                expected_xsum = torch.zeros(len(experts), HIDDEN_SIZE, device="cuda")
-                expected_wsum = torch.zeros(len(experts), device="cuda")
-                for attn_rank, num_tokens in enumerate(case.tokens_per_attn_rank):
-                    x, ids, w = make_inputs(seed, attn_rank, num_tokens)
-                    sent = as_sent(x, payload_format)
-                    mask = (ids >= experts.start) & (ids < experts.stop)
-                    rows, slots = mask.nonzero(as_tuple=True)
-                    local = ids[rows, slots] - experts.start
-                    expected_counts.index_add_(0, local, torch.ones_like(local))
-                    expected_xsum.index_add_(0, local, sent[rows])
-                    expected_wsum.index_add_(0, local, w[rows, slots])
-                got_counts = [end - start for start, end in ranges]
-                if got_counts != expected_counts.tolist():
-                    raise AssertionError(
-                        f"{case.name} L{layer}: counts {got_counts} != "
-                        f"{expected_counts.tolist()}"
+                payloads, outs = run_ffn_step(connector, checker.weights, len(stages))
+                for stage, (payload, out) in enumerate(
+                    zip(payloads, outs, strict=True)
+                ):
+                    label = f"{case.name} L{layer} S{stage}"
+                    checker.check_ffn_receive(
+                        payload, stages[stage], stage_seed(step, stage), label
                     )
-                # The host list counts each expert's rows padded to the alignment.
-                padded_counts = [
-                    align_up(count, connector.expert_alignment) for count in got_counts
-                ]
-                synced = connector.stage_plans[0].do_cpu_sync
-                if synced and state.recv_counts_host != padded_counts:
-                    raise AssertionError(
-                        f"{case.name}: host counts {state.recv_counts_host} != "
-                        f"padded psum counts {padded_counts}"
-                    )
-                got_xsum = torch.stack([received[s:e].sum(0) for s, e in ranges])
-                got_wsum = torch.stack(
-                    [state.recv_topk_weights[s:e].sum() for s, e in ranges]
-                )
-                record("dispatch_rows_rel_err", rel_err(got_xsum, expected_xsum))
-                record("dispatch_weights_rel_err", rel_err(got_wsum, expected_wsum))
-                # MoE FFN: DeepGEMM path vs fp32 reference and vLLM fused_experts.
-                out = connector.run_experts(payload, weights)
-                reference = reference_executor(
-                    payload.hidden_states,
-                    state.recv_scale,
-                    state.recv_topk_weights,
-                    state.recv_count_psum,
-                    weights,
-                )
-                for expert, (start, end) in enumerate(ranges):
-                    if end == start:
-                        continue
-                    exact = (
-                        expert_mlp_fp32(
-                            received[start:end], w13_ref[expert], w2_ref[expert]
-                        )
-                        * state.recv_topk_weights[start:end, None]
-                    )
-                    record("experts_rel_err", rel_err(out[start:end], exact))
-                    record(
-                        "experts_vs_fused_rel_err",
-                        rel_err(out[start:end], reference[start:end]),
-                    )
-                connector.send_ffn_output(out, payload.context)
+                    checker.check_ffn_experts(payload, out)
             else:
-                attn_rank = connector.role_rank
-                x, ids, w = make_inputs(
-                    seed, attn_rank, case.tokens_per_attn_rank[attn_rank]
-                )
-                context = AFDTransferContext(
-                    metadata=AFDTransferMetadata.create_attention_metadata(
-                        layer_idx=layer, stage_idx=0, seq_len=x.shape[0]
+                rank = connector.role_rank
+                inputs = [
+                    make_inputs(stage_seed(step, stage), rank, tokens[rank])
+                    for stage, tokens in enumerate(stages)
+                ]
+                outs = [torch.empty_like(x) for x, _, _ in inputs]
+                run_attention_step(connector, inputs, outs, layer)
+                for (x, ids, w), out in zip(inputs, outs, strict=True):
+                    checker.check_combined(out, x, ids, w)
+    return checker.finish()
+
+
+def compile_scenario(
+    connector: Any, topology: Topology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Attention side runs send + recv under ``torch.compile(fullgraph=True)``."""
+
+    def attention_layer(
+        x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        connector.send_attn_output(
+            x, attention_context(0, 0, x.shape[0]), topk_ids=ids, topk_weights=w
+        )
+        return connector.recv_ffn_output(out, 0) * 1.0
+
+    compiled = torch.compile(attention_layer, fullgraph=True)
+    checker = Checker(connector)
+    step = 0
+    for case in [Case(**case) for case in args["cases"]]:
+        stages = case.stage_tokens()
+        for _ in range(case.num_layers):
+            step += 1
+            control_step(connector, stages, graph_mode=case.graph_mode)
+            if connector.is_ffn:
+                run_ffn_step(connector, checker.weights, 1)
+            else:
+                rank = connector.role_rank
+                x, ids, w = make_inputs(stage_seed(step, 0), rank, stages[0][rank])
+                combined = compiled(x, ids, w, torch.empty_like(x))
+                checker.check_combined(combined, x, ids, w)
+    return checker.finish()
+
+
+@dataclass
+class CapturedStep:
+    """One CUDA graph for one bucket, with its static inputs and outputs."""
+
+    graph: torch.cuda.CUDAGraph
+    inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    outs: list[torch.Tensor]
+    payloads: list[Any]
+
+
+def capture_step(
+    connector: Any, topology: Topology, bucket: int, weights: Any
+) -> CapturedStep:
+    """Warm up one eager graph-mode step, then capture the same step.
+
+    Every Attention rank runs exactly ``bucket`` tokens per stage, so all
+    shapes are fixed. Graph-mode payloads skip the host sync and give
+    worst-case receive shapes on every rank.
+    """
+    num_stages = connector.config.num_lanes
+    stages = [(bucket,) * topology.attn_size] * num_stages
+    inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    outs: list[torch.Tensor] = []
+    if not connector.is_ffn:
+        inputs = [
+            make_inputs(stage_seed(0, stage), connector.role_rank, bucket)
+            for stage in range(num_stages)
+        ]
+        outs = [torch.empty_like(x) for x, _, _ in inputs]
+    for capture in (False, True):
+        control_step(connector, stages, graph_mode=True)
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph) if capture else nullcontext():
+            if connector.is_ffn:
+                payloads, outs = run_ffn_step(connector, weights, num_stages)
+            else:
+                payloads = []
+                run_attention_step(connector, inputs, outs)
+        torch.cuda.synchronize()
+    return CapturedStep(graph=graph, inputs=inputs, outs=outs, payloads=payloads)
+
+
+def replay_step(
+    connector: Any, topology: Topology, captured: CapturedStep, bucket: int
+) -> None:
+    stages = [(bucket,) * topology.attn_size] * connector.config.num_lanes
+    control_step(connector, stages, graph_mode=True)
+    captured.graph.replay()
+
+
+def graph_scenario(
+    connector: Any, topology: Topology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Capture one graph per bucket; replay them interleaved with new inputs."""
+    checker = Checker(connector)
+    weights = checker.weights if connector.is_ffn else None
+    buckets = args["buckets"]
+    captured = {
+        bucket: capture_step(connector, topology, bucket, weights) for bucket in buckets
+    }
+    num_stages = connector.config.num_lanes
+    step = 0
+    for _ in range(args["replays"]):
+        for bucket in buckets:
+            step += 1
+            graph_step = captured[bucket]
+            if not connector.is_ffn:
+                rank = connector.role_rank
+                fresh = [
+                    make_inputs(stage_seed(step, stage), rank, bucket)
+                    for stage in range(num_stages)
+                ]
+                for static, new in zip(graph_step.inputs, fresh, strict=True):
+                    for static_tensor, new_tensor in zip(static, new, strict=True):
+                        static_tensor.copy_(new_tensor)
+            replay_step(connector, topology, graph_step, bucket)
+            torch.cuda.synchronize()
+            if connector.is_ffn:
+                tokens = (bucket,) * topology.attn_size
+                for stage, (payload, out) in enumerate(
+                    zip(graph_step.payloads, graph_step.outs, strict=True)
+                ):
+                    label = f"graph bucket={bucket} step={step} S{stage}"
+                    checker.check_ffn_receive(
+                        payload, tokens, stage_seed(step, stage), label
                     )
-                )
-                connector.send_attn_output(x, context, topk_ids=ids, topk_weights=w)
-                combined = connector.recv_ffn_output(torch.empty_like(x), 0)
-                if x.shape[0]:
-                    expected = dense_moe_reference(x, ids, w, w13_ref, w2_ref)
-                    record("combine_rel_err", rel_err(combined, expected))
-    torch.cuda.synchronize()
-    for key, limit in tolerances.items():
-        if worst.get(key, 0.0) > limit:
-            raise AssertionError(f"{key}={worst[key]:.3e} exceeds {limit:.0e}")
-    worst["expert_alignment"] = connector.expert_alignment
-    return worst
+                    checker.check_ffn_experts(payload, out)
+            else:
+                for (x, ids, w), out in zip(
+                    graph_step.inputs, graph_step.outs, strict=True
+                ):
+                    checker.check_combined(out, x, ids, w)
+    return checker.finish()
+
+
+def _timed(fn: Any, iters: int) -> float:
+    """Mean wall time of ``fn`` in µs; ranks start each iteration together."""
+    total = 0.0
+    for iteration in range(BENCH_WARMUP_ITERS + iters):
+        torch.cuda.synchronize()
+        dist.barrier()
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        if iteration >= BENCH_WARMUP_ITERS:
+            total += time.perf_counter() - start
+    return total / iters * 1e6
+
+
+def eager_step(
+    connector: Any,
+    stages: list[tuple[int, ...]],
+    weights: Any,
+    inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    outs: list[torch.Tensor],
+) -> None:
+    """One eager step over every stage (control payload included)."""
+    control_step(connector, stages)
+    if connector.is_ffn:
+        run_ffn_step(connector, weights, len(stages))
+    else:
+        run_attention_step(connector, inputs, outs)
 
 
 def benchmark_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Per-layer dispatch / experts / combine times for each token count."""
-    from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
-
+    """Eager per-layer time. One lane: dispatch/experts/combine breakdown."""
+    num_stages = connector.config.num_lanes
     if connector.is_ffn:
         experts = connector.layout.expert_range(connector.role_rank)
         weights, _, _ = local_weights(experts, connector.config.payload_format)
     timings: dict[str, Any] = {}
     for tokens in args["tokens_per_attn_rank"]:
+        stages = [(tokens,) * topology.attn_size] * num_stages
+        if not connector.is_ffn:
+            inputs = [
+                make_inputs(stage, connector.role_rank, tokens)
+                for stage in range(num_stages)
+            ]
+            outs = [torch.empty_like(x) for x, _, _ in inputs]
+        if num_stages > 1:
+            step = functools.partial(
+                eager_step,
+                connector,
+                stages,
+                weights if connector.is_ffn else None,
+                [] if connector.is_ffn else inputs,
+                [] if connector.is_ffn else outs,
+            )
+            timings[str(tokens)] = {"total_us": _timed(step, args["iters"])}
+            continue
         per_iter: list[tuple[float, float, float]] = []
         for iteration in range(BENCH_WARMUP_ITERS + args["iters"]):
-            control_step(connector, (tokens,) * topology.attn_size, args["graph_mode"])
-            if not connector.is_ffn:
-                x, ids, w = make_inputs(iteration, connector.role_rank, tokens)
-                context = AFDTransferContext(
-                    metadata=AFDTransferMetadata.create_attention_metadata(
-                        layer_idx=0, stage_idx=0, seq_len=tokens
-                    )
-                )
-                ref = torch.empty_like(x)
+            control_step(connector, stages)
             torch.cuda.synchronize()
             dist.barrier()
             t0 = time.perf_counter()
@@ -563,11 +855,22 @@ def benchmark_scenario(
                 torch.cuda.synchronize()
                 t2 = time.perf_counter()
                 connector.send_ffn_output(out, payload.context)
+                connector.synchronize_lanes()
             else:
-                connector.send_attn_output(x, context, topk_ids=ids, topk_weights=w)
+                x, ids, w = inputs[0]
+                if args.get("bypass_custom_ops", False):
+                    # Measures the custom-op wrappers' own cost.
+                    connector.dispatch_attention(x, ids, w, 0)
+                else:
+                    connector.send_attn_output(
+                        x, attention_context(0, 0, tokens), topk_ids=ids, topk_weights=w
+                    )
                 torch.cuda.synchronize()
                 t1 = t2 = time.perf_counter()
-                connector.recv_ffn_output(ref, 0)
+                if args.get("bypass_custom_ops", False):
+                    connector.combine_attention(outs[0], 0)
+                else:
+                    connector.recv_ffn_output(outs[0], 0)
             torch.cuda.synchronize()
             t3 = time.perf_counter()
             if iteration >= BENCH_WARMUP_ITERS:
@@ -579,6 +882,37 @@ def benchmark_scenario(
             "combine_us": sum(item[2] for item in per_iter) / count * 1e6,
             "total_us": sum(sum(item) for item in per_iter) / count * 1e6,
         }
+    return timings
+
+
+def graph_benchmark_scenario(
+    connector: Any, topology: Topology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Per-layer time of a replayed CUDA graph (all lanes) per token count.
+
+    The control payload is delivered outside the timed region, as a real
+    runtime sends it once per step rather than once per layer.
+    """
+    weights = None
+    if connector.is_ffn:
+        experts = connector.layout.expert_range(connector.role_rank)
+        weights, _, _ = local_weights(experts, connector.config.payload_format)
+    timings: dict[str, Any] = {}
+    for tokens in args["tokens_per_attn_rank"]:
+        captured = capture_step(connector, topology, tokens, weights)
+        stages = [(tokens,) * topology.attn_size] * connector.config.num_lanes
+        total = 0.0
+        for iteration in range(BENCH_WARMUP_ITERS + args["iters"]):
+            control_step(connector, stages, graph_mode=True)
+            torch.cuda.synchronize()
+            dist.barrier()
+            start = time.perf_counter()
+            captured.graph.replay()
+            torch.cuda.synchronize()
+            if iteration >= BENCH_WARMUP_ITERS:
+                total += time.perf_counter() - start
+        timings[str(tokens)] = {"total_us": total / args["iters"] * 1e6}
+        del captured
     return timings
 
 

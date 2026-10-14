@@ -100,7 +100,7 @@ def test_config_defaults_and_round_trip():
         ({"expert_backend": "cutlass"}, "expert_backend"),
         ({"payload_format": "fp4"}, "payload_format"),
         ({"disable_gin": "maybe"}, "disable_gin"),
-        ({"num_lanes": 2}, "num_lanes"),
+        ({"num_lanes": 3}, "num_lanes"),
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
         ({"bucket_granularity": 0}, "bucket_granularity"),
         ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
