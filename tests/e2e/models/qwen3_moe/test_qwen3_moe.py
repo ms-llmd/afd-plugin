@@ -25,12 +25,20 @@ QWEN3_MOE_MAX_MODEL_LEN = 4096
 DEFAULT_DEVICE_IDS = ("0", "1", "2", "3")
 ATTENTION_DEVICE_COUNT = 2
 AFD_FFN_DEVICE_COUNT = 1
+DEEPEP_M2N_FFN_DEVICE_COUNT = 2
 BASELINE_DEVICE_COUNT = 4
 SCENARIOS = (
     "baseline-graph",
     "afd-eager-2a1f",
     "afd-graph-2a1f",
     "afd-graph-dbo-2a1f",
+)
+# DeepEP M2N (routing on Attention) needs EP over at least two FFN ranks, so
+# it runs 2A2F. These cases are opt-in: CI selects test ids explicitly.
+DEEPEP_M2N_SCENARIOS = (
+    "afd-deepep-m2n-eager-2a2f",
+    "afd-deepep-m2n-graph-2a2f",
+    "afd-deepep-m2n-graph-dbo-2a2f",
 )
 
 
@@ -74,9 +82,14 @@ def build_runner_command(scenario: str, gsm8k_output_path: Path) -> list[str]:
         attention_devices = devices[:BASELINE_DEVICE_COUNT]
         ffn_devices = []
     else:
+        ffn_device_count = (
+            DEEPEP_M2N_FFN_DEVICE_COUNT
+            if scenario in DEEPEP_M2N_SCENARIOS
+            else AFD_FFN_DEVICE_COUNT
+        )
         attention_devices = devices[:ATTENTION_DEVICE_COUNT]
         ffn_devices = devices[
-            ATTENTION_DEVICE_COUNT : ATTENTION_DEVICE_COUNT + AFD_FFN_DEVICE_COUNT
+            ATTENTION_DEVICE_COUNT : ATTENTION_DEVICE_COUNT + ffn_device_count
         ]
 
     command = [
@@ -119,5 +132,12 @@ def _prepare_e2e_assets() -> Iterator[None]:
 @pytest.mark.e2e
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=SCENARIOS)
 def test_qwen3_moe(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_runner(command)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
+def test_qwen3_moe_deepep_m2n(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     run_runner(command)

@@ -5,7 +5,9 @@
 The wrapper keeps the native vLLM Qwen3 MoE lifecycle and injects a
 role-aware decoder layer through the native ``decoder_layer_type`` hook.
 Attention executes the native Attention, residual, and normalization path;
-FFN executes the complete native dense MLP or MoE block.
+FFN executes the complete native dense MLP or MoE block. With
+``compute_gate_on_attention`` (DeepEP M2N only), Attention also runs the MoE
+gate and top-k, and FFN runs only the routed experts.
 """
 
 from collections.abc import Iterable, Iterator
@@ -20,6 +22,7 @@ from vllm.platforms import current_platform
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.model_executor.models.m2n_proxy import RemoteM2NFFNProxy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -38,8 +41,8 @@ def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
     )
 
 
-def _weight_layer_path(name: str) -> tuple[int, str] | None:
-    """Return ``(layer index, stage)`` for a native decoder weight path."""
+def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
+    """Return ``(layer index, stage, remainder)`` for a native decoder path."""
     parts = name.split(".")
     for marker_idx, part in enumerate(parts[:-2]):
         if part != "layers":
@@ -48,18 +51,30 @@ def _weight_layer_path(name: str) -> tuple[int, str] | None:
             layer_idx = int(parts[marker_idx + 1])
         except ValueError:
             continue
-        return layer_idx, parts[marker_idx + 2]
+        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
     return None
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
-    """Classify one native checkpoint path by its AFD execution owner."""
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    compute_gate_on_attention: bool = False,
+) -> frozenset[str]:
+    """Classify one native checkpoint path by its AFD execution owner.
+
+    With ``compute_gate_on_attention`` the MoE gate goes to both roles:
+    Attention routes with it, and FFN keeps the native gate parameter that
+    vLLM's strict loader requires but never runs it.
+    """
     layer_path = _weight_layer_path(name)
     if layer_path is None:
         return _BOTH_ROLES
 
-    _layer_idx, stage = layer_path
+    _layer_idx, stage, remainder = layer_path
     if stage == "mlp":
+        is_moe_gate = bool(remainder) and remainder[0] == "gate"
+        if is_moe_gate and compute_gate_on_attention:
+            return _BOTH_ROLES
         return _FFN_ROLE
     if stage in {"self_attn", "input_layernorm", "post_attention_layernorm"}:
         return _ATTENTION_ROLE
@@ -70,10 +85,14 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    compute_gate_on_attention: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain this role's paths."""
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
+        if role in _checkpoint_weight_roles(
+            name,
+            compute_gate_on_attention=compute_gate_on_attention,
+        ):
             yield name, loaded_weight
 
 
@@ -94,6 +113,18 @@ def _validate_supported_config(
         raise RuntimeError(
             "AFD Qwen3 MoE requires compute_gate_on_attention=false, except "
             f"with {DEEPEP_M2N_CONNECTOR}",
+        )
+    # The routed FFN runner serves MoE layers only; a dense layer would have
+    # no owner.
+    if afd_config.compute_gate_on_attention and not all(
+        _is_moe_layer(vllm_config.model_config.hf_text_config, layer_idx)
+        for layer_idx in range(
+            vllm_config.model_config.hf_text_config.num_hidden_layers
+        )
+    ):
+        raise RuntimeError(
+            "AFD Qwen3 MoE with compute_gate_on_attention requires every layer "
+            "to be MoE (no mlp_only_layers, decoder_sparse_step=1)",
         )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError(
@@ -164,7 +195,22 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 dual_chunk_attention_config=dual_chunk_attention_config,
             )
-            self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
+            if afd_config.compute_gate_on_attention:
+                # Same gate as native Qwen3MoeSparseMoeBlock, same weight path.
+                self.mlp = RemoteM2NFFNProxy(
+                    layer_idx=layer_idx,
+                    gate=native.ReplicatedLinear(
+                        config.hidden_size,
+                        config.num_experts,
+                        bias=False,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp.gate",
+                    ),
+                    top_k=config.num_experts_per_tok,
+                    renormalize=config.norm_topk_prob,
+                )
+            else:
+                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -342,7 +388,11 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: filter the checkpoint stream by AFD execution role.
-        role_weights = _iter_role_weights(weights, role=self.afd_role)
+        role_weights = _iter_role_weights(
+            weights,
+            role=self.afd_role,
+            compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+        )
         # ### PATCH END: filter the checkpoint stream by AFD execution role.
         return super().load_weights(role_weights)
 

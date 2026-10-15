@@ -68,6 +68,14 @@ V2_SCENARIOS = (
     "afd-v2-eager-dbo-dp2",
     "afd-v2-graph-dbo-dp2",
 )
+# DeepEP M2N routes on Attention (gate and top-k there) and dispatches each
+# token straight to the FFN ranks owning its experts.
+DEEPEP_M2N_CONNECTOR = "DeepEPM2NAFDConnector"
+DEEPEP_M2N_SCENARIOS = (
+    "afd-deepep-m2n-eager-2a2f",
+    "afd-deepep-m2n-graph-2a2f",
+    "afd-deepep-m2n-graph-dbo-2a2f",
+)
 V2_DBO_COMPARISON_SCENARIOS = frozenset(
     ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
 )
@@ -339,6 +347,7 @@ def parse_args() -> argparse.Namespace:
             ASYNC_UBATCH_SCENARIO,
             *DSV4_SCENARIOS,
             *V2_SCENARIOS,
+            *DEEPEP_M2N_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
@@ -489,6 +498,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
         "afd-v2-eager-dbo-dp2": (False, False, True, 2, 2),
         "afd-v2-graph-dbo-dp2": (False, True, True, 2, 2),
+        "afd-deepep-m2n-eager-2a2f": (False, False, False, 2, 2),
+        "afd-deepep-m2n-graph-2a2f": (False, True, False, 2, 2),
+        "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 2),
     }
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         # The A5 script's native DBO stays off for these scenarios: a split batch
@@ -570,6 +582,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
+    if args.scenario in DEEPEP_M2N_SCENARIOS:
+        args.afd_connector = DEEPEP_M2N_CONNECTOR
+        args.compute_gate_on_attention = True
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:

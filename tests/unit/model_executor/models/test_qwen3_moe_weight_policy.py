@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
 
 ATTENTION_ROLE = frozenset(("attention",))
@@ -68,6 +73,33 @@ WEIGHT_ROLE_CASES = (
 )
 
 
+# With gate-on-Attention (DeepEP M2N) only the MoE gate changes owner.
+GATE_ON_ATTENTION_ROLE_CASES = (
+    ("moe-gate", "model.layers.0.mlp.gate.weight", BOTH_ROLES),
+    (
+        "moe-expert-projection",
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        FFN_ROLE,
+    ),
+    (
+        "shared-expert-gate",
+        "model.layers.0.mlp.shared_expert_gate.weight",
+        FFN_ROLE,
+    ),
+    (
+        "dense-gate-projection",
+        "model.layers.3.mlp.gate_proj.weight",
+        FFN_ROLE,
+    ),
+    (
+        "attention-q-projection",
+        "model.layers.0.self_attn.q_proj.weight",
+        ATTENTION_ROLE,
+    ),
+    ("embedding", "model.embed_tokens.weight", BOTH_ROLES),
+)
+
+
 class _OneShotWeights:
     def __init__(self, names: list[str]) -> None:
         self.items = [(name, torch.tensor([index])) for index, name in enumerate(names)]
@@ -93,10 +125,34 @@ def test_weight_role_policy(
 
 
 @pytest.mark.parametrize(
-    ("role", "expected_names"),
+    ("checkpoint_name", "roles"),
+    [case[1:] for case in GATE_ON_ATTENTION_ROLE_CASES],
+    ids=[case[0] for case in GATE_ON_ATTENTION_ROLE_CASES],
+)
+def test_gate_on_attention_weight_role_policy(
+    checkpoint_name: str,
+    roles: frozenset[str],
+) -> None:
+    """The MoE gate loads on both roles; everything else keeps its owner.
+
+    Why: Attention routes with the gate, and the FFN's native MoE block still
+    owns a gate parameter that vLLM's strict loader requires to be loaded.
+    """
+    assert (
+        adapter._checkpoint_weight_roles(
+            checkpoint_name,
+            compute_gate_on_attention=True,
+        )
+        == roles
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "compute_gate_on_attention", "expected_names"),
     [
         (
             "attention",
+            False,
             [
                 "model.embed_tokens.weight",
                 "model.layers.0.self_attn.q_proj.weight",
@@ -106,6 +162,28 @@ def test_weight_role_policy(
         ),
         (
             "ffn",
+            False,
+            [
+                "model.embed_tokens.weight",
+                "model.layers.0.mlp.gate.weight",
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "lm_head.weight",
+            ],
+        ),
+        (
+            "attention",
+            True,
+            [
+                "model.embed_tokens.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.input_layernorm.weight",
+                "model.layers.0.mlp.gate.weight",
+                "lm_head.weight",
+            ],
+        ),
+        (
+            "ffn",
+            True,
             [
                 "model.embed_tokens.weight",
                 "model.layers.0.mlp.gate.weight",
@@ -118,6 +196,7 @@ def test_weight_role_policy(
 def test_load_weights_filters_once_and_delegates_to_native_loader(
     monkeypatch: pytest.MonkeyPatch,
     role: str,
+    compute_gate_on_attention: bool,
     expected_names: list[str],
 ) -> None:
     names = [
@@ -144,6 +223,11 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
     )
     model = object.__new__(adapter.AFDQwen3MoeForCausalLM)
     object.__setattr__(model, "afd_role", role)
+    object.__setattr__(
+        model,
+        "afd_config",
+        AFDConfig(role=role, compute_gate_on_attention=compute_gate_on_attention),
+    )
 
     result = model.load_weights(weights)
 
