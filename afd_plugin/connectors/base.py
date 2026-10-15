@@ -7,7 +7,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -60,14 +60,6 @@ class AFDConnectorBase(ABC):
     control_plane: AFDControlPlane | None = None
     attn_size: int = 0
     ffn_size: int = 0
-    # Whether the owning worker must construct the connector and call
-    # ``bootstrap()`` before vLLM's distributed init, e.g. because the
-    # connector sets process-wide NCCL environment that NCCL reads only when
-    # the process creates its first communicator.
-    bootstraps_before_distributed_init: ClassVar[bool] = False
-    # Whether FFN ranks receive routed (token, local expert) rows and run only
-    # their local experts (``run_experts``) instead of whole FFN blocks.
-    delivers_routed_tokens: ClassVar[bool] = False
 
     @classmethod
     @abstractmethod
@@ -128,15 +120,6 @@ class AFDConnectorBase(ABC):
         ``is_initialized`` false after successful cleanup.
         """
         raise NotImplementedError
-
-    def bootstrap(self) -> None:
-        """Set up what must exist before vLLM's distributed init.
-
-        Called by the owning worker only when
-        ``bootstraps_before_distributed_init`` is true. Connectors without
-        such state need nothing here.
-        """
-        return None
 
     @abstractmethod
     def init_afd_connector(self) -> None:

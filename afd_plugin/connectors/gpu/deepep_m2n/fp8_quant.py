@@ -22,7 +22,8 @@ import torch
 import triton
 import triton.language as tl
 
-FP8_DTYPE = torch.float8_e4m3fn
+from afd_plugin.connectors.routed_experts import FP8_DTYPE
+
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 FP8_MIN = torch.finfo(FP8_DTYPE).min
 GROUP_SIZE = 128

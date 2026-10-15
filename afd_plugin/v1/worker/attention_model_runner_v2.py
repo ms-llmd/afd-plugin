@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -38,6 +38,7 @@ from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDConnectorFactory,
     AFDForwardContextMetadata,
+    AFDRoutedExpertsConnector,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
@@ -48,10 +49,6 @@ from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
-
-    from afd_plugin.connectors.gpu.deepep_m2n.connector import (
-        DeepEPM2NAFDConnector,
-    )
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -468,8 +465,8 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         super().load_model(load_dummy_weights, *args, **kwargs)
         if self.connector.is_initialized:
             return
-        if self.connector.delivers_routed_tokens:
-            cast("DeepEPM2NAFDConnector", self.connector).init_afd_connector(
+        if isinstance(self.connector, AFDRoutedExpertsConnector):
+            self.connector.init_afd_connector(
                 moe_layer_indices=tuple(self.get_model().get_experts_layer_indices()),
             )
         else:

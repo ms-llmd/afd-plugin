@@ -55,11 +55,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.config import AFDConfig
-from afd_plugin.connectors.base import (
-    AFDConnectorBase,
-    AFDControlPlane,
-    ConnectorExtraInfo,
-)
+from afd_plugin.connectors.base import AFDControlPlane, ConnectorExtraInfo
 from afd_plugin.connectors.gpu.deepep_m2n.buffer import (
     DeepEPDispatchResult,
     DeepEPElasticBuffer,
@@ -69,10 +65,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     EXPERT_BACKENDS,
     DeepEPM2NExperts,
     ExpertBackend,
-    FFNLocalExperts,
-    LocalExpertWeights,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import FP8_DTYPE
 from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout
 from afd_plugin.connectors.gpu.deepep_m2n.network import (
     NetworkConfig,
@@ -91,6 +84,12 @@ from afd_plugin.connectors.metadata import (
     AFDTransferState,
     recv_control_payload,
     send_control_payload,
+)
+from afd_plugin.connectors.routed_experts import (
+    FP8_DTYPE,
+    AFDRoutedExpertsConnector,
+    FFNLocalExperts,
+    LocalExpertWeights,
 )
 from afd_plugin.distributed import init_afd_process_group
 
@@ -680,7 +679,7 @@ def _keep_alive_on(stream: torch.cuda.Stream, *tensors: torch.Tensor | None) -> 
             tensor.record_stream(stream)
 
 
-class DeepEPM2NAFDConnector(AFDConnectorBase):
+class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     """Expert-routed Attention <-> FFN connector over vendored DeepEP V2.
 
     Each stage (micro-batch) has a lane: its own DeepEP buffer, its own DeepEP
@@ -700,9 +699,6 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
     NCCL environment), then ``init_afd_connector`` (after weights load:
     post-load checks, NCCL control group and DeepEP buffers).
     """
-
-    bootstraps_before_distributed_init = True
-    delivers_routed_tokens = True
 
     @classmethod
     def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:

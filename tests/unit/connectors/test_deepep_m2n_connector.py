@@ -30,8 +30,6 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     validate_model_infos,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
-    FFNLocalExperts,
-    LocalExpertWeights,
     expert_row_ranges,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
@@ -42,6 +40,10 @@ from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa:
 from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
+)
+from afd_plugin.connectors.routed_experts import (  # noqa: E402
+    FFNLocalExperts,
+    LocalExpertWeights,
 )
 from tests.unit.connectors.deepep_m2n_harness import (  # noqa: E402
     HIDDEN_SIZE,

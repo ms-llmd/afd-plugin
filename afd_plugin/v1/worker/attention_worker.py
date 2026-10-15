@@ -81,9 +81,9 @@ class AFDAttentionWorker(Worker):
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
 
-        # A connector that sets process-wide NCCL environment joins the AFD
-        # world here, before vLLM's distributed init creates NCCL groups; the
-        # FFN worker does the same at the same point.
+        # A routed-experts connector joins the AFD world here, before vLLM's
+        # distributed init creates NCCL groups, so its NCCL environment applies;
+        # the FFN worker does the same at the same point.
         connector = AFDConnectorFactory.create_bootstrapped_connector(
             self.rank,
             self.local_rank,

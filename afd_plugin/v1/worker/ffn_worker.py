@@ -15,12 +15,9 @@ from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors import AFDConnectorFactory
+from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
-from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
-    GPUFFNRoutedExpertsModelRunner,
-)
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
     validate_gpu_model_runner_v2_config,
@@ -66,11 +63,11 @@ class AFDFFNWorker(Worker):
     # Patch reason: vLLM 0.30.0 selects its V2 runner from a module-level
     # symbol inside Worker.init_device and exposes no injectable runner factory.
     # Patch functionality: replace only the V2 construction seam with the
-    # connector-driven FFN runner: GPUFFNRoutedExpertsModelRunner when the
-    # connector delivers routed expert rows, else GPUFFNModelRunner. A
-    # connector with ``bootstraps_before_distributed_init`` is created and
-    # bootstrapped first, so its NCCL environment precedes vLLM's NCCL groups,
-    # and the runner adopts it after construction.
+    # connector-driven FFN runner: GPUFFNRoutedExpertsModelRunner (imported
+    # only then) for an AFDRoutedExpertsConnector, else GPUFFNModelRunner. A
+    # routed-experts connector is created and bootstrapped first, so its NCCL
+    # environment precedes vLLM's NCCL groups, and the runner adopts it after
+    # construction.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
@@ -106,13 +103,16 @@ class AFDFFNWorker(Worker):
             self.vllm_config,
             afd_config,
         )
-        runner_cls = (
-            GPUFFNRoutedExpertsModelRunner
-            if AFDConnectorFactory.get_connector_class(
-                afd_config.connector
-            ).delivers_routed_tokens
-            else GPUFFNModelRunner
-        )
+        runner_cls: type[GPUFFNModelRunner] = GPUFFNModelRunner
+        connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+        if issubclass(connector_cls, AFDRoutedExpertsConnector):
+            # Lazy: only workers whose connector delivers routed rows load the
+            # routed-experts runner.
+            from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
+                GPUFFNRoutedExpertsModelRunner,
+            )
+
+            runner_cls = GPUFFNRoutedExpertsModelRunner
         native_runner_cls = gpu_model_runner_v2.GPUModelRunner
         gpu_model_runner_v2.GPUModelRunner = runner_cls
         try:

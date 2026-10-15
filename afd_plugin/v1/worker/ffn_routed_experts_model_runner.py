@@ -4,26 +4,24 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import DPMetadata
 
-from afd_plugin.connectors import AFDDPMetadata
-from afd_plugin.connectors.gpu.deepep_m2n.experts import (
+from afd_plugin.connectors import (
+    AFDConnectorBase,
+    AFDDPMetadata,
+    AFDRoutedExpertsConnector,
     FFNLocalExperts,
     LocalExpertWeights,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import FP8_DTYPE
+from afd_plugin.connectors.routed_experts import FP8_DTYPE
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-    from afd_plugin.connectors.gpu.deepep_m2n.connector import (
-        DeepEPM2NAFDConnector,
-    )
 
 
 def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
@@ -49,6 +47,15 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
     )
 
 
+def _require_routed(connector: AFDConnectorBase) -> AFDRoutedExpertsConnector:
+    if not isinstance(connector, AFDRoutedExpertsConnector):
+        raise TypeError(
+            f"{type(connector).__name__} is not an AFDRoutedExpertsConnector; "
+            "use GPUFFNModelRunner",
+        )
+    return connector
+
+
 class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     """FFN runner for connectors that deliver routed (token, expert) rows.
 
@@ -59,23 +66,21 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     the expert weights; its MoE forward never runs, so the P2P path's
     forward-context and DP metadata setup is skipped.
 
-    The worker selects this runner when the connector class sets
-    ``delivers_routed_tokens`` (DeepEP M2N).
+    The worker selects this runner for an ``AFDRoutedExpertsConnector``
+    (DeepEP M2N).
     """
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
-        if not self.connector.delivers_routed_tokens:
-            raise TypeError(
-                f"{type(self.connector).__name__} does not deliver routed tokens; "
-                "use GPUFFNModelRunner",
-            )
+        _require_routed(self.connector)
         self.moe_layer_indices: tuple[int, ...] = ()
         self.local_experts: dict[int, FFNLocalExperts] = {}
 
     @property
-    def routed_connector(self) -> DeepEPM2NAFDConnector:
-        return cast("DeepEPM2NAFDConnector", self.connector)
+    def routed_connector(self) -> AFDRoutedExpertsConnector:
+        """The connector; the worker may replace it with the one it
+        bootstrapped, so it is checked where it is used."""
+        return _require_routed(self.connector)
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load with the native loader, then take each MoE layer's experts.

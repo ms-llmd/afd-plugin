@@ -12,6 +12,7 @@ from afd_plugin.connectors import (
     AFDA2FTransferPayload,
     AFDConnectorBase,
     AFDConnectorFactory,
+    AFDRoutedExpertsConnector,
     AFDTransferContext,
     AFDTransferMetadata,
 )
@@ -192,9 +193,7 @@ def test_factory_resolves_role_rank_before_connector_construction(monkeypatch):
     assert connector.role_rank == 1
 
 
-class _BootstrappingConnector(_MinimalConnector):
-    bootstraps_before_distributed_init = True
-
+class _BootstrappingConnector(_MinimalConnector, AFDRoutedExpertsConnector):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.events: list[str] = []
@@ -203,6 +202,15 @@ class _BootstrappingConnector(_MinimalConnector):
         self.events.append("bootstrap")
         if self.vllm_config.fail_bootstrap:
             raise RuntimeError("bootstrap failed")
+
+    def init_afd_connector(self, *, moe_layer_indices=None, local_experts=None):
+        return None
+
+    def run_experts(self, payload, weights):
+        return payload.hidden_states
+
+    def synchronize_lanes(self):
+        return None
 
     def close(self):
         self.events.append("close")
@@ -225,17 +233,12 @@ def _single_rank_config(*, fail_bootstrap=False):
     )
 
 
-def test_connectors_bootstrap_after_vllm_by_default():
-    """A connector without the flag is not created before vLLM's distributed
-    init: the factory returns None and its runner creates it later.
+def test_create_bootstrapped_connector_skips_other_connectors(monkeypatch):
+    """A connector that is not an ``AFDRoutedExpertsConnector`` is not
+    created before vLLM's distributed init; its runner creates it later.
 
     Why: P2P and the NPU connectors keep their existing bring-up order.
     """
-    assert _MinimalConnector.bootstraps_before_distributed_init is False
-    assert _MinimalConnector.delivers_routed_tokens is False
-
-
-def test_create_bootstrapped_connector_skips_connectors_without_flag(monkeypatch):
     _register(monkeypatch, "MinimalConnector", _MinimalConnector)
 
     connector = AFDConnectorFactory.create_bootstrapped_connector(
@@ -249,7 +252,8 @@ def test_create_bootstrapped_connector_skips_connectors_without_flag(monkeypatch
 
 
 def test_create_bootstrapped_connector_creates_and_bootstraps(monkeypatch):
-    """A flagged connector is created with the worker's ranks and bootstrapped.
+    """A routed-experts connector is created with the worker's ranks and
+    bootstrapped.
 
     Why: workers call this before vLLM's distributed init so the connector's
     NCCL environment precedes vLLM's NCCL groups.

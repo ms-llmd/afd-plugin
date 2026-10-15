@@ -605,11 +605,11 @@ def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
     FP8 payloads use FP8 block-128 weights; the references are then the
     dequantized weights, so kernel checks isolate the kernels' own error.
     """
-    from afd_plugin.connectors.gpu.deepep_m2n.experts import LocalExpertWeights
     from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
         dequantize_fp8_block128,
         quantize_fp8_block128,
     )
+    from afd_plugin.connectors.routed_experts import LocalExpertWeights
 
     w13, w2 = make_expert_weights(experts)
     if payload_format == "bf16":

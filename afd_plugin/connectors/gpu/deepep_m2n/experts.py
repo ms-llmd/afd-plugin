@@ -30,7 +30,6 @@ Backends:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -39,62 +38,14 @@ from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
 from afd_plugin.connectors.gpu.deepep_m2n import deepgemm
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
-    FP8_DTYPE,
     dequantize_fp8_block128,
     dequantize_fp8_rows,
     silu_mul_fp8_quant,
 )
+from afd_plugin.connectors.routed_experts import FP8_DTYPE, LocalExpertWeights
 
 ExpertBackend = Literal["deepgemm", "fused_experts"]
 EXPERT_BACKENDS: tuple[ExpertBackend, ...] = ("deepgemm", "fused_experts")
-
-
-@dataclass(frozen=True)
-class LocalExpertWeights:
-    """This FFN rank's experts, in vLLM ``FusedMoE`` layout.
-
-    Attributes:
-        w13: ``[E_local, 2 * I, H]`` gate and up projections (gate first),
-            BF16 or FP8.
-        w2: ``[E_local, H, I]`` down projection, same dtype as ``w13``.
-        w13_scale: FP8 only: ``[E_local, 2 * I / 128, H / 128]`` fp32 block
-            scales (vLLM ``w13_weight_scale_inv``).
-        w2_scale: FP8 only: ``[E_local, H / 128, I / 128]`` fp32 block scales.
-    """
-
-    w13: torch.Tensor
-    w2: torch.Tensor
-    w13_scale: torch.Tensor | None = None
-    w2_scale: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        if self.w13.dtype != self.w2.dtype:
-            raise ValueError("w13 and w2 must have the same dtype")
-        if self.is_fp8 != (self.w13_scale is not None and self.w2_scale is not None):
-            raise ValueError(
-                "FP8 expert weights need both block scales (and BF16 none)"
-            )
-
-    @property
-    def num_experts(self) -> int:
-        return int(self.w13.shape[0])
-
-    @property
-    def is_fp8(self) -> bool:
-        return self.w13.dtype == FP8_DTYPE
-
-
-@dataclass(frozen=True)
-class FFNLocalExperts:
-    """One MoE layer's experts on this FFN rank, as vLLM loaded them.
-
-    Attributes:
-        expert_ids: Global ids of the experts in ``weights``, in slot order.
-        weights: The same experts in the executor's layout.
-    """
-
-    expert_ids: tuple[int, ...]
-    weights: LocalExpertWeights
 
 
 def align_up(value: int, alignment: int) -> int:

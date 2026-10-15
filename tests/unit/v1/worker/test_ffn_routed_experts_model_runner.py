@@ -11,12 +11,6 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from afd_plugin.connectors import (  # noqa: E402
-    AFDA2FTransferPayload,
-    AFDControlPayload,
-    AFDTransferContext,
-    AFDTransferMetadata,
-)
 from afd_plugin.v1.worker import (  # noqa: E402
     ffn_routed_experts_model_runner as routed_module,
 )
@@ -24,6 +18,9 @@ from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E40
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
     GPUFFNRoutedExpertsModelRunner,
     local_experts_from_vllm,
+)
+from tests.unit.connectors.fake_routed_connector import (  # noqa: E402
+    FakeRoutedConnector,
 )
 
 MOE_LAYERS = (1, 3)
@@ -33,51 +30,9 @@ INTERMEDIATE = 128
 FP8_BLOCK = 128
 
 
-class _RoutedConnector:
-    """Records the data path; ``recv`` hands out one payload per call."""
-
-    delivers_routed_tokens = True
-
-    def __init__(self):
-        self.events: list[tuple] = []
-        self.control_updates: list[AFDControlPayload] = []
-        self.init_kwargs: dict | None = None
-        self.control_plane = self
-
-    def update_state_from_dp_metadata(self, payload):
-        self.control_updates.append(payload)
-
-    def recv_attn_output(self, ubatch_idx=0, **kwargs):
-        assert not kwargs, "routed path passes no P2P receive options"
-        self.events.append(("recv", ubatch_idx))
-        return AFDA2FTransferPayload(
-            hidden_states=f"rows{ubatch_idx}",
-            context=AFDTransferContext(
-                metadata=AFDTransferMetadata.create_ffn_metadata(
-                    layer_idx=0,
-                    stage_idx=ubatch_idx,
-                    seq_lens=[1],
-                ),
-            ),
-        )
-
-    def run_experts(self, payload, weights):
-        self.events.append(("run", payload.hidden_states, weights))
-        return f"out({payload.hidden_states})"
-
-    def send_ffn_output(self, ffn_output, context, **kwargs):
-        self.events.append(("send", ffn_output, context.metadata.stage_idx))
-
-    def synchronize_lanes(self):
-        self.events.append(("sync",))
-
-    def init_afd_connector(self, **kwargs):
-        self.init_kwargs = kwargs
-
-
 def _runner(connector=None):
     runner = object.__new__(GPUFFNRoutedExpertsModelRunner)
-    runner.connector = connector or _RoutedConnector()
+    runner.connector = connector or FakeRoutedConnector()
     runner.moe_layer_indices = MOE_LAYERS
     runner.local_experts = {
         layer: SimpleNamespace(weights=f"w{layer}") for layer in MOE_LAYERS
@@ -197,11 +152,11 @@ def test_initialize_passes_moe_layers_and_experts_to_the_connector():
 
 def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
     def base_init(self, vllm_config, device):
-        self.connector = SimpleNamespace(delivers_routed_tokens=False)
+        self.connector = SimpleNamespace(close=lambda: None)
 
     monkeypatch.setattr(GPUFFNModelRunner, "__init__", base_init)
 
-    with pytest.raises(TypeError, match="does not deliver routed tokens"):
+    with pytest.raises(TypeError, match="is not an AFDRoutedExpertsConnector"):
         GPUFFNRoutedExpertsModelRunner(SimpleNamespace(), torch.device("cpu"))
 
 
@@ -213,7 +168,7 @@ def test_ffn_runner_adopts_bootstrapped_connector_and_closes_placeholder():
     """
     events: list[str] = []
     runner = _runner(SimpleNamespace(close=lambda: events.append("close")))
-    bootstrapped = _RoutedConnector()
+    bootstrapped = FakeRoutedConnector()
 
     runner.adopt_bootstrapped_connector(bootstrapped)
 
