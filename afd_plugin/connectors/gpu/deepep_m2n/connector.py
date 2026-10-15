@@ -94,6 +94,7 @@ FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
 FP8_GROUP_SIZE = 128
 DISABLE_GIN_MODES = ("auto", "always", "never")
+CONTROL_BACKENDS = ("nccl", "gloo")
 # DeepEP V2 needs Hopper (SM90) or newer.
 MIN_SM_MAJOR = 9
 PROCESS_GROUP_NAME = "afd_deepep_m2n"
@@ -123,6 +124,17 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
             host sync that reads receive counts; they allocate the worst-case
             receive size instead. ``0`` always syncs in eager mode.
+        ib_hca_by_local_rank: Multi-node RoCE/IB: the NIC each rank uses,
+            indexed by its local rank (GPU index on its node); sets
+            ``NCCL_IB_HCA`` per rank. ``None`` keeps NCCL's choice. On fabrics
+            whose rails are separate, unrouted subnets (pokprod), give a
+            single NIC (``["mlx5_0"]``) so every rank uses the same rail: NCCL
+            rings and DeepEP's GIN setup connect ranks with different local
+            indices, so per-rank NICs on different rails time out.
+        control_backend: Backend of the connector's own process group
+            (handshake, DeepEP communicator bootstrap, per-step control
+            payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
+            DeepEP's communicator is the only RDMA user.
     """
 
     capacity_tokens_per_rank: int | None = None
@@ -134,6 +146,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     bucket_granularity: int = 1
     num_sms: int = 0
     cpu_sync_min_tokens: int = 0
+    ib_hca_by_local_rank: tuple[str, ...] | None = None
+    control_backend: str = "nccl"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -142,6 +156,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         unknown = sorted(set(raw) - known)
         if unknown:
             raise ValueError(f"unknown DeepEPM2NAFDConnector options: {unknown}")
+        if raw.get("ib_hca_by_local_rank") is not None:
+            raw["ib_hca_by_local_rank"] = tuple(raw["ib_hca_by_local_rank"])
         config = cls(**raw)
         config.validate()
         return config
@@ -166,6 +182,15 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("num_sms must be non-negative")
         if self.cpu_sync_min_tokens < 0:
             raise ValueError("cpu_sync_min_tokens must be non-negative")
+        if self.ib_hca_by_local_rank is not None and (
+            not self.ib_hca_by_local_rank
+            or not all(
+                isinstance(hca, str) and hca for hca in self.ib_hca_by_local_rank
+            )
+        ):
+            raise ValueError("ib_hca_by_local_rank must be a non-empty list of names")
+        if self.control_backend not in CONTROL_BACKENDS:
+            raise ValueError(f"control_backend must be one of {CONTROL_BACKENDS}")
 
     def to_mapping(self) -> dict[str, Any]:
         return asdict(self)
@@ -307,10 +332,30 @@ def validate_handshake(
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
         raise RuntimeError(f"FFN ranks disagree on expert_alignment: {alignments}")
+    hosts = [info["host"] for info in infos]
+    _check_host_layout(hosts)
     return HandshakeResult(
         expert_alignment=int(alignments.pop()),
-        single_host=len({info["host"] for info in infos}) == 1,
+        single_host=len(set(hosts)) == 1,
     )
+
+
+def _check_host_layout(hosts: list[str]) -> None:
+    """DeepEP's hybrid mode needs equal, contiguous rank blocks per host.
+
+    It derives each rank's node from ``world_rank // ranks_per_node``, so the
+    ranks of one host must be consecutive and every host must hold as many.
+    """
+    blocks: list[tuple[str, int]] = []
+    for host in hosts:
+        if blocks and blocks[-1][0] == host:
+            blocks[-1] = (host, blocks[-1][1] + 1)
+        else:
+            blocks.append((host, 1))
+    if len({host for host, _ in blocks}) != len(blocks):
+        raise RuntimeError(f"ranks of one host are not contiguous: {hosts}")
+    if len({count for _, count in blocks}) != 1:
+        raise RuntimeError(f"hosts hold different rank counts: {blocks}")
 
 
 @dataclass(slots=True)
@@ -458,6 +503,12 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
             or vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.device = torch.device("cuda", local_rank)
+        # Where control payloads are staged: gloo moves CPU tensors.
+        self.control_device = (
+            torch.device("cpu")
+            if self.config.control_backend == "gloo"
+            else self.device
+        )
         self.group: dist.ProcessGroup | None = None
         self.lanes: list[DeepEPElasticBuffer] = []
         self.lane_streams: list[torch.cuda.Stream] = []
@@ -482,9 +533,13 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         if self._initialized:
             return
         torch.cuda.set_device(self.device)
+        if self.config.ib_hca_by_local_rank is not None:
+            # Before any NCCL communicator exists (torch groups and DeepEP's).
+            hcas = self.config.ib_hca_by_local_rank
+            os.environ["NCCL_IB_HCA"] = "=" + hcas[self.local_rank % len(hcas)]
         _register_custom_ops()
         self.group = init_afd_process_group(
-            backend="nccl",
+            backend=self.config.control_backend,
             init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
             world_size=self.layout.union_size,
             rank=self.world_rank,
@@ -569,6 +624,13 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def domain(self) -> tuple[int, int]:
+        """DeepEP ``(scale-out ranks, scale-up ranks)``: nodes and GPUs per node
+        in hybrid mode, ``(1, world)`` when everything is in one NVLink domain."""
+        self._check_initialized()
+        return self.lanes[0].num_scaleout_ranks, self.lanes[0].num_scaleup_ranks
 
     # ==============================
     # Attention side
@@ -871,7 +933,7 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
             payload,
             dst=list(range(connector.ffn_size)),
             group=connector.group,
-            device=connector.device,
+            device=connector.control_device,
         )
 
     def recv_dp_metadata_list(self) -> AFDControlPayload:
@@ -881,5 +943,5 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
         return recv_control_payload(
             src=connector.layout.world_rank("attention", CONTROL_SENDER_ATTN_RANK),
             group=connector.group,
-            device=connector.device,
+            device=connector.control_device,
         )

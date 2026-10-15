@@ -1,0 +1,61 @@
+== correctness (worst over all ranks, both nodes)
+p4-2f2a-correct-fp8 ok [(2, 2)] {'dispatch_rows_rel_err': '9.58e-08', 'dispatch_weights_rel_err': '8.57e-08', 'experts_rel_err': '2.84e-02', 'experts_vs_fused_rel_err': '2.87e-02', 'combine_rel_err': '6.61e-02'}
+p4-2f2a-graph-fp8 ok [(2, 2)] {'dispatch_rows_rel_err': '1.25e-07', 'dispatch_weights_rel_err': '1.12e-07', 'experts_rel_err': '2.72e-02', 'experts_vs_fused_rel_err': '2.75e-02', 'combine_rel_err': '6.53e-02'}
+p4-2f2a-graph2-fp8 ok [(2, 2)] {'dispatch_rows_rel_err': '1.25e-07', 'dispatch_weights_rel_err': '1.20e-07', 'experts_rel_err': '2.74e-02', 'experts_vs_fused_rel_err': '2.80e-02', 'combine_rel_err': '6.65e-02'}
+p4-2f2a-lanes-fp8 ok [(2, 2)] {'dispatch_rows_rel_err': '9.54e-08', 'dispatch_weights_rel_err': '8.46e-08', 'experts_rel_err': '2.74e-02', 'experts_vs_fused_rel_err': '2.82e-02', 'combine_rel_err': '6.86e-02'}
+p4-4f4a-correct-bf16 ok [(2, 4)] {'dispatch_rows_rel_err': '1.29e-09', 'dispatch_weights_rel_err': '1.04e-07', 'experts_rel_err': '6.00e-03', 'experts_vs_fused_rel_err': '4.47e-03', 'combine_rel_err': '5.47e-03'}
+p4-4f4a-correct-fp8 ok [(2, 4)] {'dispatch_rows_rel_err': '9.77e-08', 'dispatch_weights_rel_err': '1.01e-07', 'experts_rel_err': '2.65e-02', 'experts_vs_fused_rel_err': '2.75e-02', 'combine_rel_err': '6.71e-02'}
+p4-4f4a-graph-fp8 ok [(2, 4)] {'dispatch_rows_rel_err': '1.62e-07', 'dispatch_weights_rel_err': '1.37e-07', 'experts_rel_err': '2.73e-02', 'experts_vs_fused_rel_err': '2.80e-02', 'combine_rel_err': '6.53e-02'}
+p4-4f4a-lanes-fp8 ok [(2, 4)] {'dispatch_rows_rel_err': '9.77e-08', 'dispatch_weights_rel_err': '1.13e-07', 'experts_rel_err': '2.64e-02', 'experts_vs_fused_rel_err': '2.75e-02', 'combine_rel_err': '6.87e-02'}
+== benchmarks (FFN rank 0 breakdown on node0, Attention rank 0 round trip on node1)
+-- p4-2f2a-bench-fp8-nosync
+     1   238.7   160.1    96.2 rt=   493.1 tok/s=      4056
+     8   250.0   183.4   111.6 rt=   551.3 tok/s=     29024
+    32   226.6   209.3   117.9 rt=   585.0 tok/s=    109405
+   128   281.6   206.2    94.6 rt=   645.4 tok/s=    396652
+   512   404.7   219.1   117.0 rt=  1097.1 tok/s=    933343
+  2048  1021.1   294.9   208.8 rt=  2869.1 tok/s=   1427630
+  8192  3553.9   724.6   539.6 rt= 10216.3 tok/s=   1603718
+-- p4-2f2a-gbench-bf16
+     1       -       -       - rt=   247.0 tok/s=      8096
+     8       -       -       - rt=   386.5 tok/s=     41395
+    32       -       -       - rt=   484.5 tok/s=    132086
+   128       -       -       - rt=   650.4 tok/s=    393615
+   512       -       -       - rt=  1315.2 tok/s=    778581
+  2048       -       -       - rt=  4013.5 tok/s=   1020568
+-- p4-2f2a-gbench-fp8
+     1       -       -       - rt=   162.8 tok/s=     12288
+     8       -       -       - rt=   268.3 tok/s=     59632
+    32       -       -       - rt=   310.8 tok/s=    205915
+   128       -       -       - rt=   437.9 tok/s=    584630
+   512       -       -       - rt=   851.3 tok/s=   1202817
+  2048       -       -       - rt=  2664.1 tok/s=   1537464
+-- p4-2f2a-gbench2-fp8
+     1       -       -       - rt=   235.8 tok/s=     16963
+     8       -       -       - rt=   425.3 tok/s=     75245
+    32       -       -       - rt=   487.7 tok/s=    262465
+   128       -       -       - rt=   660.1 tok/s=    775657
+   512       -       -       - rt=  1481.1 tok/s=   1382784
+  2048       -       -       - rt=  5014.9 tok/s=   1633523
+-- p4-4f4a-bench-fp8-nosync
+     1   271.0   152.5   136.9 rt=   621.7 tok/s=      6434
+     8   267.0   170.2   124.6 rt=   642.4 tok/s=     49816
+    32   309.0   173.2   139.1 rt=   679.8 tok/s=    188278
+   128   346.7   173.5   146.3 rt=   861.1 tok/s=    594574
+   512   700.3   178.4   149.3 rt=  1737.7 tok/s=   1178544
+  2048  1843.7   253.7   263.4 rt=  5166.0 tok/s=   1585739
+  8192  6834.8   703.7   717.8 rt= 19510.8 tok/s=   1679477
+-- p4-4f4a-gbench-fp8
+     1       -       -       - rt=   303.1 tok/s=     13196
+     8       -       -       - rt=   379.5 tok/s=     84328
+    32       -       -       - rt=   409.1 tok/s=    312852
+   128       -       -       - rt=   574.7 tok/s=    890930
+   512       -       -       - rt=  1514.6 tok/s=   1352209
+  2048       -       -       - rt=  5021.3 tok/s=   1631438
+-- p4-4f4a-gbench2-fp8
+     1       -       -       - rt=   502.3 tok/s=     15928
+     8       -       -       - rt=   548.1 tok/s=    116757
+    32       -       -       - rt=   620.9 tok/s=    412333
+   128       -       -       - rt=  1031.7 tok/s=    992573
+   512       -       -       - rt=  2832.8 tok/s=   1445909
+  2048       -       -       - rt= 10326.8 tok/s=   1586556

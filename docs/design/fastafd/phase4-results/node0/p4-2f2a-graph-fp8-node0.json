@@ -1,0 +1,53 @@
+{
+ "scenario": "graph",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 1.2462576125581404e-07,
+    "dispatch_weights_rel_err": 1.0675844464404949e-07,
+    "experts_rel_err": 0.02720318762366014,
+    "experts_vs_fused_rel_err": 0.027494271513462783,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ]
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 1.239013703876975e-07,
+    "dispatch_weights_rel_err": 1.1232745334140268e-07,
+    "experts_rel_err": 0.0269415819401151,
+    "experts_vs_fused_rel_err": 0.0275033831595044,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ]
+   }
+  }
+ ],
+ "all_ok": true
+}

@@ -1,0 +1,141 @@
+# DeepEP M2N two-node pods on pokprod (namespace ronenkat-test1): one pod per
+# node (required anti-affinity), 4x H100 + RoCE each. Node 0 hosts the FFN
+# ranks, node 1 the Attention ranks. Run
+# tests/unit/connectors/deepep_m2n_multinode.py in both with node 0's pod IP.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: deepep-m2n-node0
+  labels:
+    app: deepep-m2n-2node
+  annotations:
+    k8s.v1.cni.cncf.io/networks: multi-nic-compute
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              # H100 nodes with >= 4 free GPUs when this was written; edit as needed.
+              - key: kubernetes.io/hostname
+                operator: In
+                values: ["pokprod-b93r39s2", "pokprod-b93r43s0", "pokprod-b93r44s2"]
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: deepep-m2n-2node
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: dev
+      image: ghcr.io/ronenkat/afd-plugin-e2e:e2e-f82ab8a
+      command: ["bash", "-c", "sleep 86400"]
+      env:
+        - name: HOME
+          value: /work
+        - name: PYTHONPATH
+          value: /work/src
+        # NCCL's TCP bootstrap must use the routable pod network, not a RoCE rail.
+        - name: NCCL_SOCKET_IFNAME
+          value: eth0
+        - name: AFD_DEEPEP_BUILD_DIR
+          value: /work/cache/deepep_build
+        - name: AFD_DEEPGEMM_BUILD_DIR
+          value: /work/cache/deepgemm_build
+        - name: EP_JIT_CACHE_DIR
+          value: /work/cache/deepep_jit
+        - name: DG_JIT_CACHE_DIR
+          value: /work/cache/deepgemm_jit
+      resources:
+        requests:
+          nvidia.com/gpu: 4
+          rdma/roce_gdr: 1
+          cpu: "16"
+          memory: 128Gi
+        limits:
+          nvidia.com/gpu: 4
+          rdma/roce_gdr: 1
+          cpu: "16"
+          memory: 128Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: work
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: deepep-m2n-node1
+  labels:
+    app: deepep-m2n-2node
+  annotations:
+    k8s.v1.cni.cncf.io/networks: multi-nic-compute
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              # H100 nodes with >= 4 free GPUs when this was written; edit as needed.
+              - key: kubernetes.io/hostname
+                operator: In
+                values: ["pokprod-b93r39s2", "pokprod-b93r43s0", "pokprod-b93r44s2"]
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: deepep-m2n-2node
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: dev
+      image: ghcr.io/ronenkat/afd-plugin-e2e:e2e-f82ab8a
+      command: ["bash", "-c", "sleep 86400"]
+      env:
+        - name: HOME
+          value: /work
+        - name: PYTHONPATH
+          value: /work/src
+        # NCCL's TCP bootstrap must use the routable pod network, not a RoCE rail.
+        - name: NCCL_SOCKET_IFNAME
+          value: eth0
+        - name: AFD_DEEPEP_BUILD_DIR
+          value: /work/cache/deepep_build
+        - name: AFD_DEEPGEMM_BUILD_DIR
+          value: /work/cache/deepgemm_build
+        - name: EP_JIT_CACHE_DIR
+          value: /work/cache/deepep_jit
+        - name: DG_JIT_CACHE_DIR
+          value: /work/cache/deepgemm_jit
+      resources:
+        requests:
+          nvidia.com/gpu: 4
+          rdma/roce_gdr: 1
+          cpu: "16"
+          memory: 128Gi
+        limits:
+          nvidia.com/gpu: 4
+          rdma/roce_gdr: 1
+          cpu: "16"
+          memory: 128Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: work
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi

@@ -104,6 +104,7 @@ def test_config_defaults_and_round_trip():
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
         ({"bucket_granularity": 0}, "bucket_granularity"),
         ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
+        ({"control_backend": "mpi"}, "control_backend"),
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
@@ -235,6 +236,45 @@ def test_handshake_rejects_mismatches(overrides, message):
 
     with pytest.raises(RuntimeError, match=message):
         validate_handshake(_handshake(layout, overrides), layout)
+
+
+def test_handshake_accepts_equal_contiguous_hosts():
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    hosts = {(rank, "host"): host for rank, host in enumerate("aabb")}
+
+    result = validate_handshake(_handshake(layout, hosts), layout)
+
+    assert not result.single_host
+
+
+@pytest.mark.parametrize(
+    ("hosts", "message"),
+    [("aaab", "different rank counts"), ("abab", "not contiguous")],
+)
+def test_handshake_rejects_unsupported_host_layouts(hosts, message):
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    overrides = {(rank, "host"): host for rank, host in enumerate(hosts)}
+
+    with pytest.raises(RuntimeError, match=message):
+        validate_handshake(_handshake(layout, overrides), layout)
+
+
+def test_gloo_control_backend_stages_payloads_on_cpu():
+    connector = _connector(
+        "attention", 0, Topology(ffn_size=1, attn_size=1), {"control_backend": "gloo"}
+    )
+
+    assert connector.control_device == torch.device("cpu")
+
+
+def test_config_parses_nic_per_local_rank():
+    config = DeepEPM2NConfig.from_mapping(
+        {"ib_hca_by_local_rank": ["mlx5_0", "mlx5_2"]}
+    )
+
+    assert config.ib_hca_by_local_rank == ("mlx5_0", "mlx5_2")
+    with pytest.raises(ValueError, match="ib_hca_by_local_rank"):
+        DeepEPM2NConfig.from_mapping({"ib_hca_by_local_rank": []})
 
 
 def test_expert_row_ranges_follow_alignment():

@@ -1,0 +1,87 @@
+{
+ "scenario": "correctness",
+ "topology": {
+  "ffn_size": 4,
+  "attn_size": 4
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.587294234221263e-08,
+    "dispatch_weights_rel_err": 8.708638373855639e-08,
+    "experts_rel_err": 0.02593759231398901,
+    "experts_vs_fused_rel_err": 0.026571650443909765,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.771284647311786e-08,
+    "dispatch_weights_rel_err": 9.24337385774536e-08,
+    "experts_rel_err": 0.026503146302885257,
+    "experts_vs_fused_rel_err": 0.02749715141946377,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "world_rank": 2,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.673126107547516e-08,
+    "dispatch_weights_rel_err": 8.538434000060335e-08,
+    "experts_rel_err": 0.02621110057736358,
+    "experts_vs_fused_rel_err": 0.02722120499303603,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "world_rank": 3,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.66055203674884e-08,
+    "dispatch_weights_rel_err": 1.0050317833413774e-07,
+    "experts_rel_err": 0.026544622124683833,
+    "experts_vs_fused_rel_err": 0.02734174371028321,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  }
+ ],
+ "all_ok": true
+}

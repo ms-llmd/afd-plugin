@@ -93,6 +93,20 @@ class Case:
         return [self.tokens_per_attn_rank, self.second_stage]
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Which world ranks this host runs and where the ranks rendezvous.
+
+    Single-node runs use the defaults. Multi-node runs launch one ``run_ranks``
+    per node with that node's ``local_ranks`` (contiguous; local index =
+    GPU index), the same ``master_addr`` (node 0) and the same fixed ports.
+    """
+
+    master_addr: str = "127.0.0.1"
+    ports: tuple[int, int] | None = None
+    local_ranks: tuple[int, ...] | None = None
+
+
 @dataclass
 class RankResult:
     world_rank: int
@@ -227,10 +241,17 @@ def rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
 # ---------------------------------------------------------------------------
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def free_ports(count: int) -> tuple[int, ...]:
+    """Distinct free ports: the sockets stay open until all are picked, so two
+    calls cannot hand out the same port (the default and AFD groups collide)."""
+    sockets = [socket.socket() for _ in range(count)]
+    try:
+        for sock in sockets:
+            sock.bind(("127.0.0.1", 0))
+        return tuple(int(sock.getsockname()[1]) for sock in sockets)
+    finally:
+        for sock in sockets:
+            sock.close()
 
 
 def fake_vllm_config(
@@ -239,6 +260,7 @@ def fake_vllm_config(
     role_rank: int,
     extra_config: dict[str, Any],
     port: int,
+    host: str = "127.0.0.1",
 ) -> SimpleNamespace:
     text_config = SimpleNamespace(
         hidden_size=HIDDEN_SIZE,
@@ -253,7 +275,7 @@ def fake_vllm_config(
             "afd": {
                 "connector": "DeepEPM2NAFDConnector",
                 "role": role,
-                "host": "127.0.0.1",
+                "host": host,
                 "port": port,
                 "num_attention_ranks": topology.attn_size,
                 "num_ffn_ranks": topology.ffn_size,
@@ -277,16 +299,21 @@ def fake_vllm_config(
 
 
 def build_connector(
-    topology: Topology, world_rank: int, extra_config: dict[str, Any], port: int
+    topology: Topology,
+    world_rank: int,
+    local_rank: int,
+    extra_config: dict[str, Any],
+    port: int,
+    host: str,
 ) -> Any:
     from afd_plugin.config import afd_config_from_mapping
     from afd_plugin.connectors import AFDConnectorFactory
 
     role, role_rank = topology.role(world_rank)
-    vllm_config = fake_vllm_config(topology, role, role_rank, extra_config, port)
+    vllm_config = fake_vllm_config(topology, role, role_rank, extra_config, port, host)
     afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
     connector = AFDConnectorFactory.create_connector(
-        world_rank, world_rank, vllm_config, afd_config
+        world_rank, local_rank, vllm_config, afd_config
     )
     connector.init_afd_connector()
     return connector
@@ -324,10 +351,12 @@ def control_step(
 
 def _rank_main(
     world_rank: int,
+    local_rank: int,
     topology: Topology,
     scenario: Callable[[Any, Topology, dict[str, Any]], dict[str, Any]],
     scenario_args: dict[str, Any],
     extra_config: dict[str, Any],
+    master_addr: str,
     ports: tuple[int, int],
     out_dir: str,
 ) -> None:
@@ -335,15 +364,17 @@ def _rank_main(
     result = RankResult(world_rank=world_rank, role=role)
     connector = None
     try:
-        torch.cuda.set_device(world_rank)
+        torch.cuda.set_device(local_rank)
         # vLLM workers always have a default group; the AFD world is separate.
         dist.init_process_group(
             "gloo",
-            init_method=f"tcp://127.0.0.1:{ports[0]}",
+            init_method=f"tcp://{master_addr}:{ports[0]}",
             world_size=topology.world_size,
             rank=world_rank,
         )
-        connector = build_connector(topology, world_rank, extra_config, ports[1])
+        connector = build_connector(
+            topology, world_rank, local_rank, extra_config, ports[1], master_addr
+        )
         result.metrics = scenario(connector, topology, scenario_args)
     except Exception:
         result.ok = False
@@ -364,23 +395,29 @@ def run_ranks(
     scenario_args: dict[str, Any],
     extra_config: dict[str, Any],
     out_dir: Path,
+    placement: Placement | None = None,
 ) -> list[RankResult]:
+    """Run ``scenario`` on this host's ranks; results come back in rank order."""
+    placement = placement or Placement()
     ctx = mp.get_context("spawn")
-    ports = (free_port(), free_port())
+    ports = placement.ports or free_ports(2)
+    local_ranks = placement.local_ranks or tuple(range(topology.world_size))
     procs = [
         ctx.Process(
             target=_rank_main,
             args=(
                 rank,
+                local_index,
                 topology,
                 scenario,
                 scenario_args,
                 extra_config,
+                placement.master_addr,
                 ports,
                 str(out_dir),
             ),
         )
-        for rank in range(topology.world_size)
+        for local_index, rank in enumerate(local_ranks)
     ]
     for proc in procs:
         proc.start()
@@ -391,7 +428,7 @@ def run_ranks(
     for proc in hung:
         proc.kill()
     results = []
-    for rank in range(topology.world_size):
+    for rank in local_ranks:
         path = out_dir / f"rank{rank}.json"
         if path.exists():
             results.append(RankResult(**json.loads(path.read_text(encoding="utf-8"))))
@@ -581,7 +618,11 @@ class Checker:
         for key, limit in self.tolerances.items():
             if self.worst.get(key, 0.0) > limit:
                 raise AssertionError(f"{key}={self.worst[key]:.3e} exceeds {limit:.0e}")
-        return {**self.worst, "expert_alignment": self.connector.expert_alignment}
+        return {
+            **self.worst,
+            "expert_alignment": self.connector.expert_alignment,
+            "domain": list(self.connector.domain),
+        }
 
 
 def attention_context(layer: int, stage: int, num_tokens: int) -> Any:
