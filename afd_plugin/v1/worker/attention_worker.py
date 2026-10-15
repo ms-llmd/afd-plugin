@@ -9,6 +9,8 @@ from vllm.config import VllmConfig
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 
+from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
@@ -79,12 +81,27 @@ class AFDAttentionWorker(Worker):
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
 
+        # A connector that sets process-wide NCCL environment joins the AFD
+        # world here, before vLLM's distributed init creates NCCL groups; the
+        # FFN worker does the same at the same point.
+        connector = AFDConnectorFactory.create_bootstrapped_connector(
+            self.rank,
+            self.local_rank,
+            self.vllm_config,
+            parse_afd_config(self.vllm_config, expected_role="attention"),
+        )
         native_runner_cls = gpu_model_runner_v2.GPUModelRunner
         gpu_model_runner_v2.GPUModelRunner = AFDAttentionModelRunnerV2
         try:
             super().init_device()
+        except BaseException:
+            if connector is not None:
+                connector.close()
+            raise
         finally:
             gpu_model_runner_v2.GPUModelRunner = native_runner_cls
+        if connector is not None:
+            self.model_runner.adopt_bootstrapped_connector(connector)
         # ### PATCH END: select and directly construct the AFD runner.
 
         torch.accelerator.empty_cache()

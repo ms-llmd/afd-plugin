@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -48,6 +48,10 @@ from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+    from afd_plugin.connectors.gpu.deepep_m2n.connector import (
+        DeepEPM2NAFDConnector,
+    )
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -439,9 +443,20 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
 
+    def adopt_bootstrapped_connector(self, connector: AFDConnectorBase) -> None:
+        """Use the connector the worker bootstrapped before vLLM's init.
+
+        Replaces the connector created at construction, which never
+        communicated, so the native constructor signature stays unchanged.
+        """
+        self.connector.close()
+        self.connector = connector
+
     # Patch reason: native V2 load_model has no AFD connector lifecycle.
     # Patch functionality: initialize the AFD connector after native weight
-    # loading so Attention and FFN model loading overlap across roles.
+    # loading so Attention and FFN model loading overlap across roles. A
+    # connector that delivers routed expert rows also receives the MoE layers
+    # this model dispatches, which every rank checks against the FFN's.
     # Signature: matches vLLM v0.30.0 GPUModelRunnerV2.load_model exactly,
     # including the upstream *args/**kwargs pass-through.
     def load_model(
@@ -451,7 +466,13 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         **kwargs,
     ) -> None:
         super().load_model(load_dummy_weights, *args, **kwargs)
-        if not self.connector.is_initialized:
+        if self.connector.is_initialized:
+            return
+        if self.connector.delivers_routed_tokens:
+            cast("DeepEPM2NAFDConnector", self.connector).init_afd_connector(
+                moe_layer_indices=tuple(self.get_model().get_experts_layer_indices()),
+            )
+        else:
             self.connector.init_afd_connector()
 
     # Patch reason: native KV initialization excludes DP1 from UBatchRunner

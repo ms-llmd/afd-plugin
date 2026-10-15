@@ -68,6 +68,32 @@ class AFDConnectorFactory:
         )
 
     @classmethod
+    def create_bootstrapped_connector(
+        cls,
+        rank: int,
+        local_rank: int,
+        vllm_config: VllmConfig,
+        afd_config: AFDConfig,
+    ) -> AFDConnectorBase | None:
+        """Create and bootstrap the connector if it needs to precede vLLM.
+
+        Workers call this before vLLM's distributed init. Returns ``None`` for
+        connectors without ``bootstraps_before_distributed_init``; their
+        runner creates them later, as before. The role rank is resolved from
+        config alone, so callers must run with TP = 1.
+        """
+        connector_cls = cls.get_connector_class(afd_config.connector)
+        if not connector_cls.bootstraps_before_distributed_init:
+            return None
+        connector = cls.create_connector(rank, local_rank, vllm_config, afd_config)
+        try:
+            connector.bootstrap()
+        except BaseException:
+            connector.close()
+            raise
+        return connector
+
+    @classmethod
     def get_connector_class(cls, connector_name: str) -> type[AFDConnectorBase]:
         if connector_name not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {connector_name}")
