@@ -55,8 +55,18 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
 
 ## Also open (from the phase reports)
 
-- Teardown when a peer dies: survivors hit DeepEP's barrier timeout and
-  abort.
+- Teardown when a peer dies. `test_peer_exit_fails_within_timeout` shows
+  the failure is bounded: with 10 s DeepEP timeouts the survivors stop in
+  ~40 s ("DeepEP NVLink barrier timeout", then `cudaErrorLaunchFailure`).
+  The CUDA context is then unusable: `close()` raises and a DeepEP handle
+  destructor asserts at exit. Still open: `close()` should tolerate a
+  faulted context, and the runtime needs to restart the process.
+- `close()` frees the DeepEP buffers but not the connector's process groups
+  (bootstrap gloo group, NCCL control group); re-initializing in the same
+  process is untested.
 - BF16 psum-bounded fused SiLU-mul (graph mode at large buckets).
 - Attention TP > 1 (sequence-split dispatch).
-- Runner integration and a model E2E (single and multi-node).
+- Runner integration and a model E2E (single and multi-node). Note from
+  `test_graph_and_eager_plans_mixed_across_ranks`: results stay correct when
+  one side plans a step as graph (no host sync) and the other as eager, so
+  an FFN runner may fall back to eager for a step Attention replays.

@@ -17,12 +17,13 @@ from __future__ import annotations
 import functools
 import json
 import os
+import random
 import socket
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -38,13 +39,16 @@ TOP_K = 8
 INTERMEDIATE_SIZE = 768
 INPUT_SEED_STRIDE = 1_000_003
 WEIGHT_SEED_OFFSET = 7_777
-CHECKSUM_REL_TOL = 1e-3
+# Limits are about 1.3x the worst value seen on H100 (2026-10-15), so a real
+# regression fails. Rows are matched exactly; the per-expert sums only differ
+# by fp32 summation order.
+CHECKSUM_REL_TOL = 1e-5
 BF16_TOLERANCES = {
     "dispatch_rows_rel_err": CHECKSUM_REL_TOL,
     "dispatch_weights_rel_err": CHECKSUM_REL_TOL,
-    "experts_rel_err": 2e-2,
-    "experts_vs_fused_rel_err": 2e-2,
-    "combine_rel_err": 2e-2,
+    "experts_rel_err": 9e-3,  # worst seen 6.5e-3
+    "experts_vs_fused_rel_err": 7e-3,  # worst seen 4.8e-3
+    "combine_rel_err": 8e-3,  # worst seen 5.9e-3
 }
 # FP8: the experts' references use the same FP8 inputs and weights, so they
 # only see the requantized intermediate; combine is checked end to end against
@@ -52,11 +56,21 @@ BF16_TOLERANCES = {
 FP8_TOLERANCES = {
     "dispatch_rows_rel_err": CHECKSUM_REL_TOL,
     "dispatch_weights_rel_err": CHECKSUM_REL_TOL,
-    "experts_rel_err": 6e-2,
-    "experts_vs_fused_rel_err": 6e-2,
-    "combine_rel_err": 1e-1,
+    "experts_rel_err": 4e-2,  # worst seen 2.84e-2
+    "experts_vs_fused_rel_err": 4e-2,  # worst seen 2.87e-2
+    "combine_rel_err": 9e-2,  # worst seen 6.87e-2
 }
 RANK_TIMEOUT_S = 900
+# Rendezvous ports come from [PORT_RANGE_LOW, ephemeral range start).
+PORT_RANGE_LOW = 20_000
+PORT_RANGE_HIGH = 32_768
+DEFAULT_EPHEMERAL_PORT_LOW = 32_768
+EPHEMERAL_PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
+CLOSE_FAILED = "\nclose() failed:\n"
+NO_RESULT = "no result"
+PEER_EXIT_CODE = 17
+ROW_KEY_SEED = 4_242
+ROW_KEY_MAX_COEFFICIENT = 1 << 31
 BENCH_WARMUP_ITERS = 5
 # Seeds reserve room for this many stages (lanes) per step.
 MAX_STAGES = 2
@@ -79,6 +93,8 @@ class Topology:
 
 @dataclass(frozen=True)
 class Case:
+    """One step: a control payload, then ``num_layers`` MoE layers under it."""
+
     name: str
     tokens_per_attn_rank: tuple[int, ...]
     # Graph-mode payloads skip the host sync (worst-case receive allocation).
@@ -86,6 +102,11 @@ class Case:
     num_layers: int = 2
     # Second stage (lane 1) token counts for two-lane (DBO) cases.
     second_stage: tuple[int, ...] | None = None
+    # Route every top-k choice to FFN rank 0's experts (worst-case receive).
+    hot_ffn_rank: bool = False
+    # FFN ranks plan the step as graph (True) or eager (False) regardless of
+    # the payload: one side replaying a graph while the other runs eagerly.
+    ffn_graph_mode: bool | None = None
 
     def stage_tokens(self) -> list[tuple[int, ...]]:
         if self.second_stage is None:
@@ -132,6 +153,35 @@ def standard_cases(attn_size: int, capacity: int) -> list[Case]:
     return cases
 
 
+def hot_cases(attn_size: int, capacity: int) -> list[Case]:
+    """Standard cases with all routes on FFN rank 0's experts."""
+    return [
+        replace(case, name=f"hot_{case.name}", hot_ffn_rank=True)
+        for case in standard_cases(attn_size, capacity)
+    ]
+
+
+def mixed_mode_cases(attn_size: int) -> list[Case]:
+    """Attention and FFN plan the same step differently (graph vs eager)."""
+    cases: list[Case] = []
+    for attention_graph in (True, False):
+        tag = "attn_graph_ffn_eager" if attention_graph else "attn_eager_ffn_graph"
+        cases += [
+            Case(
+                f"{tag}_{name}",
+                tokens,
+                graph_mode=attention_graph,
+                ffn_graph_mode=not attention_graph,
+            )
+            for name, tokens in (
+                ("even64", (64,) * attn_size),
+                ("decode1", (1,) * attn_size),
+                ("mixed", tuple(17 + 5 * rank for rank in range(attn_size))),
+            )
+        ]
+    return cases
+
+
 def lane_cases(attn_size: int, capacity: int) -> list[Case]:
     """Two-lane (DBO) cases: different token counts per lane, incl. empty lanes."""
     cases: list[Case] = []
@@ -161,13 +211,18 @@ def lane_cases(attn_size: int, capacity: int) -> list[Case]:
 
 
 def make_inputs(
-    seed: int, attn_rank: int, num_tokens: int
+    seed: int, attn_rank: int, num_tokens: int, expert_limit: int = NUM_EXPERTS
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Hidden states and Qwen3-style (softmax, renormalized) top-k routing."""
+    """Hidden states and Qwen3-style (softmax, renormalized) top-k routing.
+
+    ``expert_limit`` restricts routing to experts ``[0, expert_limit)``; the
+    random draws are the same either way.
+    """
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed * INPUT_SEED_STRIDE + attn_rank)
     x = torch.randn(num_tokens, HIDDEN_SIZE, generator=gen, device="cuda")
     logits = torch.randn(num_tokens, NUM_EXPERTS, generator=gen, device="cuda")
+    logits[:, expert_limit:] = float("-inf")
     weights, ids = torch.topk(torch.softmax(logits, dim=-1), TOP_K, dim=-1)
     weights = weights / weights.sum(dim=-1, keepdim=True)
     return x.to(torch.bfloat16), ids, weights.float()
@@ -230,6 +285,34 @@ def dense_moe_reference(
     return ref
 
 
+def routing_limit(case: Case, layout: Any) -> int:
+    """Routing range for ``case``: FFN rank 0's experts when it is hot."""
+    return layout.experts_per_rank if case.hot_ffn_rank else NUM_EXPERTS
+
+
+def row_keys(rows: torch.Tensor) -> torch.Tensor:
+    """An exact 64-bit fingerprint per fp32 row (bit pattern, wrapping sum).
+
+    Equal rows give equal keys whatever the batch shape, so received rows can
+    be matched against sent rows without depending on their order.
+    """
+    gen = torch.Generator(device=rows.device)
+    gen.manual_seed(ROW_KEY_SEED)
+    coefficients = torch.randint(
+        1, ROW_KEY_MAX_COEFFICIENT, (rows.shape[-1],), generator=gen, device=rows.device
+    )
+    return (rows.contiguous().view(torch.int32).long() * coefficients).sum(-1)
+
+
+def sort_rows(
+    local_ids: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Order rows by (local expert, key) for an order-independent comparison."""
+    by_key = torch.argsort(keys, stable=True)
+    order = by_key[torch.argsort(local_ids[by_key], stable=True)]
+    return local_ids[order], keys[order], weights[order]
+
+
 def rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
     denom = expected.float().norm().item()
     diff = (actual.float() - expected.float()).norm().item()
@@ -242,16 +325,40 @@ def rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 def free_ports(count: int) -> tuple[int, ...]:
-    """Distinct free ports: the sockets stay open until all are picked, so two
-    calls cannot hand out the same port (the default and AFD groups collide)."""
-    sockets = [socket.socket() for _ in range(count)]
+    """Distinct free ports below the kernel's ephemeral range.
+
+    The ports are released before the ranks bind them. A port from the
+    ephemeral range (what binding port 0 returns) can be taken in between by
+    any outgoing connection, e.g. another test's NCCL or gloo sockets, which
+    fails the rendezvous with EADDRINUSE. Below that range only explicit binds
+    compete. The sockets stay open until all are picked, so one call cannot
+    return the same port twice.
+    """
+    rng = random.SystemRandom()
+    high = min(_ephemeral_port_low(), PORT_RANGE_HIGH)
+    if high <= PORT_RANGE_LOW:
+        high = PORT_RANGE_HIGH
+    sockets: list[socket.socket] = []
     try:
-        for sock in sockets:
-            sock.bind(("127.0.0.1", 0))
+        while len(sockets) < count:
+            sock = socket.socket()
+            try:
+                sock.bind(("", rng.randrange(PORT_RANGE_LOW, high)))
+            except OSError:
+                sock.close()
+                continue
+            sockets.append(sock)
         return tuple(int(sock.getsockname()[1]) for sock in sockets)
     finally:
         for sock in sockets:
             sock.close()
+
+
+def _ephemeral_port_low() -> int:
+    try:
+        return int(EPHEMERAL_PORT_RANGE.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return DEFAULT_EPHEMERAL_PORT_LOW
 
 
 def fake_vllm_config(
@@ -298,7 +405,7 @@ def fake_vllm_config(
     )
 
 
-def build_connector(
+def make_connector(
     topology: Topology,
     world_rank: int,
     local_rank: int,
@@ -306,17 +413,16 @@ def build_connector(
     port: int,
     host: str,
 ) -> Any:
+    """The connector as the runtime constructs it (not yet initialized)."""
     from afd_plugin.config import afd_config_from_mapping
     from afd_plugin.connectors import AFDConnectorFactory
 
     role, role_rank = topology.role(world_rank)
     vllm_config = fake_vllm_config(topology, role, role_rank, extra_config, port, host)
     afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
-    connector = AFDConnectorFactory.create_connector(
+    return AFDConnectorFactory.create_connector(
         world_rank, local_rank, vllm_config, afd_config
     )
-    connector.init_afd_connector()
-    return connector
 
 
 def control_step(
@@ -324,17 +430,24 @@ def control_step(
     tokens_by_stage: list[tuple[int, ...]],
     *,
     graph_mode: bool = False,
+    ffn_graph_mode: bool | None = None,
 ) -> None:
     """Deliver one step's control payload like the runtime does.
 
     ``tokens_by_stage[s]`` holds every Attention rank's token count for stage
     (lane) ``s``. ``graph_mode`` marks the step as graph capture/replay (no
-    host sync, fixed worst-case shapes).
+    host sync, fixed worst-case shapes). ``ffn_graph_mode`` makes FFN ranks
+    plan the step in the other mode than the payload says, as an FFN runner
+    does when it has no graph for a step Attention replays.
     """
     from afd_plugin.connectors import AFDControlPayload, AFDDPMetadata
 
     if connector.is_ffn:
         payload = connector.control_plane.recv_dp_metadata_list()
+        if ffn_graph_mode is not None:
+            payload = replace(
+                payload, is_graph_capturing=False, is_graph_replaying=ffn_graph_mode
+            )
     else:
         payload = AFDControlPayload(
             dp_metadata_list={
@@ -372,16 +485,22 @@ def _rank_main(
             world_size=topology.world_size,
             rank=world_rank,
         )
-        connector = build_connector(
+        connector = make_connector(
             topology, world_rank, local_rank, extra_config, ports[1], master_addr
         )
+        # Separate from construction so close() also runs after a failed init.
+        connector.init_afd_connector()
         result.metrics = scenario(connector, topology, scenario_args)
     except Exception:
         result.ok = False
         result.error = traceback.format_exc()
     finally:
         if connector is not None:
-            connector.close()
+            try:
+                connector.close()
+            except Exception:
+                result.ok = False
+                result.error += CLOSE_FAILED + traceback.format_exc()
         Path(out_dir, f"rank{world_rank}.json").write_text(
             json.dumps(asdict(result), default=str), encoding="utf-8"
         )
@@ -396,9 +515,17 @@ def run_ranks(
     extra_config: dict[str, Any],
     out_dir: Path,
     placement: Placement | None = None,
+    rank_extra_config: Mapping[int, dict[str, Any]] | None = None,
+    timeout_s: float = RANK_TIMEOUT_S,
 ) -> list[RankResult]:
-    """Run ``scenario`` on this host's ranks; results come back in rank order."""
+    """Run ``scenario`` on this host's ranks; results come back in rank order.
+
+    ``rank_extra_config`` adds per-rank config keys on top of ``extra_config``
+    (to make ranks disagree). Ranks still alive after ``timeout_s`` are killed
+    and reported as ``no result (hung=True)``.
+    """
     placement = placement or Placement()
+    rank_extra_config = rank_extra_config or {}
     ctx = mp.get_context("spawn")
     ports = placement.ports or free_ports(2)
     local_ranks = placement.local_ranks or tuple(range(topology.world_size))
@@ -411,7 +538,7 @@ def run_ranks(
                 topology,
                 scenario,
                 scenario_args,
-                extra_config,
+                {**extra_config, **rank_extra_config.get(rank, {})},
                 placement.master_addr,
                 ports,
                 str(out_dir),
@@ -421,7 +548,7 @@ def run_ranks(
     ]
     for proc in procs:
         proc.start()
-    deadline = time.monotonic() + RANK_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     for proc in procs:
         proc.join(timeout=max(1.0, deadline - time.monotonic()))
     hung = [proc for proc in procs if proc.is_alive()]
@@ -435,7 +562,9 @@ def run_ranks(
         else:
             role, _ = topology.role(rank)
             results.append(
-                RankResult(rank, role, ok=False, error=f"no result (hung={bool(hung)})")
+                RankResult(
+                    rank, role, ok=False, error=f"{NO_RESULT} (hung={bool(hung)})"
+                )
             )
     return results
 
@@ -515,9 +644,20 @@ class Checker:
         self.worst[key] = max(self.worst.get(key, 0.0), value)
 
     def check_ffn_receive(
-        self, payload: Any, tokens_per_attn_rank: tuple[int, ...], seed: int, label: str
+        self,
+        payload: Any,
+        tokens_per_attn_rank: tuple[int, ...],
+        seed: int,
+        label: str,
+        limit: int = NUM_EXPERTS,
     ) -> None:
-        """Exact per-expert counts, then row and weight checksums."""
+        """Exact per-expert counts, then every row and weight matched exactly.
+
+        Rows are matched as a multiset per expert (bit-exact fingerprints and
+        their top-k weights), so dropped, duplicated, swapped or wrongly weighted
+        rows fail even when per-expert sums agree. The sums are still recorded
+        as error metrics. ``limit`` is the routing range used for the inputs.
+        """
         from afd_plugin.connectors.gpu.deepep_m2n.experts import (
             align_up,
             expert_row_ranges,
@@ -539,8 +679,9 @@ class Checker:
         expected_counts = torch.zeros(len(experts), dtype=torch.int64, device="cuda")
         expected_xsum = torch.zeros(len(experts), HIDDEN_SIZE, device="cuda")
         expected_wsum = torch.zeros(len(experts), device="cuda")
+        expected_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for attn_rank, num_tokens in enumerate(tokens_per_attn_rank):
-            x, ids, w = make_inputs(seed, attn_rank, num_tokens)
+            x, ids, w = make_inputs(seed, attn_rank, num_tokens, limit)
             sent = as_sent(x, self.payload_format)
             mask = (ids >= experts.start) & (ids < experts.stop)
             rows, slots = mask.nonzero(as_tuple=True)
@@ -548,11 +689,37 @@ class Checker:
             expected_counts.index_add_(0, local, torch.ones_like(local))
             expected_xsum.index_add_(0, local, sent[rows])
             expected_wsum.index_add_(0, local, w[rows, slots])
+            expected_rows.append((local, row_keys(sent[rows]), w[rows, slots]))
         got_counts = [end - start for start, end in ranges]
         if got_counts != expected_counts.tolist():
             raise AssertionError(
                 f"{label}: counts {got_counts} != {expected_counts.tolist()}"
             )
+        valid = [
+            torch.arange(start, end, device="cuda")
+            for start, end in ranges
+            if end > start
+        ]
+        if valid:
+            index = torch.cat(valid)
+            got_local = torch.repeat_interleave(
+                torch.arange(len(experts), device="cuda"),
+                torch.tensor(got_counts, device="cuda"),
+            )
+            got = sort_rows(
+                got_local,
+                row_keys(received[index]),
+                state.recv_topk_weights[index].float(),
+            )
+            local, keys, weights = (
+                torch.cat(parts) for parts in zip(*expected_rows, strict=True)
+            )
+            want = sort_rows(local, keys, weights)
+            for name, got_part, want_part in zip(
+                ("expert ids", "rows", "top-k weights"), got, want, strict=True
+            ):
+                if not torch.equal(got_part, want_part):
+                    raise AssertionError(f"{label}: received {name} differ from sent")
         plan = connector.stage_plans[state.lane]
         padded = [align_up(count, connector.expert_alignment) for count in got_counts]
         if plan.do_cpu_sync and state.recv_counts_host != padded:
@@ -675,14 +842,24 @@ def run_ffn_step(
 def correctness_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Eager steps over every case; each case lists per-stage token counts."""
+    """Eager steps over every case; each case lists per-stage token counts.
+
+    Like the runtime, one control payload covers a whole step: every layer of
+    the case reuses the plan it set up.
+    """
     checker = Checker(connector)
     step = 0
     for case in [Case(**case) for case in args["cases"]]:
         stages = case.stage_tokens()
+        limit = routing_limit(case, connector.layout)
+        control_step(
+            connector,
+            stages,
+            graph_mode=case.graph_mode,
+            ffn_graph_mode=case.ffn_graph_mode,
+        )
         for layer in range(case.num_layers):
             step += 1
-            control_step(connector, stages, graph_mode=case.graph_mode)
             if connector.is_ffn:
                 payloads, outs = run_ffn_step(connector, checker.weights, len(stages))
                 for stage, (payload, out) in enumerate(
@@ -690,13 +867,13 @@ def correctness_scenario(
                 ):
                     label = f"{case.name} L{layer} S{stage}"
                     checker.check_ffn_receive(
-                        payload, stages[stage], stage_seed(step, stage), label
+                        payload, stages[stage], stage_seed(step, stage), label, limit
                     )
                     checker.check_ffn_experts(payload, out)
             else:
                 rank = connector.role_rank
                 inputs = [
-                    make_inputs(stage_seed(step, stage), rank, tokens[rank])
+                    make_inputs(stage_seed(step, stage), rank, tokens[rank], limit)
                     for stage, tokens in enumerate(stages)
                 ]
                 outs = [torch.empty_like(x) for x, _, _ in inputs]
@@ -724,9 +901,9 @@ def compile_scenario(
     step = 0
     for case in [Case(**case) for case in args["cases"]]:
         stages = case.stage_tokens()
+        control_step(connector, stages, graph_mode=case.graph_mode)
         for _ in range(case.num_layers):
             step += 1
-            control_step(connector, stages, graph_mode=case.graph_mode)
             if connector.is_ffn:
                 run_ffn_step(connector, checker.weights, 1)
             else:
@@ -737,45 +914,68 @@ def compile_scenario(
     return checker.finish()
 
 
+Inputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 @dataclass
 class CapturedStep:
-    """One CUDA graph for one bucket, with its static inputs and outputs."""
+    """One CUDA graph for one bucket: ``num_layers`` MoE layers of one step.
+
+    ``inputs``/``outs``/``payloads`` are indexed ``[layer][stage]``; inputs and
+    outs are filled on Attention ranks, payloads and outs on FFN ranks.
+    """
 
     graph: torch.cuda.CUDAGraph
-    inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-    outs: list[torch.Tensor]
-    payloads: list[Any]
+    inputs: list[list[Inputs]]
+    outs: list[list[torch.Tensor]]
+    payloads: list[list[Any]]
 
 
 def capture_step(
-    connector: Any, topology: Topology, bucket: int, weights: Any
+    connector: Any,
+    topology: Topology,
+    bucket: int,
+    weights: Any,
+    num_layers: int = 1,
+    limit: int = NUM_EXPERTS,
 ) -> CapturedStep:
     """Warm up one eager graph-mode step, then capture the same step.
 
     Every Attention rank runs exactly ``bucket`` tokens per stage, so all
     shapes are fixed. Graph-mode payloads skip the host sync and give
-    worst-case receive shapes on every rank.
+    worst-case receive shapes on every rank. The graph holds ``num_layers``
+    layers under one control payload, as a decode graph holds a whole step.
     """
     num_stages = connector.config.num_lanes
     stages = [(bucket,) * topology.attn_size] * num_stages
-    inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    outs: list[torch.Tensor] = []
+    inputs: list[list[Inputs]] = []
+    outs: list[list[torch.Tensor]] = []
     if not connector.is_ffn:
         inputs = [
-            make_inputs(stage_seed(0, stage), connector.role_rank, bucket)
-            for stage in range(num_stages)
+            [
+                make_inputs(stage_seed(0, stage), connector.role_rank, bucket, limit)
+                for stage in range(num_stages)
+            ]
+            for _ in range(num_layers)
         ]
-        outs = [torch.empty_like(x) for x, _, _ in inputs]
+        outs = [[torch.empty_like(x) for x, _, _ in layer] for layer in inputs]
+    payloads: list[list[Any]] = []
     for capture in (False, True):
         control_step(connector, stages, graph_mode=True)
         graph = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         with torch.cuda.graph(graph) if capture else nullcontext():
             if connector.is_ffn:
-                payloads, outs = run_ffn_step(connector, weights, num_stages)
+                payloads, outs = [], []
+                for _ in range(num_layers):
+                    layer_payloads, layer_outs = run_ffn_step(
+                        connector, weights, num_stages
+                    )
+                    payloads.append(layer_payloads)
+                    outs.append(layer_outs)
             else:
-                payloads = []
-                run_attention_step(connector, inputs, outs)
+                for layer in range(num_layers):
+                    run_attention_step(connector, inputs[layer], outs[layer], layer)
         torch.cuda.synchronize()
     return CapturedStep(graph=graph, inputs=inputs, outs=outs, payloads=payloads)
 
@@ -791,46 +991,93 @@ def replay_step(
 def graph_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Capture one graph per bucket; replay them interleaved with new inputs."""
+    """Capture one graph per bucket; replay them interleaved with new inputs.
+
+    Args: ``buckets``, ``replays``, optional ``num_layers`` (layers per graph,
+    default 1) and ``hot_ffn_rank`` (route everything to FFN rank 0).
+    """
     checker = Checker(connector)
     weights = checker.weights if connector.is_ffn else None
     buckets = args["buckets"]
+    num_layers = args.get("num_layers", 1)
+    case = Case("graph", (), hot_ffn_rank=args.get("hot_ffn_rank", False))
+    limit = routing_limit(case, connector.layout)
     captured = {
-        bucket: capture_step(connector, topology, bucket, weights) for bucket in buckets
+        bucket: capture_step(connector, topology, bucket, weights, num_layers, limit)
+        for bucket in buckets
     }
-    num_stages = connector.config.num_lanes
     step = 0
     for _ in range(args["replays"]):
         for bucket in buckets:
-            step += 1
             graph_step = captured[bucket]
+            first_step = step + 1
+            step += num_layers
             if not connector.is_ffn:
                 rank = connector.role_rank
-                fresh = [
-                    make_inputs(stage_seed(step, stage), rank, bucket)
-                    for stage in range(num_stages)
-                ]
-                for static, new in zip(graph_step.inputs, fresh, strict=True):
-                    for static_tensor, new_tensor in zip(static, new, strict=True):
-                        static_tensor.copy_(new_tensor)
+                for layer, layer_inputs in enumerate(graph_step.inputs):
+                    for stage, static in enumerate(layer_inputs):
+                        fresh = make_inputs(
+                            stage_seed(first_step + layer, stage), rank, bucket, limit
+                        )
+                        for static_tensor, new_tensor in zip(
+                            static, fresh, strict=True
+                        ):
+                            static_tensor.copy_(new_tensor)
             replay_step(connector, topology, graph_step, bucket)
             torch.cuda.synchronize()
             if connector.is_ffn:
                 tokens = (bucket,) * topology.attn_size
-                for stage, (payload, out) in enumerate(
-                    zip(graph_step.payloads, graph_step.outs, strict=True)
-                ):
-                    label = f"graph bucket={bucket} step={step} S{stage}"
-                    checker.check_ffn_receive(
-                        payload, tokens, stage_seed(step, stage), label
-                    )
-                    checker.check_ffn_experts(payload, out)
+                for layer in range(num_layers):
+                    for stage, (payload, out) in enumerate(
+                        zip(
+                            graph_step.payloads[layer],
+                            graph_step.outs[layer],
+                            strict=True,
+                        )
+                    ):
+                        label = f"graph bucket={bucket} step={step} L{layer} S{stage}"
+                        checker.check_ffn_receive(
+                            payload,
+                            tokens,
+                            stage_seed(first_step + layer, stage),
+                            label,
+                            limit,
+                        )
+                        checker.check_ffn_experts(payload, out)
             else:
-                for (x, ids, w), out in zip(
+                for layer_inputs, layer_outs in zip(
                     graph_step.inputs, graph_step.outs, strict=True
                 ):
-                    checker.check_combined(out, x, ids, w)
+                    for (x, ids, w), out in zip(layer_inputs, layer_outs, strict=True):
+                        checker.check_combined(out, x, ids, w)
     return checker.finish()
+
+
+def peer_exit_scenario(
+    connector: Any, topology: Topology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """One rank dies (``os._exit``, no cleanup) after the step's control payload.
+
+    The others then run the layer and are expected to fail through DeepEP's
+    timeouts rather than wait forever. Returns normally only if the layer
+    completed despite the missing peer, which the test treats as a failure.
+    """
+    tokens = (args["tokens"],) * topology.attn_size
+    control_step(connector, [tokens])
+    if connector.world_rank == args["exit_world_rank"]:
+        os._exit(PEER_EXIT_CODE)
+    start = time.monotonic()
+    if connector.is_ffn:
+        weights, _, _ = local_weights(
+            connector.layout.expert_range(connector.role_rank),
+            connector.config.payload_format,
+        )
+        run_ffn_step(connector, weights, 1)
+    else:
+        x, ids, w = make_inputs(0, connector.role_rank, args["tokens"])
+        run_attention_step(connector, [(x, ids, w)], [torch.empty_like(x)])
+    torch.cuda.synchronize()
+    return {"completed_without_peer_s": time.monotonic() - start}
 
 
 def _timed(fn: Any, iters: int) -> float:

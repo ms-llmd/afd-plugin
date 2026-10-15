@@ -75,6 +75,11 @@ def _pokprod_two_nodes() -> list[RankTopology]:
 
 
 def test_presets_expand_and_explicit_keys_override():
+    """Presets fill in defaults, explicit keys override them, and the config
+    survives a round trip.
+
+    Why: presets are defaults, not locks.
+    """
     rail_isolated = NetworkConfig.from_mapping({"preset": "roce-rail-isolated"})
     overridden = NetworkConfig.from_mapping({"preset": "ib", "nic_policy": "shared"})
 
@@ -94,11 +99,20 @@ def test_presets_expand_and_explicit_keys_override():
     ],
 )
 def test_network_config_rejects_invalid_values(raw, message):
+    """Bad ``gin``, ``explicit`` without NICs, non-NCCL env keys,
+    ``EP_DISABLE_GIN`` in ``nccl_env`` and unknown keys are rejected.
+
+    Why: bad or conflicting network settings must fail at parse time.
+    """
     with pytest.raises(ValueError, match=message):
         NetworkConfig.from_mapping(raw)
 
 
 def test_single_host_needs_no_rdma():
+    """Four ranks on one host: one domain, GIN off, no NIC pins.
+
+    Why: single-node runs must never touch RDMA.
+    """
     plan = plan_network(
         [_rank(r, "n0", r, [_nic("mlx5_0", RAIL_A, 2)]) for r in range(4)],
         NetworkConfig(),
@@ -109,6 +123,11 @@ def test_single_host_needs_no_rdma():
 
 
 def test_isolated_rails_put_every_rank_on_one_shared_rail():
+    """pokprod-like hosts (each NIC its own subnet) get the shared policy,
+    one rail, and the same NIC for every rank.
+
+    Why: encodes the Phase 4 finding as the automatic choice.
+    """
     plan = plan_network(_pokprod_two_nodes(), NetworkConfig())
 
     assert (plan.use_gin, plan.nic_policy, plan.rail) == (True, "shared", RAIL_A)
@@ -116,6 +135,11 @@ def test_isolated_rails_put_every_rank_on_one_shared_rail():
 
 
 def test_shared_rail_uses_each_hosts_own_nic_name():
+    """The shared subnet is ``mlx5_0`` on one host and ``mlx5_7`` on the
+    other; each rank gets its own host's name.
+
+    Why: NIC names are not consistent across hosts.
+    """
     ranks = [
         _rank(0, "n0", 0, [_nic("mlx5_0", RAIL_A, 2)]),
         _rank(1, "n1", 0, [_nic("mlx5_7", RAIL_A, 2), _nic("mlx5_0", RAIL_B, 2)]),
@@ -127,6 +151,10 @@ def test_shared_rail_uses_each_hosts_own_nic_name():
 
 
 def test_shared_rail_prefers_the_configured_nic():
+    """``nics: [mlx5_5]`` selects that NIC's subnet as the shared rail.
+
+    Why: operators can steer which NIC is shared.
+    """
     plan = plan_network(
         _pokprod_two_nodes(), NetworkConfig(nic_policy="shared", nics=("mlx5_5",))
     )
@@ -140,6 +168,11 @@ def test_shared_rail_prefers_the_configured_nic():
     ids=["routed-roce", "ib-preset"],
 )
 def test_routed_fabrics_keep_nccls_nearest_nic(config):
+    """``rails_routed`` and the ``ib`` preset keep NCCL's per-GPU NIC choice
+    (no pins) with GIN on.
+
+    Why: routed fabrics should use every NIC, not throttle to one.
+    """
     plan = plan_network(_pokprod_two_nodes(), config)
 
     assert (plan.use_gin, plan.nic_policy) == (True, "nccl")
@@ -147,6 +180,10 @@ def test_routed_fabrics_keep_nccls_nearest_nic(config):
 
 
 def test_ib_fat_tree_is_one_rail():
+    """IB NICs on one subnet prefix get the NCCL policy without pins.
+
+    Why: one rail needs no pinning.
+    """
     ib_nic = NicInfo(name="mlx5_0", link_layer="infiniband", rail=IB_RAIL, distance=2)
     plan = plan_network(
         [_rank(r, f"n{r // 2}", r % 2, [ib_nic]) for r in range(4)], NetworkConfig()
@@ -157,6 +194,11 @@ def test_ib_fat_tree_is_one_rail():
 
 def test_nvl72_is_one_domain_even_with_uneven_hosts():
     # One NVLink fabric spans the hosts, so per-host counts need not match.
+    """Four ranks on two trays (3+1) in one NVLink fabric: one domain of 4,
+    GIN off.
+
+    Why: NVL72 is one domain; per-host layout rules must not apply.
+    """
     ranks = [
         _rank(r, f"tray{0 if r < 3 else 1}", r, domain="nvl:abc:1") for r in range(4)
     ]
@@ -167,6 +209,10 @@ def test_nvl72_is_one_domain_even_with_uneven_hosts():
 
 
 def test_explicit_nics_follow_local_rank():
+    """``explicit`` assigns ``nics`` by local rank on every host.
+
+    Why: a manual override for fabrics the planner cannot model.
+    """
     plan = plan_network(
         _pokprod_two_nodes(),
         NetworkConfig(nic_policy="explicit", nics=("mlx5_0", "mlx5_5")),
@@ -176,6 +222,10 @@ def test_explicit_nics_follow_local_rank():
 
 
 def test_no_common_rail_is_an_error():
+    """Hosts with no subnet in common raise "no RDMA rail".
+
+    Why: fail at init instead of a QP timeout minutes later.
+    """
     ranks = [
         _rank(0, "n0", 0, [_nic("mlx5_0", RAIL_A, 2)]),
         _rank(1, "n1", 0, [_nic("mlx5_0", RAIL_B, 2)]),
@@ -192,11 +242,20 @@ def test_no_common_rail_is_an_error():
 )
 def test_gin_off_across_nvlink_domains_is_an_error(config):
     # NVLink load/store cannot reach another domain; GIN is the only path.
+    """``gin: off`` (or the ``single-node`` preset) with ranks on two hosts
+    raises.
+
+    Why: without GIN DeepEP cannot reach another NVLink domain.
+    """
     with pytest.raises(RuntimeError, match="span 2 NVLink domains"):
         plan_network(_pokprod_two_nodes(), config)
 
 
 def test_gin_off_on_one_host_is_allowed():
+    """``gin: off`` with all ranks on one host plans normally.
+
+    Why: the multi-domain check must not block single-node use.
+    """
     plan = plan_network(
         [_rank(r, "n0", r, [_nic("mlx5_0", RAIL_A, 2)]) for r in range(2)],
         NetworkConfig(gin="off"),
@@ -206,6 +265,10 @@ def test_gin_off_on_one_host_is_allowed():
 
 
 def test_forced_gin_on_one_domain_still_plans_nics():
+    """``gin: on`` on one host keeps GIN on and pins no NICs.
+
+    Why: a forced setting is honored without inventing NIC pins.
+    """
     plan = plan_network(
         [_rank(r, "n0", r, [_nic("mlx5_0", RAIL_A, 2)]) for r in range(2)],
         NetworkConfig(gin="on"),
@@ -216,6 +279,11 @@ def test_forced_gin_on_one_domain_still_plans_nics():
 
 
 def test_rank_environment_pins_nic_and_gin(monkeypatch):
+    """Applying a plan sets ``NCCL_IB_HCA``, ``nccl_env`` values and
+    ``EP_DISABLE_GIN`` (absent with GIN, 1 without).
+
+    Why: the plan only works if these reach NCCL and DeepEP.
+    """
     for key in ("NCCL_IB_HCA", "EP_DISABLE_GIN", "NCCL_IB_TC"):
         monkeypatch.delenv(key, raising=False)
     config = NetworkConfig(nccl_env=(("NCCL_IB_TC", "106"),))
@@ -286,6 +354,12 @@ def _fake_sysfs(tmp_path):
 
 
 def test_discovery_reads_rails_and_pcie_distance(tmp_path):
+    """A fake sysfs tree: active RoCE and IB ports found (down port skipped),
+    rails from interface subnets, GID prefix or /32, and PCIe distance
+    ordering near before far.
+
+    Why: topology discovery is tested without RDMA hardware.
+    """
     sysfs_ib, sysfs_pci = _fake_sysfs(tmp_path)
 
     nics = {

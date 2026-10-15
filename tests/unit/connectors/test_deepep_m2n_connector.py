@@ -93,6 +93,10 @@ def _handshake(
 
 
 def test_connector_is_registered():
+    """The factory resolves ``DeepEPM2NAFDConnector`` to this module's class.
+
+    Why: deployments select the connector by name in the AFD config.
+    """
     cls = AFDConnectorFactory.get_connector_class(CONNECTOR)
 
     assert cls.__name__ == CONNECTOR
@@ -100,6 +104,12 @@ def test_connector_is_registered():
 
 
 def test_config_defaults_and_round_trip():
+    """An empty config gives DeepGEMM experts and a BF16 payload, and the
+    config survives to_mapping/from_mapping unchanged.
+
+    Why: defaults are what deployments get, and the handshake compares
+    serialized configs.
+    """
     config = DeepEPM2NConfig.from_mapping(None)
 
     assert config.expert_backend == "deepgemm"
@@ -126,11 +136,21 @@ def test_config_defaults_and_round_trip():
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
+    """Each bad or stale option (unknown or removed key, bad enum, zero or
+    negative size, bad network preset, bad timeout) raises a ValueError
+    naming the field.
+
+    Why: typos and removed keys must fail at startup, not be ignored.
+    """
     with pytest.raises(ValueError, match=message):
         DeepEPM2NConfig.from_mapping(raw)
 
 
 def test_config_accepts_fp8_payload_and_sync_threshold():
+    """The FP8 payload format and ``cpu_sync_min_tokens`` parse as given.
+
+    Why: the Phase 2 options must reach the connector intact.
+    """
     config = DeepEPM2NConfig.from_mapping(
         {"payload_format": "fp8_block128_fp32", "cpu_sync_min_tokens": 512}
     )
@@ -140,6 +160,12 @@ def test_config_accepts_fp8_payload_and_sync_threshold():
 
 
 def test_plan_stage_skips_host_sync_below_threshold():
+    """With a threshold of 256, an eager 255-token step skips the host sync
+    and a 256-token step keeps it.
+
+    Why: pins the boundary of the small-batch no-sync shortcut.
+    """
+
     def plan(tokens: int):
         return plan_stage(
             _dp(tokens),
@@ -155,6 +181,11 @@ def test_plan_stage_skips_host_sync_below_threshold():
 
 
 def test_fp8_block128_round_trip():
+    """Block-128 FP8 quantization gives e4m3 values and one scale per
+    128x128 block, and dequantizes back within 5% relative error.
+
+    Why: test weights and the reference math rely on this helper.
+    """
     w = torch.randn(2, 256, 384)
 
     w_q, scale = quantize_fp8_block128(w)
@@ -166,6 +197,11 @@ def test_fp8_block128_round_trip():
 
 
 def test_expert_weights_require_matching_fp8_scales():
+    """FP8 weights with scales are FP8, BF16 weights without scales are not,
+    and FP8 weights without scales are rejected.
+
+    Why: a half-configured FP8 layer must fail loudly, not compute garbage.
+    """
     w13, w2 = torch.zeros(1, 256, 128), torch.zeros(1, 128, 128)
     w13_q, w13_s = quantize_fp8_block128(w13)
     w2_q, w2_s = quantize_fp8_block128(w2)
@@ -177,6 +213,11 @@ def test_expert_weights_require_matching_fp8_scales():
 
 
 def test_layout_is_ffn_first_with_identity_expert_ids():
+    """2F3A with 128 experts: 64 experts per FFN rank, 5x64 DeepEP expert
+    slots, FFN ranks first in world order, FFN 1 owning experts 64-127.
+
+    Why: real expert ids must equal DeepEP ids in the plugin's rank order.
+    """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=3, num_experts=128)
 
     assert layout.experts_per_rank == 64
@@ -187,11 +228,20 @@ def test_layout_is_ffn_first_with_identity_expert_ids():
 
 
 def test_layout_rejects_indivisible_experts():
+    """128 experts over 3 FFN ranks is rejected.
+
+    Why: uneven expert splits are unsupported and must be refused.
+    """
     with pytest.raises(ValueError, match="divisible"):
         DeepEPM2NLayout(ffn_size=3, attn_size=1, num_experts=128)
 
 
 def test_tokens_per_attention_rank_expands_tp_peers():
+    """Per-DP token counts are repeated for each Attention TP peer; a count
+    list that fits neither layout raises.
+
+    Why: with Attention TP every rank needs its DP rank's token count.
+    """
     assert tokens_per_attention_rank(_dp(3, 5), attn_size=2) == (3, 5)
     assert tokens_per_attention_rank(_dp(3, 5), attn_size=4) == (3, 3, 5, 5)
     with pytest.raises(ValueError, match="token counts"):
@@ -199,6 +249,12 @@ def test_tokens_per_attention_rank_expands_tp_peers():
 
 
 def test_plan_stage_rounds_bucket_and_picks_host_sync():
+    """An eager (17, 4) step with granularity 16 gives bucket 32 and a host
+    sync; a graph-mode empty step gives bucket 1 and no sync.
+
+    Why: the bucket must be the largest rank rounded up and never 0, and
+    graph mode must never block on the host.
+    """
     eager = plan_stage(
         _dp(17, 4),
         attn_size=2,
@@ -220,6 +276,10 @@ def test_plan_stage_rounds_bucket_and_picks_host_sync():
 
 
 def test_plan_stage_rejects_bucket_above_capacity():
+    """65 tokens against a capacity of 64 raises.
+
+    Why: an overflow must be an error, not memory corruption in DeepEP.
+    """
     with pytest.raises(ValueError, match="exceeds capacity"):
         plan_stage(
             _dp(65),
@@ -231,6 +291,11 @@ def test_plan_stage_rejects_bucket_above_capacity():
 
 
 def test_handshake_accepts_consistent_ranks():
+    """Four consistent handshake records pass, giving expert alignment 128
+    and no GIN (one host).
+
+    Why: the normal path must pass and yield the right settings.
+    """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
     result = validate_handshake(_handshake(layout), layout, NetworkConfig())
@@ -250,6 +315,11 @@ def test_handshake_accepts_consistent_ranks():
     ],
 )
 def test_handshake_rejects_mismatches(overrides, message):
+    """One rank's record differs (hidden size, payload format, expert
+    alignment, role order, or a pre-Hopper GPU): the handshake raises.
+
+    Why: disagreeing ranks would corrupt data or hang; fail before buffers.
+    """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
     with pytest.raises(RuntimeError, match=message):
@@ -257,6 +327,10 @@ def test_handshake_rejects_mismatches(overrides, message):
 
 
 def test_handshake_plans_gin_across_nvlink_domains():
+    """Ranks on hosts ``aabb`` give a plan of 2 domains of 2 ranks with GIN.
+
+    Why: the handshake must hand the network plan the right domains.
+    """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
     result = validate_handshake(
@@ -275,6 +349,10 @@ def test_handshake_plans_gin_across_nvlink_domains():
     [("aaab", "different rank counts"), ("abab", "not contiguous")],
 )
 def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
+    """Hosts ``aaab`` (unequal counts) and ``abab`` (not contiguous) raise.
+
+    Why: DeepEP's hybrid mode needs equal, contiguous ranks per domain.
+    """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
     with pytest.raises(RuntimeError, match=message):
@@ -282,6 +360,10 @@ def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
 
 
 def test_handshake_rejects_mismatched_network_config():
+    """One rank with a different ``network`` config fails the handshake.
+
+    Why: every rank must derive the same NIC and GIN plan.
+    """
     layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
     infos = _handshake(layout)
     infos[1]["network"] = "something else"
@@ -291,6 +373,10 @@ def test_handshake_rejects_mismatched_network_config():
 
 
 def test_gloo_control_backend_stages_payloads_on_cpu():
+    """With ``control_backend: gloo`` control payloads are staged on CPU.
+
+    Why: gloo cannot send CUDA tensors.
+    """
     connector = _connector(
         "attention", 0, Topology(ffn_size=1, attn_size=1), {"control_backend": "gloo"}
     )
@@ -299,6 +385,11 @@ def test_gloo_control_backend_stages_payloads_on_cpu():
 
 
 def test_config_parses_network_section_and_tunables():
+    """The ``network`` section (preset plus NIC), ``num_qps`` and timeouts
+    parse and survive a round trip.
+
+    Why: the Phase 4b options must reach the connector intact.
+    """
     config = DeepEPM2NConfig.from_mapping(
         {
             "network": {"preset": "roce-rail-isolated", "nics": ["mlx5_0"]},
@@ -314,6 +405,11 @@ def test_config_parses_network_section_and_tunables():
 
 
 def test_expert_row_ranges_follow_alignment():
+    """Per-expert row ranges from the prefix sum: contiguous with alignment 1,
+    each group starting on a multiple of 128 with alignment 128.
+
+    Why: every receive check reads DeepEP's padded per-expert layout.
+    """
     psum = torch.tensor([3, 128 + 5, 256])
 
     assert expert_row_ranges(psum, 1) == [(0, 3), (3, 133), (133, 256)]
@@ -321,6 +417,11 @@ def test_expert_row_ranges_follow_alignment():
 
 
 def test_connector_constructs_without_initialization():
+    """Constructing Attention and FFN connectors computes world ranks and
+    capacity (explicit, or max_num_batched_tokens) without initializing.
+
+    Why: construction must not communicate, and rank math must be right.
+    """
     topology = Topology(ffn_size=2, attn_size=3)
     attention = _connector("attention", 1, topology, {"capacity_tokens_per_rank": 64})
     ffn = _connector("ffn", 1, topology)
@@ -333,6 +434,10 @@ def test_connector_constructs_without_initialization():
 
 
 def test_connector_rejects_non_bf16_model():
+    """An FP16 model is rejected at construction.
+
+    Why: only BF16 hidden states are supported.
+    """
     topology = Topology(ffn_size=1, attn_size=1)
     vllm_config = fake_vllm_config(topology, "ffn", 0, {}, port=12345)
     vllm_config.model_config.dtype = torch.float16
@@ -343,6 +448,11 @@ def test_connector_rejects_non_bf16_model():
 
 
 def test_control_plane_derives_one_plan_per_stage():
+    """A control payload with counts (5, 9) leaves stage 0 with bucket 9 and
+    a host sync on a real connector object.
+
+    Why: the runtime path from control payload to plan must work.
+    """
     connector = _connector(
         "attention",
         0,
@@ -362,6 +472,10 @@ def test_control_plane_derives_one_plan_per_stage():
 
 
 def test_control_plane_rejects_more_stages_than_lanes():
+    """Two stages on a one-lane connector raise.
+
+    Why: each in-flight micro-batch needs its own buffer.
+    """
     connector = _connector("ffn", 0, Topology(ffn_size=1, attn_size=1))
     payload = AFDControlPayload(
         dp_metadata_list={0: _dp(1), 1: _dp(1)},
@@ -373,7 +487,24 @@ def test_control_plane_rejects_more_stages_than_lanes():
         connector.control_plane.update_state_from_dp_metadata(payload)
 
 
+def test_close_without_init_is_safe():
+    """``close()`` on a never-initialized connector succeeds, twice.
+
+    Why: runtimes call close() on every exit path, including before init.
+    """
+    connector = _connector("ffn", 0, Topology(ffn_size=1, attn_size=1))
+
+    connector.close()
+    connector.close()
+
+    assert connector.is_initialized is False
+
+
 def test_data_path_requires_initialization():
+    """``send_attn_output`` before init raises "not initialized".
+
+    Why: misuse must give a clear Python error, not a native crash.
+    """
     connector = _connector("attention", 0, Topology(ffn_size=1, attn_size=1))
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(

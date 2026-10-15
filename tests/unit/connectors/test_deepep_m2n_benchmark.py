@@ -115,6 +115,14 @@ def _format_table(report: dict) -> str:
 
 
 def test_deepep_m2n_per_layer_benchmark(tmp_path):
+    """Times one MoE layer round trip for 2F2A and 1F3A, every variant
+    (payload, host-sync threshold, eager or graph, lanes) and token count,
+    against a single-GPU local MoE baseline. Prints a table and writes
+    JSON (``AFD_DEEPEP_M2N_BENCH_OUT``).
+
+    Why: each phase's performance claim needs a number against a
+    no-communication baseline.
+    """
     needed = max(topology.world_size for topology in TOPOLOGIES)
     if available_gpus() < needed:
         pytest.skip(f"needs {needed} GPUs")
