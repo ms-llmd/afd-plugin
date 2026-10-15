@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -24,6 +24,10 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
 
+from afd_plugin.compat.patches.gpu_mrv2_ubatching import (
+    use_gpu_mrv2_dbo_dispatch,
+    use_gpu_mrv2_ubatch_factory,
+)
 from afd_plugin.compat.profiler import (
     create_afd_gpu_profiler,
     step_afd_gpu_profiler,
@@ -328,6 +332,7 @@ def _use_afd_execution_context(
     )
     try:
         with (
+            use_gpu_mrv2_dbo_dispatch(),
             replay_scope,
             _use_afd_ubatch_preparation(runner),
             use_afd_metadata_provider(
@@ -414,6 +419,22 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             )
         return int(batch_descriptor.num_tokens)
 
+    # Native ActiveKVConnector creates a context without attention metadata or
+    # a batch descriptor for KV-only work, including idle steps and async loads
+    # after eager forward. It must not start or repeat an AFD model transaction.
+    # Keep this exception in GPU V2; native model/ubatch contexts still use the
+    # shared metadata provider, and NPU context handling is unchanged.
+    def install_afd_metadata_on_forward_context(
+        self,
+        forward_context: ForwardContext,
+    ) -> None:
+        if (
+            forward_context.batch_descriptor is None
+            and forward_context.attn_metadata is None
+        ):
+            return
+        super().install_afd_metadata_on_forward_context(forward_context)
+
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
@@ -432,6 +453,30 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         super().load_model(load_dummy_weights, *args, **kwargs)
         if not self.connector.is_initialized:
             self.connector.init_afd_connector()
+
+    # Patch reason: native KV initialization excludes DP1 from UBatchRunner
+    # construction, although AFD can coordinate its two microbatches locally.
+    # Patch functionality: scope only the native factory alias to AFD's DP1
+    # adapter; native KV allocation, runner and CUDA graph setup stay upstream.
+    # Signature: matches GPUModelRunner.initialize_kv_cache at the pinned commit.
+    # Upstream: vllm/v1/worker/gpu/model_runner.py, initialize_kv_cache;
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607 (vLLM 0.30.0).
+    # Delegation exception: the large native KV/graph lifecycle remains in super;
+    # only its factory seam is missing. Remove when upstream supports DP1 DBO.
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        # ### PATCH START: enable native DP1 UBatchRunner construction.
+        with use_gpu_mrv2_ubatch_factory():
+            super().initialize_kv_cache(
+                kv_cache_config,
+                is_profiling=is_profiling,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+            )
+        # ### PATCH END: enable native DP1 UBatchRunner construction.
 
     # Patch reason: vLLM 0.30.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose

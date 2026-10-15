@@ -22,7 +22,7 @@ primary_code_paths:
   - "setup.py"
   - "MANIFEST.in"
 related_code_paths:
-  - "afd_plugin/v1/worker/{attention_metadata,attention_model_runner,attention_model_runner_v2,ffn_model_runner}.py"
+  - "afd_plugin/v1/worker/{attention_metadata,attention_model_runner_v2,ffn_model_runner}.py"
   - "afd_plugin/v1/worker/npu/{attention_model_runner,attention_model_runner_v2,ffn_model_runner}.py"
   - "afd_plugin/connectors/{gpu,npu}/**"
 depends_on:
@@ -45,7 +45,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
   - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
-  - "vLLM vllm.compilation and vllm.v1.worker V1/V2 graph/ubatching APIs"
+  - "vLLM vllm.compilation and vllm.v1.worker.gpu V2 graph/ubatching APIs"
   - "vLLM-Ascend ACL graph, forward-context, and model-runner V1/V2 APIs in the tested environment"
   - "PyTorch CUDA, torch_npu, CMake, and Ascend CANN build interfaces used by the repository"
 verified_platform_refs:
@@ -82,10 +82,10 @@ upstream runtime classes:
 | Role | CUDA | Ascend |
 | --- | --- | --- |
 | Attention worker | `AFDAttentionWorker(Worker)` | `AFDNPUAttentionWorker(NPUWorker)` |
-| Attention runner V1 | `AFDAttentionModelRunner(GPUModelRunner)` | `AFDNPUAttentionModelRunner(NPUModelRunner)` |
+| Attention runner V1 | Unavailable; no GPU V1 fallback | `AFDNPUAttentionModelRunner(NPUModelRunner)` |
 | Attention runner V2 | `AFDAttentionModelRunnerV2(GPUModelRunnerV2)` | `AFDNPUAttentionModelRunnerV2(NPUModelRunnerV2)` |
 | FFN worker | `AFDFFNWorker(Worker)` | `AFDNPUFFNWorker(NPUWorker)` |
-| FFN runner for V1/V2 pairs | plugin-owned minimal `GPUFFNModelRunner` | `AFDNPUFFNModelRunner(NPUModelRunner)` |
+| FFN runner | plugin-owned, connector-driven `GPUFFNModelRunner` | `AFDNPUFFNModelRunner(NPUModelRunner)` |
 
 The NPU classes do not inherit CUDA AFD classes. Shared behavior is carried
 by configuration, connector payloads, forward-context metadata, graph-policy
@@ -103,10 +103,10 @@ the corresponding runtime stack.
 | Mechanism | CUDA owner | NPU owner |
 | --- | --- | --- |
 | Worker/device lifecycle | vLLM `Worker` plus AFD role worker | vLLM-Ascend `NPUWorker` plus AFD role worker |
-| Attention execution | upstream V1 or V2 `GPUModelRunner` extension | upstream V1 or V2 `NPUModelRunner` extension |
+| Attention execution | native V2 `GPUModelRunner` extension | upstream V1 or V2 `NPUModelRunner` extension |
 | FFN execution | plugin minimal runner | upstream `NPUModelRunner` extension |
 | Graph policy/keying | `v1/worker/cuda_graph.py` | shared policy/keying plus ACL/NPUGraph integration |
-| Native ubatching | V1 `AFDUBatchWrapper`; V2 native vLLM ubatch runner | V1 `AscendUBatchWrapper`; V2 `NPUUBatchRunner` adapting native child inputs, contexts, and streams |
+| Native ubatching | native `UBatchRunner` with scoped AFD metadata preparation | V1 `AscendUBatchWrapper`; V2 `NPUUBatchRunner` adapting native child inputs, contexts, and streams |
 | Profiling | `compat/profiler.py` | `compat/npu/profiler.py` |
 | Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P | plugin CANN A2E/E2A and routed-only async CAM ops |
 | Build/packaging | no plugin CUDA extension | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
@@ -117,7 +117,7 @@ flowchart TB
     COMMON --> CUDA["CUDA role workers"]
     COMMON --> NPU["Ascend role workers"]
     CUDA --> GPU_RUNNERS["GPUModelRunner extension / minimal FFN runner"]
-    CUDA --> CUDA_GRAPH["CUDA Graph and AFDUBatchWrapper"]
+    CUDA --> CUDA_GRAPH["CUDA Graph and native UBatchRunner"]
     CUDA --> NCCL["NCCL P2P transport"]
     NPU --> NPU_RUNNERS["NPUModelRunner extensions"]
     NPU --> ACL["ACL/NPUGraph and AscendUBatchWrapper"]
@@ -136,10 +136,10 @@ flowchart TB
 
 Both CUDA workers delegate device and distributed setup to native
 `Worker.init_device()`. During that synchronous construction window, they
-temporarily replace the selected upstream runner symbol with the AFD runner
-and restore it in `finally`. V1 Attention selects `AFDAttentionModelRunner`;
-V2 selects `AFDAttentionModelRunnerV2`; a V2-paired FFN still selects the
-minimal `GPUFFNModelRunner`. `torch.accelerator.empty_cache()` releases
+temporarily replace the native V2 runner symbol with the AFD runner
+and restore it in `finally`. Both roles require ModelRunnerV2. Attention
+selects `AFDAttentionModelRunnerV2`; FFN selects the connector-driven
+`GPUFFNModelRunner`. `torch.accelerator.empty_cache()` releases
 startup allocations. Attention retains the matching upstream request,
 KV-cache, sampling, and output behavior; FFN remains connector-driven.
 
@@ -157,11 +157,12 @@ torch or vLLM at module import time. Current behavior is:
 
 Attention treats DP metadata transfer as a control-plane side effect. For a
 single-stage capture it sends the padded capture shape before entering formal
-CUDA Graph capture. For an ubatched capture, `AFDUBatchWrapper` supplies the
-exact stage slices and sends per-stage metadata before the graph body.
+CUDA Graph capture. For an ubatched capture, the native `UBatchRunner`
+preparation hook attaches AFD metadata to the exact stage slices and sends
+their layout before the graph body.
 
 CUDA ModelRunnerV2 supports exactly two native microbatches at Attention
-DP > 1 and reuses the native full-graph manager. Its Attention wrapper observes
+DP1 or DP > 1 and reuses the native full-graph manager. Its Attention wrapper observes
 each capture descriptor at input preparation and publishes warmup/capture
 control outside the graph. Two-stage preparation installs metadata on both
 children and sends the complete layout before eager execution or graph replay.
@@ -178,19 +179,19 @@ otherwise FFN executes eagerly.
 
 ### CUDA native ubatching
 
-`AFDUBatchWrapper` replaces vLLM's GPU wrapper during Attention model load
-when native ubatching is enabled. It:
+Native `UBatchRunner` owns input slicing, stage contexts, execution threads,
+streams, capture/replay, and output merge. AFD attaches stage-local metadata
+and publishes the complete stage layout before native execution. Padded token
+sizes drive graph coordination while unpadded lengths retain transfer semantics.
+Scoped factory and dispatch adapters enable the native path at Attention DP1
+as well as DP > 1. AFD accepts exactly two native ubatches.
 
-- preserves vLLM's two-ubatch execution model;
-- installs stage-local `AFDForwardContextMetadata`;
-- builds the stage `additional_kwargs` and DP metadata list;
-- uses padded token sizes for graph coordination while retaining unpadded
-  lengths for transfer semantics;
-- supports the DP-size-1 decision path that upstream normally coordinates
-  only across multiple DP ranks;
-- rejects a split that would produce an empty first or final stage.
-
-The current AFD policy accepts exactly two native ubatches.
+Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal DBO validation
+applies. Qwen3 MoE DBO remains supported. Earlier Qwen GDN Graph + DBO and
+six-cell recurrent-state/CUDA Graph parity results describe the removed adapter
+and are historical evidence only. The DP1 path has H20
+DeepSeek-V2-Lite DP1/TP2 Graph + DBO validation with 128 GSM8K samples
+and live two-stage/full-replay assertions.
 
 ### CUDA profiling
 
@@ -243,8 +244,8 @@ reassembled to match the upstream Ascend layout.
 
 ### NPU native ubatching and DBO
 
-`AscendUBatchWrapper` is plugin-owned and deliberately separate from the CUDA
-wrapper. This is the V1 path; V2 uses `NPUUBatchRunner`. The V1 wrapper:
+`AscendUBatchWrapper` is plugin-owned and separate from the native CUDA
+`UBatchRunner`. This is the NPU V1 path; V2 uses `NPUUBatchRunner`. The V1 wrapper:
 
 - supports exactly two native ubatches;
 - creates one forward context and execution thread per stage;
@@ -362,13 +363,14 @@ during shutdown.
 
 ## Tested runtime matrix
 
-This table records current validation gates and repository evidence. It is not
-an expansion of the supported runtime contract.
+This table records current validation gates and repository evidence. The
+historical CUDA V1 row is not a current launch option or fallback. Evidence
+does not expand the supported runtime contract.
 
 | Platform/path | Execution | Ubatching | Routing/quantization limits | Evidence |
 | --- | --- | --- | --- | --- |
-| CUDA V1 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | Registered CUDA model boundaries; Attention-side or FFN-side gate where the model supports it | DeepSeek-V2-Lite eager/graph/DBO accuracy E2E; model, graph, connector, and profiler unit tests |
-| CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP > 1 | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | DeepSeek-V2-Lite eager/graph DP2 and TP2 E2E; H20 live two-stage execution and representative 300-question comparisons; numerical equivalence is not established |
+| Historical CUDA V1 (removed) + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | Registered CUDA model boundaries; Attention-side or FFN-side gate where the model supports it | DeepSeek-V2-Lite eager/graph/DBO accuracy E2E; model, graph, connector, and profiler unit tests |
+| CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP1 or DP > 1 | Model-specific gate placement; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | DeepSeek-V2-Lite eager/graph DP2 and TP2 E2E; H20 live two-stage execution and representative 300-question comparisons; numerical equivalence is not established. Qwen3.5/3.6 GDN DBO is unsupported; Qwen3 MoE DBO remains supported; DeepSeek-V2-Lite DP1/TP2 Graph + DBO passes 128 GSM8K samples and live two-stage/full-replay assertions |
 | Ascend V1 + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager native DBO with two ubatches and Attention DP > 1; graphs remain single-batch | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
 | Ascend + `CAMAsyncAFDConnector` | Eager only | Two native DBO microbatches on Attention, including DP1; legacy split selector is ignored | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Earlier V2-Lite and DSV4 layered comparisons retain their original scope; native-only migration has local checks and awaits NPU/accuracy validation |

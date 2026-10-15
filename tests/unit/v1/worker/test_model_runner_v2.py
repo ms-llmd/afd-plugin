@@ -18,10 +18,12 @@ from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.forward_context import (  # noqa: E402
     BatchDescriptor,
     ForwardContext,
+    override_forward_context,
 )
 from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
+from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.gpu_worker import Worker  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
@@ -38,9 +40,6 @@ from afd_plugin.v1.worker import (  # noqa: E402
 from afd_plugin.v1.worker import (  # noqa: E402
     attention_worker,
     ffn_worker,
-)
-from afd_plugin.v1.worker.attention_model_runner import (  # noqa: E402
-    AFDAttentionModelRunner,
 )
 from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
@@ -680,12 +679,6 @@ def test_npu_v2_validator_rejects_non_full_acl_graph(cudagraph_mode):
             "P2pNcclAFDConnector",
         ),
         (
-            lambda c: c.additional_config["afd"].update(
-                compute_gate_on_attention=True,
-            ),
-            "compute_gate_on_attention=false",
-        ),
-        (
             lambda c: c.additional_config["afd"].update(num_attention_ranks=2),
             "ranks must match DP",
         ),
@@ -780,7 +773,16 @@ def test_mrv2_stage_sidecars_preserve_native_slices_and_isolate_mutation(
         UBatchSlice(slice(0, 2), slice(0, 4)),
         UBatchSlice(slice(1, 3), slice(4, 8)),
     ]
-    contexts = [SimpleNamespace(additional_kwargs={}) for _ in slices]
+    native_attention_metadata = [{"layer": object()} for _ in slices]
+    native_slot_mappings = [object() for _ in slices]
+    contexts = [
+        SimpleNamespace(
+            additional_kwargs={"platform_key": f"stage-{stage_idx}"},
+            attn_metadata=native_attention_metadata[stage_idx],
+            slot_mapping=native_slot_mappings[stage_idx],
+        )
+        for stage_idx in range(len(slices))
+    ]
     runner.install_mrv2_ubatch_metadata(slices, contexts, real_tokens)
     stages = [c.additional_kwargs["afd_metadata"] for c in contexts]
     assert [m.stage_idx for m in stages] == [0, 1]
@@ -791,15 +793,20 @@ def test_mrv2_stage_sidecars_preserve_native_slices_and_isolate_mutation(
     assert all(m.num_stages == 2 for m in stages)
     assert stages[0].transaction_id == stages[1].transaction_id
     assert all(m.connector is runner.connector for m in stages)
+    for stage_idx, context in enumerate(contexts):
+        assert context.attn_metadata is native_attention_metadata[stage_idx]
+        assert context.slot_mapping is native_slot_mappings[stage_idx]
+        assert context.additional_kwargs["platform_key"] == f"stage-{stage_idx}"
     stages[0].tokens_lens[0] = 99
     assert stages[1].tokens_lens == [4]
     assert runner._afd_pending_metadata.tokens_lens == [4, 4]
 
 
 @pytest.mark.parametrize("graph", [False, True])
-def test_mrv2_prepare_sends_one_complete_payload_and_restores_instance(graph):
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_mrv2_prepare_sends_one_complete_payload_and_restores_instance(graph, dp_size):
     events: list[str] = []
-    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner = _runner_for_metadata(events, data_parallel_size=dp_size)
     slices = [
         UBatchSlice(slice(0, 2), slice(0, 4)),
         UBatchSlice(slice(2, 4), slice(4, 8)),
@@ -829,7 +836,7 @@ def test_mrv2_prepare_sends_one_complete_payload_and_restores_instance(graph):
     assert list(payload.dp_metadata_list) == [0, 1]
     assert [
         m.num_tokens_across_dp_cpu.tolist() for m in payload.dp_metadata_list.values()
-    ] == [[4, 4], [4, 4]]
+    ] == [[4] * dp_size, [4] * dp_size]
 
 
 def test_mrv2_capture_tracker_distinguishes_equal_size_stage_layouts():
@@ -847,9 +854,10 @@ def test_mrv2_capture_tracker_distinguishes_equal_size_stage_layouts():
 
 
 @pytest.mark.parametrize("fail_control", [False, True])
-def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control):
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control, dp_size):
     events: list[str] = []
-    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner = _runner_for_metadata(events, data_parallel_size=dp_size)
     slices = [
         UBatchSlice(slice(0, 2), slice(0, 4)),
         UBatchSlice(slice(2, 4), slice(4, 8)),
@@ -887,6 +895,11 @@ def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control):
         assert [
             (p.is_warmup, p.is_graph_capturing, p.is_graph_replaying) for p in payloads
         ] == [(True, False, False), (False, True, False)]
+        assert all(
+            metadata.num_tokens_across_dp_cpu.tolist() == [4] * dp_size
+            for payload in payloads
+            for metadata in payload.dp_metadata_list.values()
+        )
         assert events == ["control_update", "control_send"] * 2
     assert runner.ubatch_runner.prepare is native_prepare
 
@@ -938,7 +951,10 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
     original_create = afd_forward_context.forward_context_module.create_forward_context
 
     def native_create_forward_context():
-        return SimpleNamespace(
+        return ForwardContext(
+            no_compile_layers={},
+            attn_metadata={},
+            slot_mapping={},
             additional_kwargs={},
             ubatch_slices=None,
             dp_metadata=None,
@@ -1058,7 +1074,10 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
         runner.connector.send_dp_metadata_list = fail_control
 
     def native_create_forward_context():
-        return SimpleNamespace(
+        return ForwardContext(
+            no_compile_layers={},
+            attn_metadata={},
+            slot_mapping={},
             additional_kwargs={},
             ubatch_slices=None,
             dp_metadata=None,
@@ -1797,6 +1816,117 @@ def test_v2_provider_orders_control_before_data_and_always_restores(
     assert runner.prof.steps == 1
 
 
+def _active_native_kv_connector(runner, loaded_contexts):
+    # Exercise native KV-only context creation with a device-free transport.
+    # These are the only compilation fields read by create_forward_context.
+    runner.vllm_config.compilation_config.fast_moe_cold_start = False
+    runner.vllm_config.compilation_config.static_forward_context = {}
+    connector = object.__new__(ActiveKVConnector)
+    connector.vllm_config = runner.vllm_config
+    connector._disabled = False
+    connector._pending_load_kwargs = None
+    connector.kv_connector = SimpleNamespace(
+        handle_preemptions=lambda _metadata: None,
+        bind_connector_metadata=lambda _metadata: None,
+        start_load_kv=lambda context, **_kwargs: loaded_contexts.append(context),
+        finish_forward=lambda: None,
+        wait_for_save=lambda: None,
+        get_transfer_results=lambda _finished: SimpleNamespace(
+            finished_sending=set(),
+            finished_recving={"kv-only"},
+            failed_recving=set(),
+        ),
+        get_block_ids_with_load_errors=set,
+        get_kv_connector_stats=lambda: None,
+        get_kv_connector_kv_cache_events=lambda: None,
+        build_connector_worker_meta=lambda: None,
+        clear_connector_metadata=lambda: None,
+    )
+    return connector
+
+
+@pytest.mark.parametrize("has_sync_kv_loads", [False, True])
+def test_v2_idle_native_kv_helper_context_does_not_publish_afd_control(
+    has_sync_kv_loads,
+):
+    events: list[str] = []
+    runner = _runner_for_metadata(events)
+    loaded_contexts: list[ForwardContext] = []
+    connector = _active_native_kv_connector(runner, loaded_contexts)
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=0,
+        kv_connector_metadata=object(),
+        has_sync_kv_loads=has_sync_kv_loads,
+        finished_req_ids=set(),
+    )
+
+    with (
+        afd_forward_context.use_afd_metadata_provider(
+            runner.install_afd_metadata_on_forward_context
+        ),
+        override_forward_context(None),
+    ):
+        output = connector.no_forward(scheduler_output)
+
+    assert output.kv_connector_output.finished_recving == {"kv-only"}
+    assert len(loaded_contexts) == 1
+    context = loaded_contexts[0]
+    assert context.attn_metadata is None
+    assert context.batch_descriptor is None
+    assert context.ubatch_slices is None
+    assert "afd_metadata" not in context.additional_kwargs
+    assert events == []
+    assert runner._afd_pending_metadata is None
+    assert runner._afd_transaction_counter == 0
+
+
+def test_v2_eager_native_kv_helper_context_preserves_pending_afd_transaction():
+    events: list[str] = []
+    runner = _runner_for_metadata(events)
+    model_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={},
+        dp_metadata=None,
+        ubatch_slices=None,
+        batch_descriptor=BatchDescriptor(num_tokens=7),
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+    runner.install_afd_metadata_on_forward_context(model_context)
+    pending_metadata = runner._afd_pending_metadata
+    loaded_contexts: list[ForwardContext] = []
+    connector = _active_native_kv_connector(runner, loaded_contexts)
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=7,
+        kv_connector_metadata=object(),
+        has_sync_kv_loads=False,
+        finished_req_ids=set(),
+    )
+
+    with afd_forward_context.use_afd_metadata_provider(
+        runner.install_afd_metadata_on_forward_context
+    ):
+        with override_forward_context(model_context):
+            connector.pre_forward(scheduler_output)
+            connector.finish_forward()
+        # Native eager execution starts asynchronous KV loading after leaving
+        # the model context, while the AFD execute_model provider is still live.
+        with override_forward_context(None):
+            output = connector.post_forward(scheduler_output.finished_req_ids)
+
+    assert output.finished_recving == {"kv-only"}
+    assert len(loaded_contexts) == 1
+    context = loaded_contexts[0]
+    assert context.attn_metadata is None
+    assert context.batch_descriptor is None
+    assert "afd_metadata" not in context.additional_kwargs
+    assert events == ["control_update", "control_send"]
+    assert runner._afd_pending_metadata is pending_metadata
+    assert runner._afd_transaction_counter == 1
+    assert runner._afd_suppress_metadata_send is False
+
+
 def test_v2_repeated_execute_reinstalls_provider_and_advances_transactions(
     monkeypatch,
 ):
@@ -1860,35 +1990,6 @@ def test_v2_repeated_execute_reinstalls_provider_and_advances_transactions(
         "data",
     ]
     assert runner.prof.steps == 2
-
-
-def test_v1_execute_does_not_install_v2_provider(monkeypatch):
-    context = SimpleNamespace(additional_kwargs={})
-
-    def original_create_forward_context():
-        return context
-
-    forward_context_module = afd_forward_context.forward_context_module
-    monkeypatch.setattr(
-        forward_context_module,
-        "create_forward_context",
-        original_create_forward_context,
-    )
-
-    def native_execute(self, *args, **kwargs):
-        return forward_context_module.create_forward_context()
-
-    monkeypatch.setattr(native_v1.GPUModelRunner, "execute_model", native_execute)
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.prof = _StepProfiler()
-
-    result = AFDAttentionModelRunner.execute_model(runner, None)
-
-    assert result is context
-    assert "afd_metadata" not in context.additional_kwargs
-    assert (
-        forward_context_module.create_forward_context is original_create_forward_context
-    )
 
 
 @pytest.mark.parametrize("failure", ["profiler", "native", "connector"])
@@ -2064,6 +2165,11 @@ def test_v2_worker_directly_constructs_one_plugin_runner(
 
     monkeypatch.setattr(worker_module, runner_name, _RunnerRecorder)
     monkeypatch.setattr(native_module, "GPUModelRunner", _NativeRunnerSentinel)
+
+    def unexpected_v1_construction(*_args, **_kwargs):
+        pytest.fail("AFD GPU startup constructed native ModelRunnerV1")
+
+    monkeypatch.setattr(native_v1, "GPUModelRunner", unexpected_v1_construction)
     monkeypatch.setattr(worker_module.Worker, "init_device", _fake_worker_init)
     monkeypatch.setattr(
         worker_module,
@@ -2092,45 +2198,39 @@ def test_v2_worker_directly_constructs_one_plugin_runner(
         (
             attention_worker,
             attention_worker.AFDAttentionWorker,
-            "AFDAttentionModelRunner",
+            "AFDAttentionModelRunnerV2",
         ),
         (ffn_worker, AFDFFNWorker, "GPUFFNModelRunner"),
     ],
 )
-def test_v1_worker_preserves_role_specific_construction_path(
-    monkeypatch,
-    worker_module,
-    worker_cls,
-    runner_name,
+def test_gpu_workers_reject_v1_before_native_or_plugin_runner_construction(
+    monkeypatch, worker_module, worker_cls, runner_name
 ):
     config = _v2_config(
         role="ffn" if worker_cls is AFDFFNWorker else "attention",
         use_v2=False,
     )
     worker = _prepare_worker(worker_cls, config, use_v2=False)
-    _RunnerRecorder.instances.clear()
-    _NativeRunnerSentinel.instances = 0
+    original_model_config = worker.model_config
 
-    native_module = native_v1
-    monkeypatch.setattr(worker_module, runner_name, _RunnerRecorder)
-    monkeypatch.setattr(native_module, "GPUModelRunner", _NativeRunnerSentinel)
-    monkeypatch.setattr(worker_module.Worker, "init_device", _fake_worker_init)
+    def unexpected_construction(*_args, **_kwargs):
+        pytest.fail("V1 configuration reached worker/runner initialization")
+
+    monkeypatch.setattr(worker_module, runner_name, unexpected_construction)
+    monkeypatch.setattr(native_v1, "GPUModelRunner", unexpected_construction)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", unexpected_construction)
+    monkeypatch.setattr(worker_module.Worker, "init_device", unexpected_construction)
     monkeypatch.setattr(
         worker_module,
         "assert_compatible_afd_stack",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
 
-    worker.init_device()
+    with pytest.raises(RuntimeError, match="requires ModelRunnerV2"):
+        worker.init_device()
 
-    assert len(_RunnerRecorder.instances) == 1
-    expected_native_instances = 1 if worker_cls is AFDFFNWorker else 0
-    assert _NativeRunnerSentinel.instances == expected_native_instances
-    assert native_module.GPUModelRunner is _NativeRunnerSentinel
-    assert worker.model_runner.__class__ is _RunnerRecorder
-    _construct_like_native_worker(worker)
-    assert _NativeRunnerSentinel.instances == expected_native_instances + 1
+    assert worker.model_config is original_model_config
+    assert config.model_config.hf_config.architectures == ["DeepseekV2ForCausalLM"]
 
 
 @pytest.mark.parametrize(

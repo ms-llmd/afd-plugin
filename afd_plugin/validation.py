@@ -23,9 +23,10 @@ if TYPE_CHECKING:
 
 ATTENTION_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.AFDAttentionWorker"
 FFN_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.AFDFFNWorker"
-ATTENTION_MODEL_RUNNER_FQCN: Final[str] = "afd_plugin.v1.worker.AFDAttentionModelRunner"
+ATTENTION_MODEL_RUNNER_FQCN: Final[str] = (
+    "afd_plugin.v1.worker.AFDAttentionModelRunnerV2"
+)
 FFN_MODEL_RUNNER_FQCN: Final[str] = "afd_plugin.v1.worker.GPUFFNModelRunner"
-UBATCH_WRAPPER_FQCN: Final[str] = "afd_plugin.v1.worker.AFDUBatchWrapper"
 NPU_ATTENTION_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUAttentionWorker"
 NPU_FFN_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUFFNWorker"
 NPU_ATTENTION_MODEL_RUNNER_FQCN: Final[str] = (
@@ -53,15 +54,13 @@ def validate_gpu_model_runner_v2_config(
     connector-driven and does not implement native ModelRunnerV2 execution.
     """
 
+    if not vllm_config.use_v2_model_runner:
+        raise RuntimeError("AFD GPU requires ModelRunnerV2")
+
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if (
-        device_type != "cuda"
-        or afd_config.connector != "P2pNcclAFDConnector"
-        or afd_config.compute_gate_on_attention
-    ):
+    if device_type != "cuda" or afd_config.connector != "P2pNcclAFDConnector":
         raise RuntimeError(
-            "AFD ModelRunnerV2 requires CUDA, synchronous P2pNcclAFDConnector, and "
-            "compute_gate_on_attention=false",
+            "AFD ModelRunnerV2 requires CUDA and synchronous P2pNcclAFDConnector",
         )
 
     parallel = vllm_config.parallel_config
@@ -91,17 +90,12 @@ def validate_gpu_model_runner_v2_config(
         or vllm_config.compilation_config.pass_config.enable_sp
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
-    if parallel.enable_dbo or parallel.use_ubatching:
-        if parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
-            raise RuntimeError(
-                "AFD ModelRunnerV2 DBO/ubatching requires exactly two microbatches",
-            )
-        # Native maybe_build_ubatch_runner requires DP > 1. FFN does not
-        # construct it: its stage layout comes from Attention control messages.
-        if expected_role == "attention" and parallel.data_parallel_size <= 1:
-            raise RuntimeError(
-                "AFD ModelRunnerV2 DBO/ubatching requires Attention DP > 1"
-            )
+    if (
+        parallel.enable_dbo or parallel.use_ubatching
+    ) and parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
+        raise RuntimeError(
+            "AFD ModelRunnerV2 DBO/ubatching requires exactly two microbatches",
+        )
 
     # Keep importing this CPU-safe validation module independent of the vLLM
     # model-wrapper package; the validator itself runs only after vLLM config
@@ -350,7 +344,6 @@ __all__ = [
     "NPU_ATTENTION_WORKER_FQCN",
     "NPU_FFN_MODEL_RUNNER_FQCN",
     "NPU_FFN_WORKER_FQCN",
-    "UBATCH_WRAPPER_FQCN",
     "assert_compatible_afd_stack",
     "expected_npu_worker_qualname",
     "expected_worker_qualname",

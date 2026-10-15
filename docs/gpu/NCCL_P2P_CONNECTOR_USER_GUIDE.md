@@ -123,11 +123,17 @@ Examples:
 
 ## Minimal launch shape
 
-The following DP1 + DBO example selects ModelRunnerV1 on both GPU roles:
+Select native ModelRunnerV2 before starting either GPU role. Attention uses
+the native V2 runner; FFN remains connector-driven. GPU V1 is unavailable.
 
 ```bash
-export VLLM_USE_V2_MODEL_RUNNER=0
+export VLLM_USE_V2_MODEL_RUNNER=1
 ```
+
+The minimal DP1/TP1 commands below illustrate the launch shape. H20
+hardware validation covers DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128
+GSM8K samples and live two-stage/full-replay assertions; see the
+[PR #454](https://github.com/vllm-project/afd-plugin/pull/454).
 
 Attention side:
 
@@ -169,17 +175,17 @@ For complete `1A1F`, `2A2F`, `4A4F`, eager, DBO, and CUDA graph examples, see `r
 
 Set `VLLM_USE_V2_MODEL_RUNNER=1` on both roles to select the V2 pairing.
 Only Attention uses the native V2 runner; FFN remains connector-driven.
-Current validation requires FFN-side gating, static EP, PP=PCP=DCP=1,
+Current validation requires model-specific gate placement, static EP, PP=PCP=DCP=1,
 role-rank totals equal to DP x TP, and a registered AFD architecture. Elastic
 EP, EPLB, sequence-parallel MoE and compile SP are rejected.
 
 Eager and `FULL_DECODE_ONLY` graph execution are accepted. V2 DBO requires
-exactly two microbatches and Attention DP > 1, so the DP1 + DBO launch above
-cannot be converted by changing only the environment variable. Use the DP2
-cases in [the E2E runner](../../tests/e2e/runner.py):
-`afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`. The generic V2 gate also
-covers eager/graph DP2 and TP2 without DBO. Model-specific exclusions still
-apply; a registered model is not evidence that every topology is qualified.
+exactly two microbatches and accepts Attention DP1 or DP > 1. The generic
+[GPU E2E runner](../../tests/e2e/runner.py) covers eager/graph DP2 and TP2,
+including `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`. H20 validation
+also covers the existing DeepSeek-V2-Lite DP1/TP2 Graph + DBO recipe with
+128 GSM8K samples and live two-stage/full-replay assertions. Model-specific
+exclusions still apply; a registered model does not qualify every topology.
 
 ## Receive buffers and memory
 

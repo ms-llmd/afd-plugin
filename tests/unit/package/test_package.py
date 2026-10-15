@@ -12,6 +12,22 @@ import pytest
 
 import afd_plugin
 from afd_plugin.compat import is_vllm_version_supported
+from afd_plugin.v1 import worker as gpu_runtime
+
+
+def test_gpu_runtime_exports_only_mrv2_attention_and_connector_ffn():
+    assert set(gpu_runtime.__all__) == {
+        "AFDAttentionWorker",
+        "AFDAttentionModelRunnerV2",
+        "AFDFFNWorker",
+        "GPUFFNModelRunner",
+    }
+    for retired_class in ("AFDAttentionModelRunner", "AFDUBatchWrapper"):
+        with pytest.raises(AttributeError, match=retired_class):
+            getattr(gpu_runtime, retired_class)
+    assert (
+        importlib.util.find_spec("afd_plugin.v1.worker.attention_model_runner") is None
+    )
 
 
 def test_package_import_is_cpu_safe():

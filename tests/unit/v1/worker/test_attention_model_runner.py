@@ -13,7 +13,7 @@ pytest.importorskip("vllm")
 
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 import afd_plugin.model_executor.models.forward_context as afd_forward_context
 from afd_plugin.config import AFDConfig
@@ -21,16 +21,14 @@ from afd_plugin.connectors import AFDControlPayload
 from afd_plugin.distributed import resolve_role_rank
 from afd_plugin.model_executor.models.forward_context import (
     get_afd_metadata_from_forward_context,
+    use_afd_metadata_provider,
 )
 from afd_plugin.v1.worker.attention_metadata import _is_ubatch_child_afd_context
-from afd_plugin.v1.worker.attention_model_runner import (
-    AFDAttentionModelRunner,
-    fail_if_cuda_graph_enabled,
-    fail_if_unsupported_ubatching,
+from afd_plugin.v1.worker.attention_model_runner_v2 import (
+    AFDAttentionModelRunnerV2,
 )
 from afd_plugin.v1.worker.cuda_graph import validate_cuda_graph_mode
 from afd_plugin.v1.worker.ubatch_wrapper import (
-    AFDUBatchWrapper,
     build_ubatch_additional_kwargs,
     build_ubatch_afd_metadata,
 )
@@ -96,18 +94,6 @@ class _RecordingConnector:
         self.closed = True
 
 
-class _StepProfiler:
-    def __init__(self):
-        self.steps = 0
-        self.stopped = False
-
-    def step(self):
-        self.steps += 1
-
-    def stop(self):
-        self.stopped = True
-
-
 def _install_fake_vllm_forward_context(monkeypatch):
     forward_context_module = afd_forward_context.forward_context_module
 
@@ -148,7 +134,7 @@ def _parallel_config(**overrides):
 
 
 def test_attention_runner_builds_single_stage_metadata():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.connector = object()
     runner._afd_transaction_counter = 0
 
@@ -163,7 +149,7 @@ def test_attention_runner_builds_single_stage_metadata():
 
 
 def test_attention_runner_installs_afd_metadata_on_forward_context():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.connector = _RecordingConnector()
     runner._is_warmup = False
@@ -193,7 +179,7 @@ def test_attention_runner_installs_afd_metadata_on_forward_context():
 
 
 def test_attention_runner_initializes_missing_forward_context_kwargs():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.connector = _RecordingConnector()
     runner._is_warmup = False
@@ -218,7 +204,7 @@ def test_attention_runner_initializes_missing_forward_context_kwargs():
 
 
 def test_attention_runner_uses_padded_full_graph_tokens_for_afd_metadata():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -251,7 +237,7 @@ def test_attention_runner_uses_padded_full_graph_tokens_for_afd_metadata():
 
 
 def test_attention_runner_sends_per_ubatch_dp_metadata():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -270,7 +256,7 @@ def test_attention_runner_sends_per_ubatch_dp_metadata():
 
 
 def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -311,7 +297,7 @@ def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
 
 
 def test_attention_runner_does_not_skip_single_stage_context():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -344,7 +330,7 @@ def test_attention_runner_does_not_skip_single_stage_context():
 
 
 def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.connector = object()
     runner._afd_transaction_counter = 0
     parent = runner.build_afd_metadata(
@@ -378,8 +364,8 @@ def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
     assert child_kwargs["afd_metadata"] is second
 
 
-def test_ubatch_missing_metadata_uses_complete_public_installer():
-    runner = object.__new__(AFDAttentionModelRunner)
+def test_mrv2_missing_parent_metadata_uses_complete_public_installer():
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.vllm_config = SimpleNamespace(parallel_config=_parallel_config())
     runner.connector = _RecordingConnector()
     runner._is_warmup = False
@@ -398,12 +384,7 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
         batch_descriptor=BatchDescriptor(num_tokens=8),
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
-    wrapper = object.__new__(AFDUBatchWrapper)
-    wrapper.configure_afd_context_provider(
-        runner.install_afd_metadata_on_forward_context,
-    )
-
-    wrapper._install_missing_afd_metadata(forward_context)
+    runner.install_afd_metadata_on_forward_context(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
     assert metadata is runner._afd_pending_metadata
@@ -414,421 +395,11 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0, 1}
 
 
-def test_phase5_allows_two_way_ubatching_but_rejects_other_counts():
-    fail_if_unsupported_ubatching(
-        SimpleNamespace(
-            parallel_config=_parallel_config(use_ubatching=True, num_ubatches=2),
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="exactly two"):
-        fail_if_unsupported_ubatching(
-            SimpleNamespace(
-                parallel_config=_parallel_config(use_ubatching=True, num_ubatches=4),
-            ),
-        )
-
-
-def _ubatch_runner(uniform_decode, **parallel_overrides):
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config(**parallel_overrides),
-    )
-    runner.uniform_decode_query_len = 1
-    runner._is_uniform_decode = lambda **_kwargs: uniform_decode
-    return runner
-
-
-@pytest.mark.parametrize(
-    (
-        "parallel_overrides",
-        "uniform_decode",
-        "num_tokens",
-        "padded_num_tokens",
-        "allow_microbatching",
-        "expected",
-    ),
-    [
-        pytest.param(
-            {"use_ubatching": False, "num_ubatches": 2},
-            True,
-            64,
-            64,
-            True,
-            False,
-            id="ubatching-disabled",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            True,
-            64,
-            64,
-            False,
-            False,
-            id="microbatching-disallowed",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            True,
-            16,
-            16,
-            True,
-            False,
-            id="decode-below-threshold",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            True,
-            32,
-            32,
-            True,
-            True,
-            id="decode-at-threshold",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            False,
-            256,
-            256,
-            True,
-            False,
-            id="prefill-below-threshold",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            False,
-            512,
-            512,
-            True,
-            True,
-            id="prefill-at-threshold",
-        ),
-        pytest.param(
-            {
-                "use_ubatching": True,
-                "num_ubatches": 2,
-                "dbo_decode_token_threshold": 1,
-            },
-            True,
-            1,
-            1,
-            True,
-            False,
-            id="fewer-tokens-than-ubatches",
-        ),
-        pytest.param(
-            {
-                "use_ubatching": True,
-                "num_ubatches": 2,
-                "dbo_decode_token_threshold": 2,
-            },
-            True,
-            2,
-            64,
-            True,
-            False,
-            id="cudagraph-pad-empties-last-ubatch",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            True,
-            32,
-            64,
-            True,
-            False,
-            id="cudagraph-pad-split-at-real-boundary",
-        ),
-        pytest.param(
-            {"use_ubatching": True, "num_ubatches": 2},
-            True,
-            33,
-            64,
-            True,
-            True,
-            id="cudagraph-pad-split-inside-real",
-        ),
-    ],
-)
-def test_should_ubatch_single_rank(
-    parallel_overrides,
-    uniform_decode,
-    num_tokens,
-    padded_num_tokens,
-    allow_microbatching,
-    expected,
-):
-    runner = _ubatch_runner(uniform_decode, **parallel_overrides)
-    batch_descriptor = SimpleNamespace(num_tokens=padded_num_tokens)
-
-    assert (
-        runner._should_ubatch_single_rank(
-            batch_descriptor,
-            (),
-            {
-                "num_tokens": num_tokens,
-                "num_reqs": num_tokens,
-                "num_scheduled_tokens_np": [1] * num_tokens,
-                "max_num_scheduled_tokens": 1,
-                "use_cascade_attn": False,
-                "allow_microbatching": allow_microbatching,
-            },
-        )
-        is expected
-    )
-
-
-@pytest.mark.parametrize(
-    (
-        "dp_size",
-        "parent_should_ubatch",
-        "num_tokens",
-        "padded_num_tokens",
-        "expected",
-    ),
-    [
-        pytest.param(1, False, 48, 64, True, id="dp1-enables-local-dbo"),
-        pytest.param(1, False, 2, 64, False, id="dp1-rejects-empty-last-ubatch"),
-        pytest.param(2, True, 2, 64, True, id="dp2-keeps-coordinated-true"),
-        pytest.param(2, False, 48, 64, False, id="dp2-keeps-coordinated-false"),
-        pytest.param(2, True, 1, 1, False, id="dp2-rejects-empty-first-ubatch"),
-        pytest.param(2, True, 2, 2, True, id="dp2-keeps-minimal-nonempty-split"),
-    ],
-)
-def test_determine_batch_execution_overrides_ubatch_only_for_dp1(
-    monkeypatch,
-    dp_size,
-    parent_should_ubatch,
-    num_tokens,
-    padded_num_tokens,
-    expected,
-):
-    runner = _ubatch_runner(
-        True,
-        data_parallel_size=dp_size,
-        use_ubatching=True,
-        num_ubatches=2,
-        dbo_decode_token_threshold=2,
-    )
-    batch_descriptor = SimpleNamespace(num_tokens=padded_num_tokens)
-    parent_result = (
-        "cudagraph-mode",
-        batch_descriptor,
-        parent_should_ubatch,
-        "num-tokens-across-dp",
-        "cudagraph-stats",
-    )
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "_determine_batch_execution_and_padding",
-        lambda _self, *_args, **_kwargs: parent_result,
-    )
-
-    result = runner._determine_batch_execution_and_padding(
-        num_tokens=num_tokens,
-        num_reqs=num_tokens,
-        num_scheduled_tokens_np=[1] * num_tokens,
-        max_num_scheduled_tokens=1,
-        use_cascade_attn=False,
-    )
-
-    assert result == (
-        "cudagraph-mode",
-        batch_descriptor,
-        expected,
-        "num-tokens-across-dp",
-        "cudagraph-stats",
-    )
-
-
-def test_attention_metadata_disables_cross_ubatch_block_table_cache(
-    monkeypatch,
-):
-    runner = object.__new__(AFDAttentionModelRunner)
-    builders = [
-        SimpleNamespace(supports_update_block_table=True),
-        SimpleNamespace(supports_update_block_table=True),
-    ]
-    attention_group = SimpleNamespace(
-        get_metadata_builder=lambda ubatch_idx: builders[ubatch_idx],
-    )
-    runner.attn_groups = [[attention_group]]
-    runner.build_afd_metadata = lambda *_args: object()
-    observed_cache_flags = []
-
-    def build_attention_metadata(_self, *_args, **_kwargs):
-        observed_cache_flags.append(
-            [builder.supports_update_block_table for builder in builders],
-        )
-        return "attention-metadata", None
-
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "_build_attention_metadata",
-        build_attention_metadata,
-    )
-    ubatch_slices = [
-        _UbatchSlice(0, 4, 0, 1),
-        _UbatchSlice(4, 8, 1, 2),
-    ]
-
-    assert runner._build_attention_metadata(
-        8,
-        2,
-        4,
-        ubatch_slices=ubatch_slices,
-    ) == ("attention-metadata", None)
-
-    assert observed_cache_flags == [[False, False]]
-    assert [builder.supports_update_block_table for builder in builders] == [
-        True,
-        True,
-    ]
-
-
-def test_attention_metadata_restores_cache_when_builder_lookup_fails() -> None:
-    runner = object.__new__(AFDAttentionModelRunner)
-    first_builder = SimpleNamespace(supports_update_block_table=True)
-
-    def get_metadata_builder(ubatch_idx: int) -> SimpleNamespace:
-        if ubatch_idx == 1:
-            raise RuntimeError("metadata builder lookup failed")
-        return first_builder
-
-    runner.attn_groups = [
-        [SimpleNamespace(get_metadata_builder=get_metadata_builder)],
-    ]
-    runner.build_afd_metadata = lambda *_args: object()
-    ubatch_slices = [
-        _UbatchSlice(0, 4, 0, 1),
-        _UbatchSlice(4, 8, 1, 2),
-    ]
-
-    with pytest.raises(RuntimeError, match="metadata builder lookup failed"):
-        runner._build_attention_metadata(
-            8,
-            2,
-            4,
-            ubatch_slices=ubatch_slices,
-        )
-
-    assert first_builder.supports_update_block_table is True
-
-
-def test_attention_runner_inherits_native_dummy_run_microbatching():
-    assert "_dummy_run" in AFDAttentionModelRunner.__dict__
-
-
-@pytest.mark.parametrize("use_ubatching", [False, True])
-@pytest.mark.parametrize("enforce_eager", [False, True])
-def test_attention_profile_preserves_native_and_warms_unsplit_dbo(
-    monkeypatch, use_ubatching, enforce_eager
-):
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.parallel_config = _parallel_config(
-        use_ubatching=use_ubatching, num_ubatches=2 if use_ubatching else 1
-    )
-    runner.afd_cudagraph_policy = validate_cuda_graph_mode(
-        SimpleNamespace(
-            model_config=SimpleNamespace(enforce_eager=enforce_eager),
-            compilation_config=SimpleNamespace(
-                cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
-            ),
-            parallel_config=runner.parallel_config,
-        ),
-        role="attention",
-    )
-    runner.max_num_tokens = 8192
-    calls: list[str] = []
-
-    def native_profile(self):
-        assert self is runner
-        calls.append("native")
-
-    def dummy_run(*args, **kwargs):
-        assert args == (8192,)
-        assert kwargs == {"allow_microbatching": False, "is_profile": True}
-        calls.append("dummy")
-
-    monkeypatch.setattr(GPUModelRunner, "profile_run", native_profile)
-    runner._dummy_run = dummy_run
-    runner._sync_device = lambda: calls.append("sync")
-
-    runner.profile_run()
-
-    assert calls == (
-        ["native", "dummy", "sync"]
-        if use_ubatching and not enforce_eager
-        else ["native"]
-    )
-
-
-def test_attention_runner_steps_gpu_profiler(monkeypatch):
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.prof = _StepProfiler()
-
-    def execute_model(_self, *args, **kwargs):
-        return args, kwargs
-
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "execute_model",
-        execute_model,
-    )
-
-    result = runner.execute_model("scheduler", "intermediate")
-
-    assert runner.prof.steps == 1
-    assert result == (("scheduler", "intermediate"), {})
-
-
-def test_attention_runner_preserves_native_shutdown(monkeypatch):
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.prof = _StepProfiler()
-    runner.connector = _RecordingConnector()
-    native_shutdowns = []
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "shutdown",
-        lambda self: native_shutdowns.append(self),
-    )
-
-    runner.shutdown()
-
-    assert native_shutdowns == [runner]
-    assert runner.prof.stopped is True
-    assert runner.connector.closed is True
-
-
-def test_attention_warmup_preserves_profile_seq_lens(monkeypatch):
-    import torch
-
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
-    runner._is_warmup = False
-    runner._afd_pending_metadata = None
-    runner._afd_suppress_metadata_send = False
-    runner._afd_is_graph_capturing = False
-    runner.build_afd_metadata = lambda *_args: object()
-    runner.build_capture_dp_metadata = lambda *_args: object()
-    runner.send_dp_metadata = lambda *_args: None
-    dummy_runs = []
-    runner._dummy_run = lambda *args, **kwargs: dummy_runs.append((args, kwargs))
-
-    runner._warmup_and_capture(
-        SimpleNamespace(num_tokens=8, uniform=True, num_active_loras=0),
-        CUDAGraphMode.FULL,
-        profile_seq_lens=7,
-    )
-
-    assert [kwargs["profile_seq_lens"] for _, kwargs in dummy_runs] == [7, 7]
-
-
 @pytest.mark.parametrize("has_control_plane", [False, True])
 def test_forward_context_provider_installs_metadata_before_model_forward(
     monkeypatch, has_control_plane
 ):
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -842,10 +413,6 @@ def test_forward_context_provider_installs_metadata_before_model_forward(
     runner._afd_transaction_counter = 0
     fake_forward_context, original_create = _install_fake_vllm_forward_context(
         monkeypatch,
-    )
-
-    from afd_plugin.model_executor.models.forward_context import (
-        use_afd_metadata_provider,
     )
 
     with use_afd_metadata_provider(
@@ -863,7 +430,7 @@ def test_forward_context_provider_installs_metadata_before_model_forward(
 
 
 def test_forward_context_provider_can_install_without_sending_metadata(monkeypatch):
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -876,10 +443,6 @@ def test_forward_context_provider_can_install_without_sending_metadata(monkeypat
     runner._afd_pending_metadata = runner.build_afd_metadata(None, 1)
     fake_forward_context, original_create = _install_fake_vllm_forward_context(
         monkeypatch,
-    )
-
-    from afd_plugin.model_executor.models.forward_context import (
-        use_afd_metadata_provider,
     )
 
     with use_afd_metadata_provider(
@@ -901,7 +464,7 @@ def test_attention_runtime_rejects_unsupported_cuda_graph_modes():
     )
 
     with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
-        fail_if_cuda_graph_enabled(vllm_config)
+        validate_cuda_graph_mode(vllm_config, role="attention")
 
 
 def test_attention_runtime_allows_full_decode_only_cuda_graph():
@@ -911,11 +474,11 @@ def test_attention_runtime_allows_full_decode_only_cuda_graph():
         parallel_config=_parallel_config(),
     )
 
-    fail_if_cuda_graph_enabled(vllm_config)
+    validate_cuda_graph_mode(vllm_config, role="attention")
 
 
 def test_attention_runner_forwards_capture_and_warmup_flags():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -933,7 +496,7 @@ def test_attention_runner_forwards_capture_and_warmup_flags():
 
 
 def test_attention_runner_forwards_profile_flag():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
@@ -952,7 +515,7 @@ def test_attention_runner_forwards_profile_flag():
 
 
 def test_attention_runner_builds_capture_dp_metadata_for_native_dp():
-    runner = object.__new__(AFDAttentionModelRunner)
+    runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(data_parallel_size=2),
     )
@@ -980,9 +543,6 @@ def test_afd_rank_derives_from_data_parallel_rank():
     role_rank = resolve_role_rank(vllm_config, config)
 
     assert role_rank == 1
-
-
-# --- TP rank derivation tests ---
 
 
 def _parallel_config_with_tp(
@@ -1143,111 +703,8 @@ def test_afd_rank_raises_for_out_of_range_dp2_tp2(monkeypatch):
         resolve_role_rank(vllm_config, config)
 
 
-class _LifecycleConnector:
-    """Connector fake recording lifecycle events for load-order tests."""
-
-    def __init__(self, events):
-        self.events = events
-        self.control_plane = object()
-        self._initialized = False
-
-    @property
-    def is_initialized(self):
-        return self._initialized
-
-    def init_afd_connector(self):
-        self.events.append("connector_init")
-        self._initialized = True
-
-
-def _fake_connector_factory(monkeypatch, connector):
-    import afd_plugin.v1.worker.attention_model_runner as attention_model_runner
-
-    monkeypatch.setattr(
-        attention_model_runner,
-        "_resolve_world_ranks",
-        lambda: (3, 1),
-    )
-    monkeypatch.setattr(
-        attention_model_runner.AFDConnectorFactory,
-        "create_connector",
-        lambda rank, local_rank, vllm_config, afd_config: connector,
-    )
-
-
-def test_attention_runner_constructor_does_not_initialize_connector(monkeypatch):
-    import afd_plugin.v1.worker.attention_model_runner as attention_model_runner
-
-    events: list[str] = []
-    connector = _LifecycleConnector(events)
-
-    def fake_native_init(self, vllm_config, device):
-        self.vllm_config = vllm_config
-        self.device = device
-
-    monkeypatch.setattr(GPUModelRunner, "__init__", fake_native_init)
-    monkeypatch.setattr(
-        attention_model_runner,
-        "fail_if_unsupported_ubatching",
-        lambda _config: None,
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "validate_cuda_graph_mode",
-        lambda _config, role: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "create_afd_gpu_profiler",
-        lambda _name: object(),
-    )
-    monkeypatch.setattr(
-        AFDAttentionModelRunner,
-        "parse_config",
-        staticmethod(lambda _vllm_config: SimpleNamespace()),
-    )
-    _fake_connector_factory(monkeypatch, connector)
-
-    runner = AFDAttentionModelRunner(SimpleNamespace(), SimpleNamespace(index=0))
-
-    assert runner.connector is connector
-    # Connector construction is device-light; the collective rendezvous is
-    # deferred to load_model() so Attention and FFN weight loading overlap.
-    assert events == []
-    assert connector.is_initialized is False
-
-
-@pytest.mark.parametrize("use_ubatching", [False, True])
-def test_attention_runner_load_model_initializes_connector_after_weights(
-    monkeypatch,
-    use_ubatching,
-):
-    events: list[str] = []
-    connector = _LifecycleConnector(events)
-    runner = object.__new__(AFDAttentionModelRunner)
-    runner.connector = connector
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(use_ubatching=use_ubatching),
-    )
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "load_model",
-        lambda self, load_dummy_weights=False: events.append("model_load"),
-    )
-    if use_ubatching:
-        monkeypatch.setattr(
-            AFDAttentionModelRunner,
-            "_install_afd_ubatch_wrapper",
-            lambda self: events.append("wrapper_install"),
-        )
-
-    runner.load_model(load_dummy_weights=True)
-
-    expected = ["model_load"]
-    if use_ubatching:
-        # Wrapper installation is local; the connector rendezvous is the
-        # blocking cross-role collective and comes last.
-        expected.append("wrapper_install")
-    expected.append("connector_init")
-    assert events == expected
-    assert connector.is_initialized is True
+def test_attention_runner_delegates_native_profile_and_dummy_execution():
+    # MRV2 owns input preparation and microbatching; AFD wraps execute_model's
+    # provider seam rather than retaining V1 dummy/profile implementations.
+    assert AFDAttentionModelRunnerV2.profile_run is GPUModelRunner.profile_run
+    assert AFDAttentionModelRunnerV2._dummy_run is GPUModelRunner._dummy_run

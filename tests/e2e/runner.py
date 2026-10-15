@@ -12,12 +12,13 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from tests.e2e.accuracy.gsm8k import (
     _extract_gsm8k_accuracy,
@@ -54,7 +55,6 @@ ASYNC_UBATCH_FFN_RANKS = 1
 ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
 ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
-V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
 # Graph capture default for the scenarios that do not carry their own launch
 # profile; the DSV4 synchronous profiles override it.
 DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
@@ -103,6 +103,9 @@ COMPLETION_TEMPERATURE = 0
 DBO_EVAL_NUM_CONCURRENT = 12
 DBO_EVAL_MIN_SAMPLES = 2 * DBO_EVAL_NUM_CONCURRENT
 DBO_EVAL_NUM_UBATCHES = 2
+GPU_EVIDENCE_RPC_TIMEOUT_S = 30
+GPU_EVIDENCE_REPLAY_MIN_COUNT = 2
+GPU_EVIDENCE_PREFIX = "AFD E2E execution: "
 # The engine logs one DEBUG line per executed step carrying its ubatch slice
 # list; a step line containing UBatchSlice entries is a live two-ubatch run.
 DBO_SPLIT_EVIDENCE_ENTRY = "UBatchSlice("
@@ -148,8 +151,10 @@ def main() -> int:
     processes_by_role: dict[str, subprocess.Popen[str]] = {}
     log_threads: list[threading.Thread] = []
     dbo_split_steps: list[float] = []
-    mrv2_execution_events: list[tuple[float, str, str]] = []
-    dbo_eval_started_at: float | None = None
+    gpu_execution_evidence: list[tuple[str, str]] = []
+    gpu_evidence_dir: tempfile.TemporaryDirectory[str] | None = None
+    gpu_evidence_start: Path | None = None
+    eval_started_at: float | None = None
     handled_signals = (signal.SIGTERM, signal.SIGINT)
     previous_handlers = {signum: signal.getsignal(signum) for signum in handled_signals}
     received_signal: int | None = None
@@ -168,6 +173,9 @@ def main() -> int:
 
     launch_order: tuple[tuple[str, str], ...]
     try:
+        if needs_gpu_execution_evidence(args):
+            gpu_evidence_dir = tempfile.TemporaryDirectory(prefix="afd-e2e-gpu-")
+            gpu_evidence_start = Path(gpu_evidence_dir.name) / "evaluation-start"
         if args.baseline:
             role_devices = {"baseline": attention_devices}
             launch_order = (("baseline", "BASELINE"),)
@@ -195,6 +203,7 @@ def main() -> int:
                 args,
                 role=role,
                 e2e_run_id=e2e_run_id,
+                gpu_evidence_start=gpu_evidence_start,
             )
             print_command(
                 label,
@@ -210,30 +219,31 @@ def main() -> int:
             processes.append(process)
             processes_by_role[role] = process
             log_threads.append(
-                stream_output(role, process, dbo_split_steps, mrv2_execution_events)
+                stream_output(role, process, dbo_split_steps, gpu_execution_evidence)
             )
             ensure_alive(process, f"{label} process exited during startup")
 
         wait_for_openai_api(args, processes)
         ensure_processes_alive(processes)
 
+        if needs_gpu_execution_evidence(args):
+            gpu_execution_evidence_rpc(args, "afd_reset_execution_evidence")
+            assert gpu_evidence_start is not None
+            gpu_evidence_start.touch()
+        eval_started_at = time.time()
         if args.scenario == ASYNC_CAM_SCENARIO:
             run_completion_evaluation(args)
         elif args.scenario in DSV4_SCENARIOS:
             run_concurrent_completion_evaluation(args)
         else:
-            if args.enable_dbo:
-                dbo_eval_started_at = time.time()
             run_gsm8k_evaluation(args)
-        if args.enable_dbo:
-            if args.use_v2_model_runner:
-                assert_mrv2_dbo_execution(
-                    mrv2_execution_events, cast(float, dbo_eval_started_at), args
-                )
-            else:
-                assert_dbo_live_split_coverage(
-                    dbo_split_steps, dbo_eval_started_at, args
-                )
+        if needs_gpu_execution_evidence(args):
+            gpu_execution_evidence_rpc(args, "afd_log_execution_evidence")
+            assert gpu_evidence_start is not None
+            gpu_evidence_start.with_name("evaluation-complete").touch()
+            wait_for_gpu_execution_summaries(gpu_execution_evidence, args, processes)
+        if args.enable_dbo and args.device_backend == "npu":
+            assert_dbo_live_split_coverage(dbo_split_steps, eval_started_at, args)
 
         ensure_processes_alive(processes)
     finally:
@@ -281,6 +291,8 @@ def main() -> int:
                                 if previous_handler is None
                                 else previous_handler,
                             )
+                        if gpu_evidence_dir is not None:
+                            gpu_evidence_dir.cleanup()
             except BaseException as exc:
                 cleanup_error = exc
         finally:
@@ -296,6 +308,10 @@ def main() -> int:
                 raise body_error from cleanup_error
             raise cleanup_error
 
+    # FFN reports through its existing health RPC. Read all summaries after process
+    # shutdown/join so stdout-reader scheduling cannot look like missing ranks.
+    if needs_gpu_execution_evidence(args):
+        assert_gpu_execution_evidence(gpu_execution_evidence, args)
     print(f"\nE2E SCENARIO {args.scenario} PASSED")
     return 0
 
@@ -516,26 +532,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.ffn_tp_size = active_sync_profile.ffn_tp_size
     else:
         args.ffn_tp_size = 1
-    args.use_v2_model_runner = args.scenario in V2_SCENARIOS
-    if args.use_v2_model_runner:
-        if args.afd_async or args.afd_connector == ASYNC_AFD_CONNECTOR:
-            raise ValueError("ModelRunnerV2 E2E scenarios require synchronous AFD")
-        if args.compute_gate_on_attention:
-            raise ValueError(
-                "ModelRunnerV2 E2E scenarios require compute_gate_on_attention=false",
-            )
-        if args.afd_connector not in (None, V2_SYNC_CONNECTOR):
-            raise ValueError(
-                "ModelRunnerV2 E2E scenarios require P2pNcclAFDConnector",
-            )
-        if args.afd_connector_extra_config:
-            raise ValueError(
-                "ModelRunnerV2 E2E scenarios do not support connector extra config",
-            )
-        if args.use_decode_bench_connector:
-            raise ValueError(
-                "ModelRunnerV2 E2E scenarios do not support decode-bench connector",
-            )
     if not is_async_cam and not is_dsv4 and args.gsm8k_output_path is None:
         raise ValueError("--gsm8k-output-path is required for GSM8K scenarios")
     if is_async_cam:
@@ -623,7 +619,7 @@ def validate_topology(
         if role_tp_size(args, "attention") != 1:
             raise ValueError("baseline E2E requires Attention TP=1")
         return
-    if args.use_v2_model_runner and args.device_backend != "gpu":
+    if args.scenario in V2_SCENARIOS and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
     if (
         args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
@@ -761,15 +757,8 @@ def build_vllm_command(
             json.dumps(afd_config, separators=(",", ":")),
         ],
     )
-    if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
+    if needs_gpu_execution_evidence(args):
         cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
-    if args.use_v2_model_runner:
-        cmd.extend(
-            [
-                "--no-enable-prefix-caching",
-                "--no-async-scheduling",
-            ],
-        )
     if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
         # Keep request concurrency identical across the no-DBO, eager DBO
         # and graph DBO comparison; retain native chunked-prefill defaults.
@@ -994,84 +983,133 @@ def assert_dbo_live_split_coverage(
     )
 
 
-def assert_mrv2_dbo_execution(
-    events: list[tuple[float, str, str]],
-    eval_started_at: float,
-    args: argparse.Namespace,
-) -> None:
-    """Require all-rank layout coverage in the window, not exact step pairing."""
-    attention_mode = "FULL" if args.cuda_graph_full_decode_only else "eager"
-    ffn_mode = "replay" if args.cuda_graph_full_decode_only else "eager"
-    attention_layouts: dict[
-        tuple[tuple[int, tuple[int, ...]], ...], set[tuple[int, int]]
-    ] = {}
-    previous_attention: dict[
-        tuple[int, int], tuple[int, tuple[tuple[int, tuple[int, ...]], ...]]
-    ] = {}
-    ffn_layouts: dict[
-        tuple[tuple[int, tuple[int, ...]], ...], set[tuple[int, int]]
-    ] = {}
-    for received_at, role, line in events:
-        if received_at < eval_started_at:
-            continue
-        worker = re.search(r"\(Worker_([^ ]+) pid=\d+\)", line)
-        if worker is None:
-            continue
-        ranks = dict(re.findall(r"(DP|TP)(\d+)", worker[1]))
-        rank = (int(ranks["DP"]), int(ranks.get("TP", "0")))
-        if role == "attention" and (
-            f"runner=MRV2 phase=live mode={attention_mode} stages=2 " in line
-        ):
-            real_match = re.search(r"real_tokens=(\[[^]]+\])", line)
-            tokens_match = re.search(r"\btokens=(\[[^]]+\])", line)
-            count_match = re.search(r"count=(\d+)", line)
-            if real_match is None or tokens_match is None or count_match is None:
-                continue
-            if not all(count > 0 for count in json.loads(real_match[1])):
-                continue
-            tokens = json.loads(tokens_match[1])
-            layout = tuple(
-                (stage, (count,) * args.num_attention_ranks)
-                for stage, count in enumerate(tokens)
-            )
-            count = int(count_match[1])
-            previous = previous_attention.get(rank)
-            previous_attention[rank] = (count, layout)
-            if args.cuda_graph_full_decode_only and previous != (count - 1, layout):
-                continue
-            attention_layouts.setdefault(layout, set()).add(rank)
-        if role == "ffn" and f"runner=FFN mode={ffn_mode} stages=2 " in line:
-            layout_match = re.search(r"layout=(\[.*\]) count=", line)
-            if layout_match is not None:
-                layout = tuple(
-                    (stage, tuple(counts))
-                    for stage, counts in json.loads(layout_match[1])
-                )
-                ffn_layouts.setdefault(layout, set()).add(rank)
-    expected_attention = {
-        (dp, tp)
-        for dp in range(args.num_attention_ranks // args.attention_tp_size)
-        for tp in range(args.attention_tp_size)
-    }
-    expected_ffn = {
-        (dp, tp)
-        for dp in range(args.num_ffn_ranks // args.ffn_tp_size)
-        for tp in range(args.ffn_tp_size)
-    }
-    if any(
-        expected_attention <= ranks and expected_ffn <= ffn_layouts.get(layout, set())
-        for layout, ranks in attention_layouts.items()
-    ):
-        print(
-            f"[dbo-coverage] MRV2 live two-stage {attention_mode} and FFN "
-            f"{ffn_mode} confirmed on all expected ranks with matching DP layouts"
-        )
-        return
-    raise RuntimeError(
-        f"MRV2 DBO lacks live two-stage {attention_mode} and matching FFN "
-        f"{ffn_mode} evidence in the evaluation window; FULL requires "
-        "all expected ranks, consecutive replays and two non-empty microbatches"
+def needs_gpu_execution_evidence(args: argparse.Namespace) -> bool:
+    return (
+        args.device_backend == "gpu"
+        and not args.baseline
+        and (args.cuda_graph_full_decode_only or args.enable_dbo)
     )
+
+
+def gpu_execution_evidence_rpc(args: argparse.Namespace, method: str) -> None:
+    """Broadcast on Attention; its DP/TP workers log their own summaries.
+
+    Pinned vLLM's DP load balancer returns only the first DP engine's result,
+    so the final assertion consumes the per-worker summary lines instead.
+    FFN's daemon reports through its existing periodic worker health RPC.
+    """
+    request = urllib.request.Request(
+        f"http://{args.api_host}:{attention_api_port(args)}/collective_rpc",
+        data=json.dumps(
+            {"method": method, "timeout": GPU_EVIDENCE_RPC_TIMEOUT_S}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(
+        request, timeout=GPU_EVIDENCE_RPC_TIMEOUT_S
+    ) as response:
+        response.read()
+
+
+def wait_for_gpu_execution_summaries(
+    evidence: list[tuple[str, str]],
+    args: argparse.Namespace,
+    processes: list[subprocess.Popen[str]],
+) -> None:
+    expected: set[tuple[str, int, int]] = set()
+    for role in ("attention", "ffn"):
+        tp_size = role_tp_size(args, role)
+        rank_count = (
+            args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
+        )
+        expected.update(
+            (role, dp, tp)
+            for dp in range(rank_count // tp_size)
+            for tp in range(tp_size)
+        )
+    deadline = time.monotonic() + GPU_EVIDENCE_RPC_TIMEOUT_S
+    while True:
+        ensure_processes_alive(processes)
+        observed = {
+            (role, int(match[1]), int(match[2]))
+            for role, line in evidence
+            if (match := re.search(r"dp_rank=(\d+) tp_rank=(\d+)", line)) is not None
+        }
+        if expected <= observed:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for GPU execution summaries: "
+                f"{sorted(expected - observed)}"
+            )
+        time.sleep(PROCESS_POLL_INTERVAL_S)
+
+
+def assert_gpu_execution_evidence(
+    evidence: list[tuple[str, str]], args: argparse.Namespace
+) -> None:
+    metric = (
+        "two_stage_graph_replays"
+        if args.enable_dbo and args.cuda_graph_full_decode_only
+        else "two_stage_steps"
+        if args.enable_dbo
+        else "graph_replays"
+    )
+    minimum = (
+        GPU_EVIDENCE_REPLAY_MIN_COUNT if metric == "two_stage_graph_replays" else 1
+    )
+    layout_kind = (
+        "consecutive_graph" if args.cuda_graph_full_decode_only else "two_stage"
+    )
+    common_layouts: set[str] | None = None
+    for role in ("attention", "ffn"):
+        tp_size = role_tp_size(args, role)
+        rank_count = (
+            args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
+        )
+        expected = {
+            (dp, tp) for dp in range(rank_count // tp_size) for tp in range(tp_size)
+        }
+        observed = set()
+        layouts: dict[str, set[tuple[int, int]]] = {}
+        for recorded_role, line in evidence:
+            if recorded_role != role:
+                continue
+            match = re.search(
+                rf"dp_rank=(\d+) tp_rank=(\d+).*\b{metric}=(\d+)(?: |$)", line
+            )
+            if match is not None and int(match[3]) >= minimum:
+                rank = (int(match[1]), int(match[2]))
+                observed.add(rank)
+                if args.enable_dbo:
+                    payload = json.loads(line.split(" layouts=", 1)[1])
+                    for layout in payload[layout_kind]:
+                        key = json.dumps(layout, separators=(",", ":"))
+                        layouts.setdefault(key, set()).add(rank)
+        if missing := expected - observed:
+            raise RuntimeError(
+                f"GPU {role} lacks live {metric}>={minimum} evidence on ranks "
+                f"{sorted(missing)}"
+            )
+        if args.enable_dbo:
+            complete_layouts = {
+                layout for layout, ranks in layouts.items() if expected <= ranks
+            }
+            common_layouts = (
+                complete_layouts
+                if common_layouts is None
+                else common_layouts & complete_layouts
+            )
+    if args.enable_dbo and not common_layouts:
+        raise RuntimeError(
+            "GPU DBO lacks matching two-stage layouts across every A/F rank"
+            + (
+                " with consecutive graph replays"
+                if args.cuda_graph_full_decode_only
+                else ""
+            )
+        )
+    print(f"[execution-coverage] live {metric}>={minimum} confirmed on every A/F rank")
 
 
 def run_completion_evaluation(args: argparse.Namespace) -> None:
@@ -1132,13 +1170,16 @@ def build_env(
     *,
     role: str | None = None,
     e2e_run_id: str | None = None,
+    gpu_evidence_start: Path | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
-    env["VLLM_USE_V2_MODEL_RUNNER"] = (
-        "1" if args.device_backend == "gpu" and args.use_v2_model_runner else "0"
-    )
+    env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.device_backend == "gpu" else "0"
+    if needs_gpu_execution_evidence(args):
+        env["VLLM_SERVER_DEV_MODE"] = "1"
+        if gpu_evidence_start is not None:
+            env["AFD_E2E_GPU_EVIDENCE_START"] = str(gpu_evidence_start)
     if args.baseline:
         env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
     else:
@@ -1184,14 +1225,14 @@ def stream_output(
     name: str,
     process: subprocess.Popen[str],
     dbo_split_steps: list[float] | None = None,
-    mrv2_execution_events: list[tuple[float, str, str]] | None = None,
+    gpu_execution_evidence: list[tuple[str, str]] | None = None,
 ) -> threading.Thread:
     def worker() -> None:
         assert process.stdout is not None
         for line in process.stdout:
             print(f"[{name}] {line}", end="")
-            if mrv2_execution_events is not None and "AFD execution: " in line:
-                mrv2_execution_events.append((time.time(), name, line))
+            if gpu_execution_evidence is not None and GPU_EVIDENCE_PREFIX in line:
+                gpu_execution_evidence.append((name, line.strip()))
             if (
                 dbo_split_steps is not None
                 and name == "attention"

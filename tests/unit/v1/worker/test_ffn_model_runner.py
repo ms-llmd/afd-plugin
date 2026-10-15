@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from vllm.forward_context import get_forward_context  # noqa: E402
+from vllm.v1.worker import gpu_worker as gpu_worker_module  # noqa: E402
 
 import afd_plugin.v1.worker.ffn_model_runner as ffn_model_runner_module  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
@@ -31,6 +33,29 @@ from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     _set_moe_layer_index,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+
+
+def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):
+    events = []
+    worker = object.__new__(AFDFFNWorker)
+    worker.model_runner = object.__new__(GPUFFNModelRunner)
+    worker.vllm_config = SimpleNamespace()
+    worker._weight_update_active = True
+    worker._weight_update_is_draft = False
+    worker.weight_transfer_engine = SimpleNamespace(
+        finish_weight_update=lambda: events.append("finish"),
+        reset_weight_update_target=lambda: events.append("reset_target"),
+    )
+    monkeypatch.setattr(worker, "_check_weight_transfer_engine", lambda: None)
+    monkeypatch.setattr(
+        gpu_worker_module, "set_current_vllm_config", lambda config: nullcontext()
+    )
+
+    worker.finish_weight_update()
+
+    assert events == ["finish", "reset_target"]
+    assert not worker._weight_update_active
+    assert worker.model_runner.lora_config is None
 
 
 class _FakeConnector:
@@ -133,9 +158,8 @@ def _payload(hidden_states, metadata):
 def _runner_with_connector_and_model(model, *, num_layers=1):
     runner = object.__new__(GPUFFNModelRunner)
     runner.vllm_config = SimpleNamespace(
-        # vLLM 0.26 VllmConfig field read by the Ascend platform's
-        # set_additional_forward_context hook on NPU test environments.
-        use_v2_model_runner=False,
+        # FFN keeps connector-driven execution within a GPU MRV2 deployment.
+        use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             is_moe_model=True,
@@ -179,6 +203,65 @@ class _FakeGraph:
 
     def reset(self):
         self.reset_count += 1
+
+
+def test_ffn_runner_owns_connector_execution_without_native_runner_inheritance():
+    assert all(base.__name__ != "GPUModelRunner" for base in GPUFFNModelRunner.__mro__)
+
+
+def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(monkeypatch):
+    config = SimpleNamespace(
+        use_v2_model_runner=True,
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(num_hidden_layers=2),
+        ),
+        load_config=SimpleNamespace(),
+    )
+    connector = _FakeConnector()
+    events = []
+    monkeypatch.setattr(
+        GPUFFNModelRunner,
+        "parse_config",
+        staticmethod(lambda _config: SimpleNamespace(role="ffn")),
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module,
+        "validate_gpu_model_runner_v2_config",
+        lambda *_args, **_kwargs: events.append("validate"),
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module,
+        "validate_cuda_graph_mode",
+        lambda *_args, **_kwargs: SimpleNamespace(enable_ffn_graph_cache=True),
+    )
+    monkeypatch.setattr(ffn_model_runner_module, "_resolve_world_ranks", lambda: (0, 0))
+
+    def create_connector(*_args):
+        events.append("connector")
+        return connector
+
+    monkeypatch.setattr(
+        ffn_model_runner_module.AFDConnectorFactory,
+        "create_connector",
+        create_connector,
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module, "create_afd_gpu_profiler", lambda _role: None
+    )
+
+    runner = GPUFFNModelRunner(config, torch.device("cpu"))
+
+    assert events == ["validate", "connector"]
+    assert runner.connector is connector
+    assert runner.model is None
+    assert runner.model_memory_usage == 0
+    assert runner.model_config is config.model_config
+    assert runner.load_config is config.load_config
+    assert runner.num_layers == 2
+    assert runner.use_cuda_graph is True
+    assert runner._cuda_graphs == {}
+    assert runner._graph_memory_pool is None
 
 
 def test_ffn_runner_executes_model_compute_ffn_output():

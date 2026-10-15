@@ -14,19 +14,43 @@ Run one of the model suites:
 - `tests/e2e/models/qwen3_6/test_qwen3_6.py` on CUDA (text-only Qwen3.6
   evidence for the Qwen3.5/3.6 adapter family)
 
-Each suite contains four gate scenarios:
+DeepSeek-V2-Lite on GPU has seven gate scenarios:
 
-- baseline-graph
-- afd-eager-2a2f (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use afd-eager-2a1f)
-- afd-graph-2a2f (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use afd-graph-2a1f)
-- afd-graph-dbo-2a2f (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use afd-graph-dbo-2a1f)
+- `baseline-graph`
+- `afd-v2-eager-dp2` and `afd-v2-graph-dp2`
+- `afd-v2-eager-tp2` and `afd-v2-graph-tp2`
+- `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`
 
-Each gate scenario evaluates the first 7 GSM8K samples. The 2A2F AFD gate
-scenarios (DeepSeek-V2-Lite only) use 2 Attention ranks and 2 FFN ranks.
+The V2 DP2 cases replace the duplicate GPU 2A2F cases. NPU retains its four
+DeepSeek gate cases: `baseline-graph`, `afd-eager-2a2f`, `afd-graph-2a2f`,
+and `afd-graph-dbo-2a2f`. Qwen3 MoE retains four GPU cases: baseline plus
+AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains three: baseline
+plus AFD eager and graph on 2A1F. Qwen3.5/3.6 GDN DBO is unsupported.
+
+Ordinary cases evaluate the first 7 GSM8K samples, with the existing
+24-sample minimum for DBO. GPU `afd-v2-eager-dp2`, `afd-v2-eager-dbo-dp2`
+and `afd-v2-graph-dbo-dp2` retain 128 samples, concurrency 12,
+`max_num_seqs=8` and the 0.27 accuracy threshold. GPU cases check accuracy,
+service liveness and cleanup. AFD GPU graph/DBO cases also use a test-only
+worker extension: after readiness, native collective RPC resets Attention
+counters and a shared marker arms FFN at its next call entry. Attention reports
+through RPC after evaluation; a completion marker requests FFN summaries through
+its existing periodic worker health RPC. The harness waits up to 30 seconds for
+every rank while checking service liveness before teardown. The markers are
+removed after process cleanup; the FFN daemon does not service HTTP utilities. All Attention/FFN ranks must
+execute the requested feature. DBO requires matching two-stage A/F layouts;
+graph+DBO requires consecutive completed replays of the same layout. Dummy/profile/
+capture work and empty second microbatches do not qualify.
+Pure eager and native baseline cases do not load the probe,
+and performance comparisons omit it. No per-step logging or runner identity
+checks are used. NPU DBO retains its existing live split check.
+
+DeepSeek 2A2F cases use 2 Attention ranks and 2 FFN ranks.
 `baseline-graph` uses native DP4/TP1/EP4. The 2A1F cases (`afd-eager-2a1f`,
 `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) use 2 Attention ranks and 1 FFN rank.
-Note that for DeepSeek-V2-Lite 2A1F are local-only scenarios, while for Qwen3 MoE and
-Qwen3.6 MoE they are the suite's gate scenarios.
+DeepSeek-V2-Lite 2A1F eager/graph are local-only; its Graph + DBO case
+also runs in weekly CI. All Qwen3 MoE and Qwen3.6 MoE 2A1F scenarios are
+suite gate scenarios.
 
 ## Workflow
 
@@ -88,16 +112,30 @@ export AFD_E2E_DEVICES=0,1,2,3
 # Optional: export AFD_NPU_E2E_VLLM_BIN=/path/to/vllm
 ~~~
 
-Device order defines roles: the 2A2F AFD scenarios use the first two devices
-for Attention DP2/TP1 and the last two for FFN DP2/TP1/EP2. `baseline-graph`
+Device order defines roles: DeepSeek DP2 cases use the first two devices
+for Attention DP2/TP1 and the last two for FFN DP2/TP1/EP2. GPU TP2 cases use
+DP1/TP2 on both roles. `baseline-graph`
 uses the first four for native DP4/TP1/EP4.
 The 2A1F scenarios use the first
-two for Attention and the third for FFN (used local-only for DeepSeek-V2-Lite; and
-gate topology for Qwen3 MoE and Qwen3.6 MoE).
+two for Attention and the third for FFN (the gate topology for Qwen3 MoE and Qwen3.6 MoE).
 
 ### 4. Run
 
-From the repository root, stream output in the foreground:
+From the repository root, stream output in the foreground. For the GPU
+DeepSeek-V2-Lite gate (`AFD_E2E_BACKEND=gpu`):
+
+~~~bash
+python -m pytest -q -s \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[baseline-graph]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-eager-dp2]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-graph-dp2]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-eager-tp2]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-graph-tp2]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-eager-dbo-dp2]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-graph-dbo-dp2]"
+~~~
+
+For the existing NPU DeepSeek gate (`AFD_E2E_BACKEND=npu`):
 
 ~~~bash
 python -m pytest -q -s \
@@ -124,7 +162,12 @@ python -m pytest -q -s \
   tests/e2e/models/qwen3_6/test_qwen3_6.py
 ~~~
 
-The Qwen3.6 suite uses `Qwen/Qwen3.6-35B-A3B`, vLLM V1, and passes
+The Qwen3.6 suite uses `Qwen/Qwen3.6-35B-A3B` and selects native vLLM V2
+for every GPU runner invocation, including the baseline. FFN remains
+connector-driven; there is no GPU V1 fallback. Qwen3.5/3.6 GDN DBO is
+unsupported under native hybrid/multimodal validation. Earlier H20 Graph +
+DBO and recurrent-state/CUDA Graph parity results describe the removed
+adapter and are historical evidence only. The suite passes
 `--language-model-only` to every runner invocation. It is CUDA-only and
 text-only: `baseline-graph` is native DP4/TP1/EP4, while the AFD scenarios are
 synchronous 2A1F with Attention on the first two devices and FFN on the third.
@@ -141,9 +184,12 @@ On cancellation, forward SIGTERM and allow over 90 seconds for cleanup.
 
 ### 5. Report
 
-Success means the selected suite reports 4 passed and 0 skipped. Report the
-failed scenario, first actionable error, and cleanup status. Any skip is a
-gate failure.
+Success means all selected cases pass with zero skips: seven for the GPU
+DeepSeek gate; four for the NPU DeepSeek gate or GPU Qwen3 MoE suite;
+three for the GPU Qwen3.6 MoE suite.
+The entire DeepSeek module includes local cases and collects 12 on GPU or
+seven on NPU. Report the actual selected count, failed scenario, first
+actionable error, and cleanup status. Any skip is a gate failure.
 
 ## Environment reference
 
