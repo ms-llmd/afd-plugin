@@ -11,7 +11,6 @@ coexist with the ``deep_ep`` package that vLLM itself imports.
 from __future__ import annotations
 
 import functools
-import os
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -33,13 +32,12 @@ EXT_NAME = "_afd_deepep"
 BUILD_DIR_ENV = "AFD_DEEPEP_BUILD_DIR"
 DEEPEP_ROOT = CSRC_ROOT / "deepep"
 # FastAFD passes 120 s for both the CPU wait and the GPU spin timeouts.
-CPU_TIMEOUT_SECS = 120
-GPU_TIMEOUT_SECS = 120
 HYBRID_MODE_DEFAULT_QPS = 129
 NON_HYBRID_MODE_DEFAULT_QPS = 17
-DEFAULT_RDMA_SERVICE_LEVEL = "3"
 MIN_COMM_SMS = 4
-MAX_OVERLAP_COMM_SMS = 24
+# Share of the device's SMs DeepEP kernels use by default (24 of 132 on H100,
+# FastAFD's overlap setting).
+DEFAULT_COMM_SM_FRACTION = 24 / 132
 
 _CXX_FLAGS = [
     "-O3",
@@ -183,8 +181,12 @@ class DeepEPElasticBuffer:
         num_experts: int,
         top_k: int,
         allow_hybrid_mode: bool,
+        rdma_traffic_class: int,
+        cpu_timeout_s: int,
+        gpu_timeout_s: int,
         use_fp8_dispatch: bool = False,
         num_sms: int = 0,
+        num_qps: int = 0,
     ) -> None:
         self._module = load_deepep()
         self._group = group
@@ -196,7 +198,7 @@ class DeepEPElasticBuffer:
         self._allocated_tokens_per_rank = capacity_tokens_per_rank + 1
         self.num_experts = num_experts
         self.allow_hybrid_mode = allow_hybrid_mode
-        self.num_allocated_qps = (
+        self.num_allocated_qps = num_qps or (
             HYBRID_MODE_DEFAULT_QPS
             if allow_hybrid_mode
             else NON_HYBRID_MODE_DEFAULT_QPS
@@ -224,10 +226,10 @@ class DeepEPElasticBuffer:
             allow_hybrid_mode,
             allow_multiple_reduction,
             True,  # prefer_overlap_with_compute
-            int(os.environ.get("EP_OVERRIDE_RDMA_SL", DEFAULT_RDMA_SERVICE_LEVEL)),
+            rdma_traffic_class,
             self.num_allocated_qps,
-            CPU_TIMEOUT_SECS,
-            GPU_TIMEOUT_SECS,
+            cpu_timeout_s,
+            gpu_timeout_s,
             True,  # explicitly_destroy
         )
         self.num_scaleout_ranks, self.num_scaleup_ranks = (
@@ -250,7 +252,7 @@ class DeepEPElasticBuffer:
         device_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        return max(MIN_COMM_SMS, min(device_sms, MAX_OVERLAP_COMM_SMS))
+        return max(MIN_COMM_SMS, round(device_sms * DEFAULT_COMM_SM_FRACTION))
 
     def _num_qps(self, num_sms: int) -> int:
         if self.allow_hybrid_mode:

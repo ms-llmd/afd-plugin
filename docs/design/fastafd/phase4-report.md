@@ -22,6 +22,9 @@ per layer per second.
 
 ## What changed
 
+> Phase 4b replaced `ib_hca_by_local_rank` with the `network` section (an
+> automatic NIC plan); see `phase4b-report.md`.
+
 | Area | Change |
 | --- | --- |
 | `ib_hca_by_local_rank` | Sets `NCCL_IB_HCA` per rank (by local rank) before any NCCL communicator exists. On pokprod use a single entry (`["mlx5_0"]`). |

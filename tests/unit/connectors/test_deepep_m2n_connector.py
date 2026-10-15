@@ -33,6 +33,10 @@ from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
     quantize_fp8_block128,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa: E402
+from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
+    NetworkConfig,
+    RankTopology,
+)
 from tests.unit.connectors.deepep_m2n_harness import (  # noqa: E402
     HIDDEN_SIZE,
     Topology,
@@ -55,7 +59,11 @@ def _connector(
     return AFDConnectorFactory.create_connector(0, 0, vllm_config, afd_config)
 
 
-def _handshake(layout: DeepEPM2NLayout, overrides: dict | None = None) -> list[dict]:
+def _handshake(
+    layout: DeepEPM2NLayout, overrides: dict | None = None, hosts: str | None = None
+) -> list[dict]:
+    """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host)."""
+    hosts = hosts or "a" * layout.union_size
     infos = []
     for world_rank in range(layout.union_size):
         is_ffn = world_rank < layout.ffn_size
@@ -71,6 +79,12 @@ def _handshake(layout: DeepEPM2NLayout, overrides: dict | None = None) -> list[d
             capacity_tokens_per_rank=256,
             expert_alignment=128 if is_ffn else None,
             sm=HOPPER,
+            topology=RankTopology(
+                world_rank=world_rank,
+                host=hosts[world_rank],
+                nvlink_domain=f"host:{hosts[world_rank]}",
+                local_index=hosts[: world_rank + 1].count(hosts[world_rank]) - 1,
+            ),
         )
         infos.append(info)
     for (world_rank, key), value in (overrides or {}).items():
@@ -99,12 +113,16 @@ def test_config_defaults_and_round_trip():
         ({"bogus": 1}, "unknown DeepEPM2NAFDConnector options"),
         ({"expert_backend": "cutlass"}, "expert_backend"),
         ({"payload_format": "fp4"}, "payload_format"),
-        ({"disable_gin": "maybe"}, "disable_gin"),
+        # Removed in Phase 4b (now under ``network``): rejected, not ignored.
+        ({"disable_gin": "auto"}, "unknown DeepEPM2NAFDConnector options.*disable_gin"),
         ({"num_lanes": 3}, "num_lanes"),
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
         ({"bucket_granularity": 0}, "bucket_granularity"),
         ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
         ({"control_backend": "mpi"}, "control_backend"),
+        ({"network": {"preset": "token-ring"}}, "network.preset"),
+        ({"num_qps": -1}, "num_qps"),
+        ({"cpu_timeout_s": 0}, "cpu_timeout_s"),
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
@@ -215,10 +233,10 @@ def test_plan_stage_rejects_bucket_above_capacity():
 def test_handshake_accepts_consistent_ranks():
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
-    result = validate_handshake(_handshake(layout), layout)
+    result = validate_handshake(_handshake(layout), layout, NetworkConfig())
 
     assert result.expert_alignment == 128
-    assert result.single_host
+    assert not result.network_plan.use_gin
 
 
 @pytest.mark.parametrize(
@@ -235,28 +253,41 @@ def test_handshake_rejects_mismatches(overrides, message):
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
     with pytest.raises(RuntimeError, match=message):
-        validate_handshake(_handshake(layout, overrides), layout)
+        validate_handshake(_handshake(layout, overrides), layout, NetworkConfig())
 
 
-def test_handshake_accepts_equal_contiguous_hosts():
+def test_handshake_plans_gin_across_nvlink_domains():
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
-    hosts = {(rank, "host"): host for rank, host in enumerate("aabb")}
 
-    result = validate_handshake(_handshake(layout, hosts), layout)
+    result = validate_handshake(
+        _handshake(layout, hosts="aabb"), layout, NetworkConfig()
+    )
 
-    assert not result.single_host
+    assert result.network_plan.use_gin
+    assert (result.network_plan.num_domains, result.network_plan.ranks_per_domain) == (
+        2,
+        2,
+    )
 
 
 @pytest.mark.parametrize(
     ("hosts", "message"),
     [("aaab", "different rank counts"), ("abab", "not contiguous")],
 )
-def test_handshake_rejects_unsupported_host_layouts(hosts, message):
+def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
-    overrides = {(rank, "host"): host for rank, host in enumerate(hosts)}
 
     with pytest.raises(RuntimeError, match=message):
-        validate_handshake(_handshake(layout, overrides), layout)
+        validate_handshake(_handshake(layout, hosts=hosts), layout, NetworkConfig())
+
+
+def test_handshake_rejects_mismatched_network_config():
+    layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
+    infos = _handshake(layout)
+    infos[1]["network"] = "something else"
+
+    with pytest.raises(RuntimeError, match="disagree on network"):
+        validate_handshake(infos, layout, NetworkConfig())
 
 
 def test_gloo_control_backend_stages_payloads_on_cpu():
@@ -267,14 +298,19 @@ def test_gloo_control_backend_stages_payloads_on_cpu():
     assert connector.control_device == torch.device("cpu")
 
 
-def test_config_parses_nic_per_local_rank():
+def test_config_parses_network_section_and_tunables():
     config = DeepEPM2NConfig.from_mapping(
-        {"ib_hca_by_local_rank": ["mlx5_0", "mlx5_2"]}
+        {
+            "network": {"preset": "roce-rail-isolated", "nics": ["mlx5_0"]},
+            "num_qps": 33,
+            "gpu_timeout_s": 60,
+        }
     )
 
-    assert config.ib_hca_by_local_rank == ("mlx5_0", "mlx5_2")
-    with pytest.raises(ValueError, match="ib_hca_by_local_rank"):
-        DeepEPM2NConfig.from_mapping({"ib_hca_by_local_rank": []})
+    assert config.network.nic_policy == "shared"
+    assert config.network.nics == ("mlx5_0",)
+    assert (config.num_qps, config.gpu_timeout_s) == (33, 60)
+    assert DeepEPM2NConfig.from_mapping(config.to_mapping()) == config
 
 
 def test_expert_row_ranges_follow_alignment():

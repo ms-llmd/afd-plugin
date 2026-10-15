@@ -40,14 +40,14 @@ from __future__ import annotations
 
 import itertools
 import os
-import socket
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -72,6 +72,14 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
 )
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import FP8_DTYPE
 from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout
+from afd_plugin.connectors.gpu.deepep_m2n.network import (
+    NetworkConfig,
+    NetworkPlan,
+    RankTopology,
+    apply_rank_environment,
+    discover_local_topology,
+    plan_network,
+)
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
     AFDControlPayload,
@@ -87,17 +95,23 @@ from afd_plugin.distributed import init_afd_process_group
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+logger = init_logger(__name__)
+
 PROTOCOL_VERSION = "deepep_m2n/1"
 BF16_PAYLOAD = "bf16"
 # FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
 FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
 FP8_GROUP_SIZE = 128
-DISABLE_GIN_MODES = ("auto", "always", "never")
 CONTROL_BACKENDS = ("nccl", "gloo")
 # DeepEP V2 needs Hopper (SM90) or newer.
 MIN_SM_MAJOR = 9
 PROCESS_GROUP_NAME = "afd_deepep_m2n"
+# CPU (gloo) group for the handshake and DeepEP's communicator bootstrap,
+# created before any NCCL communicator so the network plan can still set NCCL_*.
+BOOTSTRAP_GROUP_NAME = "afd_deepep_m2n_bootstrap"
+# FastAFD passes 120 s for both the CPU wait and the GPU spin timeouts.
+DEFAULT_TIMEOUT_S = 120
 # Only Attention rank 0 sends the per-step control payload.
 CONTROL_SENDER_ATTN_RANK = 0
 # Lanes = in-flight micro-batches (DBO uses two).
@@ -116,21 +130,18 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         num_lanes: In-flight micro-batches (one DeepEP buffer each).
         payload_format: Dispatch wire format.
         expert_backend: ``deepgemm`` (fast) or ``fused_experts`` (reference).
-        allow_hybrid_mode: DeepEP hybrid mode (NVLink + rail-aligned RDMA).
-        disable_gin: ``auto`` disables NCCL GIN when every rank is on one host
-            (data then moves over NVLink only); ``always``/``never`` force it.
+        network: Fabric settings (GIN, NIC choice, hybrid mode, traffic
+            class, extra NCCL env); see ``network.NetworkConfig`` and its
+            presets.
         bucket_granularity: Dispatch bucket is rounded up to this multiple.
-        num_sms: SMs DeepEP kernels use; ``0`` picks DeepEP's default.
+        num_sms: SMs DeepEP kernels use; ``0`` = a fixed fraction of the
+            device's SMs (24 on H100).
+        num_qps: RDMA queue pairs per DeepEP buffer; ``0`` = DeepEP's default.
+        cpu_timeout_s / gpu_timeout_s: DeepEP host-wait and kernel-spin
+            timeouts.
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
             host sync that reads receive counts; they allocate the worst-case
             receive size instead. ``0`` always syncs in eager mode.
-        ib_hca_by_local_rank: Multi-node RoCE/IB: the NIC each rank uses,
-            indexed by its local rank (GPU index on its node); sets
-            ``NCCL_IB_HCA`` per rank. ``None`` keeps NCCL's choice. On fabrics
-            whose rails are separate, unrouted subnets (pokprod), give a
-            single NIC (``["mlx5_0"]``) so every rank uses the same rail: NCCL
-            rings and DeepEP's GIN setup connect ranks with different local
-            indices, so per-rank NICs on different rails time out.
         control_backend: Backend of the connector's own process group
             (handshake, DeepEP communicator bootstrap, per-step control
             payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
@@ -141,12 +152,13 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     num_lanes: int = 1
     payload_format: str = "bf16"
     expert_backend: ExpertBackend = "deepgemm"
-    allow_hybrid_mode: bool = True
-    disable_gin: str = "auto"
+    network: NetworkConfig = field(default_factory=NetworkConfig)
     bucket_granularity: int = 1
     num_sms: int = 0
+    num_qps: int = 0
+    cpu_timeout_s: int = DEFAULT_TIMEOUT_S
+    gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
-    ib_hca_by_local_rank: tuple[str, ...] | None = None
     control_backend: str = "nccl"
 
     @classmethod
@@ -156,8 +168,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         unknown = sorted(set(raw) - known)
         if unknown:
             raise ValueError(f"unknown DeepEPM2NAFDConnector options: {unknown}")
-        if raw.get("ib_hca_by_local_rank") is not None:
-            raw["ib_hca_by_local_rank"] = tuple(raw["ib_hca_by_local_rank"])
+        raw["network"] = NetworkConfig.from_mapping(raw.get("network"))
         config = cls(**raw)
         config.validate()
         return config
@@ -174,26 +185,21 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError(f"payload_format must be one of {PAYLOAD_FORMATS}")
         if self.expert_backend not in EXPERT_BACKENDS:
             raise ValueError(f"expert_backend must be one of {EXPERT_BACKENDS}")
-        if self.disable_gin not in DISABLE_GIN_MODES:
-            raise ValueError(f"disable_gin must be one of {DISABLE_GIN_MODES}")
         if self.bucket_granularity <= 0:
             raise ValueError("bucket_granularity must be positive")
         if self.num_sms < 0:
             raise ValueError("num_sms must be non-negative")
         if self.cpu_sync_min_tokens < 0:
             raise ValueError("cpu_sync_min_tokens must be non-negative")
-        if self.ib_hca_by_local_rank is not None and (
-            not self.ib_hca_by_local_rank
-            or not all(
-                isinstance(hca, str) and hca for hca in self.ib_hca_by_local_rank
-            )
-        ):
-            raise ValueError("ib_hca_by_local_rank must be a non-empty list of names")
+        if self.num_qps < 0:
+            raise ValueError("num_qps must be non-negative")
+        if self.cpu_timeout_s <= 0 or self.gpu_timeout_s <= 0:
+            raise ValueError("cpu_timeout_s and gpu_timeout_s must be positive")
         if self.control_backend not in CONTROL_BACKENDS:
             raise ValueError(f"control_backend must be one of {CONTROL_BACKENDS}")
 
     def to_mapping(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "network": self.network.to_mapping()}
 
 
 @dataclass(frozen=True)
@@ -256,7 +262,7 @@ def plan_stage(
 @dataclass(frozen=True)
 class HandshakeResult:
     expert_alignment: int
-    single_host: bool
+    network_plan: NetworkPlan
 
 
 def local_handshake_info(
@@ -272,13 +278,13 @@ def local_handshake_info(
     capacity_tokens_per_rank: int,
     expert_alignment: int | None,
     sm: tuple[int, int],
+    topology: RankTopology,
 ) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL_VERSION,
         "role": role,
         "role_rank": role_rank,
         "world_rank": world_rank,
-        "host": socket.gethostname(),
         "sm": list(sm),
         "payload_format": config.payload_format,
         "hidden_size": hidden_size,
@@ -287,8 +293,9 @@ def local_handshake_info(
         "top_k": top_k,
         "num_lanes": config.num_lanes,
         "capacity_tokens_per_rank": capacity_tokens_per_rank,
-        "allow_hybrid_mode": config.allow_hybrid_mode,
+        "network": str(config.network.to_mapping()),
         "expert_alignment": expert_alignment,
+        "topology": topology.to_mapping(),
     }
 
 
@@ -301,12 +308,12 @@ _MUST_MATCH = (
     "top_k",
     "num_lanes",
     "capacity_tokens_per_rank",
-    "allow_hybrid_mode",
+    "network",
 )
 
 
 def validate_handshake(
-    infos: list[dict[str, Any]], layout: DeepEPM2NLayout
+    infos: list[dict[str, Any]], layout: DeepEPM2NLayout, network: NetworkConfig
 ) -> HandshakeResult:
     """Fail fast, before any buffer allocation, if ranks disagree."""
     if len(infos) != layout.union_size:
@@ -332,30 +339,14 @@ def validate_handshake(
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
         raise RuntimeError(f"FFN ranks disagree on expert_alignment: {alignments}")
-    hosts = [info["host"] for info in infos]
-    _check_host_layout(hosts)
+    # Every rank evaluates the same plan on the same list.
+    plan = plan_network(
+        [RankTopology.from_mapping(info["topology"]) for info in infos], network
+    )
     return HandshakeResult(
         expert_alignment=int(alignments.pop()),
-        single_host=len(set(hosts)) == 1,
+        network_plan=plan,
     )
-
-
-def _check_host_layout(hosts: list[str]) -> None:
-    """DeepEP's hybrid mode needs equal, contiguous rank blocks per host.
-
-    It derives each rank's node from ``world_rank // ranks_per_node``, so the
-    ranks of one host must be consecutive and every host must hold as many.
-    """
-    blocks: list[tuple[str, int]] = []
-    for host in hosts:
-        if blocks and blocks[-1][0] == host:
-            blocks[-1] = (host, blocks[-1][1] + 1)
-        else:
-            blocks.append((host, 1))
-    if len({host for host, _ in blocks}) != len(blocks):
-        raise RuntimeError(f"ranks of one host are not contiguous: {hosts}")
-    if len({count for _, count in blocks}) != 1:
-        raise RuntimeError(f"hosts hold different rank counts: {blocks}")
 
 
 @dataclass(slots=True)
@@ -510,6 +501,8 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
             else self.device
         )
         self.group: dist.ProcessGroup | None = None
+        self.bootstrap_group: dist.ProcessGroup | None = None
+        self.network_plan: NetworkPlan | None = None
         self.lanes: list[DeepEPElasticBuffer] = []
         self.lane_streams: list[torch.cuda.Stream] = []
         self.experts: DeepEPM2NExperts | None = None
@@ -533,18 +526,16 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         if self._initialized:
             return
         torch.cuda.set_device(self.device)
-        if self.config.ib_hca_by_local_rank is not None:
-            # Before any NCCL communicator exists (torch groups and DeepEP's).
-            hcas = self.config.ib_hca_by_local_rank
-            os.environ["NCCL_IB_HCA"] = "=" + hcas[self.local_rank % len(hcas)]
         _register_custom_ops()
-        self.group = init_afd_process_group(
-            backend=self.config.control_backend,
-            init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
+        rendezvous = f"tcp://{self.afd_config.host}:{self.afd_config.port}"
+        timeout = timedelta(seconds=self.afd_config.afd_process_group_timeout_s)
+        self.bootstrap_group = init_afd_process_group(
+            backend="gloo",
+            init_method=rendezvous,
             world_size=self.layout.union_size,
             rank=self.world_rank,
-            group_name=PROCESS_GROUP_NAME,
-            timeout=timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
+            group_name=BOOTSTRAP_GROUP_NAME,
+            timeout=timeout,
         )
         local_alignment = None
         if self.is_ffn:
@@ -565,35 +556,55 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
             expert_alignment=local_alignment,
             sm=torch.cuda.get_device_capability(self.device),
+            topology=discover_local_topology(
+                self.world_rank, self.device, self.local_rank
+            ),
         )
         infos: list[dict[str, Any] | None] = [None] * self.layout.union_size
-        dist.all_gather_object(infos, info, group=self.group)
+        dist.all_gather_object(infos, info, group=self.bootstrap_group)
         result = validate_handshake(
-            [info for info in infos if info is not None], self.layout
+            [info for info in infos if info is not None],
+            self.layout,
+            self.config.network,
         )
         self.expert_alignment = result.expert_alignment
-        # DeepEP reads these when each buffer is created. On one host every
-        # peer is in the NVLink domain, and GIN setup across RoCE rails fails
-        # (see docs/design/fastafd/phase0-report.md). With several lanes each
-        # buffer needs its own communication stream so lanes do not serialize.
-        if self.config.disable_gin == "always" or (
-            self.config.disable_gin == "auto" and result.single_host
-        ):
-            os.environ["EP_DISABLE_GIN"] = "1"
+        self.network_plan = result.network_plan
+        if self.world_rank == 0:
+            logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
+        # Before any NCCL communicator of this connector exists.
+        apply_rank_environment(self.network_plan, self.config.network, self.world_rank)
+        # DeepEP reads this when each buffer is created: with several lanes
+        # each buffer needs its own communication stream.
         if self.config.num_lanes > 1:
             os.environ[PER_BUFFER_COMM_STREAM_ENV] = "1"
+        self.group = (
+            self.bootstrap_group
+            if self.config.control_backend == "gloo"
+            else init_afd_process_group(
+                backend="nccl",
+                init_method=rendezvous,
+                world_size=self.layout.union_size,
+                rank=self.world_rank,
+                group_name=PROCESS_GROUP_NAME,
+                timeout=timeout,
+            )
+        )
         try:
             for _ in range(self.config.num_lanes):
                 self.lanes.append(
                     DeepEPElasticBuffer(
-                        group=self.group,
+                        group=self.bootstrap_group,
                         capacity_tokens_per_rank=self.capacity_tokens_per_rank,
                         hidden_size=self.hidden_size,
                         num_experts=self.layout.deepep_num_experts,
                         top_k=self.top_k,
-                        allow_hybrid_mode=self.config.allow_hybrid_mode,
+                        allow_hybrid_mode=self.network_plan.hybrid,
                         use_fp8_dispatch=self.is_fp8_payload,
                         num_sms=self.config.num_sms,
+                        num_qps=self.config.num_qps,
+                        rdma_traffic_class=self.network_plan.rdma_traffic_class,
+                        cpu_timeout_s=self.config.cpu_timeout_s,
+                        gpu_timeout_s=self.config.gpu_timeout_s,
                     )
                 )
                 # One lane runs on the caller's stream: no fork/join cost.

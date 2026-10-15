@@ -41,7 +41,8 @@ The control plane derives everything per step from the existing
 graph capture/replay); Attention rank 0 sends the payload to every FFN rank.
 The init handshake (`all_gather_object`) checks protocol, shapes, dtype,
 format, lanes, capacity, SM ≥ 9.0 and FFN expert alignment, and sets
-`EP_DISABLE_GIN=1` when all ranks share one host (`disable_gin: auto`).
+`EP_DISABLE_GIN=1` when all ranks share one host (`disable_gin: auto`; since
+Phase 4b, `network.gin: auto`).
 
 Changes outside the package:
 

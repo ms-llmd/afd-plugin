@@ -622,7 +622,15 @@ class Checker:
             **self.worst,
             "expert_alignment": self.connector.expert_alignment,
             "domain": list(self.connector.domain),
+            "network_plan": self.network_plan_summary(),
         }
+
+    def network_plan_summary(self) -> str:
+        plan = self.connector.network_plan
+        if plan is None:
+            return ""
+        nic = plan.nic_by_rank[self.connector.world_rank]
+        return f"{plan.summary()} this_rank_nic={nic or 'nccl'}"
 
 
 def attention_context(layer: int, stage: int, num_tokens: int) -> Any:
