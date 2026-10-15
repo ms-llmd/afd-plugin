@@ -815,3 +815,45 @@ def test_attention_init_rejects_local_experts_before_communicating():
         connector.init_afd_connector(local_experts={})
 
     assert connector.bootstrap_group is None
+
+
+def test_nccl_comm_rank_comes_from_the_afd_group_not_the_default_world(monkeypatch):
+    """DeepEP's communicator uses the AFD group's own rank and size.
+
+    Why: inside a vLLM worker the default world is vLLM's (one role's DP
+    ranks), and dist.get_rank(group) maps through it: both DP0 ranks then
+    joined DeepEP's communicator as rank 0 and the DP1 ranks timed out.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import buffer
+
+    class _Group:
+        def rank(self):
+            return 2
+
+        def size(self):
+            return 4
+
+    class _Module:
+        def __init__(self):
+            self.created = []
+
+        def get_local_nccl_unique_id(self):
+            return b"local"
+
+        def create_nccl_comm(self, unique_id, size, rank):
+            self.created.append((unique_id, size, rank))
+            return 7
+
+    def fake_all_gather_object(output, obj, group):
+        output[:] = [b"root", b"r1", obj, b"r3"]
+
+    monkeypatch.setattr(buffer.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(buffer.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(buffer.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(buffer, "_NCCL_COMMS", {})
+    module = _Module()
+
+    handle = buffer._acquire_nccl_comm(module, _Group())
+
+    assert module.created == [(b"root", 4, 2)]
+    assert handle.nccl_comm == 7
