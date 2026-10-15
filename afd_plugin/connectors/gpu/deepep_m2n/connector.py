@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import itertools
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -68,6 +69,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     EXPERT_BACKENDS,
     DeepEPM2NExperts,
     ExpertBackend,
+    FFNLocalExperts,
     LocalExpertWeights,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import FP8_DTYPE
@@ -94,6 +96,9 @@ from afd_plugin.distributed import init_afd_process_group
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 logger = init_logger(__name__)
 
@@ -103,6 +108,17 @@ BF16_PAYLOAD = "bf16"
 FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
 FP8_GROUP_SIZE = 128
+# Expert weight formats the FFN must load for each payload format.
+BF16_WEIGHTS = "bf16"
+FP8_BLOCK128_WEIGHTS = "fp8_block128"
+PAYLOAD_WEIGHT_FORMATS = {
+    BF16_PAYLOAD: BF16_WEIGHTS,
+    FP8_PAYLOAD: FP8_BLOCK128_WEIGHTS,
+}
+# vLLM's all2all backend on the FFN. The connector already moved the rows, so
+# vLLM's own MoE all-to-all never runs; this backend allocates no buffers and
+# keeps vLLM's DeepEP out of the process.
+IDLE_ALL2ALL_BACKEND = "allgather_reducescatter"
 CONTROL_BACKENDS = ("nccl", "gloo")
 # DeepEP V2 needs Hopper (SM90) or newer.
 MIN_SM_MAJOR = 9
@@ -125,9 +141,12 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
 
     Attributes:
         capacity_tokens_per_rank: Max tokens one Attention rank dispatches per
-            call; sizes the DeepEP buffers. ``None`` uses vLLM's
-            ``max_num_batched_tokens``.
-        num_lanes: In-flight micro-batches (one DeepEP buffer each).
+            call; sizes the DeepEP buffers. ``None`` uses the larger of vLLM's
+            ``max_num_batched_tokens`` and its largest CUDA-graph capture
+            size (``resolve_capacity_tokens_per_rank``).
+        num_lanes: In-flight micro-batches (one DeepEP buffer each). ``None``
+            uses vLLM's micro-batch count: two under DBO, otherwise one
+            (``resolve_num_lanes``).
         payload_format: Dispatch wire format.
         expert_backend: ``deepgemm`` (fast) or ``fused_experts`` (reference).
         network: Fabric settings (GIN, NIC choice, hybrid mode, traffic
@@ -149,7 +168,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     """
 
     capacity_tokens_per_rank: int | None = None
-    num_lanes: int = 1
+    num_lanes: int | None = None
     payload_format: str = "bf16"
     expert_backend: ExpertBackend = "deepgemm"
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -179,7 +198,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             and self.capacity_tokens_per_rank <= 0
         ):
             raise ValueError("capacity_tokens_per_rank must be positive")
-        if not 1 <= self.num_lanes <= MAX_LANES:
+        if self.num_lanes is not None and not 1 <= self.num_lanes <= MAX_LANES:
             raise ValueError(f"num_lanes must be in [1, {MAX_LANES}]")
         if self.payload_format not in PAYLOAD_FORMATS:
             raise ValueError(f"payload_format must be one of {PAYLOAD_FORMATS}")
@@ -200,6 +219,36 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
 
     def to_mapping(self) -> dict[str, Any]:
         return {**asdict(self), "network": self.network.to_mapping()}
+
+
+# Both roles derive these from their own vLLM config; the handshake requires
+# the results to match, so Attention and FFN must share the scheduler budget,
+# the CUDA-graph capture sizes and the DBO setting.
+def resolve_capacity_tokens_per_rank(
+    config: DeepEPM2NConfig, vllm_config: VllmConfig
+) -> int:
+    """Largest dispatch one Attention rank may issue: a prefill chunk or the
+    largest decode graph, whichever is bigger."""
+    if config.capacity_tokens_per_rank is not None:
+        return config.capacity_tokens_per_rank
+    return max(
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        vllm_config.compilation_config.max_cudagraph_capture_size,
+    )
+
+
+def resolve_num_lanes(config: DeepEPM2NConfig, vllm_config: VllmConfig) -> int:
+    """One lane per vLLM micro-batch, so a DBO deployment gets two."""
+    if config.num_lanes is not None:
+        return config.num_lanes
+    parallel_config = vllm_config.parallel_config
+    num_lanes = parallel_config.num_ubatches if parallel_config.use_ubatching else 1
+    if num_lanes > MAX_LANES:
+        raise ValueError(
+            f"vLLM runs {num_lanes} micro-batches; DeepEP M2N supports at most "
+            f"{MAX_LANES} lanes"
+        )
+    return num_lanes
 
 
 @dataclass(frozen=True)
@@ -265,6 +314,33 @@ class HandshakeResult:
     network_plan: NetworkPlan
 
 
+def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
+    """Expert weight format vLLM will load, named like ``payload_format``."""
+    if quant_config is None:
+        return BF16_WEIGHTS
+    if isinstance(quant_config, Fp8Config) and quant_config.weight_block_size == [
+        FP8_GROUP_SIZE,
+        FP8_GROUP_SIZE,
+    ]:
+        return FP8_BLOCK128_WEIGHTS
+    return f"unsupported ({quant_config.get_name()})"
+
+
+def ffn_deployment_info(vllm_config: VllmConfig) -> dict[str, Any]:
+    """FFN-side vLLM settings that decide which experts each rank loads."""
+    parallel_config = vllm_config.parallel_config
+    return {
+        "expert_parallel": parallel_config.enable_expert_parallel,
+        "ep_size": parallel_config.data_parallel_size
+        * parallel_config.tensor_parallel_size,
+        "tensor_parallel_size": parallel_config.tensor_parallel_size,
+        "expert_placement_strategy": parallel_config.expert_placement_strategy,
+        "eplb": parallel_config.enable_eplb,
+        "all2all_backend": parallel_config.all2all_backend,
+        "weight_format": expert_weight_format(vllm_config.quant_config),
+    }
+
+
 def local_handshake_info(
     *,
     role: str,
@@ -275,8 +351,11 @@ def local_handshake_info(
     dtype: torch.dtype,
     num_experts: int,
     top_k: int,
+    num_lanes: int,
     capacity_tokens_per_rank: int,
+    compute_gate_on_attention: bool,
     expert_alignment: int | None,
+    ffn_deployment: dict[str, Any] | None,
     sm: tuple[int, int],
     topology: RankTopology,
 ) -> dict[str, Any]:
@@ -291,10 +370,12 @@ def local_handshake_info(
         "dtype": str(dtype),
         "num_experts": num_experts,
         "top_k": top_k,
-        "num_lanes": config.num_lanes,
+        "num_lanes": num_lanes,
         "capacity_tokens_per_rank": capacity_tokens_per_rank,
+        "compute_gate_on_attention": compute_gate_on_attention,
         "network": str(config.network.to_mapping()),
         "expert_alignment": expert_alignment,
+        "ffn_deployment": ffn_deployment,
         "topology": topology.to_mapping(),
     }
 
@@ -308,8 +389,44 @@ _MUST_MATCH = (
     "top_k",
     "num_lanes",
     "capacity_tokens_per_rank",
+    "compute_gate_on_attention",
     "network",
 )
+
+
+def _check_ffn_deployment(
+    world_rank: int,
+    deployment: dict[str, Any] | None,
+    layout: DeepEPM2NLayout,
+    payload_format: str,
+) -> None:
+    """vLLM must place experts on FFN ranks exactly as DeepEP routes them.
+
+    Otherwise rows reach a rank that holds other experts and the results are
+    silently wrong. Every rank runs this, so Attention fails with the FFN.
+    """
+    if deployment is None:
+        raise RuntimeError(f"FFN world rank {world_rank} sent no deployment info")
+    expected = {
+        "expert_parallel": True,
+        "ep_size": layout.ffn_size,
+        "tensor_parallel_size": 1,
+        "expert_placement_strategy": "linear",
+        "eplb": False,
+        "all2all_backend": IDLE_ALL2ALL_BACKEND,
+        "weight_format": PAYLOAD_WEIGHT_FORMATS[payload_format],
+    }
+    mismatches = {
+        key: deployment[key]
+        for key, value in expected.items()
+        if deployment[key] != value
+    }
+    if mismatches:
+        required = {key: expected[key] for key in mismatches}
+        raise RuntimeError(
+            f"FFN world rank {world_rank} is deployed with {mismatches}; "
+            f"DeepEP M2N with payload_format={payload_format!r} needs {required}"
+        )
 
 
 def validate_handshake(
@@ -336,6 +453,15 @@ def validate_handshake(
         values = {str(info[key]) for info in infos}
         if len(values) != 1:
             raise RuntimeError(f"ranks disagree on {key}: {sorted(values)}")
+    if not infos[0]["compute_gate_on_attention"]:
+        raise RuntimeError(
+            "DeepEP M2N routes tokens on Attention: set "
+            "compute_gate_on_attention=true on both roles"
+        )
+    for world_rank, info in enumerate(infos[: layout.ffn_size]):
+        _check_ffn_deployment(
+            world_rank, info["ffn_deployment"], layout, info["payload_format"]
+        )
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
         raise RuntimeError(f"FFN ranks disagree on expert_alignment: {alignments}")
@@ -347,6 +473,123 @@ def validate_handshake(
         expert_alignment=int(alignments.pop()),
         network_plan=plan,
     )
+
+
+def _describe_tensor(tensor: torch.Tensor | None) -> list[Any] | None:
+    return None if tensor is None else [str(tensor.dtype), list(tensor.shape)]
+
+
+def local_model_info(
+    moe_layer_indices: Sequence[int] | None,
+    local_experts: Mapping[int, FFNLocalExperts] | None,
+) -> dict[str, Any] | None:
+    """What this rank loaded, in a picklable form; ``None`` if not reported."""
+    if moe_layer_indices is None:
+        return None
+    experts = None
+    if local_experts is not None:
+        experts = {
+            layer_idx: {
+                "ids": list(layer_experts.expert_ids),
+                "w13": _describe_tensor(layer_experts.weights.w13),
+                "w2": _describe_tensor(layer_experts.weights.w2),
+                "w13_scale": _describe_tensor(layer_experts.weights.w13_scale),
+                "w2_scale": _describe_tensor(layer_experts.weights.w2_scale),
+            }
+            for layer_idx, layer_experts in local_experts.items()
+        }
+    return {"moe_layers": list(moe_layer_indices), "experts": experts}
+
+
+def _expected_expert_tensors(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    payload_format: str,
+) -> dict[str, list[Any] | None]:
+    """dtype and shape of every ``LocalExpertWeights`` tensor."""
+    if payload_format == BF16_PAYLOAD:
+        weight_dtype = str(torch.bfloat16)
+        w13_scale = w2_scale = None
+    else:
+        weight_dtype = str(FP8_DTYPE)
+        hidden_blocks = -(-hidden_size // FP8_GROUP_SIZE)
+        intermediate_blocks = -(-intermediate_size // FP8_GROUP_SIZE)
+        w13_scale = [
+            str(torch.float32),
+            [num_experts, -(-2 * intermediate_size // FP8_GROUP_SIZE), hidden_blocks],
+        ]
+        w2_scale = [
+            str(torch.float32),
+            [num_experts, hidden_blocks, intermediate_blocks],
+        ]
+    return {
+        "w13": [weight_dtype, [num_experts, 2 * intermediate_size, hidden_size]],
+        "w2": [weight_dtype, [num_experts, hidden_size, intermediate_size]],
+        "w13_scale": w13_scale,
+        "w2_scale": w2_scale,
+    }
+
+
+def validate_model_infos(
+    infos: list[dict[str, Any] | None],
+    layout: DeepEPM2NLayout,
+    *,
+    hidden_size: int,
+    payload_format: str,
+) -> None:
+    """After weights load, check what every rank actually holds.
+
+    All ranks must run the same MoE layers (dispatch and combine are
+    collectives issued once per MoE layer), and every FFN rank must hold
+    exactly the experts DeepEP routes to it, in the payload's format. Ranks
+    that report nothing (``None``) are skipped; an FFN rank must report its
+    experts once any rank reports.
+    """
+    reported = [
+        (world_rank, info) for world_rank, info in enumerate(infos) if info is not None
+    ]
+    if not reported:
+        return
+    layer_lists = {str(info["moe_layers"]) for _, info in reported}
+    if len(layer_lists) != 1:
+        raise RuntimeError(f"ranks disagree on MoE layers: {sorted(layer_lists)}")
+    moe_layers = reported[0][1]["moe_layers"]
+    for world_rank in range(layout.ffn_size):
+        info = infos[world_rank]
+        if info is None or info["experts"] is None:
+            raise RuntimeError(f"FFN world rank {world_rank} reported no local experts")
+        experts = info["experts"]
+        if sorted(experts) != sorted(moe_layers):
+            raise RuntimeError(
+                f"FFN world rank {world_rank} holds experts for layers "
+                f"{sorted(experts)}, expected MoE layers {moe_layers}"
+            )
+        expected_ids = list(layout.expert_range(world_rank))
+        for layer_idx, described in experts.items():
+            if described["ids"] != expected_ids:
+                raise RuntimeError(
+                    f"FFN world rank {world_rank} layer {layer_idx} holds experts "
+                    f"{described['ids']}, but DeepEP M2N routes experts "
+                    f"[{expected_ids[0]}, {expected_ids[-1] + 1}) to it: use "
+                    "linear expert placement with EP size = num_ffn_ranks"
+                )
+            intermediate_size = described["w2"][1][2]
+            expected = _expected_expert_tensors(
+                layout.experts_per_rank, hidden_size, intermediate_size, payload_format
+            )
+            wrong = {
+                name: described[name]
+                for name, value in expected.items()
+                if described[name] != value
+            }
+            if wrong:
+                required = {name: expected[name] for name in wrong}
+                raise RuntimeError(
+                    f"FFN world rank {world_rank} layer {layer_idx} expert tensors "
+                    f"{wrong} do not match payload_format={payload_format!r}, "
+                    f"expected {required}"
+                )
 
 
 @dataclass(slots=True)
@@ -452,7 +695,14 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
     payloads (no host sync, fixed worst-case shapes) after one warm-up step at
     the same bucket (it JIT-compiles the kernels and caches the Attention-side
     zero buffer). FFN ranks call ``synchronize_lanes`` before the capture ends.
+
+    Lifecycle: ``bootstrap`` (before vLLM's distributed init: handshake and
+    NCCL environment), then ``init_afd_connector`` (after weights load:
+    post-load checks, NCCL control group and DeepEP buffers).
     """
+
+    bootstraps_before_distributed_init = True
+    delivers_routed_tokens = True
 
     @classmethod
     def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -489,10 +739,10 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
             raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
         self.world_rank = self.layout.world_rank(afd_config.role, role_rank)
-        self.capacity_tokens_per_rank: int = (
-            self.config.capacity_tokens_per_rank
-            or vllm_config.scheduler_config.max_num_batched_tokens
+        self.capacity_tokens_per_rank = resolve_capacity_tokens_per_rank(
+            self.config, vllm_config
         )
+        self.num_lanes = resolve_num_lanes(self.config, vllm_config)
         self.device = torch.device("cuda", local_rank)
         # Where control payloads are staged: gloo moves CPU tensors.
         self.control_device = (
@@ -500,6 +750,8 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
             if self.config.control_backend == "gloo"
             else self.device
         )
+        self._rendezvous = f"tcp://{afd_config.host}:{afd_config.port}"
+        self._timeout = timedelta(seconds=afd_config.afd_process_group_timeout_s)
         self.group: dist.ProcessGroup | None = None
         self.bootstrap_group: dist.ProcessGroup | None = None
         self.network_plan: NetworkPlan | None = None
@@ -521,21 +773,25 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
     # Lifecycle
     # ==============================
 
-    def init_afd_connector(self) -> None:
-        """Collective: join the AFD world, check compatibility, create buffers."""
-        if self._initialized:
+    def bootstrap(self) -> None:
+        """Collective: join the AFD world, check compatibility, set NCCL env.
+
+        Workers call this before vLLM's distributed init, because NCCL reads
+        its environment (``NCCL_IB_HCA``, the GIN switch) once per process,
+        when the first communicator is created. Uses gloo only, so it creates
+        no NCCL communicator itself. ``init_afd_connector`` calls it when the
+        caller has not.
+        """
+        if self.bootstrap_group is not None:
             return
         torch.cuda.set_device(self.device)
-        _register_custom_ops()
-        rendezvous = f"tcp://{self.afd_config.host}:{self.afd_config.port}"
-        timeout = timedelta(seconds=self.afd_config.afd_process_group_timeout_s)
         self.bootstrap_group = init_afd_process_group(
             backend="gloo",
-            init_method=rendezvous,
+            init_method=self._rendezvous,
             world_size=self.layout.union_size,
             rank=self.world_rank,
             group_name=BOOTSTRAP_GROUP_NAME,
-            timeout=timeout,
+            timeout=self._timeout,
         )
         local_alignment = None
         if self.is_ffn:
@@ -553,8 +809,13 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
             dtype=self.dtype,
             num_experts=self.layout.num_experts,
             top_k=self.top_k,
+            num_lanes=self.num_lanes,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
             expert_alignment=local_alignment,
+            ffn_deployment=(
+                ffn_deployment_info(self.vllm_config) if self.is_ffn else None
+            ),
             sm=torch.cuda.get_device_capability(self.device),
             topology=discover_local_topology(
                 self.world_rank, self.device, self.local_rank
@@ -571,26 +832,62 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
         self.network_plan = result.network_plan
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
-        # Before any NCCL communicator of this connector exists.
+        # Before any NCCL communicator in this process exists, when the worker
+        # bootstraps ahead of vLLM's distributed init.
         apply_rank_environment(self.network_plan, self.config.network, self.world_rank)
         # DeepEP reads this when each buffer is created: with several lanes
         # each buffer needs its own communication stream.
-        if self.config.num_lanes > 1:
+        if self.num_lanes > 1:
             os.environ[PER_BUFFER_COMM_STREAM_ENV] = "1"
+
+    def init_afd_connector(
+        self,
+        *,
+        moe_layer_indices: Sequence[int] | None = None,
+        local_experts: Mapping[int, FFNLocalExperts] | None = None,
+    ) -> None:
+        """Collective: check what every rank loaded, then create buffers.
+
+        Args:
+            moe_layer_indices: MoE layers this rank's model runs, in order.
+                ``None`` skips the post-load checks for this rank.
+            local_experts: FFN only: this rank's experts per MoE layer, as
+                vLLM loaded them.
+        """
+        if self._initialized:
+            return
+        if local_experts is not None and not self.is_ffn:
+            raise ValueError("only FFN ranks hold local experts")
+        self.bootstrap()
+        torch.cuda.set_device(self.device)
+        _register_custom_ops()
+        assert self.bootstrap_group is not None and self.network_plan is not None
+        model_infos: list[dict[str, Any] | None] = [None] * self.layout.union_size
+        dist.all_gather_object(
+            model_infos,
+            local_model_info(moe_layer_indices, local_experts),
+            group=self.bootstrap_group,
+        )
+        validate_model_infos(
+            model_infos,
+            self.layout,
+            hidden_size=self.hidden_size,
+            payload_format=self.config.payload_format,
+        )
         self.group = (
             self.bootstrap_group
             if self.config.control_backend == "gloo"
             else init_afd_process_group(
                 backend="nccl",
-                init_method=rendezvous,
+                init_method=self._rendezvous,
                 world_size=self.layout.union_size,
                 rank=self.world_rank,
                 group_name=PROCESS_GROUP_NAME,
-                timeout=timeout,
+                timeout=self._timeout,
             )
         )
         try:
-            for _ in range(self.config.num_lanes):
+            for _ in range(self.num_lanes):
                 self.lanes.append(
                     DeepEPElasticBuffer(
                         group=self.bootstrap_group,
@@ -608,7 +905,7 @@ class DeepEPM2NAFDConnector(AFDConnectorBase):
                     )
                 )
                 # One lane runs on the caller's stream: no fork/join cost.
-                if self.config.num_lanes > 1:
+                if self.num_lanes > 1:
                     self.lane_streams.append(torch.cuda.Stream(self.device))
             if self.is_ffn:
                 self.experts = DeepEPM2NExperts(
@@ -916,10 +1213,10 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
 
     def update_state_from_dp_metadata(self, payload: AFDControlPayload) -> None:
         connector = self.connector
-        if len(payload.dp_metadata_list) > connector.config.num_lanes:
+        if len(payload.dp_metadata_list) > connector.num_lanes:
             raise ValueError(
                 f"{len(payload.dp_metadata_list)} stages exceed "
-                f"num_lanes={connector.config.num_lanes}"
+                f"num_lanes={connector.num_lanes}"
             )
         graph_mode = payload.is_graph_capturing or payload.is_graph_replaying
         connector.stage_plans = {

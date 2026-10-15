@@ -59,6 +59,19 @@ def _connector(
     return AFDConnectorFactory.create_connector(0, 0, vllm_config, afd_config)
 
 
+def _ffn_deployment(layout: DeepEPM2NLayout, weight_format: str = "bf16") -> dict:
+    """A valid FFN deployment: linear EP over the FFN ranks, idle all2all."""
+    return {
+        "expert_parallel": True,
+        "ep_size": layout.ffn_size,
+        "tensor_parallel_size": 1,
+        "expert_placement_strategy": "linear",
+        "eplb": False,
+        "all2all_backend": "allgather_reducescatter",
+        "weight_format": weight_format,
+    }
+
+
 def _handshake(
     layout: DeepEPM2NLayout, overrides: dict | None = None, hosts: str | None = None
 ) -> list[dict]:
@@ -76,8 +89,11 @@ def _handshake(
             dtype=torch.bfloat16,
             num_experts=layout.num_experts,
             top_k=8,
+            num_lanes=1,
             capacity_tokens_per_rank=256,
+            compute_gate_on_attention=True,
             expert_alignment=128 if is_ffn else None,
+            ffn_deployment=_ffn_deployment(layout) if is_ffn else None,
             sm=HOPPER,
             topology=RankTopology(
                 world_rank=world_rank,
@@ -418,7 +434,8 @@ def test_expert_row_ranges_follow_alignment():
 
 def test_connector_constructs_without_initialization():
     """Constructing Attention and FFN connectors computes world ranks and
-    capacity (explicit, or max_num_batched_tokens) without initializing.
+    capacity (explicit, or the larger of max_num_batched_tokens and the
+    largest CUDA-graph capture size) without initializing.
 
     Why: construction must not communicate, and rank math must be right.
     """

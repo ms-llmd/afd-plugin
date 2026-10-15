@@ -84,6 +84,19 @@ class LocalExpertWeights:
         return self.w13.dtype == FP8_DTYPE
 
 
+@dataclass(frozen=True)
+class FFNLocalExperts:
+    """One MoE layer's experts on this FFN rank, as vLLM loaded them.
+
+    Attributes:
+        expert_ids: Global ids of the experts in ``weights``, in slot order.
+        weights: The same experts in the executor's layout.
+    """
+
+    expert_ids: tuple[int, ...]
+    weights: LocalExpertWeights
+
+
 def align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 

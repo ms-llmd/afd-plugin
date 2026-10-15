@@ -488,9 +488,10 @@ def apply_rank_environment(
 ) -> None:
     """Process-wide NCCL/DeepEP settings for this rank, before any communicator.
 
-    NCCL reads these when its first communicator in the process is created; if
-    the process already created one (another vLLM group), set them in the
-    deployment environment instead.
+    NCCL reads these when its first communicator in the process is created.
+    AFD workers therefore run the connector's ``bootstrap`` (which calls this)
+    before vLLM's distributed init creates its own NCCL groups; a process that
+    already created a communicator keeps the values it started with.
     """
     for key, value in config.nccl_env:
         os.environ[key] = value
