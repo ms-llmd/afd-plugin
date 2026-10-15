@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import inspect
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+else:
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
 pytest.importorskip("vllm")
-nn = torch.nn
 
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper  # noqa: E402
 from vllm.config import CompilationMode  # noqa: E402
@@ -38,7 +43,7 @@ class _FakeMissingLayer(nn.Module):
 
 @pytest.fixture
 def construction_env(monkeypatch: pytest.MonkeyPatch):
-    calls = {
+    calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
         "moe": [],
@@ -343,6 +348,21 @@ def test_unsupported_modes_fail_closed(
 
     with pytest.raises(RuntimeError, match=message):
         adapter._validate_supported_config(vllm_config, afd_config)
+
+
+def test_gate_on_attention_is_accepted_with_deepep_m2n(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeepEP M2N routes on Attention, so Qwen3 accepts the gate there.
+
+    Why: its FFN runs only the routed experts and never the native gate.
+    """
+    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
+
+    adapter._validate_supported_config(
+        _model_config(),
+        AFDConfig(connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True),
+    )
 
 
 def test_rocm_platform_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

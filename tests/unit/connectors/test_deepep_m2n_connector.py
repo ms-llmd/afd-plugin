@@ -19,12 +19,18 @@ from afd_plugin.connectors import (  # noqa: E402
 )
 from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     DeepEPM2NConfig,
+    expert_weight_format,
     local_handshake_info,
+    local_model_info,
     plan_stage,
+    resolve_capacity_tokens_per_rank,
+    resolve_num_lanes,
     tokens_per_attention_rank,
     validate_handshake,
+    validate_model_infos,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
+    FFNLocalExperts,
     LocalExpertWeights,
     expert_row_ranges,
 )
@@ -536,3 +542,274 @@ def test_data_path_requires_initialization():
             topk_ids=torch.zeros(1, 8, dtype=torch.int64),
             topk_weights=torch.zeros(1, 8),
         )
+
+
+# ---------------------------------------------------------------------------
+# Bring-up: defaults, FFN deployment in the handshake, post-load checks
+# ---------------------------------------------------------------------------
+
+SMALL_HIDDEN = 256
+SMALL_INTERMEDIATE = 128
+FP8_BLOCK = 128
+SMALL_LAYOUT = DeepEPM2NLayout(ffn_size=2, attn_size=1, num_experts=8)
+MOE_LAYERS = [1, 3]
+
+
+def _ffn_vllm_config():
+    return fake_vllm_config(Topology(ffn_size=1, attn_size=1), "ffn", 0, {}, port=1)
+
+
+@pytest.mark.parametrize(
+    ("capture_size", "explicit", "expected"),
+    [(512, None, 8192), (16384, None, 16384), (16384, 64, 64)],
+)
+def test_capacity_covers_prefill_budget_and_largest_graph(
+    capture_size, explicit, expected
+):
+    """Default capacity is the larger of max_num_batched_tokens (8192) and
+    the largest CUDA-graph capture size; an explicit value wins.
+
+    Why: a decode graph larger than the prefill budget must still fit.
+    """
+    vllm_config = _ffn_vllm_config()
+    vllm_config.compilation_config.max_cudagraph_capture_size = capture_size
+    config = DeepEPM2NConfig(capacity_tokens_per_rank=explicit)
+
+    assert resolve_capacity_tokens_per_rank(config, vllm_config) == expected
+
+
+@pytest.mark.parametrize(
+    ("use_ubatching", "num_ubatches", "explicit", "expected"),
+    [(False, 1, None, 1), (True, 2, None, 2), (True, 2, 1, 1)],
+)
+def test_num_lanes_follows_vllm_micro_batches(
+    use_ubatching, num_ubatches, explicit, expected
+):
+    """One lane without micro-batching, two under DBO; explicit wins.
+
+    Why: a DBO deployment needs a buffer per in-flight micro-batch.
+    """
+    vllm_config = _ffn_vllm_config()
+    vllm_config.parallel_config.use_ubatching = use_ubatching
+    vllm_config.parallel_config.num_ubatches = num_ubatches
+
+    lanes = resolve_num_lanes(DeepEPM2NConfig(num_lanes=explicit), vllm_config)
+
+    assert lanes == expected
+
+
+def test_num_lanes_rejects_more_micro_batches_than_lanes():
+    vllm_config = _ffn_vllm_config()
+    vllm_config.parallel_config.use_ubatching = True
+    vllm_config.parallel_config.num_ubatches = 3
+
+    with pytest.raises(ValueError, match="at most 2 lanes"):
+        resolve_num_lanes(DeepEPM2NConfig(), vllm_config)
+
+
+def test_expert_weight_format_names_what_vllm_loads():
+    """BF16 checkpoints, block-128 FP8 checkpoints, and anything else.
+
+    Why: the handshake compares this with the payload format before loading.
+    """
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    block_fp8 = Fp8Config(
+        is_checkpoint_fp8_serialized=True, weight_block_size=[FP8_BLOCK, FP8_BLOCK]
+    )
+    per_tensor_fp8 = Fp8Config(is_checkpoint_fp8_serialized=True)
+
+    assert expert_weight_format(None) == "bf16"
+    assert expert_weight_format(block_fp8) == "fp8_block128"
+    assert expert_weight_format(per_tensor_fp8) == "unsupported (fp8)"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("expert_parallel", False),
+        ("ep_size", 4),
+        ("tensor_parallel_size", 2),
+        ("expert_placement_strategy", "round_robin"),
+        ("eplb", True),
+        ("all2all_backend", "deepep_low_latency"),
+        ("weight_format", "fp8_block128"),
+    ],
+)
+def test_handshake_rejects_ffn_deployments_that_misplace_experts(key, value):
+    """An FFN rank whose vLLM deployment would hold other experts, run
+    vLLM's own all-to-all, or load weights in another format fails the
+    handshake on every rank.
+
+    Why: rows would reach the wrong experts with no error later.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    infos = _handshake(layout)
+    infos[1]["ffn_deployment"] = {**infos[1]["ffn_deployment"], key: value}
+
+    with pytest.raises(
+        RuntimeError, match=f"FFN world rank 1 is deployed with .*{key}"
+    ):
+        validate_handshake(infos, layout, NetworkConfig())
+
+
+def test_handshake_accepts_fp8_block_weights_for_fp8_payload():
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    infos = _handshake(
+        layout,
+        {(rank, "payload_format"): "fp8_block128_fp32" for rank in range(4)},
+    )
+    for rank in range(layout.ffn_size):
+        infos[rank]["ffn_deployment"] = _ffn_deployment(layout, "fp8_block128")
+
+    validate_handshake(infos, layout, NetworkConfig())
+
+
+def test_handshake_requires_gate_on_attention():
+    """Both roles must route on Attention; a mix, or false everywhere, fails.
+
+    Why: DeepEP M2N dispatches by top-k ids computed on Attention.
+    """
+    layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
+    mixed = _handshake(layout, {(0, "compute_gate_on_attention"): False})
+    neither = _handshake(
+        layout,
+        {(rank, "compute_gate_on_attention"): False for rank in range(2)},
+    )
+
+    with pytest.raises(RuntimeError, match="disagree on compute_gate_on_attention"):
+        validate_handshake(mixed, layout, NetworkConfig())
+    with pytest.raises(RuntimeError, match="compute_gate_on_attention=true"):
+        validate_handshake(neither, layout, NetworkConfig())
+
+
+def _local_experts(
+    expert_ids: range, *, fp8: bool = False, w2_scale_blocks: int | None = None
+) -> FFNLocalExperts:
+    num_experts = len(expert_ids)
+    w13_shape = (num_experts, 2 * SMALL_INTERMEDIATE, SMALL_HIDDEN)
+    w2_shape = (num_experts, SMALL_HIDDEN, SMALL_INTERMEDIATE)
+    if fp8:
+        weights = LocalExpertWeights(
+            w13=torch.zeros(w13_shape, dtype=torch.float8_e4m3fn),
+            w2=torch.zeros(w2_shape, dtype=torch.float8_e4m3fn),
+            w13_scale=torch.ones(
+                num_experts,
+                2 * SMALL_INTERMEDIATE // FP8_BLOCK,
+                SMALL_HIDDEN // FP8_BLOCK,
+            ),
+            w2_scale=torch.ones(
+                num_experts,
+                SMALL_HIDDEN // FP8_BLOCK,
+                w2_scale_blocks or SMALL_INTERMEDIATE // FP8_BLOCK,
+            ),
+        )
+    else:
+        weights = LocalExpertWeights(
+            w13=torch.zeros(w13_shape, dtype=torch.bfloat16),
+            w2=torch.zeros(w2_shape, dtype=torch.bfloat16),
+        )
+    return FFNLocalExperts(expert_ids=tuple(expert_ids), weights=weights)
+
+
+def _model_infos(
+    *,
+    ffn_ranges: tuple[range, range] = (range(0, 4), range(4, 8)),
+    attention_layers: list[int] = MOE_LAYERS,
+    fp8: bool = False,
+    w2_scale_blocks: int | None = None,
+) -> list:
+    infos = [
+        local_model_info(
+            MOE_LAYERS,
+            {
+                layer: _local_experts(experts, fp8=fp8, w2_scale_blocks=w2_scale_blocks)
+                for layer in MOE_LAYERS
+            },
+        )
+        for experts in ffn_ranges
+    ]
+    infos.append(local_model_info(attention_layers, None))
+    return infos
+
+
+def test_model_check_accepts_matching_layers_and_expert_placement():
+    """Two FFN ranks hold experts [0, 4) and [4, 8) of layers 1 and 3, and
+    Attention dispatches the same layers: the check passes, BF16 and FP8.
+
+    Why: this is the deployment DeepEP M2N routes for.
+    """
+    validate_model_infos(
+        _model_infos(), SMALL_LAYOUT, hidden_size=SMALL_HIDDEN, payload_format="bf16"
+    )
+    validate_model_infos(
+        _model_infos(fp8=True),
+        SMALL_LAYOUT,
+        hidden_size=SMALL_HIDDEN,
+        payload_format="fp8_block128_fp32",
+    )
+
+
+def test_model_check_skips_when_no_rank_reports():
+    """Ranks that report nothing (the connector harness) skip the check."""
+    validate_model_infos(
+        [None, None, None],
+        SMALL_LAYOUT,
+        hidden_size=SMALL_HIDDEN,
+        payload_format="bf16",
+    )
+
+
+@pytest.mark.parametrize(
+    ("infos_kwargs", "payload_format", "message"),
+    [
+        ({"attention_layers": [1]}, "bf16", "disagree on MoE layers"),
+        (
+            {"ffn_ranges": (range(0, 4), range(0, 4))},
+            "bf16",
+            r"routes experts \[4, 8\) to it",
+        ),
+        ({}, "fp8_block128_fp32", "do not match payload_format"),
+        ({"fp8": True, "w2_scale_blocks": 2}, "fp8_block128_fp32", "w2_scale"),
+    ],
+    ids=["layers", "placement", "format", "scale-shape"],
+)
+def test_model_check_rejects_what_would_compute_wrong_rows(
+    infos_kwargs, payload_format, message
+):
+    """Ranks running different MoE layers, an FFN rank holding experts DeepEP
+    does not route to it, weights in another format, or scales of the wrong
+    shape fail on every rank after loading.
+
+    Why: each of these hangs the collectives or silently corrupts outputs.
+    """
+    with pytest.raises(RuntimeError, match=message):
+        validate_model_infos(
+            _model_infos(**infos_kwargs),
+            SMALL_LAYOUT,
+            hidden_size=SMALL_HIDDEN,
+            payload_format=payload_format,
+        )
+
+
+def test_model_check_requires_ffn_experts_once_anyone_reports():
+    infos = _model_infos()
+    infos[1] = None
+
+    with pytest.raises(RuntimeError, match="FFN world rank 1 reported no local"):
+        validate_model_infos(
+            infos, SMALL_LAYOUT, hidden_size=SMALL_HIDDEN, payload_format="bf16"
+        )
+
+
+def test_attention_init_rejects_local_experts_before_communicating():
+    """Passing experts on an Attention rank raises before any rendezvous.
+
+    Why: a wiring bug must not leave the peers waiting in a collective.
+    """
+    connector = _connector("attention", 0, Topology(ffn_size=1, attn_size=1))
+
+    with pytest.raises(ValueError, match="only FFN ranks hold local experts"):
+        connector.init_afd_connector(local_experts={})
+
+    assert connector.bootstrap_group is None
