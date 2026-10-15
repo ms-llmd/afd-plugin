@@ -1,0 +1,72 @@
+{
+ "scenario": "graph_benchmark",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 8192,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32",
+  "num_lanes": 2
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 217.47455466538668
+    },
+    "8": {
+     "total_us": 327.9640048276633
+    },
+    "32": {
+     "total_us": 470.3982063801959
+    },
+    "128": {
+     "total_us": 507.52065144479275
+    },
+    "512": {
+     "total_us": 967.531994683668
+    },
+    "2048": {
+     "total_us": 2643.7038992298767
+    }
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 257.372556370683
+    },
+    "8": {
+     "total_us": 468.11774373054504
+    },
+    "32": {
+     "total_us": 525.0198562862352
+    },
+    "128": {
+     "total_us": 602.5454087648541
+    },
+    "512": {
+     "total_us": 1053.0486528296024
+    },
+    "2048": {
+     "total_us": 2738.005298306234
+    }
+   }
+  }
+ ],
+ "all_ok": true
+}

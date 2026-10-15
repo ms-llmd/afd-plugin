@@ -1,0 +1,123 @@
+{
+ "scenario": "graph_benchmark",
+ "topology": {
+  "ffn_size": 4,
+  "attn_size": 4
+ },
+ "num_nodes": 2,
+ "node_rank": 1,
+ "extra_config": {
+  "capacity_tokens_per_rank": 8192,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 4,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 303.114322014153
+    },
+    "8": {
+     "total_us": 379.47201635688543
+    },
+    "32": {
+     "total_us": 409.1390292160213
+    },
+    "128": {
+     "total_us": 574.6800801716745
+    },
+    "512": {
+     "total_us": 1514.5592391490936
+    },
+    "2048": {
+     "total_us": 5021.338339429349
+    }
+   }
+  },
+  {
+   "world_rank": 5,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 332.95678440481424
+    },
+    "8": {
+     "total_us": 426.3212555088103
+    },
+    "32": {
+     "total_us": 487.4389502219856
+    },
+    "128": {
+     "total_us": 647.2220527939498
+    },
+    "512": {
+     "total_us": 1555.057941004634
+    },
+    "2048": {
+     "total_us": 5072.655505500734
+    }
+   }
+  },
+  {
+   "world_rank": 6,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 298.0911289341748
+    },
+    "8": {
+     "total_us": 324.3500366806984
+    },
+    "32": {
+     "total_us": 352.904514875263
+    },
+    "128": {
+     "total_us": 537.1132050640881
+    },
+    "512": {
+     "total_us": 1428.7594938650727
+    },
+    "2048": {
+     "total_us": 4954.574629664421
+    }
+   }
+  },
+  {
+   "world_rank": 7,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 352.13392693549395
+    },
+    "8": {
+     "total_us": 457.07704266533256
+    },
+    "32": {
+     "total_us": 522.071379236877
+    },
+    "128": {
+     "total_us": 709.0187747962773
+    },
+    "512": {
+     "total_us": 1591.0494490526617
+    },
+    "2048": {
+     "total_us": 5144.065618515015
+    }
+   }
+  }
+ ],
+ "all_ok": true
+}

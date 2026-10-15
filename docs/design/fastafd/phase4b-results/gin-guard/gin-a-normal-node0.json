@@ -1,0 +1,52 @@
+{
+ "scenario": "correctness",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.497887159964205e-08,
+    "dispatch_weights_rel_err": 7.368013787330176e-08,
+    "experts_rel_err": 0.027180828524882517,
+    "experts_vs_fused_rel_err": 0.02792082482882206,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ],
+    "network_plan": "domains=2x2 gin=True hybrid=True nic_policy=shared rail=roce:172.22.160.0/21 nics=['mlx5_10'] traffic_class=3 this_rank_nic=mlx5_10"
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.606901764355014e-08,
+    "dispatch_weights_rel_err": 9.380372765746018e-08,
+    "experts_rel_err": 0.02842403583102514,
+    "experts_vs_fused_rel_err": 0.028678378350035522,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ],
+    "network_plan": "domains=2x2 gin=True hybrid=True nic_policy=shared rail=roce:172.22.160.0/21 nics=['mlx5_10'] traffic_class=3 this_rank_nic=mlx5_10"
+   }
+  }
+ ],
+ "all_ok": true
+}
