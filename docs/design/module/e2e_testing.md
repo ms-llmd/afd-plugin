@@ -8,7 +8,6 @@ primary_code_paths:
   - "tests/e2e/runner.py"
   - "tests/e2e/process_utils.py"
   - "tests/e2e/environment.py"
-  - "tests/e2e/mrv2_evidence.py"
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/**"
 related_code_paths:
@@ -67,7 +66,6 @@ tests/e2e/
 ├── models/<model>/test_*.py  # Test entries and case lists
 ├── accuracy/<task>.py       # Accuracy tool and result parsing
 ├── environment.py           # Backend and role launch environment
-├── mrv2_evidence.py          # Live native two-stage execution evidence
 ├── runner.py                # Service startup, evaluation, and cleanup
 └── process_utils.py         # Process-group termination and reaping
 ```
@@ -80,8 +78,9 @@ cleanup. Production code does not depend on the E2E harness.
 - `E2E-INV-001` — A case **MUST** have a stable lower-kebab-case ID and cover
   behavior not already covered by an existing case.
 - `E2E-INV-002` — A PR case **MUST NOT** use more than four unique devices.
-  Gate AFD cases **MUST** use 2 Attention ranks and 2 FFN ranks; 2A1F cases
-  are local-only.
+  AFD gate topology **MUST** match the selected suite: DeepSeek-V2-Lite
+  defaults use 2A2F; Qwen3 MoE and Qwen3.6 MoE use 2A1F. Weekly CI also
+  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case.
 - `E2E-INV-003` — Cases sharing devices or ports **MUST** run sequentially,
   remain order-independent, and release owned process groups before the next
   case.
@@ -104,19 +103,35 @@ cleanup. Production code does not depend on the E2E harness.
 
 | Case | Runtime | Devices | Purpose |
 | --- | --- | ---: | --- |
-| `afd-eager-2a2f` | AFD eager, 2A2F | 4 | Lifecycle and eager smoke test. |
-| `afd-graph-2a2f` | AFD graph, 2A2F | 4 | Primary graph path. |
-| `afd-graph-dbo-2a2f` | AFD graph + DBO, 2A2F | 4 | Graph path with DBO. |
+| `afd-eager-2a2f` | Ascend NPU AFD eager, 2A2F | 4 | NPU lifecycle and eager smoke test. |
+| `afd-graph-2a2f` | Ascend NPU AFD graph, 2A2F | 4 | NPU graph path. |
+| `afd-graph-dbo-2a2f` | Ascend NPU AFD graph + DBO, 2A2F | 4 | NPU graph path with DBO. |
 | `baseline-graph` | Native vLLM graph, DP4/TP1/EP4 | 4 | Non-AFD control. |
 | `afd-v2-eager-dp2` | CUDA ModelRunnerV2 eager, Attention DP2 + FFN DP2 | 4 | V2 data-parallel lifecycle and accuracy. |
 | `afd-v2-graph-dp2` | CUDA ModelRunnerV2 graph, Attention DP2 + FFN DP2 | 4 | V2 data-parallel full-decode graph path. |
 | `afd-v2-eager-tp2` | CUDA ModelRunnerV2 eager, Attention TP2 + FFN TP2 | 4 | V2 tensor-parallel lifecycle and accuracy. |
 | `afd-v2-graph-tp2` | CUDA ModelRunnerV2 graph, Attention TP2 + FFN TP2 | 4 | V2 tensor-parallel full-decode graph path. |
-| `afd-v2-eager-dbo-dp2` | CUDA ModelRunnerV2 eager DBO, Attention DP2 + FFN DP2 | 4 | Live two-stage execution with matching A/F layouts. |
-| `afd-v2-graph-dbo-dp2` | CUDA ModelRunnerV2 graph DBO, Attention DP2 + FFN DP2 | 4 | Live two-stage execution and consecutive FULL graph replays. |
+| `afd-v2-eager-dbo-dp2` | CUDA ModelRunnerV2 eager DBO, Attention DP2 + FFN DP2 | 4 | Accuracy and lifecycle with eager DBO enabled. |
+| `afd-v2-graph-dbo-dp2` | CUDA ModelRunnerV2 graph DBO, Attention DP2 + FFN DP2 | 4 | Accuracy and lifecycle with graph DBO enabled. |
 
-CUDA CI runs the legacy and ModelRunnerV2 matrices as separate jobs with a
-40-minute timeout each. Put slower coverage in a scheduled job.
+CUDA ready/merge CI selects seven DeepSeek-V2-Lite cases: the native baseline
+and the six DP2/TP2/DBO V2 cases. The V2 DP2 cases replace the three duplicate
+GPU 2A2F cases; the eager/DBO comparison retains 128 samples, concurrency 12
+and the 0.27 accuracy threshold. The backend-neutral 2A2F IDs remain available
+for NPU. The GPU module collects 12 cases, including local 1A1F and 2A1F
+coverage; the NPU module collects its seven existing cases. Across the three
+GPU model suites, 19 cases remain: DeepSeek 12, Qwen3 MoE four, and Qwen3.6
+MoE three. Compared with the historical 23, three duplicate DeepSeek cases
+are replaced and Qwen3.6 GDN DBO coverage is explicitly withdrawn.
+
+GPU cases gate accuracy, service liveness and cleanup. AFD GPU graph/DBO
+cases additionally use a test-only worker extension to collect bounded per-rank
+execution summaries after evaluation. The summaries must prove actual replay
+or two-stage execution; dummy/profile/capture work does not qualify. Pure
+eager and native baseline cases, and performance comparisons, omit the probe.
+NPU DBO retains its live split check from existing runtime logs.
+CUDA ready/merge CI runs in one 80-minute job. Put slower coverage in a
+scheduled job.
 
 Prefer graph coverage. Keep one eager smoke test unless a feature cannot run in
 graph mode.
@@ -162,9 +177,9 @@ unverified. These smoke cases do not qualify synchronous DSV4 accuracy; see
 the [profile limits](../../../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 The async case retains its exact-answer check.
 
-The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
-local-only scenarios: they use three of the four devices (two Attention ranks,
-one FFN rank) and run outside CI.
+The 2A1F cases use three of the four devices (two Attention ranks and one
+FFN rank). DeepSeek-V2-Lite eager/graph remain local-only; its graph+DBO
+case and all Qwen3/Qwen3.6 suite scenarios run in weekly CI.
 
 The ModelRunnerV2 matrix is CUDA-only in the current E2E harness. Its local
 1A1F cases are `afd-v2-eager-1a1f` and `afd-v2-graph-1a1f`; CI selects the four
@@ -172,15 +187,20 @@ DP2/TP2 and two DBO cases by exact node ID on `l4_4`. Ascend ModelRunnerV2
 has separate V2-Lite hardware evidence recorded in [PR #425](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923);
 the generic V2 scenario entry points remain CUDA-only.
 
-The Qwen3.5/3.6 adapter family has text-only CUDA E2E evidence through
-`Qwen/Qwen3.6-35B-A3B`, using the native Qwen3.5/3.6 model boundary with
-`--language-model-only`. Its default suite uses native DP4/TP1/EP4 for
-`baseline-graph`, and
-synchronous AFD 2A1F for `afd-eager`, `afd-graph`, and `afd-graph-dbo`.
-The Qwen3.6 `afd-graph-dbo-2a1f` case remains excluded from hardware
-validation claims because a known FFN CUDA illegal memory access during a
-live two-ubatch decode split can crash FFN and hang Attention. This defect
-was recorded before v0.30; see the [weekly E2E exclusions](../../../tests/e2e/README.md#weekly-gsm8k).
+The Qwen3.5/3.6 adapter-family suite uses `Qwen/Qwen3.6-35B-A3B`, the native
+Qwen3.5/3.6 model boundary, and `--language-model-only`. All current GPU
+scenarios select native ModelRunnerV2; earlier V1 hardware records retain
+their original scope. Its default suite uses native DP4/TP1/EP4 for
+`baseline-graph`, and synchronous AFD 2A1F for `afd-eager` and `afd-graph`.
+Qwen3.5/3.6 GDN DBO is temporarily withdrawn. Native hybrid/multimodal
+validation applies; its graph+DBO node
+is removed from the suite and weekly CI. Earlier H20
+Graph + DBO and six-cell recurrent-state/CUDA Graph parity results describe
+the removed adapter and are historical evidence only. Earlier evidence also
+recorded an FFN CUDA illegal memory access during a live two-ubatch decode
+split before v0.30. Neither historical record qualifies current GDN DBO support.
+Qwen3 MoE retains its graph+DBO case in
+[weekly E2E](../../../tests/e2e/README.md#weekly-gsm8k).
 Multimodal, NPU, `compute_gate_on_attention=true`, pipeline-parallel,
 asynchronous, and multi-node execution are outside this case; quantization is
 unverified.
@@ -192,10 +212,10 @@ unverified.
 | Task | GSM8K | GSM8K |
 | Few-shot examples | 8 | 8 |
 | Generated-token limit | 512 | 512 |
-| Samples | first 7 for ordinary cases; legacy DBO floors at 24; MRV2 DP2 eager/DBO comparison defaults to 128 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
+| Samples | first 7 for ordinary cases; default DBO floors at 24; V2 DP2 eager/DBO comparison defaults to 128 | first 7; all DBO cases floor at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
-| Cases | four legacy cases plus six CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
+| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
 An accuracy of `0.27` requires at least 2 correct answers out of 7, 7 out of
 24, or 35 out of 128. The DeepSeek smoke threshold of `0.25` requires 6 out
@@ -212,14 +232,28 @@ of 24; the lower threshold applies only at sample counts up to 24.
 - DBO scenarios (`--enable-dbo`) run GSM8K with 12 concurrent requests and
   floor the sample count at 24: a sequential client never satisfies the
   DP-wide split agreement, so live requests would never run as two ubatches
-  and only warmup/capture would exercise the split path. The gate asserts
-  that at least one live two-ubatch step was recorded; `AFD_GSM8K_LIMIT=all`
-  still bypasses the floor. On vLLM 0.30 the runner sets the DBO decode token
+  and only warmup/capture would exercise the split path. The NPU gate asserts
+  that at least one live two-ubatch step was recorded. GPU AFD graph/DBO cases
+  use a test-only worker extension. After readiness, native collective RPC resets
+  Attention counters and a shared marker arms FFN at its next call entry.
+  Attention emits its summary through RPC after evaluation; a completion marker
+  requests FFN summaries through its existing periodic worker health RPC. The
+  harness waits up to 30 seconds for every rank while checking service liveness
+  before teardown. It removes the markers after process cleanup; FFN does not
+  service HTTP utilities. Every
+  Attention/FFN rank must execute the requested feature. DBO requires matching
+  two-stage A/F layouts; graph+DBO requires consecutive completed replays of
+  the same layout.
+  Dummy/profile/capture work and empty second microbatches do not qualify.
+  Pure eager and native baseline cases do not load the extension;
+  performance comparisons omit it. There is no per-step execution logging.
+  `AFD_GSM8K_LIMIT=all` still bypasses the floor. On vLLM 0.30 the runner sets the DBO decode token
   threshold to 2 because upstream validates both DBO thresholds against the
   two-microbatch count; the prefill threshold stays at 8. `AFD_E2E_API_PORT_BASE`
   (default `8000`) offsets the API server ports on shared machines, and
-  Legacy and MRV2 preserve the upstream chunked-prefill default and explicit
-  caller choices. The MRV2 B/E/G comparison retains the native token budget.
+  Default and dedicated GPU V2 scenarios preserve the upstream
+  chunked-prefill default and explicit caller choices. The MRV2 B/E/G
+  comparison retains the native token budget.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.

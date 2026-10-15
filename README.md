@@ -37,8 +37,8 @@ Core runtime support:
   execution for CUDA and Ascend NPU.
 - Eager and `FULL_DECODE_ONLY` graph execution, plus backend-specific profiling
   support.
-- Native DBO with exactly two ubatches on CUDA V1/V2 and the synchronous
-  Ascend V1 path; Ascend V2 DBO remains unsupported.
+- Native DBO with exactly two ubatches on CUDA V2. Ascend constraints are
+  recorded in the existing [NPU runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
 - DeepSeek MoE handoff at the remote-experts boundary on CUDA, with the gate
   placed on either Attention or FFN.
 
@@ -48,7 +48,7 @@ Model support:
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
-| Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F eager/graph. DBO remains excluded by a known FFN CUDA fault; see the [E2E limits](docs/design/module/e2e_testing.md). |
+| Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F. Eager and graph execution remain supported; GDN DBO is temporarily withdrawn; native hybrid/multimodal validation applies. Earlier DBO experiments are historical evidence only; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
 Connector support:
 
@@ -73,12 +73,15 @@ Known gaps:
   Other models and topologies remain unverified.
 - Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
   incorrect. See the [profile limits](tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
-- GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with
-  `compute_gate_on_attention=false`, including two-microbatch DBO and
-  `FULL_DECODE_ONLY`. H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
+- GPU Attention requires native ModelRunnerV2; there is no GPU V1 fallback.
+  FFN remains connector-driven. Synchronous `P2pNcclAFDConnector` supports
+  two-microbatch DBO and `FULL_DECODE_ONLY`, with model-specific gate placement.
+  H20 validation covers DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128
+  GSM8K samples and live two-stage/full-replay assertions.
+  Earlier H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
   see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
   Representative 300-question comparisons do not establish numerical
-  equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
+  equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for the recorded GPU evidence and separate NPU DBO constraints.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches. NPU MRV2 DBO requires eager
@@ -88,6 +91,7 @@ Known gaps:
   MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
 - Qwen3.5/Qwen3.6 MoE adapter-family support is limited to the CUDA text-only
   lane; repository hardware E2E evidence currently covers Qwen3.6-35B-A3B.
+  GDN DBO is unsupported; upstream hybrid/multimodal DBO validation applies.
   NPU and multimodal execution are unsupported/unverified;
   `compute_gate_on_attention=true`, pipeline parallelism, asynchronous and
   multi-node execution are unsupported; quantization is unverified; no
@@ -196,14 +200,15 @@ or standard Ascend NPU platform. Explicit AFD worker paths remain accepted for
 compatibility with existing commands, but are not required or stable launch
 interfaces.
 
-The examples below use model runner v1. For GPU MRV2, set
-`VLLM_USE_V2_MODEL_RUNNER=1` on both roles and use the
-[dedicated E2E scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
-MRV2 DBO requires two microbatches and Attention DP > 1.
-For the MRV1 examples below, select:
+GPU launches require `VLLM_USE_V2_MODEL_RUNNER=1` on both roles. Attention
+uses native ModelRunnerV2; FFN keeps its connector-driven runner. There is no
+GPU V1 fallback. DBO requires exactly two microbatches and accepts Attention
+DP1 or DP > 1. The DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO
+validation recorded in [PR #454](https://github.com/vllm-project/afd-plugin/pull/454).
+See the [dedicated E2E scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
 
 ```bash
-export VLLM_USE_V2_MODEL_RUNNER=0
+export VLLM_USE_V2_MODEL_RUNNER=1
 ```
 
 GPU Attention-side shape:
@@ -235,10 +240,10 @@ vllm serve /path/to/DeepSeek-V2-Lite \
 ```
 
 NPU uses the same config channel with `CAMP2pAFDConnector`; the plugin selects
-the NPU worker automatically:
+the NPU worker automatically. This example retains the NPU V1 runner:
 
 ```bash
-vllm serve /path/to/DeepSeek-V2-Lite \
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve /path/to/DeepSeek-V2-Lite \
   --served-model-name deepseek-v2-lite-afd-attention \
   --data-parallel-size 1 \
   --tensor-parallel-size 1 \

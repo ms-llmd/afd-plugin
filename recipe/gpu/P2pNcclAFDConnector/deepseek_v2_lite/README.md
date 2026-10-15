@@ -87,7 +87,7 @@ before sending traffic.
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-export VLLM_USE_V2_MODEL_RUNNER=0
+export VLLM_USE_V2_MODEL_RUNNER=1
 bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh
 ```
 
@@ -95,7 +95,7 @@ bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-export VLLM_USE_V2_MODEL_RUNNER=0
+export VLLM_USE_V2_MODEL_RUNNER=1
 bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_disaggregation/2p1a1f_graph_dbo.sh
 ```
 

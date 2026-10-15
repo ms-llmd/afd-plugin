@@ -87,7 +87,7 @@ cross-device inheritance chain.
 CUDA launch shape:
 
 ```bash
-vllm serve /path/to/model \
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"ffn","connector":"P2pNcclAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
@@ -105,7 +105,7 @@ The common FFN initialization sequence is:
 ```text
 vLLM worker construction
   -> validate AFD config, role, connector, and selected worker class
-  -> validate the paired V1 or V2 deployment contract
+  -> validate the paired CUDA V2 or NPU V1/V2 deployment contract
   -> initialize the matching upstream device worker
   -> construct the AFD FFN model runner
   -> derive the role-local AFD rank from DP/TP ranks when needed
@@ -131,9 +131,8 @@ connector owns transport/process-group resources.
 
 ## ModelRunnerV2 pairing
 
-FFN remains connector-driven when the upstream configuration selects
-ModelRunnerV2. It does not adopt native V2 request state or scheduler-driven
-execution:
+GPU requires ModelRunnerV2 on both roles. FFN remains connector-driven and
+does not adopt native V2 request state or scheduler-driven execution:
 
 - CUDA temporarily substitutes `GPUFFNModelRunner` at the native V2
   construction seam inside `Worker.init_device()`; the existing AFD runner is
@@ -146,7 +145,9 @@ execution:
 
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
-FFN-side gating and supports two native microbatches with Attention DP > 1.
+model-specific gate placement and supports two native microbatches with
+Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
+Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
 Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
 with Attention-side gating. Ascend V2 DBO is eager-only: CAMP2P requires
 Attention DP > 1 and matching two-stage FFN control metadata; Async CAM also
@@ -349,8 +350,8 @@ async model E2E coverage.
 ## Limitations and open issues
 
 Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. V1 native DBO accepts exactly
-two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
+and registered role-aware model integrations. Ascend V1 native DBO accepts
+exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
 V2-compatible construction and forward-context seam. CUDA FFN consumes the
 two-stage control layout and replays the matching graph when requested;
 Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.

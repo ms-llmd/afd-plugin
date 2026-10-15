@@ -16,7 +16,6 @@ from vllm.forward_context import DPMetadata, get_forward_context, set_forward_co
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
-from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.workspace import reset_workspace_manager
 
 from afd_plugin.compat.profiler import (
@@ -31,9 +30,6 @@ from afd_plugin.connectors import (
     AFDControlPlane,
     AFDDPMetadata,
 )
-from afd_plugin.v1.worker.attention_model_runner import (
-    fail_if_unsupported_ubatching,
-)
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
@@ -44,6 +40,7 @@ from afd_plugin.v1.worker.ffn_metadata import (
     aggregate_ffn_token_counts,
     project_ffn_token_counts_to_dp,
 )
+from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -52,7 +49,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 
-class GPUFFNModelRunner(LoRAModelRunnerMixin):
+class GPUFFNModelRunner:
     """FFN model runner for AFD GPU execution.
 
     FFN steps are driven by the connector control plane rather than the vLLM
@@ -63,14 +60,18 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
     afd_expected_role = "ffn"
 
-    def __init__(self, vllm_config: VllmConfig, device: object) -> None:
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.load_config = vllm_config.load_config
         self.device = device
         self.dtype = self.model_config.dtype
         self.afd_config = self.parse_config(vllm_config)
-        fail_if_unsupported_ubatching(vllm_config)
+        validate_gpu_model_runner_v2_config(
+            vllm_config,
+            expected_role="ffn",
+            device_type=device.type,
+        )
         self.afd_cudagraph_policy = validate_cuda_graph_mode(
             vllm_config,
             role="ffn",
@@ -415,6 +416,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
     def list_loras(self) -> set[int]:
         return set()
+
+    def reset_lora_state(self) -> None:
+        """Keep the native weight-update hook; FFN owns no LoRA state."""
 
     @property
     def lora_config(self) -> None:

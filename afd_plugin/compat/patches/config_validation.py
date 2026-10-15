@@ -21,7 +21,9 @@ from afd_plugin.compat.vllm import (
     is_target_vllm_compatible as _is_target_vllm_compatible,
 )
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.validation import afd_worker_qualname_for_platform_default
+from afd_plugin.validation import (
+    afd_worker_qualname_for_platform_default,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

@@ -15,7 +15,6 @@ from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.attention_model_runner import fail_if_unsupported_ubatching
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
@@ -62,7 +61,7 @@ class AFDFFNWorker(Worker):
     # Patch reason: vLLM 0.30.0 selects its V2 runner from a module-level
     # symbol inside Worker.init_device and exposes no injectable runner factory.
     # Patch functionality: replace only the V2 construction seam with the
-    # existing connector-driven GPUFFNModelRunner; keep the V1 path unchanged.
+    # connector-driven GPUFFNModelRunner, the sole GPU FFN runtime.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
@@ -79,39 +78,25 @@ class AFDFFNWorker(Worker):
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
         )
-        if self.use_v2_model_runner:
-            # ### PATCH START: construct the FFN runner through the V2 seam.
-            validate_gpu_model_runner_v2_config(
-                self.vllm_config,
-                expected_role="ffn",
-                device_type=self.device_config.device_type,
-            )
-            afd_model_config = get_afd_model_config(
-                self.vllm_config.model_config,
-                device_type="cuda",
-            )
-            self.vllm_config.model_config = afd_model_config
-            self.model_config = afd_model_config
-
-            native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-            gpu_model_runner_v2.GPUModelRunner = GPUFFNModelRunner
-            try:
-                super().init_device()
-            finally:
-                gpu_model_runner_v2.GPUModelRunner = native_runner_cls
-            torch.accelerator.empty_cache()
-            return
-        # ### PATCH END: construct the FFN runner through the V2 seam.
-
-        fail_if_unsupported_ubatching(self.vllm_config)
-
-        super().init_device()
-        self.vllm_config.model_config = get_afd_model_config(
+        # ### PATCH START: construct the FFN runner through the V2 seam.
+        validate_gpu_model_runner_v2_config(
+            self.vllm_config,
+            expected_role="ffn",
+            device_type=self.device_config.device_type,
+        )
+        afd_model_config = get_afd_model_config(
             self.vllm_config.model_config,
             device_type="cuda",
         )
-        self.model_runner = GPUFFNModelRunner(self.vllm_config, self.device)
-
+        self.vllm_config.model_config = afd_model_config
+        self.model_config = afd_model_config
+        native_runner_cls = gpu_model_runner_v2.GPUModelRunner
+        gpu_model_runner_v2.GPUModelRunner = GPUFFNModelRunner
+        try:
+            super().init_device()
+        finally:
+            gpu_model_runner_v2.GPUModelRunner = native_runner_cls
+        # ### PATCH END: construct the FFN runner through the V2 seam.
         torch.accelerator.empty_cache()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import sys
 import types
 from types import SimpleNamespace
@@ -38,9 +38,15 @@ def _install_fake_vllm_config(monkeypatch):
     )
 
     class VllmConfig:
+        model_config: SimpleNamespace
         parallel_config: SimpleNamespace
         additional_config: dict
         platform_worker_cls = VLLM_GPU_WORKER_FQCN
+
+        def _get_dbo_unsupported_features(self):
+            if self.model_config.is_hybrid:
+                return ["dual batch overlap with hybrid models"]
+            return []
 
         def __post_init__(self):
             if self.parallel_config.use_ubatching:
@@ -103,10 +109,28 @@ def _install_fake_vllm_config(monkeypatch):
 
 
 def _load_patch_module():
-    module_name = "afd_plugin.compat.patches.config_validation"
-    if module_name in sys.modules:
-        return importlib.reload(sys.modules[module_name])
-    return importlib.import_module(module_name)
+    # Keep fake-vLLM globals off the cached production module and its package
+    # attribute: later runtime tests must retain their real imported bindings.
+    spec = importlib.util.find_spec("afd_plugin.compat.patches.config_validation")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("is_hybrid", [False, True])
+def test_patch_preserves_native_dbo_model_restrictions(monkeypatch, is_hybrid):
+    _, config_module = _install_fake_vllm_config(monkeypatch)
+    native_restrictions = config_module.VllmConfig._get_dbo_unsupported_features
+
+    _load_patch_module()
+
+    assert config_module.VllmConfig._get_dbo_unsupported_features is native_restrictions
+    config = config_module.VllmConfig()
+    config.additional_config = {"afd": {"role": "attention"}}
+    config.model_config = SimpleNamespace(is_hybrid=is_hybrid)
+    expected = ["dual batch overlap with hybrid models"] if is_hybrid else []
+    assert config._get_dbo_unsupported_features() == expected
 
 
 def _engine_args(*, active, role="attention", worker_cls="auto"):
@@ -264,7 +288,8 @@ def _install_fake_npu_config(monkeypatch):
 def test_config_validation_patch_relaxes_backend_for_afd_ubatching(monkeypatch):
     arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
     patch_module = _load_patch_module()
-    importlib.reload(patch_module)
+    # Re-execute the same isolated module to retain the idempotence check.
+    patch_module.__spec__.loader.exec_module(patch_module)
     args = _engine_args(active=True)
 
     cfg = arg_utils_module.EngineArgs.create_engine_config(args)
@@ -546,7 +571,8 @@ def test_config_validation_installs_ascend_patch_only_on_npu(monkeypatch):
         lambda: calls.append("npu"),
     )
     patch_module = _load_patch_module()
-    importlib.reload(patch_module)
+    # Re-execute the same isolated module to retain the idempotence check.
+    patch_module.__spec__.loader.exec_module(patch_module)
 
     cuda_args = _engine_args(active=True)
     arg_utils_module.EngineArgs.create_engine_config(cuda_args)
@@ -577,7 +603,8 @@ def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypa
         engine_patch_configs.append,
     )
     patch_module = _load_patch_module()
-    importlib.reload(patch_module)
+    # Re-execute the same isolated module to retain the idempotence check.
+    patch_module.__spec__.loader.exec_module(patch_module)
     args = _engine_args(active=True)
     args.additional_config["afd"].update(
         connector="CAMAsyncAFDConnector",

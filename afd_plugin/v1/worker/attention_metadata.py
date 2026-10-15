@@ -22,10 +22,9 @@ class AFDMetadataProviderMixin:
     """AFD metadata/control plumbing shared by the V1 and V2 runners.
 
     This mixin owns only the connector-facing metadata sidecar and DP control
-    payload. ``AFDAttentionModelRunner`` consumes it alongside the existing V1
-    Attention/graph lifecycle, while ``AFDAttentionModelRunnerV2`` consumes it
-    alongside native MRV2 execution. Native runner state and model ownership
-    remain in each vLLM base class.
+    payload. GPU ModelRunnerV2 and the Ascend runners consume it alongside
+    their native execution. Native runner state and model ownership remain
+    in each vLLM base class.
     """
 
     connector: AFDConnectorBase

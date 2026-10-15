@@ -6,15 +6,10 @@ from __future__ import annotations
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.worker import gpu_model_runner as gpu_model_runner_v1
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.attention_model_runner import (
-    AFDAttentionModelRunner,
-    fail_if_unsupported_ubatching,
-)
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
 )
@@ -25,7 +20,7 @@ from afd_plugin.validation import (
 
 
 class AFDAttentionWorker(Worker):
-    """Attention worker that injects :class:`AFDAttentionModelRunner`."""
+    """Attention worker that constructs the AFD ModelRunnerV2 extension."""
 
     afd_expected_role = "attention"
 
@@ -54,9 +49,8 @@ class AFDAttentionWorker(Worker):
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # runner local-import/construct seam; commit
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
-    # local-imports GPUModelRunnerV1 from vllm.v1.worker.gpu_model_runner and
-    # GPUModelRunnerV2 from vllm.v1.worker.gpu.model_runner before construction,
-    # so the module-attribute substitutions stay effective.
+    # local-imports GPUModelRunner from vllm.v1.worker.gpu.model_runner before
+    # construction, so the module-attribute substitution stays effective.
     # Delegation exception: the large native device/distributed setup remains
     # in super().init_device(); only this missing runner-factory seam is local.
     # Removal/upstream plan: delete this substitution when vLLM adds runner
@@ -72,18 +66,11 @@ class AFDAttentionWorker(Worker):
             caller="AFDAttentionWorker.init_device",
             expected_role="attention",
         )
-        if self.use_v2_model_runner:
-            validate_gpu_model_runner_v2_config(
-                self.vllm_config,
-                expected_role="attention",
-                device_type=self.device_config.device_type,
-            )
-            afd_runner_cls = AFDAttentionModelRunnerV2
-            native_runner_module = gpu_model_runner_v2
-        else:
-            fail_if_unsupported_ubatching(self.vllm_config)
-            afd_runner_cls = AFDAttentionModelRunner
-            native_runner_module = gpu_model_runner_v1
+        validate_gpu_model_runner_v2_config(
+            self.vllm_config,
+            expected_role="attention",
+            device_type=self.device_config.device_type,
+        )
 
         afd_model_config = get_afd_model_config(
             self.vllm_config.model_config,
@@ -92,12 +79,12 @@ class AFDAttentionWorker(Worker):
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
 
-        native_runner_cls = native_runner_module.GPUModelRunner
-        native_runner_module.GPUModelRunner = afd_runner_cls
+        native_runner_cls = gpu_model_runner_v2.GPUModelRunner
+        gpu_model_runner_v2.GPUModelRunner = AFDAttentionModelRunnerV2
         try:
             super().init_device()
         finally:
-            native_runner_module.GPUModelRunner = native_runner_cls
+            gpu_model_runner_v2.GPUModelRunner = native_runner_cls
         # ### PATCH END: select and directly construct the AFD runner.
 
         torch.accelerator.empty_cache()

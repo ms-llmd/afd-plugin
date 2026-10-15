@@ -44,9 +44,8 @@ def use_afd_metadata_provider(
     The native factory symbol is restored when the scope exits, including when
     context creation or installation raises.
 
-    Native vLLM dummy runs call the model directly, bypassing
-    ``AFDAttentionModelRunner._model_forward()``. Out-of-tree plugins cannot
-    extend the ``set_forward_context()`` signature, so during dummy runs we
+    Native vLLM creates contexts inside execution and dummy runs. Out-of-tree
+    plugins cannot extend the ``set_forward_context()`` signature, so we
     temporarily wrap ``create_forward_context()`` and mutate
     ``additional_kwargs`` immediately after vLLM creates the context. Model code
     can then do a simple metadata read, which keeps ``torch.compile`` away from

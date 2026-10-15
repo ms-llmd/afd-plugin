@@ -26,11 +26,11 @@ DEFAULT_DEVICE_IDS = ("0", "1", "2", "3")
 ATTENTION_DEVICE_COUNT = 2
 AFD_FFN_DEVICE_COUNT = 1
 BASELINE_DEVICE_COUNT = 4
+# Native MRV2 does not support DBO for Qwen3.6 hybrid GDN models.
 SCENARIOS = (
     "baseline-graph",
     "afd-eager-2a1f",
     "afd-graph-2a1f",
-    "afd-graph-dbo-2a1f",
 )
 
 
