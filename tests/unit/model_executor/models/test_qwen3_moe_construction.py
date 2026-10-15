@@ -363,6 +363,12 @@ def test_adapter_signatures_match_native_contract() -> None:
         ),
         (
             True,
+            AFDConfig(connector=DEEPEP_M2N_CONNECTOR),
+            {},
+            "compute_gate_on_attention=true",
+        ),
+        (
+            True,
             AFDConfig(),
             {"use_sequence_parallel_moe": True},
             "sequence-parallel MoE",
@@ -409,6 +415,28 @@ def test_gate_on_attention_is_accepted_with_deepep_m2n(
         _model_config(),
         AFDConfig(connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True),
     )
+
+
+def test_attention_role_selects_routing_proxy_by_connector_only(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    """Without DeepEP M2N, Attention builds the plain proxy even if the
+    gate-on-Attention flag is set.
+
+    Why: only DeepEP M2N dispatches by Attention-side routes; for any other
+    connector the flag is rejected by model validation, and the layer itself
+    must not pick the routing proxy from the flag alone.
+    """
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=0,
+        afd_config=AFDConfig(role="attention", compute_gate_on_attention=True),
+    )
+
+    assert type(layer.mlp) is adapter.RemoteFFNProxy
+    assert construction_env["gate"] == []
 
 
 def test_gate_on_attention_rejects_dense_layers(

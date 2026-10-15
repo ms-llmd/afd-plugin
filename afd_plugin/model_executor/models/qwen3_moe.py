@@ -5,9 +5,9 @@
 The wrapper keeps the native vLLM Qwen3 MoE lifecycle and injects a
 role-aware decoder layer through the native ``decoder_layer_type`` hook.
 Attention executes the native Attention, residual, and normalization path;
-FFN executes the complete native dense MLP or MoE block. With
-``compute_gate_on_attention`` (DeepEP M2N only), Attention also runs the MoE
-gate and top-k, and FFN runs only the routed experts.
+FFN executes the complete native dense MLP or MoE block. With the DeepEP M2N
+connector (which requires ``compute_gate_on_attention``), Attention also runs
+the MoE gate and top-k, and FFN runs only the routed experts.
 """
 
 from collections.abc import Iterable, Iterator
@@ -39,6 +39,11 @@ def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
         and config.num_experts > 0
         and (layer_idx + 1) % config.decoder_sparse_step == 0
     )
+
+
+def _routes_on_attention(afd_config: AFDConfig) -> bool:
+    """Whether the MoE gate and top-k run on Attention (DeepEP M2N only)."""
+    return afd_config.connector == DEEPEP_M2N_CONNECTOR
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -104,26 +109,25 @@ def _validate_supported_config(
     parallel_config = vllm_config.parallel_config
     if not current_platform.is_cuda():
         raise RuntimeError("AFD Qwen3 MoE currently supports CUDA only")
-    # DeepEP M2N routes on Attention; its FFN runs only the routed experts
-    # and keeps the native gate built but unused.
-    if (
-        afd_config.compute_gate_on_attention
-        and afd_config.connector != DEEPEP_M2N_CONNECTOR
-    ):
+    # DeepEP M2N, and only it, routes on Attention; its FFN runs only the
+    # routed experts and keeps the native gate built but unused.
+    if _routes_on_attention(afd_config) != afd_config.compute_gate_on_attention:
         raise RuntimeError(
-            "AFD Qwen3 MoE requires compute_gate_on_attention=false, except "
-            f"with {DEEPEP_M2N_CONNECTOR}",
+            f"AFD Qwen3 MoE requires compute_gate_on_attention=true with "
+            f"{DEEPEP_M2N_CONNECTOR} and compute_gate_on_attention=false with "
+            f"any other connector (got connector={afd_config.connector!r}, "
+            f"compute_gate_on_attention={afd_config.compute_gate_on_attention})",
         )
     # The routed FFN runner serves MoE layers only; a dense layer would have
     # no owner.
-    if afd_config.compute_gate_on_attention and not all(
+    if _routes_on_attention(afd_config) and not all(
         _is_moe_layer(vllm_config.model_config.hf_text_config, layer_idx)
         for layer_idx in range(
             vllm_config.model_config.hf_text_config.num_hidden_layers
         )
     ):
         raise RuntimeError(
-            "AFD Qwen3 MoE with compute_gate_on_attention requires every layer "
+            f"AFD Qwen3 MoE with {DEEPEP_M2N_CONNECTOR} requires every layer "
             "to be MoE (no mlp_only_layers, decoder_sparse_step=1)",
         )
     if parallel_config.use_sequence_parallel_moe:
@@ -195,7 +199,7 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 dual_chunk_attention_config=dual_chunk_attention_config,
             )
-            if afd_config.compute_gate_on_attention:
+            if _routes_on_attention(afd_config):
                 # Same gate as native Qwen3MoeSparseMoeBlock, same weight path.
                 self.mlp = RemoteM2NFFNProxy(
                     layer_idx=layer_idx,
@@ -391,7 +395,7 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
         role_weights = _iter_role_weights(
             weights,
             role=self.afd_role,
-            compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+            compute_gate_on_attention=_routes_on_attention(self.afd_config),
         )
         # ### PATCH END: filter the checkpoint stream by AFD execution role.
         return super().load_weights(role_weights)

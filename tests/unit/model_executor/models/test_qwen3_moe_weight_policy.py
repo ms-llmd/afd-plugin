@@ -14,7 +14,7 @@ else:
     torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
 
 ATTENTION_ROLE = frozenset(("attention",))
@@ -148,7 +148,7 @@ def test_gate_on_attention_weight_role_policy(
 
 
 @pytest.mark.parametrize(
-    ("role", "compute_gate_on_attention", "expected_names"),
+    ("role", "uses_deepep_m2n", "expected_names"),
     [
         (
             "attention",
@@ -196,7 +196,7 @@ def test_gate_on_attention_weight_role_policy(
 def test_load_weights_filters_once_and_delegates_to_native_loader(
     monkeypatch: pytest.MonkeyPatch,
     role: str,
-    compute_gate_on_attention: bool,
+    uses_deepep_m2n: bool,
     expected_names: list[str],
 ) -> None:
     names = [
@@ -223,10 +223,17 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
     )
     model = object.__new__(adapter.AFDQwen3MoeForCausalLM)
     object.__setattr__(model, "afd_role", role)
+    # The gate follows the connector: only DeepEP M2N routes on Attention.
     object.__setattr__(
         model,
         "afd_config",
-        AFDConfig(role=role, compute_gate_on_attention=compute_gate_on_attention),
+        AFDConfig(
+            role=role,
+            connector=DEEPEP_M2N_CONNECTOR,
+            compute_gate_on_attention=True,
+        )
+        if uses_deepep_m2n
+        else AFDConfig(role=role),
     )
 
     result = model.load_weights(weights)
