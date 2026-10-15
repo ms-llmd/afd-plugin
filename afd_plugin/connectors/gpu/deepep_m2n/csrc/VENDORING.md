@@ -24,7 +24,7 @@ which breaks the build.
 | File | Change | Why |
 |---|---|---|
 | `csrc/elastic/utils.hpp` | `MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM` → `AFD_DEEPEP_PER_BUFFER_COMM_STREAM` | De-brand; one comm stream per ElasticBuffer (lane). |
-| `csrc/kernels/backend/nccl.cu` | Do not assert NCCL GIN; skip the GIN device-comm requirements when GIN is unavailable and assert instead that all ranks share one NVLink (LSA) domain. | Pods without RDMA devices report no GIN and upstream asserts at init even with `EP_DISABLE_GIN=1`. Upstream PR candidate. |
+| `csrc/kernels/backend/nccl.cu` | Do not assert NCCL GIN; skip the GIN device-comm requirements when GIN is unavailable or disabled (`EP_DISABLE_GIN=1`), and assert instead that all ranks share one NVLink (LSA) domain, naming both causes. | Pods without RDMA devices report no GIN and upstream asserts at init even with `EP_DISABLE_GIN=1`. Without GIN, ranks in other NVLink domains are unreachable, so a multi-node run with `EP_DISABLE_GIN=1` must fail at init rather than later. Upstream PR candidate. |
 | `csrc/python_api.cpp`, `csrc/elastic/buffer.hpp` | `py::module_local()` on `EventHandle` and `ElasticBuffer`. | vLLM's fused-MoE import loads its own `deep_ep._C` with the same C++ types; without this, loading fails with `type "EventHandle" is already registered`. |
 
 ## `deepgemm/`

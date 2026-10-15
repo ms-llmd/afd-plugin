@@ -155,6 +155,34 @@ the port is the bottleneck.
   172 passed, 3 skipped; `test_deepep_m2n_gpu.py` 16 passed (one host, so the
   plan turns GIN off).
 
+## Follow-up: GIN must stay on across NVLink domains
+
+`EP_DISABLE_GIN=1` removes DeepEP's only path between NVLink domains (NCCL
+GIN, i.e. RDMA), so it is valid on one node only. Two gaps let a multi-node
+run with GIN off get past init:
+
+- The vendored check (`nccl.cu`) tested whether GIN was *available*, not
+  whether it was *enabled*. It now asserts
+  `gin_enabled or num_rdma_ranks == 1`, naming both causes (no RDMA NICs in
+  the pod, or `EP_DISABLE_GIN=1`); `tools/vendor/apply_deepep_patches.py`
+  carries the same patch and still reproduces the vendored tree from
+  FastAFD.
+- The connector accepted `network.gin: off` (and the `single-node` preset)
+  with ranks on several NVLink domains, and `EP_DISABLE_GIN` inside
+  `network.nccl_env`. The plan now rejects the former and the config the
+  latter.
+
+Two-node check on pokprod (`phase4b-results/gin-guard/`, 2F|2A FP8
+correctness):
+
+| Run | Setting | Result |
+| --- | --- | --- |
+| A | default plan (GIN on) | pass on both nodes |
+| B | `EP_DISABLE_GIN=1` forced on every rank (pod-local code edit) | init fails on every rank: "The ranks span more than one NVLink domain, so DeepEP needs NCCL GIN (RDMA) between them, but GIN is unavailable (no RDMA NICs in the pod?) or disabled by EP_DISABLE_GIN=1." |
+
+In run B, `ncclDevCommCreate` itself succeeded (an LSA-only device
+communicator is valid NCCL usage); the failure comes from the new check.
+
 ## Not covered
 
 - Real runs on routed RoCE, InfiniBand or NVL72 (no such cluster here). On

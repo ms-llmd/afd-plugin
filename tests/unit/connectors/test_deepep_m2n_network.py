@@ -89,6 +89,7 @@ def test_presets_expand_and_explicit_keys_override():
         ({"gin": "maybe"}, "network.gin"),
         ({"nic_policy": "explicit"}, "needs network.nics"),
         ({"nccl_env": {"PATH": "/tmp"}}, "nccl_env key"),
+        ({"nccl_env": {"EP_DISABLE_GIN": "1"}}, "use network.gin"),
         ({"bogus": 1}, "unknown network options"),
     ],
 )
@@ -182,6 +183,26 @@ def test_no_common_rail_is_an_error():
 
     with pytest.raises(RuntimeError, match="no RDMA rail"):
         plan_network(ranks, NetworkConfig())
+
+
+@pytest.mark.parametrize(
+    "config",
+    [NetworkConfig(gin="off"), NetworkConfig.from_mapping({"preset": "single-node"})],
+    ids=["gin-off", "single-node-preset"],
+)
+def test_gin_off_across_nvlink_domains_is_an_error(config):
+    # NVLink load/store cannot reach another domain; GIN is the only path.
+    with pytest.raises(RuntimeError, match="span 2 NVLink domains"):
+        plan_network(_pokprod_two_nodes(), config)
+
+
+def test_gin_off_on_one_host_is_allowed():
+    plan = plan_network(
+        [_rank(r, "n0", r, [_nic("mlx5_0", RAIL_A, 2)]) for r in range(2)],
+        NetworkConfig(gin="off"),
+    )
+
+    assert not plan.use_gin
 
 
 def test_forced_gin_on_one_domain_still_plans_nics():

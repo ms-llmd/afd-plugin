@@ -88,16 +88,19 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     // Upstream asserts GIN even when every rank shares one NVLink (LSA) domain,
     // which fails in pods without RDMA devices. Without GIN, skip the GIN
     // requirements and check below that no rank needs the scale-out path.
+    // EP_DISABLE_GIN=1 turns GIN off even when it is available (single node).
     const bool gin_available =
         (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE;
+    const bool gin_enabled =
+        num_ranks > 1 and gin_available and get_env("EP_DISABLE_GIN", 0) == 0;
     if (get_env("EP_BUFFER_DEBUG", 0))
-        printf("NCCL GIN type: railed=%d full=%d (available for this mode: %d)\n",
+        printf("NCCL GIN type: railed=%d full=%d (available for this mode: %d, enabled: %d)\n",
                static_cast<int>(props.railedGinType), static_cast<int>(props.ginType),
-               static_cast<int>(gin_available));
+               static_cast<int>(gin_available), static_cast<int>(gin_enabled));
 
     // Initialize NCCL device communicator
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    if (num_ranks > 1 and gin_available and get_env("EP_DISABLE_GIN", 0) == 0) {
+    if (gin_enabled) {
     // ### PATCH END: allow NVLink-only nodes without NCCL GIN
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;
@@ -115,8 +118,10 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0 and nvl_rank_idx == rank_idx % num_nvl_ranks);
     EP_HOST_ASSERT(rank_idx == rdma_rank_idx * num_nvl_ranks + nvl_rank_idx);
     // ### PATCH START: allow NVLink-only nodes without NCCL GIN
-    EP_HOST_ASSERT((gin_available or num_rdma_ranks == 1) and
-                   "NCCL GIN is unavailable and the ranks span more than one NVLink domain.");
+    EP_HOST_ASSERT((gin_enabled or num_rdma_ranks == 1) and
+                   "The ranks span more than one NVLink domain, so DeepEP needs NCCL GIN (RDMA) "
+                   "between them, but GIN is unavailable (no RDMA NICs in the pod?) or disabled "
+                   "by EP_DISABLE_GIN=1.");
     // ### PATCH END: allow NVLink-only nodes without NCCL GIN
 
     // Calculate scaleout/up domain size

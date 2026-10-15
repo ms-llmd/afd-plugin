@@ -1,0 +1,30 @@
+{
+ "scenario": "correctness",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": false,
+   "error": "Traceback (most recent call last):\n  File \"/work/src_nogin/tests/unit/connectors/deepep_m2n_harness.py\", line 375, in _rank_main\n    connector = build_connector(\n                ^^^^^^^^^^^^^^^^\n  File \"/work/src_nogin/tests/unit/connectors/deepep_m2n_harness.py\", line 318, in build_connector\n    connector.init_afd_connector()\n  File \"/work/src_nogin/afd_plugin/connectors/gpu/deepep_m2n/connector.py\", line 595, in init_afd_connector\n    DeepEPElasticBuffer(\n  File \"/work/src_nogin/afd_plugin/connectors/gpu/deepep_m2n/buffer.py\", line 220, in __init__\n    self._runtime = self._module.ElasticBuffer(\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Assertion exception (/work/src_nogin/afd_plugin/connectors/gpu/deepep_m2n/csrc/deepep/csrc/kernels/backend/nccl.cu:121): (gin_enabled or num_rdma_ranks == 1) and \"The ranks span more than one NVLink domain, so DeepEP needs NCCL GIN (RDMA) \" \"between them, but GIN is unavailable (no RDMA NICs in the pod?) or disabled \" \"by EP_DISABLE_GIN=1.\"\n",
+   "metrics": {}
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": false,
+   "error": "Traceback (most recent call last):\n  File \"/work/src_nogin/tests/unit/connectors/deepep_m2n_harness.py\", line 375, in _rank_main\n    connector = build_connector(\n                ^^^^^^^^^^^^^^^^\n  File \"/work/src_nogin/tests/unit/connectors/deepep_m2n_harness.py\", line 318, in build_connector\n    connector.init_afd_connector()\n  File \"/work/src_nogin/afd_plugin/connectors/gpu/deepep_m2n/connector.py\", line 595, in init_afd_connector\n    DeepEPElasticBuffer(\n  File \"/work/src_nogin/afd_plugin/connectors/gpu/deepep_m2n/buffer.py\", line 220, in __init__\n    self._runtime = self._module.ElasticBuffer(\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Assertion exception (/work/src_nogin/afd_plugin/connectors/gpu/deepep_m2n/csrc/deepep/csrc/kernels/backend/nccl.cu:121): (gin_enabled or num_rdma_ranks == 1) and \"The ranks span more than one NVLink domain, so DeepEP needs NCCL GIN (RDMA) \" \"between them, but GIN is unavailable (no RDMA NICs in the pod?) or disabled \" \"by EP_DISABLE_GIN=1.\"\n",
+   "metrics": {}
+  }
+ ],
+ "all_ok": false
+}

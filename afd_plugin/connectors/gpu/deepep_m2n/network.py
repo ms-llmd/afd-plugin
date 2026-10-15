@@ -46,6 +46,8 @@ GIN_MODES = ("auto", "on", "off")
 NIC_POLICIES = ("auto", "nccl", "shared", "explicit")
 HYBRID_MODES = ("auto", "on", "off")
 NCCL_ENV_PREFIXES = ("NCCL_", "EP_")
+# Set from the plan (``network.gin``); a copy in ``nccl_env`` would fight it.
+GIN_DISABLE_ENV = "EP_DISABLE_GIN"
 # DeepEP's default RDMA service level / traffic class.
 DEFAULT_RDMA_TRAFFIC_CLASS = 3
 
@@ -67,7 +69,8 @@ class NetworkConfig:
     Attributes:
         preset: Defaults for a fabric type (see ``PRESETS``).
         gin: ``auto`` enables NCCL GIN only when ranks span several NVLink
-            domains; ``on``/``off`` force it.
+            domains; ``on``/``off`` force it (``off`` is rejected when ranks
+            span several domains: GIN is the only path between them).
         nic_policy: ``auto`` picks ``nccl`` when rails are routed or all
             NICs share one rail, else ``shared``; ``nccl`` keeps NCCL's
             per-GPU choice; ``shared`` puts every rank on NICs of one rail
@@ -130,6 +133,10 @@ class NetworkConfig:
             if not key.startswith(NCCL_ENV_PREFIXES):
                 raise ValueError(
                     f"network.nccl_env key {key!r} must start with {NCCL_ENV_PREFIXES}"
+                )
+            if key == GIN_DISABLE_ENV:
+                raise ValueError(
+                    f"network.nccl_env cannot set {GIN_DISABLE_ENV}; use network.gin"
                 )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -382,6 +389,13 @@ def plan_network(topologies: list[RankTopology], config: NetworkConfig) -> Netwo
     topologies = sorted(topologies, key=lambda topology: topology.world_rank)
     domains = _domain_blocks(topologies)
     multi_domain = len(domains) > 1
+    if multi_domain and config.gin == "off":
+        # Without GIN, DeepEP reaches peers only by NVLink load/store, which
+        # cannot cross NVLink domains.
+        raise RuntimeError(
+            f"network.gin=off, but the ranks span {len(domains)} NVLink domains; "
+            "DeepEP needs NCCL GIN (RDMA) between domains"
+        )
     use_gin = multi_domain if config.gin == "auto" else config.gin == "on"
     hybrid = config.hybrid != "off"
     policy, rail, nic_by_rank = _choose_nics(topologies, config, use_gin)
@@ -484,6 +498,6 @@ def apply_rank_environment(
     if nic is not None:
         os.environ["NCCL_IB_HCA"] = "=" + nic
     if plan.use_gin:
-        os.environ.pop("EP_DISABLE_GIN", None)
+        os.environ.pop(GIN_DISABLE_ENV, None)
     else:
-        os.environ["EP_DISABLE_GIN"] = "1"
+        os.environ[GIN_DISABLE_ENV] = "1"
