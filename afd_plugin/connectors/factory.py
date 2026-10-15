@@ -14,6 +14,7 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.connectors.base import AFDConnectorBase, ConnectorExtraInfo
+from afd_plugin.connectors.routed_experts import AFDRoutedExpertsConnector
 from afd_plugin.distributed import resolve_role_rank
 
 if TYPE_CHECKING:
@@ -66,6 +67,33 @@ class AFDConnectorFactory:
             config,
             role_rank,
         )
+
+    @classmethod
+    def create_bootstrapped_connector(
+        cls,
+        rank: int,
+        local_rank: int,
+        vllm_config: VllmConfig,
+        afd_config: AFDConfig,
+    ) -> AFDRoutedExpertsConnector | None:
+        """Create and bootstrap a routed-experts connector ahead of vLLM.
+
+        Workers call this before vLLM's distributed init. Returns ``None`` for
+        connectors that are not ``AFDRoutedExpertsConnector``; their runner
+        creates them later, as before. The role rank is resolved from config
+        alone, so callers must run with TP = 1.
+        """
+        connector_cls = cls.get_connector_class(afd_config.connector)
+        if not issubclass(connector_cls, AFDRoutedExpertsConnector):
+            return None
+        connector = cls.create_connector(rank, local_rank, vllm_config, afd_config)
+        assert isinstance(connector, AFDRoutedExpertsConnector)
+        try:
+            connector.bootstrap()
+        except BaseException:
+            connector.close()
+            raise
+        return connector
 
     @classmethod
     def get_connector_class(cls, connector_name: str) -> type[AFDConnectorBase]:

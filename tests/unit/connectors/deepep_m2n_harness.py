@@ -37,6 +37,9 @@ HIDDEN_SIZE = 2048
 NUM_EXPERTS = 128
 TOP_K = 8
 INTERMEDIATE_SIZE = 768
+# Fake vLLM limits: capacity defaults to the larger of the two.
+FAKE_MAX_NUM_BATCHED_TOKENS = 8192
+FAKE_MAX_CUDAGRAPH_CAPTURE_SIZE = 512
 INPUT_SEED_STRIDE = 1_000_003
 WEIGHT_SEED_OFFSET = 7_777
 # Limits are about 1.3x the worst value seen on H100 (2026-10-15), so a real
@@ -376,7 +379,16 @@ def fake_vllm_config(
         num_experts_per_tok=TOP_K,
         moe_intermediate_size=INTERMEDIATE_SIZE,
     )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
     role_size = topology.ffn_size if role == "ffn" else topology.attn_size
+    # The FFN deployment the handshake requires: linear EP over the FFN ranks,
+    # with checkpoint weights in the payload's format.
+    quant_config = (
+        Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        if extra_config.get("payload_format") == "fp8_block128_fp32"
+        else None
+    )
     return SimpleNamespace(
         additional_config={
             "afd": {
@@ -386,9 +398,14 @@ def fake_vllm_config(
                 "port": port,
                 "num_attention_ranks": topology.attn_size,
                 "num_ffn_ranks": topology.ffn_size,
+                "compute_gate_on_attention": True,
                 "connector_extra_config": extra_config,
             }
         },
+        quant_config=quant_config,
+        compilation_config=SimpleNamespace(
+            max_cudagraph_capture_size=FAKE_MAX_CUDAGRAPH_CAPTURE_SIZE
+        ),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             enforce_eager=True,
@@ -400,8 +417,16 @@ def fake_vllm_config(
             data_parallel_rank=role_rank,
             prefill_context_parallel_size=1,
             tensor_parallel_size=1,
+            enable_expert_parallel=True,
+            expert_placement_strategy="linear",
+            enable_eplb=False,
+            all2all_backend="allgather_reducescatter",
+            use_ubatching=False,
+            num_ubatches=1,
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=FAKE_MAX_NUM_BATCHED_TOKENS
+        ),
     )
 
 
@@ -580,11 +605,11 @@ def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
     FP8 payloads use FP8 block-128 weights; the references are then the
     dequantized weights, so kernel checks isolate the kernels' own error.
     """
-    from afd_plugin.connectors.gpu.deepep_m2n.experts import LocalExpertWeights
     from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
         dequantize_fp8_block128,
         quantize_fp8_block128,
     )
+    from afd_plugin.connectors.routed_experts import LocalExpertWeights
 
     w13, w2 = make_expert_weights(experts)
     if payload_format == "bf16":
@@ -946,7 +971,7 @@ def capture_step(
     worst-case receive shapes on every rank. The graph holds ``num_layers``
     layers under one control payload, as a decode graph holds a whole step.
     """
-    num_stages = connector.config.num_lanes
+    num_stages = connector.num_lanes
     stages = [(bucket,) * topology.attn_size] * num_stages
     inputs: list[list[Inputs]] = []
     outs: list[list[torch.Tensor]] = []
@@ -983,7 +1008,7 @@ def capture_step(
 def replay_step(
     connector: Any, topology: Topology, captured: CapturedStep, bucket: int
 ) -> None:
-    stages = [(bucket,) * topology.attn_size] * connector.config.num_lanes
+    stages = [(bucket,) * topology.attn_size] * connector.num_lanes
     control_step(connector, stages, graph_mode=True)
     captured.graph.replay()
 
@@ -1113,7 +1138,7 @@ def benchmark_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:
     """Eager per-layer time. One lane: dispatch/experts/combine breakdown."""
-    num_stages = connector.config.num_lanes
+    num_stages = connector.num_lanes
     if connector.is_ffn:
         experts = connector.layout.expert_range(connector.role_rank)
         weights, _, _ = local_weights(experts, connector.config.payload_format)
@@ -1196,7 +1221,7 @@ def graph_benchmark_scenario(
     timings: dict[str, Any] = {}
     for tokens in args["tokens_per_attn_rank"]:
         captured = capture_step(connector, topology, tokens, weights)
-        stages = [(tokens,) * topology.attn_size] * connector.config.num_lanes
+        stages = [(tokens,) * topology.attn_size] * connector.num_lanes
         total = 0.0
         for iteration in range(BENCH_WARMUP_ITERS + args["iters"]):
             control_step(connector, stages, graph_mode=True)

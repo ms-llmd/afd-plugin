@@ -9,6 +9,7 @@ FFN executes the complete native dense MLP or MoE block.
 """
 
 from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -17,8 +18,11 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models import qwen3_moe as native
 from vllm.platforms import current_platform
 
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -81,9 +85,15 @@ def _validate_supported_config(
     parallel_config = vllm_config.parallel_config
     if not current_platform.is_cuda():
         raise RuntimeError("AFD Qwen3 MoE currently supports CUDA only")
-    if afd_config.compute_gate_on_attention:
+    # DeepEP M2N routes on Attention; its FFN runs only the routed experts
+    # and keeps the native gate built but unused.
+    if (
+        afd_config.compute_gate_on_attention
+        and afd_config.connector != DEEPEP_M2N_CONNECTOR
+    ):
         raise RuntimeError(
-            "AFD Qwen3 MoE requires compute_gate_on_attention=false",
+            "AFD Qwen3 MoE requires compute_gate_on_attention=false, except "
+            f"with {DEEPEP_M2N_CONNECTOR}",
         )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError(
@@ -217,6 +227,10 @@ class AFDQwen3MoeModel(native.Qwen3MoeModel):
             if _is_moe_layer(self.config, layer_idx)
         )
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        """FFN only: the vLLM module holding one MoE layer's local experts."""
+        return self.layers[layer_idx].mlp.experts.routed_experts
+
 
 class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     """Qwen3 MoE causal LM wrapper for AFD CUDA execution."""
@@ -315,6 +329,9 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
+
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        return self.model.get_routed_experts(layer_idx)
 
     # Patch reason: the native loader would materialize both execution stages
     # even though each AFD role constructs only one stage's decoder modules.
