@@ -1,4 +1,4 @@
-# DeepEP M2N connector: open TODOs
+# DeepEP M2N connector: open TODOs 
 
 Follow-ups from the cluster-portability review (Phase 4b). Items 1–4 of that
 review (topology discovery, the network plan, configurable tunables, fabric
