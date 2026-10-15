@@ -10,7 +10,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 
 from collections.abc import Iterable, Iterator
 from copy import copy
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    DEEPEP_M2N_CONNECTOR,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -30,6 +34,9 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 logger = init_logger(__name__)
 
@@ -50,6 +57,10 @@ def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
+_NO_ROLE: frozenset[str] = frozenset()
+# Connectors whose FFN builds no shared experts: Async CAM runs them on
+# Attention; DeepEP M2N's FFN runs routed experts only.
+_FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS = (AFD_ASYNC_CONNECTOR, DEEPEP_M2N_CONNECTOR)
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -72,8 +83,14 @@ def _checkpoint_weight_roles(
     *,
     compute_gate_on_attention: bool,
     attention_shared_experts: bool = False,
+    ffn_skips_shared_experts: bool = False,
 ) -> frozenset[str]:
-    """Classify one native checkpoint path by its AFD execution owner."""
+    """Classify one native checkpoint path by its AFD execution owner.
+
+    ``ffn_skips_shared_experts`` keeps shared-expert weights off the FFN
+    without giving them to Attention, for connectors whose FFN runs routed
+    experts only while Attention does not build shared experts yet.
+    """
     layer_path = _weight_layer_path(name)
     if layer_path is None:
         return _BOTH_ROLES
@@ -87,8 +104,11 @@ def _checkpoint_weight_roles(
     if not _is_moe_layer(config, layer_idx):
         return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
 
-    if attention_shared_experts and remainder and remainder[0] == "shared_experts":
-        return _ATTENTION_ROLE
+    if remainder and remainder[0] == "shared_experts":
+        if attention_shared_experts:
+            return _ATTENTION_ROLE
+        if ffn_skips_shared_experts:
+            return _NO_ROLE
     is_moe_gate = bool(remainder) and remainder[0] == "gate"
     if is_moe_gate and compute_gate_on_attention:
         return _BOTH_ROLES
@@ -102,6 +122,7 @@ def _iter_role_weights(
     config: _DeepseekAdapterConfig,
     compute_gate_on_attention: bool,
     attention_shared_experts: bool = False,
+    ffn_skips_shared_experts: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain this role's paths."""
     for name, loaded_weight in weights:
@@ -110,6 +131,7 @@ def _iter_role_weights(
             config,
             compute_gate_on_attention=compute_gate_on_attention,
             attention_shared_experts=attention_shared_experts,
+            ffn_skips_shared_experts=ffn_skips_shared_experts,
         ):
             yield name, loaded_weight
 
@@ -528,7 +550,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector == AFD_ASYNC_CONNECTOR:
+                if afd_config.connector in _FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS:
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
@@ -892,6 +914,15 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             and layer.uses_remote_experts
         )
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        """FFN only: the vLLM module holding one MoE layer's local experts.
+
+        Connectors that route on Attention run these experts themselves, so
+        ``routed_scaling_factor`` must be folded into the top-k weights that
+        Attention sends; the FFN never applies it.
+        """
+        return self.layers[layer_idx].mlp.experts.routed_experts
+
     def get_experts_routing_spec(
         self,
         layer_idx: int,
@@ -953,6 +984,9 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        return self.model.get_routed_experts(layer_idx)
+
     def get_experts_routing_spec(
         self,
         layer_idx: int,
@@ -968,6 +1002,8 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
                 attention_shared_experts=self.afd_config.connector
                 == AFD_ASYNC_CONNECTOR,
+                ffn_skips_shared_experts=self.afd_config.connector
+                == DEEPEP_M2N_CONNECTOR,
             )
         )
 
