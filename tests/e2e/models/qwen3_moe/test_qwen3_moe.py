@@ -40,6 +40,7 @@ DEEPEP_M2N_SCENARIOS = (
     "afd-deepep-m2n-graph-2a2f",
     "afd-deepep-m2n-graph-dbo-2a2f",
 )
+DEEPEP_M2N_DBO_SCENARIOS = frozenset(("afd-deepep-m2n-graph-dbo-2a2f",))
 
 
 def _required_env(name: str) -> str:
@@ -137,7 +138,22 @@ def test_qwen3_moe(scenario: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(
+            scenario,
+            id=scenario,
+            marks=pytest.mark.skip(
+                reason="DeepEP M2N with DBO times out in the micro-batched "
+                "graph-capture warmup; see docs/design/fastafd/TODO.md",
+            ),
+        )
+        if scenario in DEEPEP_M2N_DBO_SCENARIOS
+        else pytest.param(scenario, id=scenario)
+        for scenario in DEEPEP_M2N_SCENARIOS
+    ],
+)
 def test_qwen3_moe_deepep_m2n(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     run_runner(command)

@@ -66,7 +66,26 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
   process is untested.
 - BF16 psum-bounded fused SiLU-mul (graph mode at large buckets).
 - Attention TP > 1 (sequence-split dispatch).
-- Runner integration and a model E2E (single and multi-node). Note from
-  `test_graph_and_eager_plans_mixed_across_ranks`: results stay correct when
-  one side plans a step as graph (no host sync) and the other as eager, so
-  an FFN runner may fall back to eager for a step Attention replays.
+- Model E2E. Qwen3-30B-A3B, BF16, one node, 2 Attention + 2 FFN ranks
+  (`tests/e2e/models/qwen3_moe`, `test_qwen3_moe_deepep_m2n`) on pokprod
+  4x H100, no RDMA, 2026-10-15:
+    - `afd-deepep-m2n-eager-2a2f`: passed, GSM8K exact match 1.0 (7/7).
+    - `afd-deepep-m2n-graph-2a2f`: passed, GSM8K 1.0; every rank replays
+    FULL graphs (Attention 511 + 324, FFN 841 each).
+    - `afd-deepep-m2n-graph-dbo-2a2f`: fails, and is skipped for now. Every
+    rank times out ("DeepEP NVLink barrier timeout", then
+    `cudaErrorLaunchFailure`) in the eager warmup forward vLLM runs before
+    capturing the two-micro-batch graph. The same happens with vLLM's
+    CUDA-graph memory profiling skipped (`--kv-cache-memory-bytes`) and with
+    the DeepEP host sync disabled (`cpu_sync_min_tokens` = 1e9), so neither
+    is the cause. The barrier counters differ per role on the failing buffer
+    (Attention 390, FFN 2): under DBO the two roles drive different lanes.
+    Next: log the lane/stage sequence each role issues during that warmup,
+    and compare FFN `_ffn_forward` (layer-major, stage-minor, one thread)
+    with vLLM's two micro-batch threads on Attention.
+    - Still open: multi-node E2E; DeepSeek (gate-on-Attention on CUDA and
+    Attention-side shared experts).
+  Note from `test_graph_and_eager_plans_mixed_across_ranks`: results stay
+  correct when one side plans a step as graph (no host sync) and the other
+  as eager, so an FFN runner may fall back to eager for a step Attention
+  replays.
