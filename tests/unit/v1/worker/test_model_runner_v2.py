@@ -2452,26 +2452,48 @@ def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
 
 
+def _deepep_m2n_v2_config(**kwargs):
+    config = _v2_config(**kwargs)
+    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
+    config.additional_config["afd"]["compute_gate_on_attention"] = True
+    return config
+
+
 def test_v2_validator_accepts_deepep_m2n_with_tp1_only():
     """DeepEP M2N is a supported GPU connector, but only with TP = 1.
 
     Why: its bootstrap runs before vLLM's process groups exist, when the
     role rank can only come from the DP rank.
     """
-    config = _v2_config()
-    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
     validate_gpu_model_runner_v2_config(
-        config,
+        _deepep_m2n_v2_config(),
         expected_role="attention",
         device_type="cuda",
     )
 
-    config = _v2_config(tensor_parallel_size=2, num_attention_ranks=2)
-    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
+    config = _deepep_m2n_v2_config(tensor_parallel_size=2, num_attention_ranks=2)
     with pytest.raises(RuntimeError, match="requires tensor_parallel_size=1"):
         validate_gpu_model_runner_v2_config(
             config,
             expected_role="attention",
+            device_type="cuda",
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_v2_validator_requires_gate_on_attention_for_deepep_m2n(role):
+    """DeepEP M2N without compute_gate_on_attention fails at validation.
+
+    Why: the connector routes on Attention, so a run without the gate there
+    cannot dispatch; failing here names the setting instead of failing later
+    in the connector handshake.
+    """
+    config = _deepep_m2n_v2_config(role=role)
+    config.additional_config["afd"]["compute_gate_on_attention"] = False
+    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            config,
+            expected_role=role,
             device_type="cuda",
         )
 

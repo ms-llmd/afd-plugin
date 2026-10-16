@@ -141,7 +141,7 @@ def test_gate_on_attention_weight_role_policy(
     assert (
         adapter._checkpoint_weight_roles(
             checkpoint_name,
-            compute_gate_on_attention=True,
+            routes_on_attention=True,
         )
         == roles
     )

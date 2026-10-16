@@ -19,6 +19,8 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import (
@@ -137,14 +139,40 @@ def _iter_role_weights(
 
 
 class RemoteFFNProxy(nn.Module):
-    """Parameter-free FFN stage executed through the AFD connector."""
+    """FFN stage executed through the AFD connector.
+
+    By default the proxy is parameter-free: it sends the hidden states and the
+    FFN role runs the complete MLP or MoE block. A model whose connector routes
+    on Attention (an M2N routed-experts connector such as DeepEP M2N) sets
+    ``gate``, ``top_k`` and ``renormalize`` after construction, from its model
+    config. The proxy then computes the gate and vLLM's default fused top-k
+    (``FusedTopKRouter``; EPLB is not supported) and sends ``topk_ids`` and
+    ``topk_weights``; combine returns the top-k weighted sum, which replaces
+    the native MoE block's output.
+    """
 
     def __init__(self, *, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.gate: ReplicatedLinear | None = None
+        self.top_k = 0
+        self.renormalize = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._send_and_receive(hidden_states)
+        if self.gate is None:
+            return self._send_and_receive(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        return self._send_and_receive(
+            hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     def _send_and_receive(
         self,

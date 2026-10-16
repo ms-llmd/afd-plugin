@@ -22,7 +22,6 @@ from vllm.platforms import current_platform
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
-from afd_plugin.model_executor.models.m2n_proxy import RemoteM2NFFNProxy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -42,7 +41,12 @@ def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
 
 
 def _routes_on_attention(afd_config: AFDConfig) -> bool:
-    """Whether the MoE gate and top-k run on Attention (DeepEP M2N only)."""
+    """Whether the MoE gate and top-k run on Attention (DeepEP M2N only).
+
+    Selected by connector name, while the FFN worker selects its routed runner
+    by the ``AFDRoutedExpertsConnector`` interface. A second routed-experts
+    connector must be added here too.
+    """
     return afd_config.connector == DEEPEP_M2N_CONNECTOR
 
 
@@ -63,11 +67,11 @@ def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
 def _checkpoint_weight_roles(
     name: str,
     *,
-    compute_gate_on_attention: bool = False,
+    routes_on_attention: bool = False,
 ) -> frozenset[str]:
     """Classify one native checkpoint path by its AFD execution owner.
 
-    With ``compute_gate_on_attention`` the MoE gate goes to both roles:
+    With ``routes_on_attention`` the MoE gate goes to both roles:
     Attention routes with it, and FFN keeps the native gate parameter that
     vLLM's strict loader requires but never runs it.
     """
@@ -78,7 +82,7 @@ def _checkpoint_weight_roles(
     _layer_idx, stage, remainder = layer_path
     if stage == "mlp":
         is_moe_gate = bool(remainder) and remainder[0] == "gate"
-        if is_moe_gate and compute_gate_on_attention:
+        if is_moe_gate and routes_on_attention:
             return _BOTH_ROLES
         return _FFN_ROLE
     if stage in {"self_attn", "input_layernorm", "post_attention_layernorm"}:
@@ -90,13 +94,13 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
-    compute_gate_on_attention: bool = False,
+    routes_on_attention: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain this role's paths."""
     for name, loaded_weight in weights:
         if role in _checkpoint_weight_roles(
             name,
-            compute_gate_on_attention=compute_gate_on_attention,
+            routes_on_attention=routes_on_attention,
         ):
             yield name, loaded_weight
 
@@ -110,26 +114,34 @@ def _validate_supported_config(
     if not current_platform.is_cuda():
         raise RuntimeError("AFD Qwen3 MoE currently supports CUDA only")
     # DeepEP M2N, and only it, routes on Attention; its FFN runs only the
-    # routed experts and keeps the native gate built but unused.
-    if _routes_on_attention(afd_config) != afd_config.compute_gate_on_attention:
+    # routed experts and keeps the native gate built but unused. The connector
+    # side (DeepEP M2N requires compute_gate_on_attention=true) is checked in
+    # validate_gpu_model_runner_v2_config.
+    if afd_config.compute_gate_on_attention and not _routes_on_attention(afd_config):
         raise RuntimeError(
-            f"AFD Qwen3 MoE requires compute_gate_on_attention=true with "
-            f"{DEEPEP_M2N_CONNECTOR} and compute_gate_on_attention=false with "
-            f"any other connector (got connector={afd_config.connector!r}, "
-            f"compute_gate_on_attention={afd_config.compute_gate_on_attention})",
+            "AFD Qwen3 MoE requires compute_gate_on_attention=false, except "
+            f"with {DEEPEP_M2N_CONNECTOR}",
         )
-    # The routed FFN runner serves MoE layers only; a dense layer would have
-    # no owner.
-    if _routes_on_attention(afd_config) and not all(
-        _is_moe_layer(vllm_config.model_config.hf_text_config, layer_idx)
-        for layer_idx in range(
-            vllm_config.model_config.hf_text_config.num_hidden_layers
-        )
-    ):
-        raise RuntimeError(
-            f"AFD Qwen3 MoE with {DEEPEP_M2N_CONNECTOR} requires every layer "
-            "to be MoE (no mlp_only_layers, decoder_sparse_step=1)",
-        )
+    if _routes_on_attention(afd_config):
+        text_config = vllm_config.model_config.hf_text_config
+        # The routed FFN runner serves MoE layers only; a dense layer would
+        # have no owner.
+        if not all(
+            _is_moe_layer(text_config, layer_idx)
+            for layer_idx in range(text_config.num_hidden_layers)
+        ):
+            raise RuntimeError(
+                f"AFD Qwen3 MoE with {DEEPEP_M2N_CONNECTOR} requires every "
+                "layer to be MoE (no mlp_only_layers, decoder_sparse_step=1)",
+            )
+        # Neither the Attention proxy nor the routed FFN runner computes a
+        # shared expert, so its output would be dropped silently. The field is
+        # optional on Qwen3 configs; native vLLM reads it the same way.
+        if getattr(text_config, "shared_expert_intermediate_size", 0) > 0:
+            raise RuntimeError(
+                f"AFD Qwen3 MoE with {DEEPEP_M2N_CONNECTOR} does not support "
+                "shared experts (shared_expert_intermediate_size > 0)",
+            )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError(
             "AFD Qwen3 MoE does not support sequence-parallel MoE",
@@ -199,22 +211,18 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 dual_chunk_attention_config=dual_chunk_attention_config,
             )
+            self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             if _routes_on_attention(afd_config):
                 # Same gate as native Qwen3MoeSparseMoeBlock, same weight path.
-                self.mlp = RemoteM2NFFNProxy(
-                    layer_idx=layer_idx,
-                    gate=native.ReplicatedLinear(
-                        config.hidden_size,
-                        config.num_experts,
-                        bias=False,
-                        quant_config=quant_config,
-                        prefix=f"{prefix}.mlp.gate",
-                    ),
-                    top_k=config.num_experts_per_tok,
-                    renormalize=config.norm_topk_prob,
+                self.mlp.gate = native.ReplicatedLinear(
+                    config.hidden_size,
+                    config.num_experts,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp.gate",
                 )
-            else:
-                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
+                self.mlp.top_k = int(config.num_experts_per_tok)
+                self.mlp.renormalize = bool(config.norm_topk_prob)
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -395,7 +403,7 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
         role_weights = _iter_role_weights(
             weights,
             role=self.afd_role,
-            compute_gate_on_attention=_routes_on_attention(self.afd_config),
+            routes_on_attention=_routes_on_attention(self.afd_config),
         )
         # ### PATCH END: filter the checkpoint stream by AFD execution role.
         return super().load_weights(role_weights)

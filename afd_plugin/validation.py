@@ -76,12 +76,17 @@ def validate_gpu_model_runner_v2_config(
     # DeepEP M2N bootstraps before vLLM's distributed init, when the role
     # rank can only come from the DP rank. Its deployment checks (expert
     # placement, all2all backend, weight format) run in the connector
-    # handshake so that every rank fails together.
-    if (
-        afd_config.connector == DEEPEP_M2N_CONNECTOR
-        and parallel.tensor_parallel_size != 1
-    ):
-        raise RuntimeError(f"{DEEPEP_M2N_CONNECTOR} requires tensor_parallel_size=1")
+    # handshake so that every rank fails together. It routes on Attention, so
+    # it requires the gate there.
+    if afd_config.connector == DEEPEP_M2N_CONNECTOR:
+        if parallel.tensor_parallel_size != 1:
+            raise RuntimeError(
+                f"{DEEPEP_M2N_CONNECTOR} requires tensor_parallel_size=1"
+            )
+        if not afd_config.compute_gate_on_attention:
+            raise RuntimeError(
+                f"{DEEPEP_M2N_CONNECTOR} requires compute_gate_on_attention=true"
+            )
     if (
         parallel.pipeline_parallel_size,
         parallel.prefill_context_parallel_size,

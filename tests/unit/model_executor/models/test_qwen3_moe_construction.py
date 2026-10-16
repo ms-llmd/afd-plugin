@@ -170,7 +170,7 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
     monkeypatch: pytest.MonkeyPatch,
     construction_env,
 ) -> None:
-    """With gate-on-Attention, Attention builds the routing proxy and the gate.
+    """With DeepEP M2N, Attention sets the proxy's gate and top-k settings.
 
     Why: DeepEP M2N dispatches by top-k routes computed on Attention; the gate
     keeps the native ``mlp.gate`` path so the checkpoint loads unchanged.
@@ -188,11 +188,11 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
 
     assert construction_env["gate"] == ["model.layers.5.mlp.gate"]
     assert construction_env["moe"] == []
-    assert isinstance(layer.mlp, adapter.RemoteM2NFFNProxy)
+    assert type(layer.mlp) is adapter.RemoteFFNProxy
+    assert layer.mlp.gate is not None
     assert layer.mlp.layer_idx == 5
     assert layer.mlp.top_k == 2
     assert layer.mlp.renormalize is True
-    assert layer.mlp.scoring_func == "softmax"
     assert set(dict(layer.named_parameters())) == {
         "self_attn.weight",
         "mlp.gate.weight",
@@ -363,12 +363,6 @@ def test_adapter_signatures_match_native_contract() -> None:
         ),
         (
             True,
-            AFDConfig(connector=DEEPEP_M2N_CONNECTOR),
-            {},
-            "compute_gate_on_attention=true",
-        ),
-        (
-            True,
             AFDConfig(),
             {"use_sequence_parallel_moe": True},
             "sequence-parallel MoE",
@@ -436,6 +430,7 @@ def test_attention_role_selects_routing_proxy_by_connector_only(
     )
 
     assert type(layer.mlp) is adapter.RemoteFFNProxy
+    assert layer.mlp.gate is None
     assert construction_env["gate"] == []
 
 
@@ -452,6 +447,28 @@ def test_gate_on_attention_rejects_dense_layers(
     with pytest.raises(RuntimeError, match="every layer to be MoE"):
         adapter._validate_supported_config(
             _model_config(layer_count=4, mlp_only_layers=[3]),
+            AFDConfig(
+                connector=DEEPEP_M2N_CONNECTOR,
+                compute_gate_on_attention=True,
+            ),
+        )
+
+
+def test_deepep_m2n_rejects_shared_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeepEP M2N fails closed on a Qwen3 checkpoint with shared experts.
+
+    Why: neither the Attention proxy nor the routed FFN runner computes a
+    shared expert, so its output would be dropped without an error.
+    """
+    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
+    vllm_config = _model_config()
+    vllm_config.model_config.hf_text_config.shared_expert_intermediate_size = 64
+
+    with pytest.raises(RuntimeError, match="does not support shared experts"):
+        adapter._validate_supported_config(
+            vllm_config,
             AFDConfig(
                 connector=DEEPEP_M2N_CONNECTOR,
                 compute_gate_on_attention=True,
