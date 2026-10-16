@@ -1,0 +1,75 @@
+{
+ "scenario": "correctness",
+ "topology": {
+  "ffn_size": 4,
+  "attn_size": 4
+ },
+ "num_nodes": 2,
+ "node_rank": 1,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 4,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "combine_rel_err": 0.06619171124707547,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "world_rank": 5,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "combine_rel_err": 0.06534948836293641,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "world_rank": 6,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "combine_rel_err": 0.06705066187457256,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "world_rank": 7,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "combine_rel_err": 0.06498988098672986,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     4
+    ]
+   }
+  }
+ ],
+ "all_ok": true
+}

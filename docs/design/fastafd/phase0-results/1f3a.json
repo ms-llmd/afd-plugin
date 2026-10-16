@@ -1,0 +1,1312 @@
+{
+ "layout": {
+  "ffn_size": 1,
+  "attn_size": 3,
+  "real_num_experts": 128
+ },
+ "args": {
+  "num_ffn": 1,
+  "hidden": 2048,
+  "experts": 128,
+  "topk": 8,
+  "inter": 768,
+  "capacity": 256,
+  "repeat": 2,
+  "seed": 1234,
+  "ffn_impl": "vllm",
+  "lanes": 2,
+  "bench_tokens": 128,
+  "bench_iters": 50,
+  "no_hybrid": false,
+  "out": "/work/results/1f3a.json"
+ },
+ "env": [
+  {
+   "host": "deepep-m2n-spike",
+   "rank": "0",
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "capability": "9.0",
+   "torch": "2.13.0+cu130",
+   "torch_cuda": "13.0",
+   "torch_nccl": "2.29.7",
+   "nccl_wheel": "nvidia-nccl-cu13=2.30.7",
+   "vllm": "0.30.0",
+   "nvcc": "/usr/local/cuda/bin/nvcc :: Build cuda_13.0.r13.0/compiler.36424714_0",
+   "is_sm90_compiled": "True",
+   "ext_load_s": "0.3",
+   "libnccl_mapped": "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2",
+   "topk_idx_t": "torch.int64",
+   "buffer_init_s": "0.3",
+   "buffer_bytes": "4342272",
+   "domain": "scaleout=1 scaleup=4 rdma=1 nvlink=4"
+  },
+  {
+   "host": "deepep-m2n-spike",
+   "rank": "1",
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "capability": "9.0",
+   "torch": "2.13.0+cu130",
+   "torch_cuda": "13.0",
+   "torch_nccl": "2.29.7",
+   "nccl_wheel": "nvidia-nccl-cu13=2.30.7",
+   "vllm": "0.30.0",
+   "nvcc": "/usr/local/cuda/bin/nvcc :: Build cuda_13.0.r13.0/compiler.36424714_0",
+   "ext_load_s": "0.3",
+   "libnccl_mapped": "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2",
+   "topk_idx_t": "torch.int64",
+   "buffer_init_s": "0.3",
+   "buffer_bytes": "4342272",
+   "domain": "scaleout=1 scaleup=4 rdma=1 nvlink=4"
+  },
+  {
+   "host": "deepep-m2n-spike",
+   "rank": "2",
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "capability": "9.0",
+   "torch": "2.13.0+cu130",
+   "torch_cuda": "13.0",
+   "torch_nccl": "2.29.7",
+   "nccl_wheel": "nvidia-nccl-cu13=2.30.7",
+   "vllm": "0.30.0",
+   "nvcc": "/usr/local/cuda/bin/nvcc :: Build cuda_13.0.r13.0/compiler.36424714_0",
+   "ext_load_s": "0.3",
+   "libnccl_mapped": "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2",
+   "topk_idx_t": "torch.int64",
+   "buffer_init_s": "0.3",
+   "buffer_bytes": "4342272",
+   "domain": "scaleout=1 scaleup=4 rdma=1 nvlink=4"
+  },
+  {
+   "host": "deepep-m2n-spike",
+   "rank": "3",
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "capability": "9.0",
+   "torch": "2.13.0+cu130",
+   "torch_cuda": "13.0",
+   "torch_nccl": "2.29.7",
+   "nccl_wheel": "nvidia-nccl-cu13=2.30.7",
+   "vllm": "0.30.0",
+   "nvcc": "/usr/local/cuda/bin/nvcc :: Build cuda_13.0.r13.0/compiler.36424714_0",
+   "ext_load_s": "0.3",
+   "libnccl_mapped": "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2",
+   "topk_idx_t": "torch.int64",
+   "buffer_init_s": "0.3",
+   "buffer_bytes": "4342272",
+   "domain": "scaleout=1 scaleup=4 rdma=1 nvlink=4"
+  }
+ ],
+ "results": [
+  [
+   {
+    "name": "even64_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 1536,
+     "recv_alloc_rows": 1536,
+     "dispatch_x_rel_err": 4.5544682552459095e-10,
+     "dispatch_w_rel_err": 6.82873413786728e-08,
+     "option_a_rel_err": 0.00392503968285857,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 2048,
+     "recv_alloc_rows": 2048,
+     "dispatch_x_rel_err": 1.0426624623061169e-09,
+     "dispatch_w_rel_err": 8.982152551541226e-08,
+     "option_a_rel_err": 0.003906794941884385,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 24,
+     "recv_alloc_rows": 24,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "option_a_rel_err": 0.003957849267943458,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 0,
+     "recv_alloc_rows": 0,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 528,
+     "recv_alloc_rows": 528,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 5.54259785677493e-08,
+     "option_a_rel_err": 0.003965568326533022,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 1536,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 2.5687937464668216e-10,
+     "dispatch_w_rel_err": 6.863863585185965e-08,
+     "option_a_rel_err": 0.003940398832834748,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 2048,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 1.0422656564891312e-09,
+     "dispatch_w_rel_err": 9.788953312537992e-08,
+     "option_a_rel_err": 0.0039283779721914725,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 24,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "option_a_rel_err": 0.004001782155688197,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 0,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 528,
+     "recv_alloc_rows": 864,
+     "dispatch_x_rel_err": 4.289772283944414e-10,
+     "dispatch_w_rel_err": 5.2060582601531894e-08,
+     "option_a_rel_err": 0.003923664700793822,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 1536,
+     "recv_alloc_rows": 1536,
+     "dispatch_x_rel_err": 5.418287322899997e-10,
+     "dispatch_w_rel_err": 6.66215435295021e-08,
+     "option_a_rel_err": 0.00392503968285857,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 2048,
+     "recv_alloc_rows": 2048,
+     "dispatch_x_rel_err": 9.875198738760997e-10,
+     "dispatch_w_rel_err": 8.429835148462668e-08,
+     "option_a_rel_err": 0.003906794941884385,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 24,
+     "recv_alloc_rows": 24,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "option_a_rel_err": 0.003957849267943458,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 0,
+     "recv_alloc_rows": 0,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 528,
+     "recv_alloc_rows": 528,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 4.965597094968117e-08,
+     "option_a_rel_err": 0.003965568669158038,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 1536,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 2.801816943893463e-10,
+     "dispatch_w_rel_err": 6.539006709619994e-08,
+     "option_a_rel_err": 0.003940398832834748,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 2048,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 1.1173088006021943e-09,
+     "dispatch_w_rel_err": 9.28835328324941e-08,
+     "option_a_rel_err": 0.003928378330901983,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 24,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "option_a_rel_err": 0.004001782155688197,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 0,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 0.0,
+     "dispatch_w_rel_err": 0.0,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 528,
+     "recv_alloc_rows": 864,
+     "dispatch_x_rel_err": 4.289772283944414e-10,
+     "dispatch_w_rel_err": 4.8853718187927525e-08,
+     "option_a_rel_err": 0.003923664700793822,
+     "ffn_combined_shape": "(0, 2048)"
+    },
+    "error": ""
+   },
+   {
+    "name": "bucket_overflow_raises",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "message": "DeepEP dispatch bucket exceeds allocated runtime buffer: bucket=258 allocated=257"
+    },
+    "error": ""
+   },
+   {
+    "name": "two_lanes_interleaved",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "recv_rows": 1152,
+     "recv_alloc_rows": 8192,
+     "dispatch_x_rel_err": 4.5976834310003916e-10,
+     "dispatch_w_rel_err": 6.841706634387906e-08,
+     "option_a_rel_err": 0.003911352477412919
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_nosync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 68.60021967440844
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_sync",
+    "rank": 0,
+    "role": "ffn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 81.64791855961084
+    },
+    "error": ""
+   }
+  ],
+  [
+   {
+    "name": "even64_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 64,
+     "combine_rel_err": 0.0042644223460862225,
+     "combine_max_abs": 0.006021618843078613
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 256,
+     "combine_rel_err": 0.004248880642515051,
+     "combine_max_abs": 0.006932377815246582
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 1,
+     "combine_rel_err": 0.004296914089638309,
+     "combine_max_abs": 0.004792451858520508
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 17,
+     "combine_rel_err": 0.004213090173603698,
+     "combine_max_abs": 0.004998624324798584
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 64,
+     "combine_rel_err": 0.004274951635919027,
+     "combine_max_abs": 0.0070220232009887695
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 256,
+     "combine_rel_err": 0.004263458587420591,
+     "combine_max_abs": 0.007571578025817871
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 1,
+     "combine_rel_err": 0.004741800024486405,
+     "combine_max_abs": 0.0033655762672424316
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 864,
+     "tokens": 17,
+     "combine_rel_err": 0.004266053352368046,
+     "combine_max_abs": 0.004530787467956543
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 64,
+     "combine_rel_err": 0.0042644223460862225,
+     "combine_max_abs": 0.006021618843078613
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 256,
+     "combine_rel_err": 0.004248880642515051,
+     "combine_max_abs": 0.006932377815246582
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 1,
+     "combine_rel_err": 0.004296914089638309,
+     "combine_max_abs": 0.004792451858520508
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 17,
+     "combine_rel_err": 0.004213090173603698,
+     "combine_max_abs": 0.004998624324798584
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 64,
+     "combine_rel_err": 0.004274951635919027,
+     "combine_max_abs": 0.0070220232009887695
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 256,
+     "combine_rel_err": 0.004263458587420591,
+     "combine_max_abs": 0.007571578025817871
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 1,
+     "combine_rel_err": 0.004741800024486405,
+     "combine_max_abs": 0.0033655762672424316
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 864,
+     "tokens": 17,
+     "combine_rel_err": 0.004266053352368046,
+     "combine_max_abs": 0.004530787467956543
+    },
+    "error": ""
+   },
+   {
+    "name": "bucket_overflow_raises",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "message": "DeepEP dispatch bucket exceeds allocated runtime buffer: bucket=258 allocated=257"
+    },
+    "error": ""
+   },
+   {
+    "name": "two_lanes_interleaved",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "lane0_combine_rel_err": 0.004267894660251716,
+     "lane1_combine_rel_err": 0.004244157631240695
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_nosync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 68.71402030810714
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_sync",
+    "rank": 1,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 81.65623992681503
+    },
+    "error": ""
+   }
+  ],
+  [
+   {
+    "name": "even64_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 64,
+     "combine_rel_err": 0.004271634994069221,
+     "combine_max_abs": 0.005912303924560547
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 1,
+     "combine_rel_err": 0.003976501469543316,
+     "combine_max_abs": 0.003305494785308838
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 22,
+     "combine_rel_err": 0.004421281148724034,
+     "combine_max_abs": 0.012186169624328613
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 64,
+     "combine_rel_err": 0.004309165056216585,
+     "combine_max_abs": 0.006742358207702637
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 1,
+     "combine_rel_err": 0.004251342710768437,
+     "combine_max_abs": 0.003338456153869629
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 864,
+     "tokens": 22,
+     "combine_rel_err": 0.004270598769514894,
+     "combine_max_abs": 0.005551278591156006
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 64,
+     "combine_rel_err": 0.004271634994069221,
+     "combine_max_abs": 0.005912303924560547
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 1,
+     "combine_rel_err": 0.003976501469543316,
+     "combine_max_abs": 0.003305494785308838
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 22,
+     "combine_rel_err": 0.004421281148724034,
+     "combine_max_abs": 0.012186169624328613
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 64,
+     "combine_rel_err": 0.004309165056216585,
+     "combine_max_abs": 0.006742358207702637
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 1,
+     "combine_rel_err": 0.004251342710768437,
+     "combine_max_abs": 0.003338456153869629
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 864,
+     "tokens": 22,
+     "combine_rel_err": 0.004270598769514894,
+     "combine_max_abs": 0.005551278591156006
+    },
+    "error": ""
+   },
+   {
+    "name": "bucket_overflow_raises",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "message": "DeepEP dispatch bucket exceeds allocated runtime buffer: bucket=258 allocated=257"
+    },
+    "error": ""
+   },
+   {
+    "name": "two_lanes_interleaved",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "lane0_combine_rel_err": 0.0041959860243187515,
+     "lane1_combine_rel_err": 0.004280320189742811
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_nosync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 68.60093912109733
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_sync",
+    "rank": 2,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 81.60014171153307
+    },
+    "error": ""
+   }
+  ],
+  [
+   {
+    "name": "even64_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 64,
+     "combine_rel_err": 0.0042478022629219596,
+     "combine_max_abs": 0.006191253662109375
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 1,
+     "combine_rel_err": 0.004419376658044685,
+     "combine_max_abs": 0.0041231513023376465
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 27,
+     "combine_rel_err": 0.004270248924576038,
+     "combine_max_abs": 0.006086885929107666
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 64,
+     "combine_rel_err": 0.004229530231065587,
+     "combine_max_abs": 0.005219817161560059
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 1,
+     "combine_rel_err": 0.00416597810654485,
+     "combine_max_abs": 0.0030876994132995605
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 864,
+     "tokens": 27,
+     "combine_rel_err": 0.004246116344624311,
+     "combine_max_abs": 0.004317522048950195
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 64,
+     "combine_rel_err": 0.0042478022629219596,
+     "combine_max_abs": 0.006191253662109375
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 1,
+     "combine_rel_err": 0.004419376658044685,
+     "combine_max_abs": 0.0041231513023376465
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 0,
+     "tokens": 27,
+     "combine_rel_err": 0.004270248924576038,
+     "combine_max_abs": 0.006086885929107666
+    },
+    "error": ""
+   },
+   {
+    "name": "even64_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 64,
+     "combine_rel_err": 0.004229530231065587,
+     "combine_max_abs": 0.005219817161560059
+    },
+    "error": ""
+   },
+   {
+    "name": "uneven_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "decode1_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 1,
+     "combine_rel_err": 0.00416597810654485,
+     "combine_max_abs": 0.0030876994132995605
+    },
+    "error": ""
+   },
+   {
+    "name": "empty_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 8192,
+     "tokens": 0
+    },
+    "error": ""
+   },
+   {
+    "name": "small_bucket_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "attn_recv_alloc_rows": 864,
+     "tokens": 27,
+     "combine_rel_err": 0.004246116344624311,
+     "combine_max_abs": 0.004317522048950195
+    },
+    "error": ""
+   },
+   {
+    "name": "bucket_overflow_raises",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "message": "DeepEP dispatch bucket exceeds allocated runtime buffer: bucket=258 allocated=257"
+    },
+    "error": ""
+   },
+   {
+    "name": "two_lanes_interleaved",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "lane0_combine_rel_err": 0.00434784630403808,
+     "lane1_combine_rel_err": 0.004227329987623066
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_nosync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 68.71794117614627
+    },
+    "error": ""
+   },
+   {
+    "name": "bench_128tok_sync",
+    "rank": 3,
+    "role": "attn",
+    "ok": true,
+    "metrics": {
+     "us_per_round_trip": 81.58315904438496
+    },
+    "error": ""
+   }
+  ]
+ ],
+ "all_ok": true
+}

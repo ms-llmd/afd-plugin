@@ -1,0 +1,124 @@
+{
+ "scenario": "graph_benchmark",
+ "topology": {
+  "ffn_size": 4,
+  "attn_size": 4
+ },
+ "num_nodes": 2,
+ "node_rank": 1,
+ "extra_config": {
+  "capacity_tokens_per_rank": 8192,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32",
+  "num_lanes": 2
+ },
+ "ranks": [
+  {
+   "world_rank": 4,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 502.2611818276346
+    },
+    "8": {
+     "total_us": 548.1476080603898
+    },
+    "32": {
+     "total_us": 620.8570208400488
+    },
+    "128": {
+     "total_us": 1031.6621977835894
+    },
+    "512": {
+     "total_us": 2832.820196636021
+    },
+    "2048": {
+     "total_us": 10326.771601103246
+    }
+   }
+  },
+  {
+   "world_rank": 5,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 490.61567988246674
+    },
+    "8": {
+     "total_us": 575.6366765126586
+    },
+    "32": {
+     "total_us": 665.432505775243
+    },
+    "128": {
+     "total_us": 1105.1572510041296
+    },
+    "512": {
+     "total_us": 2860.480220988393
+    },
+    "2048": {
+     "total_us": 10488.090384751558
+    }
+   }
+  },
+  {
+   "world_rank": 6,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 500.05974480882287
+    },
+    "8": {
+     "total_us": 553.3639807254076
+    },
+    "32": {
+     "total_us": 616.0576711408794
+    },
+    "128": {
+     "total_us": 1043.9942707307637
+    },
+    "512": {
+     "total_us": 2838.8997656293213
+    },
+    "2048": {
+     "total_us": 10359.8527261056
+    }
+   }
+  },
+  {
+   "world_rank": 7,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 551.3677722774446
+    },
+    "8": {
+     "total_us": 621.0727733559906
+    },
+    "32": {
+     "total_us": 713.7442589737475
+    },
+    "128": {
+     "total_us": 1163.079112302512
+    },
+    "512": {
+     "total_us": 2934.0240405872464
+    },
+    "2048": {
+     "total_us": 10618.483286816627
+    }
+   }
+  }
+ ],
+ "all_ok": true
+}

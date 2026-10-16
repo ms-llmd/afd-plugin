@@ -1,0 +1,54 @@
+{
+ "scenario": "lanes",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32",
+  "num_lanes": 2
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.535442011725506e-08,
+    "dispatch_weights_rel_err": 8.459484322251637e-08,
+    "experts_rel_err": 0.027448008545138187,
+    "experts_vs_fused_rel_err": 0.028204063887814386,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ]
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "dispatch_rows_rel_err": 9.454606565758021e-08,
+    "dispatch_weights_rel_err": 8.123593900392669e-08,
+    "experts_rel_err": 0.027442289583520886,
+    "experts_vs_fused_rel_err": 0.02804026495850071,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ]
+   }
+  }
+ ],
+ "all_ok": true
+}

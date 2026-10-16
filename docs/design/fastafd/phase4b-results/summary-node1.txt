@@ -1,0 +1,7 @@
+p4b-2f2a-correct-fp8-auto rc=0 pass=2 fail=0 
+p4b-2f2a-graph-fp8-auto rc=0 pass=2 fail=0 
+p4b-4f4a-correct-bf16-auto rc=0 pass=4 fail=0 
+p4b-4f4a-lanes-fp8-preset rc=0 pass=4 fail=0 
+p4b-2f2a-correct-fp8-gloo rc=0 pass=2 fail=0 
+p4b-2f2a-gbench-fp8-auto rc=0 pass=2 fail=0 
+done

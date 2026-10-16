@@ -1,2 +1,3 @@
 recursive-include csrc *
 recursive-include afd_plugin/_cann_ops_custom *
+recursive-include afd_plugin/connectors/gpu/deepep_m2n/csrc *
