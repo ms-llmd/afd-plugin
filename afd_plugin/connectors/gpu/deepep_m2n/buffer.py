@@ -118,8 +118,10 @@ def _acquire_nccl_comm(module: ModuleType, group: dist.ProcessGroup) -> _NCCLCom
     if (handle := _NCCL_COMMS.get(key)) is not None:
         handle.refcount += 1
         return handle
-    rank = dist.get_rank(group=group)
-    size = dist.get_world_size(group=group)
+    # The group's own rank: dist.get_rank(group) maps through the process's
+    # default world, which inside a vLLM worker is vLLM's, not the AFD world.
+    rank = group.rank()
+    size = group.size()
     unique_ids: list[bytes | None] = [None] * size
     dist.all_gather_object(unique_ids, module.get_local_nccl_unique_id(), group=group)
     handle = _NCCLCommHandle(
@@ -190,8 +192,8 @@ class DeepEPElasticBuffer:
     ) -> None:
         self._module = load_deepep()
         self._group = group
-        rank = dist.get_rank(group=group)
-        num_ranks = dist.get_world_size(group=group)
+        rank = group.rank()
+        num_ranks = group.size()
         self.capacity_tokens_per_rank = capacity_tokens_per_rank
         # DeepEP can request one metadata slot past the nominal bucket; keep
         # the public capacity unchanged and allocate the guard slot.

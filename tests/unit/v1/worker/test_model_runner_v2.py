@@ -147,6 +147,12 @@ def _v2_config(
     parallel_config = SimpleNamespace(
         data_parallel_size=data_parallel_size,
         data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+        data_parallel_backend="mp",
+        distributed_executor_backend="mp",
+        nnodes_within_dp=1,
+        assigned_physical_gpu_ids=None,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=prefill_context_parallel_size,
@@ -2379,7 +2385,7 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
     config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
     worker = _prepare_worker(worker_cls, config, use_v2=True)
     events: list[str] = []
-    connector = SimpleNamespace(close=lambda: events.append("close"))
+    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
     _ConnectorRunnerRecorder.adopted = []
 
     def create_bootstrapped_connector(rank, local_rank, vllm_config, afd_config):
@@ -2389,6 +2395,7 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
     def vllm_init(current_worker):
         events.append("vllm_init")
         _fake_worker_init(current_worker)
+        current_worker.device = torch.device("cuda", 0)
 
     factory = worker_module.AFDConnectorFactory
     monkeypatch.setattr(
@@ -2406,10 +2413,15 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "check_connector_role_rank",
+        lambda checked, vllm_config: events.append("role_rank_check"),
+    )
 
     worker.init_device()
 
-    assert events == ["bootstrap", "vllm_init"]
+    assert events == ["bootstrap", "vllm_init", "role_rank_check"]
     assert _ConnectorRunnerRecorder.adopted == [connector]
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
 
@@ -2452,26 +2464,106 @@ def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
 
 
-def test_v2_validator_accepts_deepep_m2n_with_tp1_only():
-    """DeepEP M2N is a supported GPU connector, but only with TP = 1.
+@pytest.mark.parametrize(
+    ("worker_module", "worker_cls", "runner_module", "runner_name"),
+    _ROUTED_WORKER_CASES,
+)
+def test_workers_reject_bootstrapped_connector_on_another_device(
+    monkeypatch, worker_module, worker_cls, runner_module, runner_name
+):
+    """A connector bootstrapped on a different GPU than vLLM's fails startup.
 
-    Why: its bootstrap runs before vLLM's process groups exist, when the
-    role rank can only come from the DP rank.
+    Why: the connector picks its device before vLLM does, by mirroring vLLM's
+    selection; a vLLM upgrade that changes the selection must fail here
+    rather than run the connector on another rank's GPU.
     """
-    config = _v2_config()
+    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
+    worker = _prepare_worker(worker_cls, config, use_v2=True)
+    events: list[str] = []
+    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
+    _ConnectorRunnerRecorder.adopted = []
+
+    def vllm_init(current_worker):
+        _fake_worker_init(current_worker)
+        current_worker.device = torch.device("cuda", 4)
+
+    factory = worker_module.AFDConnectorFactory
+    monkeypatch.setattr(
+        factory, "create_bootstrapped_connector", lambda *args: connector
+    )
+    monkeypatch.setattr(
+        factory, "get_connector_class", lambda name: FakeRoutedConnector
+    )
+    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
+    monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
+    monkeypatch.setattr(
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="uses cuda:0 but vLLM placed"):
+        worker.init_device()
+
+    assert events == ["close"]
+    assert _ConnectorRunnerRecorder.adopted == []
+    assert native_v2.GPUModelRunner is _NativeRunnerSentinel
+
+
+def _deepep_m2n_v2_config(**kwargs):
+    config = _v2_config(**kwargs)
     config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
+    config.additional_config["afd"]["compute_gate_on_attention"] = True
+    return config
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_v2_validator_accepts_deepep_m2n_attention_tp(tp_size):
+    """DeepEP M2N accepts Attention TP > 1.
+
+    Why: each Attention TP rank dispatches its own slice of the tokens, and
+    the bootstrap derives the TP rank from the worker rank before vLLM's
+    process groups exist.
+    """
     validate_gpu_model_runner_v2_config(
-        config,
+        _deepep_m2n_v2_config(
+            tensor_parallel_size=tp_size, num_attention_ranks=tp_size
+        ),
         expected_role="attention",
         device_type="cuda",
     )
 
-    config = _v2_config(tensor_parallel_size=2, num_attention_ranks=2)
-    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
-    with pytest.raises(RuntimeError, match="requires tensor_parallel_size=1"):
+
+def test_v2_validator_rejects_deepep_m2n_ffn_tp():
+    """DeepEP M2N FFN ranks must run TP = 1.
+
+    Why: DeepEP routes each token to the one FFN rank that owns the whole
+    expert; FFN experts are not TP-sharded.
+    """
+    config = _deepep_m2n_v2_config(role="ffn", tensor_parallel_size=2, num_ffn_ranks=2)
+    with pytest.raises(RuntimeError, match="requires FFN tensor_parallel_size=1"):
         validate_gpu_model_runner_v2_config(
             config,
-            expected_role="attention",
+            expected_role="ffn",
+            device_type="cuda",
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_v2_validator_requires_gate_on_attention_for_deepep_m2n(role):
+    """DeepEP M2N without compute_gate_on_attention fails at validation.
+
+    Why: the connector routes on Attention, so a run without the gate there
+    cannot dispatch; failing here names the setting instead of failing later
+    in the connector handshake.
+    """
+    config = _deepep_m2n_v2_config(role=role)
+    config.additional_config["afd"]["compute_gate_on_attention"] = False
+    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            config,
+            expected_role=role,
             device_type="cuda",
         )
 

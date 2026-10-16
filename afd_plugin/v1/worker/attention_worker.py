@@ -15,6 +15,11 @@ from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
 )
+from afd_plugin.v1.worker.connector_device import (
+    check_connector_device,
+    check_connector_role_rank,
+    connector_device_index,
+)
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
     validate_gpu_model_runner_v2_config,
@@ -46,7 +51,9 @@ class AFDAttentionWorker(Worker):
     # after an internal module import, with no injectable runner factory.
     # Patch functionality: validate the supported V2 contract, select the AFD model
     # identity before construction, and scope the module-class substitution to
-    # the delegated native initialization window.
+    # the delegated native initialization window. A routed-experts connector
+    # is created first on the device vLLM will select, and checked against
+    # that device once vLLM has selected it.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # runner local-import/construct seam; commit
@@ -86,7 +93,7 @@ class AFDAttentionWorker(Worker):
         # the FFN worker does the same at the same point.
         connector = AFDConnectorFactory.create_bootstrapped_connector(
             self.rank,
-            self.local_rank,
+            connector_device_index(self.vllm_config, self.local_rank),
             self.vllm_config,
             parse_afd_config(self.vllm_config, expected_role="attention"),
         )
@@ -94,6 +101,9 @@ class AFDAttentionWorker(Worker):
         gpu_model_runner_v2.GPUModelRunner = AFDAttentionModelRunnerV2
         try:
             super().init_device()
+            if connector is not None:
+                check_connector_device(connector, self.device)
+                check_connector_role_rank(connector, self.vllm_config)
         except BaseException:
             if connector is not None:
                 connector.close()

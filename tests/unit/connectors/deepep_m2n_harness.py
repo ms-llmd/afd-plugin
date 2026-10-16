@@ -83,10 +83,17 @@ MAX_STAGES = 2
 class Topology:
     ffn_size: int
     attn_size: int
+    # Attention TP peers (consecutive Attention ranks) share one DP rank's
+    # tokens; each dispatches its slice.
+    attn_tp_size: int = 1
 
     @property
     def world_size(self) -> int:
         return self.ffn_size + self.attn_size
+
+    @property
+    def attn_dp_size(self) -> int:
+        return self.attn_size // self.attn_tp_size
 
     def role(self, world_rank: int) -> tuple[str, int]:
         if world_rank < self.ffn_size:
@@ -99,6 +106,8 @@ class Case:
     """One step: a control payload, then ``num_layers`` MoE layers under it."""
 
     name: str
+    # One count per Attention DP rank (per Attention rank without TP); the
+    # control payload carries them as vLLM's DP metadata does.
     tokens_per_attn_rank: tuple[int, ...]
     # Graph-mode payloads skip the host sync (worst-case receive allocation).
     graph_mode: bool = False
@@ -229,6 +238,38 @@ def make_inputs(
     weights, ids = torch.topk(torch.softmax(logits, dim=-1), TOP_K, dim=-1)
     weights = weights / weights.sum(dim=-1, keepdim=True)
     return x.to(torch.bfloat16), ids, weights.float()
+
+
+def attention_rank_inputs(
+    seed: int,
+    attn_rank: int,
+    attn_tp_size: int,
+    dp_tokens: tuple[int, ...],
+    expert_limit: int = NUM_EXPERTS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """What one Attention rank dispatches, and how many of its rows are real.
+
+    TP peers regenerate their DP rank's tokens and each takes rows
+    ``[r * c, (r + 1) * c)`` of them padded to a multiple of the TP size
+    (``c = ceil(N / TP)``), as the Qwen3 routing proxy does. Padding rows come
+    last and route nowhere (expert id -1). Without TP this is ``make_inputs``.
+    """
+    dp_rank, tp_rank = divmod(attn_rank, attn_tp_size)
+    num_tokens = dp_tokens[dp_rank]
+    x, ids, w = make_inputs(seed, dp_rank, num_tokens, expert_limit)
+    if attn_tp_size == 1:
+        return x, ids, w, num_tokens
+    rows = -(-num_tokens // attn_tp_size)
+    start = tp_rank * rows
+    real = max(0, min(rows, num_tokens - start))
+    padding = rows - real
+    end = start + real
+    return (
+        torch.cat([x[start:end], x.new_zeros(padding, HIDDEN_SIZE)]),
+        torch.cat([ids[start:end], ids.new_full((padding, TOP_K), -1)]),
+        torch.cat([w[start:end], w.new_zeros(padding, TOP_K)]),
+        real,
+    )
 
 
 def make_expert_weights(experts: range) -> tuple[torch.Tensor, torch.Tensor]:
@@ -381,7 +422,9 @@ def fake_vllm_config(
     )
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    role_size = topology.ffn_size if role == "ffn" else topology.attn_size
+    # vLLM's view: FFN ranks are DP ranks; Attention ranks are DP x TP.
+    tp_size = 1 if role == "ffn" else topology.attn_tp_size
+    dp_size = topology.ffn_size if role == "ffn" else topology.attn_dp_size
     # The FFN deployment the handshake requires: linear EP over the FFN ranks,
     # with checkpoint weights in the payload's format.
     quant_config = (
@@ -413,10 +456,11 @@ def fake_vllm_config(
             hf_text_config=text_config,
         ),
         parallel_config=SimpleNamespace(
-            data_parallel_size=role_size,
-            data_parallel_rank=role_rank,
+            data_parallel_size=dp_size,
+            data_parallel_rank=role_rank // tp_size,
+            pipeline_parallel_size=1,
             prefill_context_parallel_size=1,
-            tensor_parallel_size=1,
+            tensor_parallel_size=tp_size,
             enable_expert_parallel=True,
             expert_placement_strategy="linear",
             enable_eplb=False,
@@ -445,8 +489,13 @@ def make_connector(
     role, role_rank = topology.role(world_rank)
     vllm_config = fake_vllm_config(topology, role, role_rank, extra_config, port, host)
     afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
+    # No vLLM TP group here: pass the TP rank, as workers do before init.
     return AFDConnectorFactory.create_connector(
-        world_rank, local_rank, vllm_config, afd_config
+        world_rank,
+        local_rank,
+        vllm_config,
+        afd_config,
+        tp_rank=role_rank % vllm_config.parallel_config.tensor_parallel_size,
     )
 
 
@@ -682,6 +731,8 @@ class Checker:
         their top-k weights), so dropped, duplicated, swapped or wrongly weighted
         rows fail even when per-expert sums agree. The sums are still recorded
         as error metrics. ``limit`` is the routing range used for the inputs.
+        ``tokens_per_attn_rank`` holds one count per Attention DP rank; with
+        Attention TP every TP peer's slice is expected once.
         """
         from afd_plugin.connectors.gpu.deepep_m2n.experts import (
             align_up,
@@ -705,8 +756,11 @@ class Checker:
         expected_xsum = torch.zeros(len(experts), HIDDEN_SIZE, device="cuda")
         expected_wsum = torch.zeros(len(experts), device="cuda")
         expected_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        for attn_rank, num_tokens in enumerate(tokens_per_attn_rank):
-            x, ids, w = make_inputs(seed, attn_rank, num_tokens, limit)
+        attn_tp_size = connector.attn_tp_size
+        for attn_rank in range(len(tokens_per_attn_rank) * attn_tp_size):
+            x, ids, w, _ = attention_rank_inputs(
+                seed, attn_rank, attn_tp_size, tokens_per_attn_rank, limit
+            )
             sent = as_sent(x, self.payload_format)
             mask = (ids >= experts.start) & (ids < experts.stop)
             rows, slots = mask.nonzero(as_tuple=True)
@@ -896,15 +950,22 @@ def correctness_scenario(
                     )
                     checker.check_ffn_experts(payload, out)
             else:
-                rank = connector.role_rank
-                inputs = [
-                    make_inputs(stage_seed(step, stage), rank, tokens[rank], limit)
+                sliced = [
+                    attention_rank_inputs(
+                        stage_seed(step, stage),
+                        connector.role_rank,
+                        connector.attn_tp_size,
+                        tokens,
+                        limit,
+                    )
                     for stage, tokens in enumerate(stages)
                 ]
+                inputs = [(x, ids, w) for x, ids, w, _ in sliced]
                 outs = [torch.empty_like(x) for x, _, _ in inputs]
                 run_attention_step(connector, inputs, outs, layer)
-                for (x, ids, w), out in zip(inputs, outs, strict=True):
-                    checker.check_combined(out, x, ids, w)
+                # Padding rows (last) route nowhere; check the real rows.
+                for (x, ids, w, real), out in zip(sliced, outs, strict=True):
+                    checker.check_combined(out[:real], x[:real], ids[:real], w[:real])
     return checker.finish()
 
 

@@ -19,6 +19,8 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import (
@@ -61,6 +63,8 @@ _NO_ROLE: frozenset[str] = frozenset()
 # Connectors whose FFN builds no shared experts: Async CAM runs them on
 # Attention; DeepEP M2N's FFN runs routed experts only.
 _FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS = (AFD_ASYNC_CONNECTOR, DEEPEP_M2N_CONNECTOR)
+# Expert id of a padding row: a routed-experts connector sends it nowhere.
+UNROUTED_EXPERT_ID = -1
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -137,14 +141,65 @@ def _iter_role_weights(
 
 
 class RemoteFFNProxy(nn.Module):
-    """Parameter-free FFN stage executed through the AFD connector."""
+    """FFN stage executed through the AFD connector.
+
+    By default the proxy is parameter-free: it sends the hidden states and the
+    FFN role runs the complete MLP or MoE block. A model whose connector routes
+    on Attention (an M2N routed-experts connector such as DeepEP M2N) sets
+    ``gate``, ``top_k``, ``renormalize`` and ``tp_size`` after construction,
+    from its model and parallel config. The proxy then computes the gate and
+    vLLM's default fused top-k (``FusedTopKRouter``; EPLB is not supported)
+    and sends ``topk_ids`` and ``topk_weights``; combine returns the top-k
+    weighted sum, which replaces the native MoE block's output.
+
+    With Attention TP > 1 every TP rank holds the same tokens after the
+    attention all-reduce; dispatching them from every rank would make the FFN
+    run each token TP times. Each rank instead pads the tokens to a multiple
+    of ``tp_size`` (``sequence_parallel_chunk``), routes and dispatches only
+    its slice, and the TP group all-gathers the combined slices, as vLLM's
+    sequence-parallel MoE does. Padding rows get ``UNROUTED_EXPERT_ID`` and
+    reach no FFN rank; they are dropped after the all-gather.
+    """
 
     def __init__(self, *, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.gate: ReplicatedLinear | None = None
+        self.top_k = 0
+        self.renormalize = False
+        self.tp_size = 1
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._send_and_receive(hidden_states)
+        if self.gate is None:
+            return self._send_and_receive(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        if self.tp_size > 1:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        if self.tp_size > 1:
+            local_tokens = hidden_states.shape[0]
+            token_index = native.get_tensor_model_parallel_rank() * local_tokens
+            token_index = token_index + torch.arange(
+                local_tokens, device=topk_ids.device
+            )
+            topk_ids = topk_ids.masked_fill(
+                (token_index >= num_tokens).unsqueeze(1), UNROUTED_EXPERT_ID
+            )
+        output = self._send_and_receive(
+            hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        if self.tp_size > 1:
+            output = native.tensor_model_parallel_all_gather(output, 0)
+            output = output[:num_tokens]
+        return output
 
     def _send_and_receive(
         self,

@@ -22,12 +22,14 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     expert_weight_format,
     local_handshake_info,
     local_model_info,
+    no_sync_bucket_limit,
     plan_stage,
     resolve_capacity_tokens_per_rank,
     resolve_num_lanes,
     tokens_per_attention_rank,
     validate_handshake,
     validate_model_infos,
+    worst_case_receive_rows,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
@@ -81,9 +83,16 @@ def _ffn_deployment(layout: DeepEPM2NLayout, weight_format: str = "bf16") -> dic
 
 
 def _handshake(
-    layout: DeepEPM2NLayout, overrides: dict | None = None, hosts: str | None = None
+    layout: DeepEPM2NLayout,
+    overrides: dict | None = None,
+    hosts: str | None = None,
+    attn_tp_size: int = 1,
 ) -> list[dict]:
-    """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host)."""
+    """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host).
+
+    Attention ranks report their TP size and a capacity of 256; FFN ranks
+    report neither, as without an explicit capacity.
+    """
     hosts = hosts or "a" * layout.union_size
     infos = []
     for world_rank in range(layout.union_size):
@@ -98,7 +107,8 @@ def _handshake(
             num_experts=layout.num_experts,
             top_k=8,
             num_lanes=1,
-            capacity_tokens_per_rank=256,
+            capacity_tokens_per_rank=None if is_ffn else 256,
+            attn_tp_size=None if is_ffn else attn_tp_size,
             compute_gate_on_attention=True,
             expert_alignment=128 if is_ffn else None,
             ffn_deployment=_ffn_deployment(layout) if is_ffn else None,
@@ -194,6 +204,7 @@ def test_plan_stage_skips_host_sync_below_threshold():
         return plan_stage(
             _dp(tokens),
             attn_size=1,
+            attn_tp_size=1,
             capacity_tokens_per_rank=1024,
             bucket_granularity=1,
             graph_mode=False,
@@ -260,16 +271,57 @@ def test_layout_rejects_indivisible_experts():
         DeepEPM2NLayout(ffn_size=3, attn_size=1, num_experts=128)
 
 
-def test_tokens_per_attention_rank_expands_tp_peers():
-    """Per-DP token counts are repeated for each Attention TP peer; a count
-    list that fits neither layout raises.
+def test_tokens_per_attention_rank_splits_each_dp_rank_over_its_tp_peers():
+    """Without TP each Attention rank dispatches its DP rank's count; with TP
+    each TP peer dispatches a ceil(count / TP) slice; a count list that does
+    not cover the Attention ranks raises.
 
-    Why: with Attention TP every rank needs its DP rank's token count.
+    Why: TP peers hold the same tokens; dispatching them all from every peer
+    would run each token's experts TP times.
     """
-    assert tokens_per_attention_rank(_dp(3, 5), attn_size=2) == (3, 5)
-    assert tokens_per_attention_rank(_dp(3, 5), attn_size=4) == (3, 3, 5, 5)
+    assert tokens_per_attention_rank(_dp(3, 5), attn_size=2, attn_tp_size=1) == (
+        3,
+        5,
+    )
+    assert tokens_per_attention_rank(_dp(3, 5), attn_size=4, attn_tp_size=2) == (
+        2,
+        2,
+        3,
+        3,
+    )
+    assert tokens_per_attention_rank(_dp(1, 0), attn_size=8, attn_tp_size=4) == (
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+    )
     with pytest.raises(ValueError, match="token counts"):
-        tokens_per_attention_rank(_dp(3, 5, 7), attn_size=2)
+        tokens_per_attention_rank(_dp(3, 5, 7), attn_size=2, attn_tp_size=1)
+    # Two counts with TP 1 do not cover four ranks: no TP is guessed.
+    with pytest.raises(ValueError, match="token counts"):
+        tokens_per_attention_rank(_dp(3, 5), attn_size=4, attn_tp_size=1)
+
+
+def test_plan_stage_sizes_the_bucket_for_the_tp_slice():
+    """A 17-token DP rank with Attention TP 2 dispatches 9-token slices.
+
+    Why: the bucket and capacity check apply to what one rank dispatches.
+    """
+    plan = plan_stage(
+        _dp(17),
+        attn_size=2,
+        attn_tp_size=2,
+        capacity_tokens_per_rank=9,
+        bucket_granularity=1,
+        graph_mode=False,
+    )
+
+    assert plan.tokens_per_attn_rank == (9, 9)
+    assert plan.bucket == 9
 
 
 def test_plan_stage_rounds_bucket_and_picks_host_sync():
@@ -282,6 +334,7 @@ def test_plan_stage_rounds_bucket_and_picks_host_sync():
     eager = plan_stage(
         _dp(17, 4),
         attn_size=2,
+        attn_tp_size=1,
         capacity_tokens_per_rank=64,
         bucket_granularity=16,
         graph_mode=False,
@@ -289,6 +342,7 @@ def test_plan_stage_rounds_bucket_and_picks_host_sync():
     graph = plan_stage(
         _dp(0, 0),
         attn_size=2,
+        attn_tp_size=1,
         capacity_tokens_per_rank=64,
         bucket_granularity=1,
         graph_mode=True,
@@ -308,6 +362,7 @@ def test_plan_stage_rejects_bucket_above_capacity():
         plan_stage(
             _dp(65),
             attn_size=1,
+            attn_tp_size=1,
             capacity_tokens_per_rank=64,
             bucket_granularity=1,
             graph_mode=False,
@@ -326,6 +381,46 @@ def test_handshake_accepts_consistent_ranks():
 
     assert result.expert_alignment == 128
     assert not result.network_plan.use_gin
+    assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (1, 256)
+
+
+def test_handshake_gives_ffn_the_attention_tp_size_and_capacity():
+    """FFN ranks report no TP size or capacity; the result carries
+    Attention's.
+
+    Why: the FFN runs without TP, so only Attention knows its TP size and the
+    capacity of a TP slice; both roles must size buffers and plans alike.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=4, num_experts=128)
+
+    result = validate_handshake(
+        _handshake(layout, attn_tp_size=2), layout, NetworkConfig()
+    )
+
+    assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (2, 256)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({(3, "attn_tp_size"): 2}, "disagree on their TP size"),
+        ({(2, "attn_tp_size"): 3, (3, "attn_tp_size"): 3}, "does not divide"),
+        ({(3, "capacity_tokens_per_rank"): 128}, "capacity_tokens_per_rank"),
+        ({(0, "capacity_tokens_per_rank"): 128}, "capacity_tokens_per_rank"),
+    ],
+)
+def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, message):
+    """Attention ranks that disagree on TP, a TP size that does not divide
+    the Attention ranks, or a capacity some rank disagrees with (an FFN rank
+    reports one only when configured explicitly) fail the handshake.
+
+    Why: ranks that plan different slices or buffer sizes would hang or
+    overflow DeepEP buffers.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+
+    with pytest.raises(RuntimeError, match=message):
+        validate_handshake(_handshake(layout, overrides), layout, NetworkConfig())
 
 
 @pytest.mark.parametrize(
@@ -441,21 +536,42 @@ def test_expert_row_ranges_follow_alignment():
 
 
 def test_connector_constructs_without_initialization():
-    """Constructing Attention and FFN connectors computes world ranks and
-    capacity (explicit, or the larger of max_num_batched_tokens and the
-    largest CUDA-graph capture size) without initializing.
+    """Constructing Attention and FFN connectors computes world ranks without
+    initializing. Attention knows its TP size and capacity; the FFN learns
+    both in the handshake unless the capacity is explicit.
 
     Why: construction must not communicate, and rank math must be right.
     """
     topology = Topology(ffn_size=2, attn_size=3)
     attention = _connector("attention", 1, topology, {"capacity_tokens_per_rank": 64})
+    default_attention = _connector("attention", 0, topology)
     ffn = _connector("ffn", 1, topology)
+    explicit_ffn = _connector("ffn", 0, topology, {"capacity_tokens_per_rank": 64})
 
     assert attention.is_initialized is False
     assert attention.world_rank == 3
-    assert attention.capacity_tokens_per_rank == 64
+    assert (attention.attn_tp_size, attention.capacity_tokens_per_rank) == (1, 64)
+    # scheduler max_num_batched_tokens
+    assert default_attention.capacity_tokens_per_rank == 8192
     assert ffn.world_rank == 1
-    assert ffn.capacity_tokens_per_rank == 8192  # scheduler max_num_batched_tokens
+    assert (ffn.attn_tp_size, ffn.capacity_tokens_per_rank) == (None, None)
+    assert explicit_ffn.capacity_tokens_per_rank == 64
+
+
+def test_control_plane_requires_the_handshake_on_ffn():
+    """An FFN connector cannot plan a step before the handshake.
+
+    Why: it does not know the Attention TP size until then.
+    """
+    connector = _connector("ffn", 0, Topology(ffn_size=1, attn_size=1))
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _dp(1)},
+        is_graph_capturing=False,
+        is_warmup=False,
+    )
+
+    with pytest.raises(RuntimeError, match="before bootstrap"):
+        connector.control_plane.update_state_from_dp_metadata(payload)
 
 
 def test_connector_rejects_non_bf16_model():
@@ -562,19 +678,29 @@ def _ffn_vllm_config():
 
 
 @pytest.mark.parametrize(
-    ("capture_size", "explicit", "expected"),
-    [(512, None, 8192), (16384, None, 16384), (16384, 64, 64)],
+    ("capture_size", "tp_size", "explicit", "expected"),
+    [
+        (512, 1, None, 8192),
+        (16384, 1, None, 16384),
+        (16384, 1, 64, 64),
+        (512, 2, None, 4096),
+        (512, 3, None, 2731),
+        (512, 2, 64, 64),
+    ],
 )
 def test_capacity_covers_prefill_budget_and_largest_graph(
-    capture_size, explicit, expected
+    capture_size, tp_size, explicit, expected
 ):
     """Default capacity is the larger of max_num_batched_tokens (8192) and
-    the largest CUDA-graph capture size; an explicit value wins.
+    the largest CUDA-graph capture size, divided (rounded up) by the
+    Attention TP size; an explicit value wins.
 
-    Why: a decode graph larger than the prefill budget must still fit.
+    Why: a decode graph larger than the prefill budget must still fit, and
+    with TP each rank dispatches only its slice.
     """
     vllm_config = _ffn_vllm_config()
     vllm_config.compilation_config.max_cudagraph_capture_size = capture_size
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
     config = DeepEPM2NConfig(capacity_tokens_per_rank=explicit)
 
     assert resolve_capacity_tokens_per_rank(config, vllm_config) == expected
@@ -815,3 +941,152 @@ def test_attention_init_rejects_local_experts_before_communicating():
         connector.init_afd_connector(local_experts={})
 
     assert connector.bootstrap_group is None
+
+
+def test_nccl_comm_rank_comes_from_the_afd_group_not_the_default_world(monkeypatch):
+    """DeepEP's communicator uses the AFD group's own rank and size.
+
+    Why: inside a vLLM worker the default world is vLLM's (one role's DP
+    ranks), and dist.get_rank(group) maps through it: both DP0 ranks then
+    joined DeepEP's communicator as rank 0 and the DP1 ranks timed out.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import buffer
+
+    class _Group:
+        def rank(self):
+            return 2
+
+        def size(self):
+            return 4
+
+    class _Module:
+        def __init__(self):
+            self.created = []
+
+        def get_local_nccl_unique_id(self):
+            return b"local"
+
+        def create_nccl_comm(self, unique_id, size, rank):
+            self.created.append((unique_id, size, rank))
+            return 7
+
+    def fake_all_gather_object(output, obj, group):
+        output[:] = [b"root", b"r1", obj, b"r3"]
+
+    monkeypatch.setattr(buffer.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(buffer.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(buffer.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(buffer, "_NCCL_COMMS", {})
+    module = _Module()
+
+    handle = buffer._acquire_nccl_comm(module, _Group())
+
+    assert module.created == [(b"root", 4, 2)]
+    assert handle.nccl_comm == 7
+
+
+# ---------------------------------------------------------------------------
+# Attention-side combine zeros: sized for the largest receive
+# ---------------------------------------------------------------------------
+
+DEEPGEMM_ALIGNMENT = 128
+
+
+@pytest.mark.parametrize(
+    ("num_ranks", "bucket", "top_k", "experts_per_rank", "alignment", "expected"),
+    [
+        # Qwen3-30B 2A2F at the default capacity, and at a 512 bucket.
+        (4, 8192, 8, 64, DEEPGEMM_ALIGNMENT, 270_336),
+        (4, 512, 8, 64, DEEPGEMM_ALIGNMENT, 24_576),
+        # Qwen3-235B 4A2F at a 512 bucket.
+        (6, 512, 8, 64, DEEPGEMM_ALIGNMENT, 32_768),
+        # No alignment (fused_experts backend): exactly ranks x bucket x top-k.
+        (4, 10, 8, 64, 1, 320),
+        # A token sends at most one route per local expert.
+        (4, 10, 8, 4, 1, 160),
+    ],
+)
+def test_worst_case_receive_rows_mirrors_deepep(
+    num_ranks, bucket, top_k, experts_per_rank, alignment, expected
+):
+    """Rows match DeepEP's worst-case receive without the host sync.
+
+    Why: the Attention-side zero buffer is sized with this; too few rows
+    would fail combine, and DeepEP's formula is the contract.
+    """
+    rows = worst_case_receive_rows(
+        num_ranks=num_ranks,
+        bucket=bucket,
+        top_k=top_k,
+        experts_per_rank=experts_per_rank,
+        expert_alignment=alignment,
+    )
+
+    assert rows == expected
+
+
+@pytest.mark.parametrize(
+    ("capture", "tp", "granularity", "sync_min", "capacity", "expected"),
+    [
+        (512, 1, 1, 0, 8192, 512),  # graph buckets only
+        (512, 2, 1, 0, 4096, 256),  # each TP rank dispatches its slice
+        (100, 1, 16, 0, 8192, 112),  # graph bucket rounded to granularity
+        (512, 1, 1, 1000, 8192, 999),  # eager buckets below the sync threshold
+        (512, 1, 1, 0, 256, 256),  # never above capacity
+        (0, 1, 1, 0, 8192, 0),  # eager-only and always syncing
+    ],
+)
+def test_no_sync_bucket_limit(capture, tp, granularity, sync_min, capacity, expected):
+    """The largest bucket that skips the host sync: the largest graph bucket or
+    the largest eager bucket below cpu_sync_min_tokens, capped by capacity.
+
+    Why: only those dispatches give an Attention rank a worst-case receive;
+    sizing the zero buffer for capacity instead would waste ~1 GiB per GPU.
+    """
+    limit = no_sync_bucket_limit(
+        capacity_tokens_per_rank=capacity,
+        max_cudagraph_capture_size=capture,
+        attn_tp_size=tp,
+        bucket_granularity=granularity,
+        cpu_sync_min_tokens=sync_min,
+    )
+
+    assert limit == expected
+
+
+def test_attention_combine_zeros_cover_the_largest_no_sync_receive():
+    """Attention allocates one zero buffer for its largest no-sync receive and
+    hands combine a contiguous view of its first rows.
+
+    Why: a cache keyed by receive shape grew without bound when eager buckets
+    skipped the sync; a fixed buffer bounds memory and keeps one address for
+    captured graphs.
+    """
+    connector = _connector(
+        "attention",
+        0,
+        Topology(ffn_size=2, attn_size=2),
+        {"capacity_tokens_per_rank": 16},
+    )
+    connector.device = torch.device("cpu")
+    connector.expert_alignment = DEEPGEMM_ALIGNMENT
+
+    connector._allocate_combine_zeros()
+
+    # Bucket min(16, 512 capture) = 16: 4 ranks x 16 x top-k 8 + 127 x 64.
+    expected_rows = worst_case_receive_rows(
+        num_ranks=4,
+        bucket=16,
+        top_k=8,
+        experts_per_rank=64,
+        expert_alignment=DEEPGEMM_ALIGNMENT,
+    )
+    zeros = connector._combine_zeros
+    assert zeros is not None
+    assert zeros.shape == (expected_rows, HIDDEN_SIZE)
+    view = connector._combine_zero_rows((5, HIDDEN_SIZE))
+    assert view.shape == (5, HIDDEN_SIZE) and view.is_contiguous()
+    assert view.data_ptr() == zeros.data_ptr()
+    assert connector._combine_zero_rows((0, HIDDEN_SIZE)).shape == (0, HIDDEN_SIZE)
+    with pytest.raises(RuntimeError, match="no_sync_bucket_limit"):
+        connector._combine_zero_rows((expected_rows + 1, HIDDEN_SIZE))
