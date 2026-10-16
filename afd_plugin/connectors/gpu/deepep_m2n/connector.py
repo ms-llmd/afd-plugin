@@ -168,7 +168,9 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             timeouts.
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
             host sync that reads receive counts; they allocate the worst-case
-            receive size instead. ``0`` always syncs in eager mode.
+            receive size instead. ``0`` always syncs in eager mode. Attention
+            ranks keep a zero buffer for the largest bucket that skips the
+            sync (``no_sync_bucket_limit``), so raising this costs memory.
         control_backend: Backend of the connector's own process group
             (handshake, DeepEP communicator bootstrap, per-step control
             payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
@@ -318,6 +320,46 @@ def plan_stage(
         do_cpu_sync=not graph_mode and bucket >= cpu_sync_min_tokens,
         graph_mode=graph_mode,
     )
+
+
+def no_sync_bucket_limit(
+    *,
+    capacity_tokens_per_rank: int,
+    max_cudagraph_capture_size: int,
+    attn_tp_size: int,
+    bucket_granularity: int,
+    cpu_sync_min_tokens: int,
+) -> int:
+    """Largest bucket a stage can dispatch without the host sync.
+
+    ``plan_stage`` skips the sync in graph mode, where a DP rank's tokens are
+    at most the largest CUDA-graph capture size and each Attention TP rank
+    dispatches its slice, and in eager mode below ``cpu_sync_min_tokens``.
+    Every other step syncs, and an Attention rank then receives no rows.
+    """
+    graph_tokens = -(-max_cudagraph_capture_size // attn_tp_size)
+    graph_bucket = -(-graph_tokens // bucket_granularity) * bucket_granularity
+    return min(capacity_tokens_per_rank, max(graph_bucket, cpu_sync_min_tokens - 1))
+
+
+def worst_case_receive_rows(
+    *,
+    num_ranks: int,
+    bucket: int,
+    top_k: int,
+    experts_per_rank: int,
+    expert_alignment: int,
+) -> int:
+    """Rows DeepEP allocates for one rank's receive when it skips the host sync.
+
+    Mirrors the vendored DeepEP's worst case for expanded receives
+    (``csrc/deepep/csrc/elastic/buffer.hpp``, non-cached dispatch without CPU
+    sync): every rank's bucket times the routes one token can send to this
+    rank, plus alignment padding for each local expert.
+    """
+    rows = num_ranks * bucket * min(top_k, experts_per_rank)
+    rows += (expert_alignment - 1) * experts_per_rank
+    return -(-rows // expert_alignment) * expert_alignment
 
 
 @dataclass(frozen=True)
@@ -809,7 +851,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._pending_combines: dict[int, DeepEPHandle] = {}
         # FFN side: combine completion per lane, joined by synchronize_lanes.
         self._lane_done: dict[int, torch.cuda.Event] = {}
-        self._zero_outputs: dict[tuple[int, int], torch.Tensor] = {}
+        # Attention side: the zero rows combine takes from Attention ranks,
+        # sized for the largest receive (see _allocate_combine_zeros).
+        self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
         self.control_plane = DeepEPM2NAFDControlPlane(self)
@@ -960,6 +1004,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 self.experts = DeepEPM2NExperts(
                     self.config.expert_backend, self.expert_alignment
                 )
+            else:
+                self._allocate_combine_zeros()
         except Exception:
             self.close()
             raise
@@ -975,7 +1021,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.lane_streams = []
         self._pending_combines.clear()
         self._lane_done.clear()
-        self._zero_outputs.clear()
+        self._combine_zeros = None
         self._initialized = False
 
     @property
@@ -1069,7 +1115,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         with torch.cuda.stream(lane_stream):
             # Attention ranks hold no experts; they contribute zero rows.
             combined = self._lanes(stage_idx).combine(
-                self._zero_output(handle.recv_shape), handle
+                self._combine_zero_rows(handle.recv_shape), handle
             )
         if combined.shape != out.shape:
             raise RuntimeError(
@@ -1236,12 +1282,48 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if lane_stream != current:
             lane_stream.wait_stream(current)
 
-    def _zero_output(self, shape: tuple[int, int]) -> torch.Tensor:
-        zeros = self._zero_outputs.get(shape)
-        if zeros is None:
-            zeros = torch.zeros(shape, dtype=self.dtype, device=self.device)
-            self._zero_outputs[shape] = zeros
-        return zeros
+    def _allocate_combine_zeros(self) -> None:
+        """One zero buffer for every combine on this Attention rank.
+
+        Combine takes one zero row per row this rank received. A synced
+        dispatch gives an Attention rank no rows; a dispatch that skips the
+        sync gets DeepEP's worst case for its bucket, so the buffer covers the
+        largest such bucket. Both lanes share it (combine only reads it), and
+        captured graphs keep one stable address.
+        """
+        assert self.attn_tp_size is not None
+        assert self.capacity_tokens_per_rank is not None
+        capture_size = self.vllm_config.compilation_config.max_cudagraph_capture_size
+        bucket = no_sync_bucket_limit(
+            capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            max_cudagraph_capture_size=capture_size or 0,
+            attn_tp_size=self.attn_tp_size,
+            bucket_granularity=self.config.bucket_granularity,
+            cpu_sync_min_tokens=self.config.cpu_sync_min_tokens,
+        )
+        rows = worst_case_receive_rows(
+            num_ranks=self.layout.union_size,
+            bucket=bucket,
+            top_k=self.top_k,
+            experts_per_rank=self.layout.experts_per_rank,
+            expert_alignment=self.expert_alignment,
+        )
+        self._combine_zeros = torch.zeros(
+            (rows, self.hidden_size), dtype=self.dtype, device=self.device
+        )
+
+    def _combine_zero_rows(self, shape: tuple[int, int]) -> torch.Tensor:
+        """The first ``shape[0]`` rows of the zero buffer (a contiguous view)."""
+        zeros = self._combine_zeros
+        assert zeros is not None
+        rows = shape[0]
+        if rows > zeros.shape[0] or shape[1] != zeros.shape[1]:
+            raise RuntimeError(
+                f"combine needs zero rows of shape {shape} but the buffer holds "
+                f"{tuple(zeros.shape)}: a dispatch skipped the host sync with a "
+                "bucket above no_sync_bucket_limit"
+            )
+        return zeros[:rows]
 
     @staticmethod
     def _transfer_state(context: AFDTransferContext) -> DeepEPM2NTransferState:

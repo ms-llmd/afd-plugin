@@ -22,12 +22,14 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     expert_weight_format,
     local_handshake_info,
     local_model_info,
+    no_sync_bucket_limit,
     plan_stage,
     resolve_capacity_tokens_per_rank,
     resolve_num_lanes,
     tokens_per_attention_rank,
     validate_handshake,
     validate_model_infos,
+    worst_case_receive_rows,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
@@ -981,3 +983,110 @@ def test_nccl_comm_rank_comes_from_the_afd_group_not_the_default_world(monkeypat
 
     assert module.created == [(b"root", 4, 2)]
     assert handle.nccl_comm == 7
+
+
+# ---------------------------------------------------------------------------
+# Attention-side combine zeros: sized for the largest receive
+# ---------------------------------------------------------------------------
+
+DEEPGEMM_ALIGNMENT = 128
+
+
+@pytest.mark.parametrize(
+    ("num_ranks", "bucket", "top_k", "experts_per_rank", "alignment", "expected"),
+    [
+        # Qwen3-30B 2A2F at the default capacity, and at a 512 bucket.
+        (4, 8192, 8, 64, DEEPGEMM_ALIGNMENT, 270_336),
+        (4, 512, 8, 64, DEEPGEMM_ALIGNMENT, 24_576),
+        # Qwen3-235B 4A2F at a 512 bucket.
+        (6, 512, 8, 64, DEEPGEMM_ALIGNMENT, 32_768),
+        # No alignment (fused_experts backend): exactly ranks x bucket x top-k.
+        (4, 10, 8, 64, 1, 320),
+        # A token sends at most one route per local expert.
+        (4, 10, 8, 4, 1, 160),
+    ],
+)
+def test_worst_case_receive_rows_mirrors_deepep(
+    num_ranks, bucket, top_k, experts_per_rank, alignment, expected
+):
+    """Rows match DeepEP's worst-case receive without the host sync.
+
+    Why: the Attention-side zero buffer is sized with this; too few rows
+    would fail combine, and DeepEP's formula is the contract.
+    """
+    rows = worst_case_receive_rows(
+        num_ranks=num_ranks,
+        bucket=bucket,
+        top_k=top_k,
+        experts_per_rank=experts_per_rank,
+        expert_alignment=alignment,
+    )
+
+    assert rows == expected
+
+
+@pytest.mark.parametrize(
+    ("capture", "tp", "granularity", "sync_min", "capacity", "expected"),
+    [
+        (512, 1, 1, 0, 8192, 512),  # graph buckets only
+        (512, 2, 1, 0, 4096, 256),  # each TP rank dispatches its slice
+        (100, 1, 16, 0, 8192, 112),  # graph bucket rounded to granularity
+        (512, 1, 1, 1000, 8192, 999),  # eager buckets below the sync threshold
+        (512, 1, 1, 0, 256, 256),  # never above capacity
+        (0, 1, 1, 0, 8192, 0),  # eager-only and always syncing
+    ],
+)
+def test_no_sync_bucket_limit(capture, tp, granularity, sync_min, capacity, expected):
+    """The largest bucket that skips the host sync: the largest graph bucket or
+    the largest eager bucket below cpu_sync_min_tokens, capped by capacity.
+
+    Why: only those dispatches give an Attention rank a worst-case receive;
+    sizing the zero buffer for capacity instead would waste ~1 GiB per GPU.
+    """
+    limit = no_sync_bucket_limit(
+        capacity_tokens_per_rank=capacity,
+        max_cudagraph_capture_size=capture,
+        attn_tp_size=tp,
+        bucket_granularity=granularity,
+        cpu_sync_min_tokens=sync_min,
+    )
+
+    assert limit == expected
+
+
+def test_attention_combine_zeros_cover_the_largest_no_sync_receive():
+    """Attention allocates one zero buffer for its largest no-sync receive and
+    hands combine a contiguous view of its first rows.
+
+    Why: a cache keyed by receive shape grew without bound when eager buckets
+    skipped the sync; a fixed buffer bounds memory and keeps one address for
+    captured graphs.
+    """
+    connector = _connector(
+        "attention",
+        0,
+        Topology(ffn_size=2, attn_size=2),
+        {"capacity_tokens_per_rank": 16},
+    )
+    connector.device = torch.device("cpu")
+    connector.expert_alignment = DEEPGEMM_ALIGNMENT
+
+    connector._allocate_combine_zeros()
+
+    # Bucket min(16, 512 capture) = 16: 4 ranks x 16 x top-k 8 + 127 x 64.
+    expected_rows = worst_case_receive_rows(
+        num_ranks=4,
+        bucket=16,
+        top_k=8,
+        experts_per_rank=64,
+        expert_alignment=DEEPGEMM_ALIGNMENT,
+    )
+    zeros = connector._combine_zeros
+    assert zeros is not None
+    assert zeros.shape == (expected_rows, HIDDEN_SIZE)
+    view = connector._combine_zero_rows((5, HIDDEN_SIZE))
+    assert view.shape == (5, HIDDEN_SIZE) and view.is_contiguous()
+    assert view.data_ptr() == zeros.data_ptr()
+    assert connector._combine_zero_rows((0, HIDDEN_SIZE)).shape == (0, HIDDEN_SIZE)
+    with pytest.raises(RuntimeError, match="no_sync_bucket_limit"):
+        connector._combine_zero_rows((expected_rows + 1, HIDDEN_SIZE))

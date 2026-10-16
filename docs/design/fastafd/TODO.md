@@ -53,6 +53,36 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
     ComputeDomain) and `NCCL_MNNVL_ENABLE`; add a values file once a GB200
     system is available.
 
+## 8. Configurations to reject before load
+
+Both pass validation today and fail only after both roles have loaded
+weights, with the FFN ranks stuck in a DeepEP collective until its 120 s
+timeout. Found in the branch review of 2026-10-16.
+
+- **DeepSeek with DeepEP M2N.**
+    - **Problem:** DeepSeek V2/V3/GLM on CUDA with
+    `connector=DeepEPM2NAFDConnector` and `compute_gate_on_attention=true`
+    passes `validate_gpu_model_runner_v2_config` (Qwen3.5 and DeepSeek-V4
+    already reject gate-on-Attention). Attention builds
+    `AFDDeepseekV2RemoteExpertsMoE`, whose `AFDAttentionFusedMoE` sends
+    `router_logits` only, so the first MoE layer of the first forward raises
+    "DeepEPM2NAFDConnector needs topk_ids and topk_weights". The shared-expert
+    weights are also loaded by no role (`_FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS`
+    in `model_executor/models/deepseek_v2.py`).
+    - **Plan:** reject the pairing in the DeepSeek wrapper (or in
+    `validate_gpu_model_runner_v2_config`) with a unit test, until DeepSeek
+    has a CUDA gate and top-k on Attention and Attention-side shared experts
+    (see "Model E2E" below).
+- **DBO with DeepEP M2N.**
+    - **Problem:** validation accepts `enable_dbo` / `use_ubatching` with
+    DeepEP M2N, and `resolve_num_lanes` gives two lanes. Graph mode with DBO
+    hangs in the micro-batched capture warmup ("DeepEP NVLink barrier
+    timeout", then `cudaErrorLaunchFailure`; `afd-deepep-m2n-graph-dbo-2a2f`
+    below). Eager DBO has no E2E run.
+    - **Plan:** reject DBO for DeepEP M2N in
+    `validate_gpu_model_runner_v2_config` (at least with CUDA graphs), with a
+    unit test, and remove the check with the lane-ordering fix.
+
 ## Also open (from the phase reports)
 
 - Teardown when a peer dies. `test_peer_exit_fails_within_timeout` shows
