@@ -220,25 +220,13 @@ def _register(monkeypatch, name, connector_cls):
     monkeypatch.setitem(AFDConnectorFactory._registry, name, lambda: connector_cls)
 
 
-def _single_rank_config(
-    *,
-    fail_bootstrap=False,
-    data_parallel_size=1,
-    data_parallel_rank=0,
-    distributed_executor_backend="mp",
-):
+def _single_rank_config(*, fail_bootstrap=False):
     return SimpleNamespace(
         additional_config={},
         fail_bootstrap=fail_bootstrap,
         parallel_config=SimpleNamespace(
-            data_parallel_size=data_parallel_size,
-            data_parallel_rank=data_parallel_rank,
-            data_parallel_rank_local=data_parallel_rank,
-            data_parallel_index=data_parallel_rank,
-            data_parallel_backend="mp",
-            distributed_executor_backend=distributed_executor_backend,
-            nnodes_within_dp=1,
-            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            data_parallel_rank=0,
             prefill_context_parallel_size=1,
             tensor_parallel_size=1,
         ),
@@ -282,38 +270,6 @@ def test_create_bootstrapped_connector_creates_and_bootstraps(monkeypatch):
     assert isinstance(connector, _BootstrappingConnector)
     assert (connector.rank, connector.local_rank, connector.role_rank) == (3, 1, 0)
     assert connector.events == ["bootstrap"]
-
-
-@pytest.mark.parametrize(
-    ("executor_backend", "expected_local_rank"),
-    [("mp", 1), ("ray", 0)],
-)
-def test_create_bootstrapped_connector_uses_vllm_dp_device(
-    monkeypatch,
-    executor_backend,
-    expected_local_rank,
-):
-    """A bootstrapped connector gets the device vLLM will give the worker.
-
-    Why: vLLM adds the local DP offset to local_rank only in init_device,
-    after this bootstrap; without it every DP rank's connector used GPU 0.
-    """
-    _register(monkeypatch, "BootstrappingConnector", _BootstrappingConnector)
-
-    connector = AFDConnectorFactory.create_bootstrapped_connector(
-        1,
-        0,
-        _single_rank_config(
-            data_parallel_size=2,
-            data_parallel_rank=1,
-            distributed_executor_backend=executor_backend,
-        ),
-        AFDConfig(connector="BootstrappingConnector", role="ffn", num_ffn_ranks=2),
-    )
-
-    assert isinstance(connector, _BootstrappingConnector)
-    assert connector.local_rank == expected_local_rank
-    assert connector.role_rank == 1
 
 
 def test_create_bootstrapped_connector_closes_on_bootstrap_failure(monkeypatch):

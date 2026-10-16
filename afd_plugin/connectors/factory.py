@@ -20,33 +20,6 @@ from afd_plugin.distributed import resolve_role_rank
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-# vLLM's GPU worker skips its local data-parallel device offset for these.
-_NO_DP_DEVICE_OFFSET_EXECUTORS = ("ray", "external_launcher")
-
-
-def dp_adjusted_local_rank(vllm_config: VllmConfig, local_rank: int) -> int:
-    """Local device index vLLM's GPU worker will use for this rank.
-
-    vLLM adds the local data-parallel offset to ``local_rank`` inside
-    ``Worker.init_device`` (vLLM v0.30.0, ``vllm/v1/worker/gpu_worker.py``,
-    commit ced6857), so a connector created before that call must apply it
-    itself. Mirrors that code's conditions.
-    """
-    parallel_config = vllm_config.parallel_config
-    if (
-        parallel_config.distributed_executor_backend in _NO_DP_DEVICE_OFFSET_EXECUTORS
-        or parallel_config.data_parallel_backend == "ray"
-        or parallel_config.nnodes_within_dp != 1
-    ):
-        return local_rank
-    dp_local_rank = parallel_config.data_parallel_rank_local
-    if dp_local_rank is None:
-        dp_local_rank = parallel_config.data_parallel_index
-    tp_pp_world_size = (
-        parallel_config.pipeline_parallel_size * parallel_config.tensor_parallel_size
-    )
-    return local_rank + dp_local_rank * tp_pp_world_size
-
 
 class AFDConnectorFactory:
     _registry: dict[str, Callable[[], type[AFDConnectorBase]]] = {}
@@ -108,19 +81,14 @@ class AFDConnectorFactory:
         Workers call this before vLLM's distributed init. Returns ``None`` for
         connectors that are not ``AFDRoutedExpertsConnector``; their runner
         creates them later, as before. The role rank is resolved from config
-        alone, so callers must run with TP = 1. ``local_rank`` is the worker's
-        value before ``init_device``; the connector gets the device index vLLM
-        will use (``dp_adjusted_local_rank``).
+        alone, so callers must run with TP = 1. ``local_rank`` is the CUDA
+        device index the connector uses; vLLM has not selected the worker's
+        device yet, so callers pass the index it will select.
         """
         connector_cls = cls.get_connector_class(afd_config.connector)
         if not issubclass(connector_cls, AFDRoutedExpertsConnector):
             return None
-        connector = cls.create_connector(
-            rank,
-            dp_adjusted_local_rank(vllm_config, local_rank),
-            vllm_config,
-            afd_config,
-        )
+        connector = cls.create_connector(rank, local_rank, vllm_config, afd_config)
         assert isinstance(connector, AFDRoutedExpertsConnector)
         try:
             connector.bootstrap()

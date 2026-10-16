@@ -17,6 +17,10 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.v1.worker.connector_device import (
+    check_connector_device,
+    connector_device_index,
+)
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
@@ -67,7 +71,8 @@ class AFDFFNWorker(Worker):
     # only then) for an AFDRoutedExpertsConnector, else GPUFFNModelRunner. A
     # routed-experts connector is created and bootstrapped first, so its NCCL
     # environment precedes vLLM's NCCL groups, and the runner adopts it after
-    # construction.
+    # construction. The connector gets the device vLLM will select, checked
+    # once vLLM has selected it.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
@@ -99,7 +104,7 @@ class AFDFFNWorker(Worker):
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
         connector = AFDConnectorFactory.create_bootstrapped_connector(
             self.rank,
-            self.local_rank,
+            connector_device_index(self.vllm_config, self.local_rank),
             self.vllm_config,
             afd_config,
         )
@@ -117,6 +122,8 @@ class AFDFFNWorker(Worker):
         gpu_model_runner_v2.GPUModelRunner = runner_cls
         try:
             super().init_device()
+            if connector is not None:
+                check_connector_device(connector, self.device)
         except BaseException:
             if connector is not None:
                 connector.close()

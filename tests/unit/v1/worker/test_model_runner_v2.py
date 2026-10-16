@@ -147,6 +147,12 @@ def _v2_config(
     parallel_config = SimpleNamespace(
         data_parallel_size=data_parallel_size,
         data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+        data_parallel_backend="mp",
+        distributed_executor_backend="mp",
+        nnodes_within_dp=1,
+        assigned_physical_gpu_ids=None,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=prefill_context_parallel_size,
@@ -2379,7 +2385,7 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
     config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
     worker = _prepare_worker(worker_cls, config, use_v2=True)
     events: list[str] = []
-    connector = SimpleNamespace(close=lambda: events.append("close"))
+    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
     _ConnectorRunnerRecorder.adopted = []
 
     def create_bootstrapped_connector(rank, local_rank, vllm_config, afd_config):
@@ -2389,6 +2395,7 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
     def vllm_init(current_worker):
         events.append("vllm_init")
         _fake_worker_init(current_worker)
+        current_worker.device = torch.device("cuda", 0)
 
     factory = worker_module.AFDConnectorFactory
     monkeypatch.setattr(
@@ -2449,6 +2456,53 @@ def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
         worker.init_device()
 
     assert events == ["close"]
+    assert native_v2.GPUModelRunner is _NativeRunnerSentinel
+
+
+@pytest.mark.parametrize(
+    ("worker_module", "worker_cls", "runner_module", "runner_name"),
+    _ROUTED_WORKER_CASES,
+)
+def test_workers_reject_bootstrapped_connector_on_another_device(
+    monkeypatch, worker_module, worker_cls, runner_module, runner_name
+):
+    """A connector bootstrapped on a different GPU than vLLM's fails startup.
+
+    Why: the connector picks its device before vLLM does, by mirroring vLLM's
+    selection; a vLLM upgrade that changes the selection must fail here
+    rather than run the connector on another rank's GPU.
+    """
+    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
+    worker = _prepare_worker(worker_cls, config, use_v2=True)
+    events: list[str] = []
+    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
+    _ConnectorRunnerRecorder.adopted = []
+
+    def vllm_init(current_worker):
+        _fake_worker_init(current_worker)
+        current_worker.device = torch.device("cuda", 4)
+
+    factory = worker_module.AFDConnectorFactory
+    monkeypatch.setattr(
+        factory, "create_bootstrapped_connector", lambda *args: connector
+    )
+    monkeypatch.setattr(
+        factory, "get_connector_class", lambda name: FakeRoutedConnector
+    )
+    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
+    monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
+    monkeypatch.setattr(
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="uses cuda:0 but vLLM placed"):
+        worker.init_device()
+
+    assert events == ["close"]
+    assert _ConnectorRunnerRecorder.adopted == []
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
 
 
