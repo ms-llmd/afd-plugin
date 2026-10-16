@@ -17,6 +17,7 @@ from tests.conftest import (
     preserve_environment_variable,
     run_runner,
 )
+from tests.e2e.runner import DEEPEP_M2N_SCENARIOS
 
 GSM8K_DATASET_ID = "openai/gsm8k"
 GSM8K_DATASET_CONFIG = "main"
@@ -34,12 +35,9 @@ SCENARIOS = (
     "afd-graph-dbo-2a1f",
 )
 # DeepEP M2N (routing on Attention) needs EP over at least two FFN ranks, so
-# it runs 2A2F. These cases are opt-in: CI selects test ids explicitly.
-DEEPEP_M2N_SCENARIOS = (
-    "afd-deepep-m2n-eager-2a2f",
-    "afd-deepep-m2n-graph-2a2f",
-    "afd-deepep-m2n-graph-dbo-2a2f",
-)
+# its scenarios (DEEPEP_M2N_SCENARIOS) run 2A2F. CI selects test ids
+# explicitly and does not run them; running the whole module (pytest -m e2e
+# tests/e2e/models/qwen3_moe) does, and they need DeepEP and 4 GPUs.
 DEEPEP_M2N_DBO_SCENARIOS = frozenset(("afd-deepep-m2n-graph-dbo-2a2f",))
 
 

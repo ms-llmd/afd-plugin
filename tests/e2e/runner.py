@@ -636,6 +636,8 @@ def validate_topology(
         return
     if args.scenario in V2_SCENARIOS and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
+    if args.scenario in DEEPEP_M2N_SCENARIOS and args.device_backend != "gpu":
+        raise ValueError("DeepEP M2N E2E scenarios require GPU")
     if (
         args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
         and args.device_backend != "npu"

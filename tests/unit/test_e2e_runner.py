@@ -782,6 +782,18 @@ def test_v2_scenarios_reject_npu_backend():
         runner.validate_topology(args, ["0"], ["1"])
 
 
+@pytest.mark.parametrize("scenario", runner.DEEPEP_M2N_SCENARIOS)
+def test_deepep_m2n_scenarios_reject_npu_backend(scenario):
+    """DeepEP M2N scenarios fail validation on NPU, before any launch."""
+    args = _args()
+    args.scenario = scenario
+    args.device_backend = "npu"
+    runner.configure_scenario(args)
+
+    with pytest.raises(ValueError, match="DeepEP M2N E2E scenarios require GPU"):
+        runner.validate_topology(args, ["0", "1"], ["2", "3"])
+
+
 def test_build_baseline_command_uses_native_dp4_graph_server():
     args = _args()
     args.scenario = "baseline-graph"
