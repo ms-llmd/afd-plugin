@@ -189,7 +189,7 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
 
     assert construction_env["gate"] == ["model.layers.5.mlp.gate"]
     assert construction_env["moe"] == []
-    assert type(layer.mlp) is adapter.AFDQwen3MoeRoutedProxy
+    assert type(layer.mlp) is adapter.RemoteFFNProxy
     assert layer.mlp.gate is not None
     assert layer.mlp.layer_idx == 5
     assert layer.mlp.top_k == 2
@@ -201,6 +201,34 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
         "input_layernorm.weight",
         "post_attention_layernorm.weight",
     }
+
+
+def test_attention_role_gives_the_proxy_the_attention_tp_size(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    """Under DeepEP M2N the proxy gets the Attention TP size.
+
+    Why: with Attention TP > 1 each TP rank must dispatch only its slice of
+    the tokens; without the TP size the proxy would dispatch every token from
+    every TP rank.
+    """
+    vllm_config = _model_config()
+    vllm_config.parallel_config.tensor_parallel_size = 2
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=5,
+        vllm_config=vllm_config,
+        afd_config=AFDConfig(
+            role="attention",
+            connector=DEEPEP_M2N_CONNECTOR,
+            compute_gate_on_attention=True,
+        ),
+    )
+
+    assert type(layer.mlp) is adapter.RemoteFFNProxy
+    assert layer.mlp.tp_size == 2
 
 
 def test_ffn_role_constructs_only_native_moe(

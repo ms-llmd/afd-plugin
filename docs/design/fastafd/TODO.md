@@ -69,7 +69,7 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
     - Each Attention TP rank pads its DP rank's N tokens to a multiple of
     TP, routes and dispatches only its `ceil(N/TP)` slice (padding rows get
     expert id -1, which DeepEP routes nowhere), and the TP group all-gathers
-    the combined slices (`AFDQwen3MoeRoutedProxy`). Before, every TP rank
+    the combined slices (`RemoteFFNProxy` with `tp_size`). Before, every TP rank
     would have dispatched all N tokens, so the FFN would run each token TP
     times.
     - Attention reports its TP size in the handshake; the FFN (TP 1) adopts
