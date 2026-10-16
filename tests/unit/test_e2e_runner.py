@@ -634,7 +634,8 @@ def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
 def test_deepep_m2n_scenarios_route_on_attention_with_ffn_expert_parallel(
     scenario,
 ):
-    """DeepEP M2N scenarios run gate-on-Attention against an EP FFN.
+    """DeepEP M2N scenarios run gate-on-Attention against an EP FFN; the
+    Attention-TP scenarios run Attention DP1 x TP2, the others DP2 x TP1.
 
     Why: the connector's handshake rejects a run unless both roles route on
     Attention and the FFN ranks hold linear EP shards with TP 1.
@@ -643,16 +644,21 @@ def test_deepep_m2n_scenarios_route_on_attention_with_ffn_expert_parallel(
     args.scenario = scenario
     runner.configure_scenario(args)
     runner.validate_topology(args, ["0", "1"], ["2", "3"])
+    attention_tp = scenario in runner.DEEPEP_M2N_ATTENTION_TP_SCENARIOS
+    expected = {
+        "attention": ("1", "2") if attention_tp else ("2", "1"),
+        "ffn": ("2", "1"),
+    }
 
-    for role in ("attention", "ffn"):
+    for role, (dp_size, tp_size) in expected.items():
         command = runner.build_vllm_command(args, role=role)
         afd_config = json.loads(
             command[command.index("--additional-config") + 1],
         )["afd"]
         assert afd_config["connector"] == runner.DEEPEP_M2N_CONNECTOR
         assert afd_config["compute_gate_on_attention"] is True
-        assert command[command.index("--data-parallel-size") + 1] == "2"
-        assert command[command.index("--tensor-parallel-size") + 1] == "1"
+        assert command[command.index("--data-parallel-size") + 1] == dp_size
+        assert command[command.index("--tensor-parallel-size") + 1] == tp_size
         assert "--enable-expert-parallel" in command
 
 

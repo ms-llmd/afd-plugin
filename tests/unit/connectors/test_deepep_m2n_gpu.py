@@ -76,7 +76,9 @@ def _run(
 ) -> None:
     _skip_without_gpus(topology)
     if scenario_args is None:
-        scenario_args = {"cases": _cases(standard_cases(topology.attn_size, CAPACITY))}
+        scenario_args = {
+            "cases": _cases(standard_cases(topology.attn_dp_size, CAPACITY))
+        }
     results = run_ranks(
         topology,
         scenario,
@@ -109,6 +111,36 @@ def test_transport_and_deepgemm_experts(ffn_size, attn_size, payload_format, tmp
     Why: the core claim, for several rank ratios and both payload formats.
     """
     _run(Topology(ffn_size, attn_size), {"payload_format": payload_format}, tmp_path)
+
+
+@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "topology",
+    [Topology(2, 2, attn_tp_size=2), Topology(2, 4, attn_tp_size=2)],
+    ids=["2F-1DPx2TP", "2F-2DPx2TP"],
+)
+def test_attention_tp_peers_dispatch_disjoint_slices(
+    topology, payload_format, tmp_path
+):
+    """With Attention TP, each TP peer dispatches its padded slice of its DP
+    rank's tokens (padding rows with expert id -1): the FFN receives every
+    token's routes exactly once and each slice combines to the dense MoE
+    reference. Covers single-lane and two-lane steps, including decode
+    batches smaller than the TP size and empty DP ranks.
+
+    Why: TP peers hold the same tokens; dispatching all of them from every
+    peer would run each token's experts TP times, and a lost or doubled slice
+    would silently corrupt the output.
+    """
+    cases = standard_cases(topology.attn_dp_size, CAPACITY) + lane_cases(
+        topology.attn_dp_size, CAPACITY
+    )
+    _run(
+        topology,
+        {"payload_format": payload_format, "num_lanes": 2},
+        tmp_path,
+        scenario_args={"cases": _cases(cases)},
+    )
 
 
 @pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])

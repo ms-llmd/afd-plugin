@@ -19,6 +19,7 @@ from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.connector_device import (
     check_connector_device,
+    check_connector_role_rank,
     connector_device_index,
 )
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -124,6 +125,7 @@ class AFDFFNWorker(Worker):
             super().init_device()
             if connector is not None:
                 check_connector_device(connector, self.device)
+                check_connector_role_rank(connector, self.vllm_config)
         except BaseException:
             if connector is not None:
                 connector.close()

@@ -112,6 +112,7 @@ def _model_config(
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             pipeline_parallel_size=1,
+            tensor_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
         quant_config=None,
@@ -188,11 +189,12 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
 
     assert construction_env["gate"] == ["model.layers.5.mlp.gate"]
     assert construction_env["moe"] == []
-    assert type(layer.mlp) is adapter.RemoteFFNProxy
+    assert type(layer.mlp) is adapter.AFDQwen3MoeRoutedProxy
     assert layer.mlp.gate is not None
     assert layer.mlp.layer_idx == 5
     assert layer.mlp.top_k == 2
     assert layer.mlp.renormalize is True
+    assert layer.mlp.tp_size == 1
     assert set(dict(layer.named_parameters())) == {
         "self_attn.weight",
         "mlp.gate.weight",

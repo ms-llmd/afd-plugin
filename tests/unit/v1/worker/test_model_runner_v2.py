@@ -2413,10 +2413,15 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "check_connector_role_rank",
+        lambda checked, vllm_config: events.append("role_rank_check"),
+    )
 
     worker.init_device()
 
-    assert events == ["bootstrap", "vllm_init"]
+    assert events == ["bootstrap", "vllm_init", "role_rank_check"]
     assert _ConnectorRunnerRecorder.adopted == [connector]
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
 
@@ -2513,23 +2518,34 @@ def _deepep_m2n_v2_config(**kwargs):
     return config
 
 
-def test_v2_validator_accepts_deepep_m2n_with_tp1_only():
-    """DeepEP M2N is a supported GPU connector, but only with TP = 1.
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_v2_validator_accepts_deepep_m2n_attention_tp(tp_size):
+    """DeepEP M2N accepts Attention TP > 1.
 
-    Why: its bootstrap runs before vLLM's process groups exist, when the
-    role rank can only come from the DP rank.
+    Why: each Attention TP rank dispatches its own slice of the tokens, and
+    the bootstrap derives the TP rank from the worker rank before vLLM's
+    process groups exist.
     """
     validate_gpu_model_runner_v2_config(
-        _deepep_m2n_v2_config(),
+        _deepep_m2n_v2_config(
+            tensor_parallel_size=tp_size, num_attention_ranks=tp_size
+        ),
         expected_role="attention",
         device_type="cuda",
     )
 
-    config = _deepep_m2n_v2_config(tensor_parallel_size=2, num_attention_ranks=2)
-    with pytest.raises(RuntimeError, match="requires tensor_parallel_size=1"):
+
+def test_v2_validator_rejects_deepep_m2n_ffn_tp():
+    """DeepEP M2N FFN ranks must run TP = 1.
+
+    Why: DeepEP routes each token to the one FFN rank that owns the whole
+    expert; FFN experts are not TP-sharded.
+    """
+    config = _deepep_m2n_v2_config(role="ffn", tensor_parallel_size=2, num_ffn_ranks=2)
+    with pytest.raises(RuntimeError, match="requires FFN tensor_parallel_size=1"):
         validate_gpu_model_runner_v2_config(
             config,
-            expected_role="attention",
+            expected_role="ffn",
             device_type="cuda",
         )
 

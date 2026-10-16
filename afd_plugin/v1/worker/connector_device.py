@@ -6,6 +6,8 @@ A routed-experts connector bootstraps before vLLM's distributed init, so it is
 created before vLLM selects the worker's device. ``connector_device_index``
 mirrors that selection; ``check_connector_device`` compares the result with
 the device vLLM chose, so a drift after a vLLM upgrade fails at startup.
+``check_connector_role_rank`` does the same for the role rank, whose TP part
+is derived from the worker rank before vLLM's TP group exists.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import set_assigned_physical_gpu_ids
 
 from afd_plugin.connectors import AFDConnectorBase
+from afd_plugin.distributed import resolve_role_rank
 
 # vLLM's GPU worker skips its local data-parallel device offset for these.
 _NO_DP_DEVICE_OFFSET_EXECUTORS = ("ray", "external_launcher")
@@ -65,4 +68,26 @@ def check_connector_device(
         )
 
 
-__all__ = ["check_connector_device", "connector_device_index"]
+def check_connector_role_rank(
+    connector: AFDConnectorBase,
+    vllm_config: VllmConfig,
+) -> None:
+    """Fail when a connector's role rank differs from vLLM's distributed ranks.
+
+    Call after vLLM's distributed init, which creates the TP group.
+    """
+    role_rank = resolve_role_rank(vllm_config, connector.afd_config)
+    if connector.role_rank != role_rank:
+        raise RuntimeError(
+            f"{type(connector).__name__} has role rank {connector.role_rank} but "
+            f"vLLM's distributed ranks give {role_rank}; the TP rank derived "
+            "before distributed init (tp_rank_before_distributed_init) no longer "
+            "matches vLLM's rank layout",
+        )
+
+
+__all__ = [
+    "check_connector_device",
+    "check_connector_role_rank",
+    "connector_device_index",
+]

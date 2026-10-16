@@ -65,7 +65,29 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
   (bootstrap gloo group, NCCL control group); re-initializing in the same
   process is untested.
 - BF16 psum-bounded fused SiLU-mul (graph mode at large buckets).
-- Attention TP > 1 (sequence-split dispatch).
+- Attention TP > 1, sequence-split dispatch (phase 1): implemented.
+    - Each Attention TP rank pads its DP rank's N tokens to a multiple of
+    TP, routes and dispatches only its `ceil(N/TP)` slice (padding rows get
+    expert id -1, which DeepEP routes nowhere), and the TP group all-gathers
+    the combined slices (`AFDQwen3MoeRoutedProxy`). Before, every TP rank
+    would have dispatched all N tokens, so the FFN would run each token TP
+    times.
+    - Attention reports its TP size in the handshake; the FFN (TP 1) adopts
+    it and Attention's capacity, `ceil(max(max_num_batched_tokens,
+    max_cudagraph_capture_size) / TP)`.
+    - The role rank before vLLM's distributed init takes its TP part from
+    the worker rank (`tp_rank_before_distributed_init`, TP is vLLM's
+    innermost rank dimension); `check_connector_role_rank` re-checks it
+    after init.
+    - Validated on pokprod H100, 2026-10-16: GPU harness 26/26, including
+    1DPx2TP and 2DPx2TP Attention against 2 FFN ranks, BF16 and FP8;
+    Qwen3-30B-A3B E2E `afd-deepep-m2n-eager-tp2-2a2f` GSM8K 1.0 (7/7) and
+    `afd-deepep-m2n-graph-tp2-2a2f` 0.857 (6/7), next to TP1 eager and
+    graph 1.0 (7/7).
+    - Still open: phase 2 (reduce-scatter after attention instead of the
+    all-reduce, residual kept split; saves one all-gather per layer, only
+    if profiling shows a prefill gain), and Attention TP with DBO (DBO
+    itself is open, see below).
 - Model E2E. Qwen3-30B-A3B, BF16, one node, 2 Attention + 2 FFN ranks
   (`tests/e2e/models/qwen3_moe`, `test_qwen3_moe_deepep_m2n`) on pokprod
   4x H100, no RDMA, 2026-10-15:

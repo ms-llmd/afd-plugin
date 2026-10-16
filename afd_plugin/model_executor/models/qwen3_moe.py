@@ -17,6 +17,9 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3MoeConfig
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models import qwen3_moe as native
 from vllm.platforms import current_platform
 
@@ -29,6 +32,8 @@ if TYPE_CHECKING:
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
+# Expert id of a padding row: the routed-experts connector sends it nowhere.
+UNROUTED_EXPERT_ID = -1
 
 
 def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
@@ -156,6 +161,72 @@ def _validate_supported_config(
         raise RuntimeError("AFD Qwen3 MoE does not support LoRA")
 
 
+class AFDQwen3MoeRoutedProxy(RemoteFFNProxy):
+    """Attention-side MoE for a connector that routes on Attention (DeepEP M2N).
+
+    Runs the native Qwen3 gate and vLLM's default fused top-k, dispatches the
+    routed tokens, and returns the combined top-k weighted expert output.
+
+    With Attention TP > 1 every TP rank holds the same tokens after the
+    attention all-reduce. Dispatching them from every rank would make the FFN
+    run each token TP times, so each rank pads the tokens to a multiple of the
+    TP size (``sequence_parallel_chunk``), routes and dispatches only its own
+    slice, and the TP group all-gathers the combined slices, as vLLM's native
+    sequence-parallel MoE does. Padding rows get ``UNROUTED_EXPERT_ID`` and
+    reach no FFN rank; they are dropped after the all-gather.
+    """
+
+    def __init__(
+        self,
+        *,
+        layer_idx: int,
+        config: Qwen3MoeConfig,
+        quant_config: QuantizationConfig | None,
+        tp_size: int,
+        prefix: str,
+    ) -> None:
+        super().__init__(layer_idx=layer_idx)
+        # Same gate as native Qwen3MoeSparseMoeBlock, same weight path.
+        self.gate = native.ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
+        self.top_k = int(config.num_experts_per_tok)
+        self.renormalize = bool(config.norm_topk_prob)
+        self.tp_size = tp_size
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.tp_size == 1:
+            return super().forward(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        local_states = native.sequence_parallel_chunk(hidden_states)
+        assert self.gate is not None
+        router_logits, _ = self.gate(local_states)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states=local_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        local_tokens = local_states.shape[0]
+        token_index = get_tensor_model_parallel_rank() * local_tokens + torch.arange(
+            local_tokens, device=topk_ids.device
+        )
+        topk_ids = topk_ids.masked_fill(
+            (token_index >= num_tokens).unsqueeze(1), UNROUTED_EXPERT_ID
+        )
+        local_output = self._send_and_receive(
+            local_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        output = native.tensor_model_parallel_all_gather(local_output, 0)
+        return output[:num_tokens]
+
+
 class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
     """Qwen3 MoE decoder layer with separable Attention and FFN execution."""
 
@@ -211,18 +282,16 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 dual_chunk_attention_config=dual_chunk_attention_config,
             )
-            self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             if _routes_on_attention(afd_config):
-                # Same gate as native Qwen3MoeSparseMoeBlock, same weight path.
-                self.mlp.gate = native.ReplicatedLinear(
-                    config.hidden_size,
-                    config.num_experts,
-                    bias=False,
+                self.mlp = AFDQwen3MoeRoutedProxy(
+                    layer_idx=layer_idx,
+                    config=config,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.gate",
+                    tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                    prefix=f"{prefix}.mlp",
                 )
-                self.mlp.top_k = int(config.num_experts_per_tok)
-                self.mlp.renormalize = bool(config.norm_topk_prob)
+            else:
+                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,

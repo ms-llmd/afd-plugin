@@ -17,6 +17,7 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
 )
 from afd_plugin.v1.worker.connector_device import (
     check_connector_device,
+    check_connector_role_rank,
     connector_device_index,
 )
 from afd_plugin.validation import (
@@ -102,6 +103,7 @@ class AFDAttentionWorker(Worker):
             super().init_device()
             if connector is not None:
                 check_connector_device(connector, self.device)
+                check_connector_role_rank(connector, self.vllm_config)
         except BaseException:
             if connector is not None:
                 connector.close()

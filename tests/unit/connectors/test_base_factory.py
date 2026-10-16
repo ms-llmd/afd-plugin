@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -220,15 +221,18 @@ def _register(monkeypatch, name, connector_cls):
     monkeypatch.setitem(AFDConnectorFactory._registry, name, lambda: connector_cls)
 
 
-def _single_rank_config(*, fail_bootstrap=False):
+def _single_rank_config(
+    *, fail_bootstrap=False, data_parallel_size=1, data_parallel_rank=0, tp_size=1
+):
     return SimpleNamespace(
         additional_config={},
         fail_bootstrap=fail_bootstrap,
         parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank=0,
+            data_parallel_size=data_parallel_size,
+            data_parallel_rank=data_parallel_rank,
+            pipeline_parallel_size=1,
             prefill_context_parallel_size=1,
-            tensor_parallel_size=1,
+            tensor_parallel_size=tp_size,
         ),
     )
 
@@ -270,6 +274,34 @@ def test_create_bootstrapped_connector_creates_and_bootstraps(monkeypatch):
     assert isinstance(connector, _BootstrappingConnector)
     assert (connector.rank, connector.local_rank, connector.role_rank) == (3, 1, 0)
     assert connector.events == ["bootstrap"]
+
+
+def test_create_bootstrapped_connector_derives_tp_rank_from_worker_rank(
+    monkeypatch,
+):
+    """With TP > 1 the role rank's TP part comes from the worker rank.
+
+    Why: vLLM's TP group does not exist before its distributed init; reading
+    it there would fail. TP is vLLM's innermost rank dimension, so the worker
+    rank modulo the TP size is the TP rank.
+    """
+    _register(monkeypatch, "BootstrappingConnector", _BootstrappingConnector)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", None)
+
+    connector = AFDConnectorFactory.create_bootstrapped_connector(
+        1,
+        1,
+        _single_rank_config(data_parallel_size=2, data_parallel_rank=1, tp_size=2),
+        AFDConfig(
+            connector="BootstrappingConnector",
+            role="attention",
+            num_attention_ranks=4,
+        ),
+    )
+
+    assert isinstance(connector, _BootstrappingConnector)
+    # DP rank 1, TP rank 1 of 2.
+    assert connector.role_rank == 3
 
 
 def test_create_bootstrapped_connector_closes_on_bootstrap_failure(monkeypatch):

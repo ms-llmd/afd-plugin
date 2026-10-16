@@ -25,6 +25,14 @@ Data path (per MoE layer and stage, identical order on every rank):
     Both calls are collectives over all ranks: every rank must issue them for
     every MoE layer and stage, including ranks with no tokens.
 
+Attention tensor parallelism:
+    Every Attention TP rank is its own union rank. TP peers hold the same
+    tokens, so each dispatches only its slice: the model pads the DP rank's
+    ``N`` tokens to a multiple of the TP size, TP rank ``r`` dispatches rows
+    ``[r * ceil(N/TP), (r + 1) * ceil(N/TP))`` and the TP group all-gathers the
+    combined rows. Attention reports its TP size in the handshake; the FFN,
+    which runs without TP, adopts it to plan the per-rank token counts.
+
 Control plane:
     The existing ``AFDControlPayload`` is enough. Every rank derives the same
     per-stage plan from it (dispatch bucket, host sync, graph mode), so no
@@ -140,8 +148,9 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
 
     Attributes:
         capacity_tokens_per_rank: Max tokens one Attention rank dispatches per
-            call; sizes the DeepEP buffers. ``None`` uses the larger of vLLM's
-            ``max_num_batched_tokens`` and its largest CUDA-graph capture
+            call (with Attention TP, its slice); sizes the DeepEP buffers.
+            ``None`` uses the larger of vLLM's ``max_num_batched_tokens`` and
+            its largest CUDA-graph capture size, divided by the Attention TP
             size (``resolve_capacity_tokens_per_rank``).
         num_lanes: In-flight micro-batches (one DeepEP buffer each). ``None``
             uses vLLM's micro-batch count: two under DBO, otherwise one
@@ -220,20 +229,22 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         return {**asdict(self), "network": self.network.to_mapping()}
 
 
-# Both roles derive these from their own vLLM config; the handshake requires
-# the results to match, so Attention and FFN must share the scheduler budget,
-# the CUDA-graph capture sizes and the DBO setting.
+# Attention derives the capacity from its own vLLM config and the FFN adopts
+# it in the handshake (the FFN does not know the Attention TP size). The lane
+# count is derived on both roles and must match, so Attention and FFN must
+# share the DBO setting.
 def resolve_capacity_tokens_per_rank(
     config: DeepEPM2NConfig, vllm_config: VllmConfig
 ) -> int:
-    """Largest dispatch one Attention rank may issue: a prefill chunk or the
-    largest decode graph, whichever is bigger."""
+    """Largest dispatch one Attention rank may issue: its TP slice of a prefill
+    chunk or of the largest decode graph, whichever is bigger."""
     if config.capacity_tokens_per_rank is not None:
         return config.capacity_tokens_per_rank
-    return max(
+    max_tokens = max(
         vllm_config.scheduler_config.max_num_batched_tokens,
         vllm_config.compilation_config.max_cudagraph_capture_size,
     )
+    return -(-max_tokens // vllm_config.parallel_config.tensor_parallel_size)
 
 
 def resolve_num_lanes(config: DeepEPM2NConfig, vllm_config: VllmConfig) -> int:
@@ -261,21 +272,22 @@ class StagePlan:
 
 
 def tokens_per_attention_rank(
-    dp_metadata: AFDDPMetadata, attn_size: int
+    dp_metadata: AFDDPMetadata, attn_size: int, attn_tp_size: int
 ) -> tuple[int, ...]:
-    """Token count of every Attention rank for one stage.
+    """Token count every Attention rank dispatches for one stage.
 
-    DP metadata lists one count per DP rank; when Attention ranks also span TP,
-    each DP count is repeated for its TP peers.
+    DP metadata lists one count per DP rank. The TP peers of a DP rank hold
+    the same tokens and each dispatches a ``ceil(count / attn_tp_size)`` slice
+    (the last slices include padding rows that route nowhere).
     """
     counts = [int(count) for count in dp_metadata.num_tokens_across_dp_cpu.flatten()]
-    if len(counts) == attn_size:
-        return tuple(counts)
-    if counts and attn_size % len(counts) == 0:
-        tp_size = attn_size // len(counts)
-        return tuple(counts[rank // tp_size] for rank in range(attn_size))
-    raise ValueError(
-        f"DP metadata has {len(counts)} token counts for {attn_size} Attention ranks"
+    if len(counts) * attn_tp_size != attn_size:
+        raise ValueError(
+            f"DP metadata has {len(counts)} token counts; with Attention TP "
+            f"{attn_tp_size} that does not cover {attn_size} Attention ranks"
+        )
+    return tuple(
+        -(-count // attn_tp_size) for count in counts for _ in range(attn_tp_size)
     )
 
 
@@ -283,12 +295,13 @@ def plan_stage(
     dp_metadata: AFDDPMetadata,
     *,
     attn_size: int,
+    attn_tp_size: int,
     capacity_tokens_per_rank: int,
     bucket_granularity: int,
     graph_mode: bool,
     cpu_sync_min_tokens: int = 0,
 ) -> StagePlan:
-    tokens = tokens_per_attention_rank(dp_metadata, attn_size)
+    tokens = tokens_per_attention_rank(dp_metadata, attn_size, attn_tp_size)
     max_tokens = max(1, max(tokens))
     bucket = -(-max_tokens // bucket_granularity) * bucket_granularity
     if bucket > capacity_tokens_per_rank:
@@ -311,6 +324,9 @@ def plan_stage(
 class HandshakeResult:
     expert_alignment: int
     network_plan: NetworkPlan
+    # Reported by Attention; FFN ranks adopt both.
+    attn_tp_size: int
+    capacity_tokens_per_rank: int
 
 
 def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
@@ -351,7 +367,8 @@ def local_handshake_info(
     num_experts: int,
     top_k: int,
     num_lanes: int,
-    capacity_tokens_per_rank: int,
+    capacity_tokens_per_rank: int | None,
+    attn_tp_size: int | None,
     compute_gate_on_attention: bool,
     expert_alignment: int | None,
     ffn_deployment: dict[str, Any] | None,
@@ -371,6 +388,7 @@ def local_handshake_info(
         "top_k": top_k,
         "num_lanes": num_lanes,
         "capacity_tokens_per_rank": capacity_tokens_per_rank,
+        "attn_tp_size": attn_tp_size,
         "compute_gate_on_attention": compute_gate_on_attention,
         "network": str(config.network.to_mapping()),
         "expert_alignment": expert_alignment,
@@ -387,7 +405,6 @@ _MUST_MATCH = (
     "num_experts",
     "top_k",
     "num_lanes",
-    "capacity_tokens_per_rank",
     "compute_gate_on_attention",
     "network",
 )
@@ -464,6 +481,29 @@ def validate_handshake(
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
         raise RuntimeError(f"FFN ranks disagree on expert_alignment: {alignments}")
+    attn_infos = infos[layout.ffn_size :]
+    tp_sizes = {info["attn_tp_size"] for info in attn_infos}
+    if len(tp_sizes) != 1 or None in tp_sizes:
+        raise RuntimeError(f"Attention ranks disagree on their TP size: {tp_sizes}")
+    attn_tp_size = int(tp_sizes.pop())
+    if attn_tp_size <= 0 or layout.attn_size % attn_tp_size != 0:
+        raise RuntimeError(
+            f"Attention TP size {attn_tp_size} does not divide the "
+            f"{layout.attn_size} Attention ranks"
+        )
+    # Attention resolves the capacity (it knows its TP size); an FFN rank
+    # reports one only when it is configured explicitly, and it must agree.
+    capacities = {info["capacity_tokens_per_rank"] for info in attn_infos}
+    capacities |= {
+        info["capacity_tokens_per_rank"]
+        for info in infos[: layout.ffn_size]
+        if info["capacity_tokens_per_rank"] is not None
+    }
+    if len(capacities) != 1 or None in capacities:
+        raise RuntimeError(
+            "ranks disagree on capacity_tokens_per_rank: "
+            f"{sorted(map(str, capacities))}"
+        )
     # Every rank evaluates the same plan on the same list.
     plan = plan_network(
         [RankTopology.from_mapping(info["topology"]) for info in infos], network
@@ -471,6 +511,8 @@ def validate_handshake(
     return HandshakeResult(
         expert_alignment=int(alignments.pop()),
         network_plan=plan,
+        attn_tp_size=attn_tp_size,
+        capacity_tokens_per_rank=int(capacities.pop()),
     )
 
 
@@ -735,8 +777,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
             raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
         self.world_rank = self.layout.world_rank(afd_config.role, role_rank)
-        self.capacity_tokens_per_rank = resolve_capacity_tokens_per_rank(
-            self.config, vllm_config
+        # The FFN runs without TP and learns the Attention TP size and the
+        # resulting capacity in the handshake (``bootstrap``).
+        self.attn_tp_size: int | None = (
+            None if self.is_ffn else vllm_config.parallel_config.tensor_parallel_size
+        )
+        self.capacity_tokens_per_rank: int | None = (
+            self.config.capacity_tokens_per_rank
+            if self.is_ffn
+            else resolve_capacity_tokens_per_rank(self.config, vllm_config)
         )
         self.num_lanes = resolve_num_lanes(self.config, vllm_config)
         self.device = torch.device("cuda", local_rank)
@@ -807,6 +856,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             top_k=self.top_k,
             num_lanes=self.num_lanes,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            attn_tp_size=self.attn_tp_size,
             compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
             expert_alignment=local_alignment,
             ffn_deployment=(
@@ -826,6 +876,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
         self.expert_alignment = result.expert_alignment
         self.network_plan = result.network_plan
+        self.attn_tp_size = result.attn_tp_size
+        self.capacity_tokens_per_rank = result.capacity_tokens_per_rank
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
         # Before any NCCL communicator in this process exists, when the worker
@@ -858,6 +910,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         torch.cuda.set_device(self.device)
         _register_custom_ops()
         assert self.bootstrap_group is not None and self.network_plan is not None
+        assert self.capacity_tokens_per_rank is not None
         model_infos: list[dict[str, Any] | None] = [None] * self.layout.union_size
         dist.all_gather_object(
             model_infos,
@@ -1215,10 +1268,13 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
                 f"num_lanes={connector.num_lanes}"
             )
         graph_mode = payload.is_graph_capturing or payload.is_graph_replaying
+        if connector.attn_tp_size is None or connector.capacity_tokens_per_rank is None:
+            raise RuntimeError("DeepEPM2N control plane used before bootstrap")
         connector.stage_plans = {
             stage_idx: plan_stage(
                 dp_metadata,
                 attn_size=connector.attn_size,
+                attn_tp_size=connector.attn_tp_size,
                 capacity_tokens_per_rank=connector.capacity_tokens_per_rank,
                 bucket_granularity=connector.config.bucket_granularity,
                 graph_mode=graph_mode,

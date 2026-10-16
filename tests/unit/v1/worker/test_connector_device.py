@@ -13,6 +13,7 @@ pytest.importorskip("vllm")
 
 from vllm.platforms import interface as platform_interface  # noqa: E402
 
+from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.v1.worker import connector_device  # noqa: E402
 
 
@@ -111,4 +112,48 @@ def test_check_rejects_another_device():
         connector_device.check_connector_device(
             SimpleNamespace(local_rank=0),
             torch.device("cuda", 4),
+        )
+
+
+def _role_rank_config(*, tp_size: int):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=tp_size,
+        ),
+    )
+
+
+def test_role_rank_check_accepts_the_distributed_role_rank(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank", lambda: 1
+    )
+    connector = SimpleNamespace(
+        role_rank=1,
+        afd_config=AFDConfig(role="attention", num_attention_ranks=2),
+    )
+
+    connector_device.check_connector_role_rank(connector, _role_rank_config(tp_size=2))
+
+
+def test_role_rank_check_rejects_a_different_role_rank(monkeypatch):
+    """A connector whose early role rank differs from vLLM's fails startup.
+
+    Why: the TP part of the role rank is derived from the worker rank before
+    vLLM's TP group exists; a vLLM change to its rank order must fail here
+    instead of routing another rank's tokens.
+    """
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank", lambda: 0
+    )
+    connector = SimpleNamespace(
+        role_rank=1,
+        afd_config=AFDConfig(role="attention", num_attention_ranks=2),
+    )
+
+    with pytest.raises(RuntimeError, match="has role rank 1 but vLLM"):
+        connector_device.check_connector_role_rank(
+            connector, _role_rank_config(tp_size=2)
         )
