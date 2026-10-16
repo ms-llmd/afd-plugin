@@ -83,7 +83,9 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
     1DPx2TP and 2DPx2TP Attention against 2 FFN ranks, BF16 and FP8;
     Qwen3-30B-A3B E2E `afd-deepep-m2n-eager-tp2-2a2f` GSM8K 1.0 (7/7) and
     `afd-deepep-m2n-graph-tp2-2a2f` 0.857 (6/7), next to TP1 eager and
-    graph 1.0 (7/7).
+    graph 1.0 (7/7). On 200 GSM8K samples (`AFD_GSM8K_LIMIT=200`) graph
+    TP2 and graph TP1 score the same: 0.91 flexible-extract, 0.94
+    strict-match (±0.02), so the 6/7 is small-sample noise.
     - Still open: phase 2 (reduce-scatter after attention instead of the
     all-reduce, residual kept split; saves one all-gather per layer, only
     if profiling shows a prefill gain), and Attention TP with DBO (DBO
