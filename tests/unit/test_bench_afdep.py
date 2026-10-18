@@ -78,6 +78,8 @@ def test_streaming_benchmark_counts_empty_text_tokens(tmp_path, monkeypatch):
         "argv",
         [
             "bench_afdep.py",
+            "--model",
+            "qwen3-30b-afdep",
             "--output",
             str(output),
             "--requests",
@@ -96,6 +98,8 @@ def test_streaming_benchmark_counts_empty_text_tokens(tmp_path, monkeypatch):
 
     result = json.loads(output.read_text())
     record = result["records"][0]
+    assert requests[0]["model"] == "qwen3-30b-afdep"
+    assert result["config"]["model"] == "qwen3-30b-afdep"
     assert requests[0]["return_token_ids"] is True
     assert "logprobs" not in requests[0]
     assert record["output"] == "A"

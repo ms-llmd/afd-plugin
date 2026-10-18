@@ -79,6 +79,7 @@ def percentile(values: list[float], quantile: float):
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:18305")
+    parser.add_argument("--model", default="deepseek-v2-lite")
     parser.add_argument("--output", required=True)
     parser.add_argument("--requests", type=int, default=96)
     parser.add_argument("--concurrency", type=int, default=16)
@@ -118,7 +119,7 @@ async def main():
                     "POST",
                     args.url + "/v1/completions",
                     json={
-                        "model": "deepseek-v2-lite",
+                        "model": args.model,
                         "prompt": prompts[index],
                         "max_tokens": args.output_tokens,
                         "temperature": 0,
