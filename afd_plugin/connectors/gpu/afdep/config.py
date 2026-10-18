@@ -13,6 +13,7 @@ from afd_plugin.connectors.base import ConnectorExtraInfo
 class AfdEPConfig(ConnectorExtraInfo):
     capacity_tokens_per_rank: int = 2048
     allow_hybrid_mode: bool = True
+    replay_prefill_graph: bool = True
     num_sms: int = 132
     expected_rows_per_expert: int = 512
 
@@ -20,8 +21,9 @@ class AfdEPConfig(ConnectorExtraInfo):
         for name in ("capacity_tokens_per_rank", "num_sms", "expected_rows_per_expert"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if type(self.allow_hybrid_mode) is not bool:
-            raise ValueError("allow_hybrid_mode must be a boolean")
+        for name in ("allow_hybrid_mode", "replay_prefill_graph"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "AfdEPConfig":

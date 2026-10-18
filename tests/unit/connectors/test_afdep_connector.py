@@ -93,7 +93,8 @@ def test_receive_and_compute_never_use_native_moe_runner():
     assert connector.experts.weights == "local shard"
 
 
-def test_one_ffn_graph_replays_for_changing_prefill_counts():
+@pytest.mark.parametrize("replay_prefill_graph", [True, False])
+def test_one_ffn_graph_replays_for_changing_prefill_counts(replay_prefill_graph):
     from unittest.mock import Mock
 
     from afd_plugin.connectors.base import ExpertLayoutConnector
@@ -105,6 +106,7 @@ def test_one_ffn_graph_replays_for_changing_prefill_counts():
     runner.use_cuda_graph = True
     runner.connector = Mock(spec=ExpertLayoutConnector)
     runner.connector.capacity = 2048
+    runner.connector.replay_prefill_graph = replay_prefill_graph
     graph = Mock()
     runner._cuda_graphs = {((0, (2048,)),): {"graph": graph}}
     runner._ffn_forward = Mock()
@@ -114,5 +116,9 @@ def test_one_ffn_graph_replays_for_changing_prefill_counts():
             # Attention prefill is eager; this must not prevent FFN replay.
             is_graph_replaying=False,
         )
-    assert graph.replay.call_count == 4
-    runner._ffn_forward.assert_not_called()
+    if replay_prefill_graph:
+        assert graph.replay.call_count == 4
+        runner._ffn_forward.assert_not_called()
+    else:
+        graph.replay.assert_not_called()
+        assert runner._ffn_forward.call_count == 4

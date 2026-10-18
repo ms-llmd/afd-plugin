@@ -181,6 +181,7 @@ class GPUFFNModelRunner:
         )
         if (
             isinstance(self.connector, ExpertLayoutConnector)
+            and self.connector.replay_prefill_graph
             and cuda_graph_info is not None
             and not is_warmup
             and not is_graph_capturing

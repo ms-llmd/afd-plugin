@@ -103,6 +103,10 @@ class AfdEPConnector(ExpertLayoutConnector):
         self._dispatch_op, self._collect_op = attention_ops(self)
 
     @property
+    def replay_prefill_graph(self) -> bool:
+        return self.options.replay_prefill_graph
+
+    @property
     def capacity(self) -> int:
         return self.options.capacity_tokens_per_rank
 

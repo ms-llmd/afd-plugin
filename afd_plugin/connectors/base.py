@@ -263,6 +263,11 @@ class ExpertLayoutConnector(AFDConnectorBase):
     """
 
     @property
+    def replay_prefill_graph(self) -> bool:
+        """Allow replay even when Attention executes an eager prefill step."""
+        return True
+
+    @property
     @abstractmethod
     def capacity(self) -> int:
         raise NotImplementedError
