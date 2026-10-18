@@ -15,10 +15,16 @@ class AfdEPConfig(ConnectorExtraInfo):
     allow_hybrid_mode: bool = True
     replay_prefill_graph: bool = True
     num_sms: int = 132
+    transport_stripes: int = 8
     expected_rows_per_expert: int = 512
 
     def __post_init__(self) -> None:
-        for name in ("capacity_tokens_per_rank", "num_sms", "expected_rows_per_expert"):
+        for name in (
+            "capacity_tokens_per_rank",
+            "num_sms",
+            "transport_stripes",
+            "expected_rows_per_expert",
+        ):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         for name in ("allow_hybrid_mode", "replay_prefill_graph"):

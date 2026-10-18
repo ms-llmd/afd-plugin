@@ -8,7 +8,7 @@ point deliberately bypasses vLLM's MoE runner and its EP collectives.
 
 from __future__ import annotations
 
-import uuid
+import hashlib
 import weakref
 from collections.abc import Mapping
 from datetime import timedelta
@@ -137,6 +137,7 @@ class AfdEPConnector(ExpertLayoutConnector):
                 top_k=self.top_k,
                 allow_hybrid_mode=self.options.allow_hybrid_mode,
                 num_sms=self.options.num_sms,
+                transport_stripes=self.options.transport_stripes,
             ),
         )
         logger.info(
@@ -265,9 +266,15 @@ class AfdEPConnector(ExpertLayoutConnector):
 
 
 def attention_ops(connector: AfdEPConnector) -> tuple:
-    """Per-instance opaque ops keep transport out of torch.compile tracing."""
+    """Endpoint-owned opaque ops with names stable across compile-cache reloads."""
     owner = weakref.ref(connector)
-    suffix = uuid.uuid4().hex
+    # vLLM can reload Inductor code in a fresh worker. Its operator references
+    # must resolve to this worker's connector rather than a previous random ID.
+    # Distinct endpoints/ranks remain isolated; each worker owns one connector.
+    endpoint = f"{connector.afd_config.host}:{connector.afd_config.port}"
+    suffix = (
+        f"{connector.world_rank}_{hashlib.sha256(endpoint.encode()).hexdigest()[:16]}"
+    )
 
     @torch.library.custom_op(
         f"afdep_serving::dispatch_{suffix}",
