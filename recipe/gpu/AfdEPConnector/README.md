@@ -29,7 +29,7 @@ Use `CONNECTOR=P2pNcclAFDConnector` for the baseline; use `EAGER=1` to disable
 graphs for either connector.
 
 | Path | Attention prefill | FFN prefill | Decode |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | P2P NCCL | Eager | Eager | Graph sizes 1/8/32 |
 | afdEP | Eager | One capacity graph, GPU counts | Same FFN graph |
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Mixed-size closed-loop serving measurements; startup excluded, replay included."""
 
 import argparse

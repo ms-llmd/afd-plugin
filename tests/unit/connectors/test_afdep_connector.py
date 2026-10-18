@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Role/ownership and router contracts without launching distributed workers."""
 
 from types import SimpleNamespace
@@ -78,6 +79,8 @@ def test_receive_and_compute_never_use_native_moe_runner():
     recorded = []
 
     class LocalExperts:
+        weights: str
+
         def __call__(self, *args):
             recorded.append(args)
             return args[0]

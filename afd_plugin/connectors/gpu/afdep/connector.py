@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Directional expert transport over the standalone afdEP library.
 
 The FFN receive layout is already grouped by local expert. Its compute entry

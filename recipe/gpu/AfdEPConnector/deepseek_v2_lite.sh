@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 set -euo pipefail
 : "${MODEL_PATH:?Set the DeepSeek-V2-Lite checkpoint path}"
 : "${ROLE:?Set attention or ffn}"

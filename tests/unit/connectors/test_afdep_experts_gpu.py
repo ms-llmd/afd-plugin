@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """GPU-count FFN graph versus an independent per-expert PyTorch reference."""
 
 import pytest

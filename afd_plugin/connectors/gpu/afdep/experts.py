@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 # ruff: noqa: N803
 """BF16 FFN workspace adapted from afdEP commit 07afc4f, experiments/prefill/ffn.py.
 
