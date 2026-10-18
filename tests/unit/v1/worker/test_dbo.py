@@ -84,15 +84,17 @@ def test_maybe_apply_dbo_yield_does_not_probe_ascend(monkeypatch):
     assert maybe_apply_dbo_yield(tensor, role="attention") is tensor
 
 
-def test_dbo_yield_keeps_legacy_ascend_context(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dbo_yield_keeps_legacy_ascend_context(monkeypatch, enabled):
     calls = []
     monkeypatch.setattr(dbo, "dbo_enabled", lambda: False)
+    monkeypatch.setattr(dbo, "current_platform", SimpleNamespace(device_type="npu"))
 
     monkeypatch.setitem(
         sys.modules,
         "afd_plugin.v1.worker.npu.ubatching",
         SimpleNamespace(
-            dbo_enabled=lambda: True,
+            dbo_enabled=lambda: enabled,
             dbo_yield=lambda: calls.append("ascend"),
         ),
     )
@@ -106,11 +108,41 @@ def test_dbo_yield_keeps_legacy_ascend_context(monkeypatch):
     )
     dbo._yield_if_dbo_enabled()
 
-    assert calls == ["ascend"]
+    assert calls == (["ascend"] if enabled else [])
+
+
+def test_cuda_without_dbo_never_imports_ascend(monkeypatch):
+    monkeypatch.setattr(dbo, "dbo_enabled", lambda: False)
+    monkeypatch.setattr(dbo, "current_platform", SimpleNamespace(device_type="cuda"))
+    real_import = builtins.__import__
+
+    def check_import(name, *args, **kwargs):
+        assert not name.startswith("afd_plugin.v1.worker.npu")
+        assert name != "torch_npu"
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", check_import)
+    for _ in range(48):
+        dbo._yield_if_dbo_enabled()
+
+
+def test_npu_without_optional_context_returns(monkeypatch):
+    monkeypatch.setattr(dbo, "dbo_enabled", lambda: False)
+    monkeypatch.setattr(dbo, "current_platform", SimpleNamespace(device_type="npu"))
+    real_import = builtins.__import__
+
+    def missing_context(name, *args, **kwargs):
+        if name == "afd_plugin.v1.worker.npu.ubatching":
+            raise ImportError("optional Ascend context unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_context)
+    dbo._yield_if_dbo_enabled()
 
 
 def test_dbo_yield_prefers_native_context_without_importing_legacy(monkeypatch):
     calls = []
+    monkeypatch.setattr(dbo, "current_platform", SimpleNamespace(device_type="cuda"))
 
     monkeypatch.setitem(
         sys.modules,

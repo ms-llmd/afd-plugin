@@ -3,6 +3,7 @@
 """Small DBO helpers used by AFD runtime/model wrappers."""
 
 import torch
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.ubatching import dbo_enabled, dbo_yield
 
@@ -52,6 +53,11 @@ def register_dbo_yield_custom_op() -> None:
 def _yield_if_dbo_enabled() -> None:
     if dbo_enabled():
         dbo_yield()
+        return
+
+    # A failed optional Ascend import is retried on every eager CUDA layer.
+    # Keep native DBO above, and probe the legacy context only on its platform.
+    if current_platform.device_type != "npu":
         return
 
     try:
