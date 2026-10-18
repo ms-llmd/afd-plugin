@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -19,11 +21,13 @@ from afd_plugin.connectors import (  # noqa: E402
 )
 from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     DeepEPM2NConfig,
+    bucket_ladder,
     expert_weight_format,
     local_handshake_info,
     local_model_info,
     no_sync_bucket_limit,
     plan_stage,
+    precompile_buckets,
     resolve_capacity_tokens_per_rank,
     resolve_num_lanes,
     tokens_per_attention_rank,
@@ -90,8 +94,8 @@ def _handshake(
 ) -> list[dict]:
     """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host).
 
-    Attention ranks report their TP size, a capacity of 256 and a no-sync
-    bucket limit of 64; FFN ranks report none, as without an explicit capacity.
+    Attention ranks report their TP size, a capacity of 256 and a bucket
+    ladder (8, 16, 64); FFN ranks report none, as without an explicit capacity.
     """
     hosts = hosts or "a" * layout.union_size
     infos = []
@@ -108,7 +112,7 @@ def _handshake(
             top_k=8,
             num_lanes=1,
             capacity_tokens_per_rank=None if is_ffn else 256,
-            no_sync_bucket_limit=None if is_ffn else 64,
+            bucket_ladder=None if is_ffn else (8, 16, 64),
             attn_tp_size=None if is_ffn else attn_tp_size,
             compute_gate_on_attention=True,
             expert_alignment=128 if is_ffn else None,
@@ -209,7 +213,7 @@ def test_plan_stage_skips_host_sync_below_threshold():
             capacity_tokens_per_rank=1024,
             bucket_granularity=1,
             graph_mode=False,
-            no_sync_bucket_limit=255,
+            bucket_ladder=(255,),
             cpu_sync_min_tokens=256,
         )
 
@@ -320,47 +324,42 @@ def test_plan_stage_sizes_the_bucket_for_the_tp_slice():
         capacity_tokens_per_rank=9,
         bucket_granularity=1,
         graph_mode=False,
-        no_sync_bucket_limit=9,
+        bucket_ladder=(9,),
     )
 
     assert plan.tokens_per_attn_rank == (9, 9)
     assert plan.bucket == 9
 
 
-def test_plan_stage_rounds_graph_bucket_without_host_sync():
-    """A graph-mode (17, 4) step with granularity 16 gives bucket 32 and no
-    host sync; a graph-mode empty step gives bucket 1.
+def test_plan_stage_rounds_graph_buckets_up_the_ladder_without_host_sync():
+    """With ladder (8, 16, 32, 64), graph-mode steps of (17, 4), (16, 16) and
+    (0, 0) tokens get buckets 32, 16 and 8 and never a host sync.
 
-    Why: a graph bucket must be the largest rank rounded up and never 0, and
-    graph mode must never block on the host.
+    Why: graph steps sit on a rung (vLLM pads them to a capture size) and must
+    keep it; anything else rounds up to the next rung, never to 0, and graph
+    mode must never block on the host.
     """
-    graph = plan_stage(
-        _dp(17, 4),
-        attn_size=2,
-        attn_tp_size=1,
-        capacity_tokens_per_rank=64,
-        bucket_granularity=16,
-        graph_mode=True,
-        no_sync_bucket_limit=64,
-    )
-    empty = plan_stage(
-        _dp(0, 0),
-        attn_size=2,
-        attn_tp_size=1,
-        capacity_tokens_per_rank=64,
-        bucket_granularity=1,
-        graph_mode=True,
-        no_sync_bucket_limit=64,
-    )
 
-    assert (graph.bucket, graph.do_cpu_sync) == (32, False)
-    assert graph.tokens_per_attn_rank == (17, 4)
-    assert (empty.bucket, empty.do_cpu_sync) == (1, False)
+    def plan(*tokens: int):
+        return plan_stage(
+            _dp(*tokens),
+            attn_size=2,
+            attn_tp_size=1,
+            capacity_tokens_per_rank=64,
+            bucket_granularity=1,
+            graph_mode=True,
+            bucket_ladder=(8, 16, 32, 64),
+        )
+
+    assert (plan(17, 4).bucket, plan(17, 4).do_cpu_sync) == (32, False)
+    assert plan(17, 4).tokens_per_attn_rank == (17, 4)
+    assert plan(16, 16).bucket == 16
+    assert plan(0, 0).bucket == 8
 
 
 def test_plan_stage_gives_buckets_above_the_no_sync_limit_the_capacity():
-    """With a no-sync limit of 16 and capacity 64, eager steps of 17, 40 and
-    64 tokens all get bucket 64, while a 5-token step keeps bucket 5.
+    """With ladder (8, 16) and capacity 64, eager steps of 17, 40 and 64
+    tokens all get bucket 64, while a 5-token step rounds up to rung 8.
 
     Why: DeepEP compiles its kernels per bucket; a bucket per eager token
     count ran nvcc on the request path (seconds per new prefill size).
@@ -374,17 +373,17 @@ def test_plan_stage_gives_buckets_above_the_no_sync_limit_the_capacity():
             capacity_tokens_per_rank=64,
             bucket_granularity=1,
             graph_mode=False,
-            no_sync_bucket_limit=16,
+            bucket_ladder=(8, 16),
         )
 
     assert [plan(tokens).bucket for tokens in (17, 40, 64)] == [64] * 3
-    assert (plan(5).bucket, plan(5).do_cpu_sync) == (5, True)
+    assert (plan(5).bucket, plan(5).do_cpu_sync) == (8, True)
 
 
 @pytest.mark.parametrize("tokens", [8, 40])
 def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     """A step planned as graph on one rank and eager on another gets the same
-    bucket, both at or below the no-sync limit (8) and above it (40).
+    bucket, both on the ladder (8 tokens) and above it (40).
 
     Why: an FFN eager fallback can plan a step Attention replays in another
     mode, and DeepEP needs the same bucket on every rank; a capacity bucket
@@ -398,7 +397,7 @@ def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
             capacity_tokens_per_rank=64,
             bucket_granularity=1,
             graph_mode=graph_mode,
-            no_sync_bucket_limit=16,
+            bucket_ladder=(8, 16),
             cpu_sync_min_tokens=sync_min,
         ).bucket
         for graph_mode in (False, True)
@@ -408,9 +407,10 @@ def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     assert len(buckets) == 1
 
 
-def test_plan_stage_keeps_an_exact_bucket_for_eager_steps_without_host_sync():
-    """With a threshold of 256, an eager 20-token step keeps bucket 20 and
-    skips the sync, while a 300-token step syncs with the capacity bucket.
+def test_plan_stage_keeps_a_ladder_bucket_for_eager_steps_without_host_sync():
+    """With a threshold of 256 and ladder (32, 128, 255), an eager 20-token
+    step skips the sync with rung 32, while a 300-token step syncs with the
+    capacity bucket.
 
     Why: without the sync DeepEP allocates the worst case for the bucket, so
     a capacity bucket there would allocate for the capacity on every step.
@@ -424,12 +424,113 @@ def test_plan_stage_keeps_an_exact_bucket_for_eager_steps_without_host_sync():
             capacity_tokens_per_rank=1024,
             bucket_granularity=1,
             graph_mode=False,
-            no_sync_bucket_limit=255,
+            bucket_ladder=(32, 128, 255),
             cpu_sync_min_tokens=256,
         )
 
-    assert (plan(20).bucket, plan(20).do_cpu_sync) == (20, False)
+    assert (plan(20).bucket, plan(20).do_cpu_sync) == (32, False)
     assert (plan(300).bucket, plan(300).do_cpu_sync) == (1024, True)
+
+
+@pytest.mark.parametrize(
+    ("sizes", "tp", "granularity", "sync_min", "capacity", "expected"),
+    [
+        ((1, 2, 4, 8, 16, 24, 32), 1, 1, 0, 1024, (1, 2, 4, 8, 16, 24, 32)),
+        ((1, 2, 4, 8, 16, 24, 32), 2, 1, 0, 1024, (1, 2, 4, 8, 12, 16)),
+        ((1, 2, 4, 8, 16, 24, 32), 1, 8, 0, 1024, (8, 16, 24, 32)),
+        ((1, 2, 4, 8, 16, 24, 32), 1, 1, 100, 1024, (1, 2, 4, 8, 16, 24, 32, 99)),
+        ((1, 2, 4, 8, 16, 24, 32), 1, 1, 0, 20, (1, 2, 4, 8, 16, 20)),
+        ((), 1, 1, 0, 1024, ()),
+    ],
+    ids=["plain", "tp2", "granularity8", "sync-threshold", "capped", "no-graphs"],
+)
+def test_bucket_ladder(sizes, tp, granularity, sync_min, capacity, expected):
+    """The ladder holds each capture size's TP slice, rounded to the
+    granularity, plus the no-sync limit as its top rung, capped at capacity;
+    without graphs or a sync threshold it is empty.
+
+    Why: graph steps must land on a rung, the top rung sizes the combine zero
+    buffer, and an empty ladder sends every eager step to the capacity.
+    """
+    ladder = bucket_ladder(
+        capacity_tokens_per_rank=capacity,
+        cudagraph_capture_sizes=sizes,
+        attn_tp_size=tp,
+        bucket_granularity=granularity,
+        cpu_sync_min_tokens=sync_min,
+    )
+
+    assert ladder == expected
+
+
+@pytest.mark.parametrize(
+    ("ladder", "sync_min", "expected"),
+    [
+        ((8, 16, 32), 0, ((8, True), (16, True), (32, True), (64, True))),
+        (
+            (8, 16, 32),
+            20,
+            ((32, True), (64, True), (8, False), (16, False), (32, False)),
+        ),
+        ((), 0, ((64, True),)),
+    ],
+    ids=["all-synced", "sync-threshold", "no-ladder"],
+)
+def test_precompile_buckets(ladder, sync_min, expected):
+    """Synced eager steps can land on rungs at or above the sync threshold
+    and on the capacity (64); steps below the threshold skip the sync on any
+    rung up to the first one covering the threshold.
+
+    Why: every pair plan_stage can give an eager step must be compiled at
+    startup, or nvcc runs on the request path again.
+    """
+    assert precompile_buckets(ladder, 64, sync_min) == expected
+
+
+class _RecordingLane:
+    """A DeepEP buffer stand-in that records dispatch and combine calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
+        self.calls.append(
+            ("dispatch", kwargs["bucket"], kwargs["do_cpu_sync"], x.shape[0])
+        )
+        return SimpleNamespace(handle=SimpleNamespace(recv_shape=(0, HIDDEN_SIZE)))
+
+    def combine(self, expert_output, handle):
+        self.calls.append(("combine", tuple(expert_output.shape)))
+
+
+def test_precompile_runs_the_same_empty_steps_on_attention_and_ffn(monkeypatch):
+    """Attention and FFN each run one empty dispatch and combine per lane for
+    every precompile bucket, in the same order.
+
+    Why: dispatch and combine are collectives; ranks that warm up different
+    buckets would hang at startup.
+    """
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    topology = Topology(ffn_size=2, attn_size=2)
+    calls = {}
+    for role in ("attention", "ffn"):
+        connector = _connector(role, 0, topology, {"capacity_tokens_per_rank": 64})
+        connector.device = torch.device("cpu")
+        connector.capacity_tokens_per_rank = 64
+        connector.bucket_ladder = (8, 16, 64)
+        connector.expert_alignment = DEEPGEMM_ALIGNMENT
+        connector.lanes = [_RecordingLane(), _RecordingLane()]
+        if role == "attention":
+            connector._allocate_combine_zeros()
+        connector._precompile_dispatch_kernels()
+        calls[role] = [lane.calls for lane in connector.lanes]
+
+    expected = [
+        call
+        for bucket in (8, 16, 64)
+        for call in (("dispatch", bucket, True, 0), ("combine", (0, HIDDEN_SIZE)))
+    ]
+    assert calls["attention"] == calls["ffn"] == [expected, expected]
 
 
 def test_plan_stage_rejects_bucket_above_capacity():
@@ -445,7 +546,7 @@ def test_plan_stage_rejects_bucket_above_capacity():
             capacity_tokens_per_rank=64,
             bucket_granularity=1,
             graph_mode=False,
-            no_sync_bucket_limit=64,
+            bucket_ladder=(64,),
         )
 
 
@@ -464,14 +565,13 @@ def test_handshake_accepts_consistent_ranks():
     assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (1, 256)
 
 
-def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_sync_limit():
-    """FFN ranks report no TP size, capacity or no-sync bucket limit; the
-    result carries Attention's.
+def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_ladder():
+    """FFN ranks report no TP size, capacity or bucket ladder; the result
+    carries Attention's.
 
     Why: the FFN runs without TP or Attention's CUDA graphs, so only
-    Attention knows its TP size, the capacity of a TP slice and the largest
-    bucket that skips the host sync; both roles must size buffers and pick
-    buckets alike.
+    Attention knows its TP size, the capacity of a TP slice and its graph
+    buckets; both roles must size buffers and pick buckets alike.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=4, num_experts=128)
 
@@ -482,8 +582,8 @@ def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_sync_limit():
     assert (
         result.attn_tp_size,
         result.capacity_tokens_per_rank,
-        result.no_sync_bucket_limit,
-    ) == (2, 256, 64)
+        result.bucket_ladder,
+    ) == (2, 256, (8, 16, 64))
 
 
 @pytest.mark.parametrize(
@@ -493,7 +593,8 @@ def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_sync_limit():
         ({(2, "attn_tp_size"): 3, (3, "attn_tp_size"): 3}, "does not divide"),
         ({(3, "capacity_tokens_per_rank"): 128}, "capacity_tokens_per_rank"),
         ({(0, "capacity_tokens_per_rank"): 128}, "capacity_tokens_per_rank"),
-        ({(3, "no_sync_bucket_limit"): 32}, "no_sync_bucket_limit"),
+        ({(3, "bucket_ladder"): [8, 32]}, "bucket_ladder"),
+        ({(0, "cpu_sync_min_tokens"): 128}, "disagree on cpu_sync_min_tokens"),
         ({(0, "bucket_granularity"): 16}, "disagree on bucket_granularity"),
     ],
 )
@@ -677,8 +778,9 @@ def test_connector_rejects_non_bf16_model():
 
 
 def test_control_plane_derives_one_plan_per_stage():
-    """An eager control payload with counts (5, 9) leaves stage 0 with
-    bucket 9 (below the no-sync limit) and a host sync on a real connector.
+    """An eager control payload with counts (5, 9) leaves stage 0 with a
+    host sync and bucket 16, the next rung of the ladder Attention derives
+    from its capture sizes (1, 2, 4, 8, 16, ... capped at capacity 64).
 
     Why: the runtime path from control payload to plan must work.
     """
@@ -696,7 +798,7 @@ def test_control_plane_derives_one_plan_per_stage():
 
     connector.control_plane.update_state_from_dp_metadata(payload)
 
-    assert connector.stage_plans[0].bucket == 9
+    assert connector.stage_plans[0].bucket == 16
     assert connector.stage_plans[0].do_cpu_sync
 
 

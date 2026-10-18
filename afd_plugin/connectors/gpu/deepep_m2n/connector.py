@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
@@ -161,10 +162,10 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         network: Fabric settings (GIN, NIC choice, hybrid mode, traffic
             class, extra NCCL env); see ``network.NetworkConfig`` and its
             presets.
-        bucket_granularity: Dispatch bucket is rounded up to this multiple.
-            A bucket above ``no_sync_bucket_limit`` (only synced eager steps
-            reach it) becomes the capacity instead, so those steps share one
-            set of DeepEP kernels.
+        bucket_granularity: Dispatch bucket is rounded up to this multiple,
+            then up to the next rung of the bucket ladder (``bucket_ladder``)
+            or, above the ladder, to the capacity, so every step uses one of a
+            few DeepEP kernel sets compiled at startup.
         num_sms: SMs DeepEP kernels use; ``0`` = a fixed fraction of the
             device's SMs (24 on H100).
         num_qps: RDMA queue pairs per DeepEP buffer; ``0`` = DeepEP's default.
@@ -174,7 +175,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             host sync that reads receive counts; they allocate the worst-case
             receive size instead. ``0`` always syncs in eager mode. Attention
             ranks keep a zero buffer for the largest bucket that skips the
-            sync (``no_sync_bucket_limit``), so raising this costs memory.
+            sync (the top rung of ``bucket_ladder``), so raising this costs
+            memory.
         control_backend: Backend of the connector's own process group
             (handshake, DeepEP communicator bootstrap, per-step control
             payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
@@ -305,7 +307,7 @@ def plan_stage(
     capacity_tokens_per_rank: int,
     bucket_granularity: int,
     graph_mode: bool,
-    no_sync_bucket_limit: int,
+    bucket_ladder: Sequence[int],
     cpu_sync_min_tokens: int = 0,
 ) -> StagePlan:
     tokens = tokens_per_attention_rank(dp_metadata, attn_size, attn_tp_size)
@@ -321,17 +323,20 @@ def plan_stage(
     # unless the bucket is small enough that skipping the host round trip wins.
     do_cpu_sync = not graph_mode and bucket >= cpu_sync_min_tokens
     # DeepEP compiles its dispatch and combine kernels per bucket (it is a
-    # template argument), so a bucket per eager token count runs nvcc on the
-    # request path. A bucket above ``no_sync_bucket_limit`` can only belong to
-    # an eager step that syncs, on every rank, and synced steps size receives
-    # by the real counts: they all use the capacity, one kernel pair compiled
-    # by vLLM's startup profile run. Smaller buckets may skip the sync (graph
-    # mode, or below ``cpu_sync_min_tokens``) and allocate the worst case for
-    # their bucket, so they stay exact. The rule depends only on the token
+    # template argument), so a bucket per token count runs nvcc on the request
+    # path. Buckets therefore come from a fixed set, compiled at startup
+    # (``precompile_buckets``). Above the ladder only synced eager steps
+    # remain, which size receives by the real counts: they all use the
+    # capacity. Smaller buckets may skip the sync (graph mode, or below
+    # ``cpu_sync_min_tokens``) and allocate the worst case for their bucket,
+    # so they round up only to the next rung: graph steps already sit on one
+    # (vLLM pads them to a capture size). The rule depends only on the token
     # counts, because every rank must pass DeepEP the same bucket even when a
     # rank plans the step in another mode (an FFN eager fallback).
-    if bucket > no_sync_bucket_limit:
+    if not bucket_ladder or bucket > bucket_ladder[-1]:
         bucket = capacity_tokens_per_rank
+    else:
+        bucket = next(rung for rung in bucket_ladder if rung >= bucket)
     return StagePlan(
         tokens_per_attn_rank=tokens,
         bucket=bucket,
@@ -358,6 +363,60 @@ def no_sync_bucket_limit(
     graph_tokens = -(-max_cudagraph_capture_size // attn_tp_size)
     graph_bucket = -(-graph_tokens // bucket_granularity) * bucket_granularity
     return min(capacity_tokens_per_rank, max(graph_bucket, cpu_sync_min_tokens - 1))
+
+
+def bucket_ladder(
+    *,
+    capacity_tokens_per_rank: int,
+    cudagraph_capture_sizes: Sequence[int],
+    attn_tp_size: int,
+    bucket_granularity: int,
+    cpu_sync_min_tokens: int,
+) -> tuple[int, ...]:
+    """Sorted buckets that steps at or below the no-sync limit round up to.
+
+    The rungs are the per-rank CUDA-graph buckets (each capture size's
+    Attention TP slice, rounded to ``bucket_granularity``) plus the no-sync
+    limit as the top rung. Empty when no step can skip the host sync (no
+    graphs and ``cpu_sync_min_tokens`` 0): every eager step then uses the
+    capacity.
+    """
+    limit = no_sync_bucket_limit(
+        capacity_tokens_per_rank=capacity_tokens_per_rank,
+        max_cudagraph_capture_size=max(cudagraph_capture_sizes, default=0),
+        attn_tp_size=attn_tp_size,
+        bucket_granularity=bucket_granularity,
+        cpu_sync_min_tokens=cpu_sync_min_tokens,
+    )
+    if limit < 1:
+        return ()
+    rungs = {limit}
+    for size in cudagraph_capture_sizes:
+        tokens = -(-size // attn_tp_size)
+        rung = -(-tokens // bucket_granularity) * bucket_granularity
+        if 1 <= rung <= limit:
+            rungs.add(rung)
+    return tuple(sorted(rungs))
+
+
+def precompile_buckets(
+    ladder: Sequence[int], capacity_tokens_per_rank: int, cpu_sync_min_tokens: int
+) -> tuple[tuple[int, bool], ...]:
+    """``(bucket, do_cpu_sync)`` pairs ``plan_stage`` can give an eager step.
+
+    A synced step lands on a rung at or above ``cpu_sync_min_tokens`` or on the
+    capacity; a step below the threshold skips the sync and rounds up to the
+    first rung that covers it. Graph steps also skip the sync, but CUDA-graph
+    capture compiles their kernels already.
+    """
+    buckets = [(rung, True) for rung in ladder if rung >= cpu_sync_min_tokens]
+    buckets.append((capacity_tokens_per_rank, True))
+    if cpu_sync_min_tokens > 0 and ladder:
+        covering = next(
+            (rung for rung in ladder if rung >= cpu_sync_min_tokens - 1), ladder[-1]
+        )
+        buckets += [(rung, False) for rung in ladder if rung <= covering]
+    return tuple(dict.fromkeys(buckets))
 
 
 def worst_case_receive_rows(
@@ -387,7 +446,7 @@ class HandshakeResult:
     # Reported by Attention; FFN ranks adopt them.
     attn_tp_size: int
     capacity_tokens_per_rank: int
-    no_sync_bucket_limit: int
+    bucket_ladder: tuple[int, ...]
 
 
 def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
@@ -429,7 +488,7 @@ def local_handshake_info(
     top_k: int,
     num_lanes: int,
     capacity_tokens_per_rank: int | None,
-    no_sync_bucket_limit: int | None,
+    bucket_ladder: Sequence[int] | None,
     attn_tp_size: int | None,
     compute_gate_on_attention: bool,
     expert_alignment: int | None,
@@ -450,8 +509,9 @@ def local_handshake_info(
         "top_k": top_k,
         "num_lanes": num_lanes,
         "capacity_tokens_per_rank": capacity_tokens_per_rank,
-        "no_sync_bucket_limit": no_sync_bucket_limit,
+        "bucket_ladder": None if bucket_ladder is None else list(bucket_ladder),
         "bucket_granularity": config.bucket_granularity,
+        "cpu_sync_min_tokens": config.cpu_sync_min_tokens,
         "attn_tp_size": attn_tp_size,
         "compute_gate_on_attention": compute_gate_on_attention,
         "network": str(config.network.to_mapping()),
@@ -472,6 +532,7 @@ _MUST_MATCH = (
     "compute_gate_on_attention",
     "network",
     "bucket_granularity",
+    "cpu_sync_min_tokens",
 )
 
 
@@ -570,12 +631,14 @@ def validate_handshake(
             f"{sorted(map(str, capacities))}"
         )
     # Attention resolves it from its CUDA-graph sizes; plan_stage needs the
-    # same value on every rank to pick the same bucket.
-    limits = {info["no_sync_bucket_limit"] for info in attn_infos}
-    if len(limits) != 1 or None in limits:
+    # same ladder on every rank to pick the same bucket.
+    ladders = {
+        None if info["bucket_ladder"] is None else tuple(info["bucket_ladder"])
+        for info in attn_infos
+    }
+    if len(ladders) != 1 or None in ladders:
         raise RuntimeError(
-            "Attention ranks disagree on no_sync_bucket_limit: "
-            f"{sorted(map(str, limits))}"
+            f"Attention ranks disagree on bucket_ladder: {sorted(map(str, ladders))}"
         )
     # Every rank evaluates the same plan on the same list.
     plan = plan_network(
@@ -586,7 +649,7 @@ def validate_handshake(
         network_plan=plan,
         attn_tp_size=attn_tp_size,
         capacity_tokens_per_rank=int(capacities.pop()),
-        no_sync_bucket_limit=int(limits.pop()),
+        bucket_ladder=ladders.pop() or (),
     )
 
 
@@ -873,16 +936,16 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             if self.is_ffn
             else resolve_capacity_tokens_per_rank(self.config, vllm_config)
         )
-        # Largest bucket a step can dispatch without the host sync; Attention
-        # derives it from its CUDA-graph sizes, the FFN adopts it.
-        self.no_sync_bucket_limit: int | None = None
+        # Buckets below the capacity (``plan_stage``); Attention derives them
+        # from its CUDA-graph sizes, the FFN adopts them in the handshake.
+        self.bucket_ladder: tuple[int, ...] | None = None
         if not self.is_ffn:
             assert self.attn_tp_size is not None
             assert self.capacity_tokens_per_rank is not None
-            self.no_sync_bucket_limit = no_sync_bucket_limit(
+            self.bucket_ladder = bucket_ladder(
                 capacity_tokens_per_rank=self.capacity_tokens_per_rank,
-                max_cudagraph_capture_size=(
-                    vllm_config.compilation_config.max_cudagraph_capture_size or 0
+                cudagraph_capture_sizes=(
+                    vllm_config.compilation_config.cudagraph_capture_sizes or ()
                 ),
                 attn_tp_size=self.attn_tp_size,
                 bucket_granularity=self.config.bucket_granularity,
@@ -959,7 +1022,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             top_k=self.top_k,
             num_lanes=self.num_lanes,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
-            no_sync_bucket_limit=self.no_sync_bucket_limit,
+            bucket_ladder=self.bucket_ladder,
             attn_tp_size=self.attn_tp_size,
             compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
             expert_alignment=local_alignment,
@@ -982,7 +1045,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.network_plan = result.network_plan
         self.attn_tp_size = result.attn_tp_size
         self.capacity_tokens_per_rank = result.capacity_tokens_per_rank
-        self.no_sync_bucket_limit = result.no_sync_bucket_limit
+        self.bucket_ladder = result.bucket_ladder
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
         # Before any NCCL communicator in this process exists, when the worker
@@ -1067,6 +1130,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 )
             else:
                 self._allocate_combine_zeros()
+            self._precompile_dispatch_kernels()
         except Exception:
             self.close()
             raise
@@ -1344,6 +1408,65 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if lane_stream != current:
             lane_stream.wait_stream(current)
 
+    def _precompile_dispatch_kernels(self) -> None:
+        """Compile every eager dispatch/combine variant before serving.
+
+        Collective: every rank runs one empty dispatch and combine per lane
+        for each ``precompile_buckets`` pair, in the same order, so DeepEP's
+        JIT builds them now instead of on the first step of each size. Graph
+        buckets compile during CUDA-graph capture.
+        """
+        assert self.bucket_ladder is not None
+        assert self.capacity_tokens_per_rank is not None
+        buckets = precompile_buckets(
+            self.bucket_ladder,
+            self.capacity_tokens_per_rank,
+            self.config.cpu_sync_min_tokens,
+        )
+        x = torch.empty(
+            (0, self.hidden_size), dtype=self.payload_dtype, device=self.device
+        )
+        x_scale = (
+            torch.empty(
+                (0, self.hidden_size // FP8_GROUP_SIZE),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if self.is_fp8_payload
+            else None
+        )
+        topk_ids = torch.empty((0, self.top_k), dtype=torch.int64, device=self.device)
+        topk_weights = torch.empty(
+            (0, self.top_k), dtype=torch.float32, device=self.device
+        )
+        start = time.perf_counter()
+        for lane in self.lanes:
+            for bucket, do_cpu_sync in buckets:
+                result = lane.dispatch(
+                    x,
+                    x_scale,
+                    topk_ids,
+                    topk_weights,
+                    bucket=bucket,
+                    expert_alignment=self.expert_alignment,
+                    do_cpu_sync=do_cpu_sync,
+                )
+                recv_shape = result.handle.recv_shape
+                expert_output = (
+                    torch.zeros(recv_shape, dtype=self.dtype, device=self.device)
+                    if self.is_ffn
+                    else self._combine_zero_rows(recv_shape)
+                )
+                lane.combine(expert_output, result.handle)
+        torch.cuda.synchronize(self.device)
+        logger.info(
+            "DeepEP M2N precompiled %d dispatch buckets x %d lanes in %.1f s: %s",
+            len(buckets),
+            len(self.lanes),
+            time.perf_counter() - start,
+            buckets,
+        )
+
     def _allocate_combine_zeros(self) -> None:
         """One zero buffer for every combine on this Attention rank.
 
@@ -1353,10 +1476,10 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         largest such bucket. Both lanes share it (combine only reads it), and
         captured graphs keep one stable address.
         """
-        assert self.no_sync_bucket_limit is not None
+        assert self.bucket_ladder is not None
         rows = worst_case_receive_rows(
             num_ranks=self.layout.union_size,
-            bucket=self.no_sync_bucket_limit,
+            bucket=self.bucket_ladder[-1] if self.bucket_ladder else 0,
             top_k=self.top_k,
             experts_per_rank=self.layout.experts_per_rank,
             expert_alignment=self.expert_alignment,
@@ -1374,7 +1497,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             raise RuntimeError(
                 f"combine needs zero rows of shape {shape} but the buffer holds "
                 f"{tuple(zeros.shape)}: a dispatch skipped the host sync with a "
-                "bucket above no_sync_bucket_limit"
+                "bucket above the ladder's top rung (no_sync_bucket_limit)"
             )
         return zeros[:rows]
 
@@ -1406,7 +1529,7 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
         if (
             connector.attn_tp_size is None
             or connector.capacity_tokens_per_rank is None
-            or connector.no_sync_bucket_limit is None
+            or connector.bucket_ladder is None
         ):
             raise RuntimeError("DeepEPM2N control plane used before bootstrap")
         connector.stage_plans = {
@@ -1417,7 +1540,7 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
                 capacity_tokens_per_rank=connector.capacity_tokens_per_rank,
                 bucket_granularity=connector.config.bucket_granularity,
                 graph_mode=graph_mode,
-                no_sync_bucket_limit=connector.no_sync_bucket_limit,
+                bucket_ladder=connector.bucket_ladder,
                 cpu_sync_min_tokens=connector.config.cpu_sync_min_tokens,
             )
             for stage_idx, dp_metadata in payload.dp_metadata_list.items()

@@ -40,6 +40,13 @@ INTERMEDIATE_SIZE = 768
 # Fake vLLM limits: capacity defaults to the larger of the two.
 FAKE_MAX_NUM_BATCHED_TOKENS = 8192
 FAKE_MAX_CUDAGRAPH_CAPTURE_SIZE = 512
+# Fake CUDA-graph capture sizes: 1, 2, 4, then every 8 up to the maximum above.
+FAKE_CUDAGRAPH_CAPTURE_SIZES = (
+    1,
+    2,
+    4,
+    *range(8, FAKE_MAX_CUDAGRAPH_CAPTURE_SIZE + 1, 8),
+)
 INPUT_SEED_STRIDE = 1_000_003
 WEIGHT_SEED_OFFSET = 7_777
 # Limits are about 1.3x the worst value seen on H100 (2026-10-15), so a real
@@ -447,7 +454,8 @@ def fake_vllm_config(
         },
         quant_config=quant_config,
         compilation_config=SimpleNamespace(
-            max_cudagraph_capture_size=FAKE_MAX_CUDAGRAPH_CAPTURE_SIZE
+            max_cudagraph_capture_size=FAKE_MAX_CUDAGRAPH_CAPTURE_SIZE,
+            cudagraph_capture_sizes=list(FAKE_CUDAGRAPH_CAPTURE_SIZES),
         ),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
