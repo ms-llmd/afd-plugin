@@ -90,8 +90,8 @@ def _handshake(
 ) -> list[dict]:
     """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host).
 
-    Attention ranks report their TP size and a capacity of 256; FFN ranks
-    report neither, as without an explicit capacity.
+    Attention ranks report their TP size, a capacity of 256 and a no-sync
+    bucket limit of 64; FFN ranks report none, as without an explicit capacity.
     """
     hosts = hosts or "a" * layout.union_size
     infos = []
@@ -108,6 +108,7 @@ def _handshake(
             top_k=8,
             num_lanes=1,
             capacity_tokens_per_rank=None if is_ffn else 256,
+            no_sync_bucket_limit=None if is_ffn else 64,
             attn_tp_size=None if is_ffn else attn_tp_size,
             compute_gate_on_attention=True,
             expert_alignment=128 if is_ffn else None,
@@ -208,6 +209,7 @@ def test_plan_stage_skips_host_sync_below_threshold():
             capacity_tokens_per_rank=1024,
             bucket_granularity=1,
             graph_mode=False,
+            no_sync_bucket_limit=255,
             cpu_sync_min_tokens=256,
         )
 
@@ -318,39 +320,116 @@ def test_plan_stage_sizes_the_bucket_for_the_tp_slice():
         capacity_tokens_per_rank=9,
         bucket_granularity=1,
         graph_mode=False,
+        no_sync_bucket_limit=9,
     )
 
     assert plan.tokens_per_attn_rank == (9, 9)
     assert plan.bucket == 9
 
 
-def test_plan_stage_rounds_bucket_and_picks_host_sync():
-    """An eager (17, 4) step with granularity 16 gives bucket 32 and a host
-    sync; a graph-mode empty step gives bucket 1 and no sync.
+def test_plan_stage_rounds_graph_bucket_without_host_sync():
+    """A graph-mode (17, 4) step with granularity 16 gives bucket 32 and no
+    host sync; a graph-mode empty step gives bucket 1.
 
-    Why: the bucket must be the largest rank rounded up and never 0, and
+    Why: a graph bucket must be the largest rank rounded up and never 0, and
     graph mode must never block on the host.
     """
-    eager = plan_stage(
+    graph = plan_stage(
         _dp(17, 4),
         attn_size=2,
         attn_tp_size=1,
         capacity_tokens_per_rank=64,
         bucket_granularity=16,
-        graph_mode=False,
+        graph_mode=True,
+        no_sync_bucket_limit=64,
     )
-    graph = plan_stage(
+    empty = plan_stage(
         _dp(0, 0),
         attn_size=2,
         attn_tp_size=1,
         capacity_tokens_per_rank=64,
         bucket_granularity=1,
         graph_mode=True,
+        no_sync_bucket_limit=64,
     )
 
-    assert (eager.bucket, eager.do_cpu_sync) == (32, True)
-    assert eager.tokens_per_attn_rank == (17, 4)
-    assert (graph.bucket, graph.do_cpu_sync) == (1, False)
+    assert (graph.bucket, graph.do_cpu_sync) == (32, False)
+    assert graph.tokens_per_attn_rank == (17, 4)
+    assert (empty.bucket, empty.do_cpu_sync) == (1, False)
+
+
+def test_plan_stage_gives_buckets_above_the_no_sync_limit_the_capacity():
+    """With a no-sync limit of 16 and capacity 64, eager steps of 17, 40 and
+    64 tokens all get bucket 64, while a 5-token step keeps bucket 5.
+
+    Why: DeepEP compiles its kernels per bucket; a bucket per eager token
+    count ran nvcc on the request path (seconds per new prefill size).
+    """
+
+    def plan(tokens: int):
+        return plan_stage(
+            _dp(tokens),
+            attn_size=1,
+            attn_tp_size=1,
+            capacity_tokens_per_rank=64,
+            bucket_granularity=1,
+            graph_mode=False,
+            no_sync_bucket_limit=16,
+        )
+
+    assert [plan(tokens).bucket for tokens in (17, 40, 64)] == [64] * 3
+    assert (plan(5).bucket, plan(5).do_cpu_sync) == (5, True)
+
+
+@pytest.mark.parametrize("tokens", [8, 40])
+def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
+    """A step planned as graph on one rank and eager on another gets the same
+    bucket, both at or below the no-sync limit (8) and above it (40).
+
+    Why: an FFN eager fallback can plan a step Attention replays in another
+    mode, and DeepEP needs the same bucket on every rank; a capacity bucket
+    chosen by the sync decision broke test_graph_and_eager_plans_mixed_across_ranks.
+    """
+    buckets = {
+        plan_stage(
+            _dp(tokens),
+            attn_size=1,
+            attn_tp_size=1,
+            capacity_tokens_per_rank=64,
+            bucket_granularity=1,
+            graph_mode=graph_mode,
+            no_sync_bucket_limit=16,
+            cpu_sync_min_tokens=sync_min,
+        ).bucket
+        for graph_mode in (False, True)
+        for sync_min in (0, 10)
+    }
+
+    assert len(buckets) == 1
+
+
+def test_plan_stage_keeps_an_exact_bucket_for_eager_steps_without_host_sync():
+    """With a threshold of 256, an eager 20-token step keeps bucket 20 and
+    skips the sync, while a 300-token step syncs with the capacity bucket.
+
+    Why: without the sync DeepEP allocates the worst case for the bucket, so
+    a capacity bucket there would allocate for the capacity on every step.
+    """
+
+    def plan(tokens: int):
+        return plan_stage(
+            _dp(tokens),
+            attn_size=1,
+            attn_tp_size=1,
+            capacity_tokens_per_rank=1024,
+            bucket_granularity=1,
+            graph_mode=False,
+            no_sync_bucket_limit=255,
+            cpu_sync_min_tokens=256,
+        )
+
+    assert (plan(20).bucket, plan(20).do_cpu_sync) == (20, False)
+    assert (plan(300).bucket, plan(300).do_cpu_sync) == (1024, True)
 
 
 def test_plan_stage_rejects_bucket_above_capacity():
@@ -366,6 +445,7 @@ def test_plan_stage_rejects_bucket_above_capacity():
             capacity_tokens_per_rank=64,
             bucket_granularity=1,
             graph_mode=False,
+            no_sync_bucket_limit=64,
         )
 
 
@@ -384,12 +464,14 @@ def test_handshake_accepts_consistent_ranks():
     assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (1, 256)
 
 
-def test_handshake_gives_ffn_the_attention_tp_size_and_capacity():
-    """FFN ranks report no TP size or capacity; the result carries
-    Attention's.
+def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_sync_limit():
+    """FFN ranks report no TP size, capacity or no-sync bucket limit; the
+    result carries Attention's.
 
-    Why: the FFN runs without TP, so only Attention knows its TP size and the
-    capacity of a TP slice; both roles must size buffers and plans alike.
+    Why: the FFN runs without TP or Attention's CUDA graphs, so only
+    Attention knows its TP size, the capacity of a TP slice and the largest
+    bucket that skips the host sync; both roles must size buffers and pick
+    buckets alike.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=4, num_experts=128)
 
@@ -397,7 +479,11 @@ def test_handshake_gives_ffn_the_attention_tp_size_and_capacity():
         _handshake(layout, attn_tp_size=2), layout, NetworkConfig()
     )
 
-    assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (2, 256)
+    assert (
+        result.attn_tp_size,
+        result.capacity_tokens_per_rank,
+        result.no_sync_bucket_limit,
+    ) == (2, 256, 64)
 
 
 @pytest.mark.parametrize(
@@ -407,6 +493,8 @@ def test_handshake_gives_ffn_the_attention_tp_size_and_capacity():
         ({(2, "attn_tp_size"): 3, (3, "attn_tp_size"): 3}, "does not divide"),
         ({(3, "capacity_tokens_per_rank"): 128}, "capacity_tokens_per_rank"),
         ({(0, "capacity_tokens_per_rank"): 128}, "capacity_tokens_per_rank"),
+        ({(3, "no_sync_bucket_limit"): 32}, "no_sync_bucket_limit"),
+        ({(0, "bucket_granularity"): 16}, "disagree on bucket_granularity"),
     ],
 )
 def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, message):
@@ -589,8 +677,8 @@ def test_connector_rejects_non_bf16_model():
 
 
 def test_control_plane_derives_one_plan_per_stage():
-    """A control payload with counts (5, 9) leaves stage 0 with bucket 9 and
-    a host sync on a real connector object.
+    """An eager control payload with counts (5, 9) leaves stage 0 with
+    bucket 9 (below the no-sync limit) and a host sync on a real connector.
 
     Why: the runtime path from control payload to plan must work.
     """

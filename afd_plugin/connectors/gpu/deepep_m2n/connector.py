@@ -162,6 +162,9 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             class, extra NCCL env); see ``network.NetworkConfig`` and its
             presets.
         bucket_granularity: Dispatch bucket is rounded up to this multiple.
+            A bucket above ``no_sync_bucket_limit`` (only synced eager steps
+            reach it) becomes the capacity instead, so those steps share one
+            set of DeepEP kernels.
         num_sms: SMs DeepEP kernels use; ``0`` = a fixed fraction of the
             device's SMs (24 on H100).
         num_qps: RDMA queue pairs per DeepEP buffer; ``0`` = DeepEP's default.
@@ -302,6 +305,7 @@ def plan_stage(
     capacity_tokens_per_rank: int,
     bucket_granularity: int,
     graph_mode: bool,
+    no_sync_bucket_limit: int,
     cpu_sync_min_tokens: int = 0,
 ) -> StagePlan:
     tokens = tokens_per_attention_rank(dp_metadata, attn_size, attn_tp_size)
@@ -315,10 +319,23 @@ def plan_stage(
     # Graph capture/replay cannot block on the host. Eager steps read the real
     # receive counts so DeepEP allocates by actual rather than worst-case size,
     # unless the bucket is small enough that skipping the host round trip wins.
+    do_cpu_sync = not graph_mode and bucket >= cpu_sync_min_tokens
+    # DeepEP compiles its dispatch and combine kernels per bucket (it is a
+    # template argument), so a bucket per eager token count runs nvcc on the
+    # request path. A bucket above ``no_sync_bucket_limit`` can only belong to
+    # an eager step that syncs, on every rank, and synced steps size receives
+    # by the real counts: they all use the capacity, one kernel pair compiled
+    # by vLLM's startup profile run. Smaller buckets may skip the sync (graph
+    # mode, or below ``cpu_sync_min_tokens``) and allocate the worst case for
+    # their bucket, so they stay exact. The rule depends only on the token
+    # counts, because every rank must pass DeepEP the same bucket even when a
+    # rank plans the step in another mode (an FFN eager fallback).
+    if bucket > no_sync_bucket_limit:
+        bucket = capacity_tokens_per_rank
     return StagePlan(
         tokens_per_attn_rank=tokens,
         bucket=bucket,
-        do_cpu_sync=not graph_mode and bucket >= cpu_sync_min_tokens,
+        do_cpu_sync=do_cpu_sync,
         graph_mode=graph_mode,
     )
 
@@ -367,9 +384,10 @@ def worst_case_receive_rows(
 class HandshakeResult:
     expert_alignment: int
     network_plan: NetworkPlan
-    # Reported by Attention; FFN ranks adopt both.
+    # Reported by Attention; FFN ranks adopt them.
     attn_tp_size: int
     capacity_tokens_per_rank: int
+    no_sync_bucket_limit: int
 
 
 def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
@@ -411,6 +429,7 @@ def local_handshake_info(
     top_k: int,
     num_lanes: int,
     capacity_tokens_per_rank: int | None,
+    no_sync_bucket_limit: int | None,
     attn_tp_size: int | None,
     compute_gate_on_attention: bool,
     expert_alignment: int | None,
@@ -431,6 +450,8 @@ def local_handshake_info(
         "top_k": top_k,
         "num_lanes": num_lanes,
         "capacity_tokens_per_rank": capacity_tokens_per_rank,
+        "no_sync_bucket_limit": no_sync_bucket_limit,
+        "bucket_granularity": config.bucket_granularity,
         "attn_tp_size": attn_tp_size,
         "compute_gate_on_attention": compute_gate_on_attention,
         "network": str(config.network.to_mapping()),
@@ -450,6 +471,7 @@ _MUST_MATCH = (
     "num_lanes",
     "compute_gate_on_attention",
     "network",
+    "bucket_granularity",
 )
 
 
@@ -547,6 +569,14 @@ def validate_handshake(
             "ranks disagree on capacity_tokens_per_rank: "
             f"{sorted(map(str, capacities))}"
         )
+    # Attention resolves it from its CUDA-graph sizes; plan_stage needs the
+    # same value on every rank to pick the same bucket.
+    limits = {info["no_sync_bucket_limit"] for info in attn_infos}
+    if len(limits) != 1 or None in limits:
+        raise RuntimeError(
+            "Attention ranks disagree on no_sync_bucket_limit: "
+            f"{sorted(map(str, limits))}"
+        )
     # Every rank evaluates the same plan on the same list.
     plan = plan_network(
         [RankTopology.from_mapping(info["topology"]) for info in infos], network
@@ -556,6 +586,7 @@ def validate_handshake(
         network_plan=plan,
         attn_tp_size=attn_tp_size,
         capacity_tokens_per_rank=int(capacities.pop()),
+        no_sync_bucket_limit=int(limits.pop()),
     )
 
 
@@ -842,6 +873,21 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             if self.is_ffn
             else resolve_capacity_tokens_per_rank(self.config, vllm_config)
         )
+        # Largest bucket a step can dispatch without the host sync; Attention
+        # derives it from its CUDA-graph sizes, the FFN adopts it.
+        self.no_sync_bucket_limit: int | None = None
+        if not self.is_ffn:
+            assert self.attn_tp_size is not None
+            assert self.capacity_tokens_per_rank is not None
+            self.no_sync_bucket_limit = no_sync_bucket_limit(
+                capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+                max_cudagraph_capture_size=(
+                    vllm_config.compilation_config.max_cudagraph_capture_size or 0
+                ),
+                attn_tp_size=self.attn_tp_size,
+                bucket_granularity=self.config.bucket_granularity,
+                cpu_sync_min_tokens=self.config.cpu_sync_min_tokens,
+            )
         self.num_lanes = resolve_num_lanes(self.config, vllm_config)
         self.device = torch.device("cuda", local_rank)
         # Where control payloads are staged: gloo moves CPU tensors.
@@ -913,6 +959,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             top_k=self.top_k,
             num_lanes=self.num_lanes,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            no_sync_bucket_limit=self.no_sync_bucket_limit,
             attn_tp_size=self.attn_tp_size,
             compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
             expert_alignment=local_alignment,
@@ -935,6 +982,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.network_plan = result.network_plan
         self.attn_tp_size = result.attn_tp_size
         self.capacity_tokens_per_rank = result.capacity_tokens_per_rank
+        self.no_sync_bucket_limit = result.no_sync_bucket_limit
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
         # Before any NCCL communicator in this process exists, when the worker
@@ -1305,19 +1353,10 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         largest such bucket. Both lanes share it (combine only reads it), and
         captured graphs keep one stable address.
         """
-        assert self.attn_tp_size is not None
-        assert self.capacity_tokens_per_rank is not None
-        capture_size = self.vllm_config.compilation_config.max_cudagraph_capture_size
-        bucket = no_sync_bucket_limit(
-            capacity_tokens_per_rank=self.capacity_tokens_per_rank,
-            max_cudagraph_capture_size=capture_size or 0,
-            attn_tp_size=self.attn_tp_size,
-            bucket_granularity=self.config.bucket_granularity,
-            cpu_sync_min_tokens=self.config.cpu_sync_min_tokens,
-        )
+        assert self.no_sync_bucket_limit is not None
         rows = worst_case_receive_rows(
             num_ranks=self.layout.union_size,
-            bucket=bucket,
+            bucket=self.no_sync_bucket_limit,
             top_k=self.top_k,
             experts_per_rank=self.layout.experts_per_rank,
             expert_alignment=self.expert_alignment,
@@ -1364,7 +1403,11 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
                 f"num_lanes={connector.num_lanes}"
             )
         graph_mode = payload.is_graph_capturing or payload.is_graph_replaying
-        if connector.attn_tp_size is None or connector.capacity_tokens_per_rank is None:
+        if (
+            connector.attn_tp_size is None
+            or connector.capacity_tokens_per_rank is None
+            or connector.no_sync_bucket_limit is None
+        ):
             raise RuntimeError("DeepEPM2N control plane used before bootstrap")
         connector.stage_plans = {
             stage_idx: plan_stage(
@@ -1374,6 +1417,7 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
                 capacity_tokens_per_rank=connector.capacity_tokens_per_rank,
                 bucket_granularity=connector.config.bucket_granularity,
                 graph_mode=graph_mode,
+                no_sync_bucket_limit=connector.no_sync_bucket_limit,
                 cpu_sync_min_tokens=connector.config.cpu_sync_min_tokens,
             )
             for stage_idx, dp_metadata in payload.dp_metadata_list.items()
