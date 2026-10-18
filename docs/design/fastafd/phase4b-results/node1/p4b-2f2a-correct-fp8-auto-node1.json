@@ -1,0 +1,44 @@
+{
+ "scenario": "correctness",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 1,
+ "extra_config": {
+  "capacity_tokens_per_rank": 256,
+  "payload_format": "fp8_block128_fp32"
+ },
+ "ranks": [
+  {
+   "world_rank": 2,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "combine_rel_err": 0.06607531081470039,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ]
+   }
+  },
+  {
+   "world_rank": 3,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "combine_rel_err": 0.06530661244586262,
+    "expert_alignment": 128,
+    "domain": [
+     2,
+     2
+    ]
+   }
+  }
+ ],
+ "all_ok": true
+}

@@ -1,0 +1,120 @@
+{
+ "scenario": "benchmark",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 8192,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32",
+  "cpu_sync_min_tokens": 1024
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "dispatch_us": 238.69995202403516,
+     "experts_us": 160.08720267564058,
+     "combine_us": 96.17435280233622,
+     "total_us": 494.9615075020119
+    },
+    "8": {
+     "dispatch_us": 249.98605658765882,
+     "experts_us": 183.3913935115561,
+     "combine_us": 111.55495012644678,
+     "total_us": 544.9324002256617
+    },
+    "32": {
+     "dispatch_us": 226.63224663119763,
+     "experts_us": 209.27510340698063,
+     "combine_us": 117.92209988925606,
+     "total_us": 553.8294499274343
+    },
+    "128": {
+     "dispatch_us": 281.64004907011986,
+     "experts_us": 206.19860151782632,
+     "combine_us": 94.64425093028694,
+     "total_us": 582.4829015182331
+    },
+    "512": {
+     "dispatch_us": 404.7492489917204,
+     "experts_us": 219.1235573263839,
+     "combine_us": 117.02069896273315,
+     "total_us": 740.8935052808374
+    },
+    "2048": {
+     "dispatch_us": 1021.1291461018844,
+     "experts_us": 294.9210494989529,
+     "combine_us": 208.81370292045176,
+     "total_us": 1524.8638985212892
+    },
+    "8192": {
+     "dispatch_us": 3553.8794938474894,
+     "experts_us": 724.6200548252091,
+     "combine_us": 539.6084510721266,
+     "total_us": 4818.107999744825
+    }
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "dispatch_us": 325.15630300622433,
+     "experts_us": 170.0054039247334,
+     "combine_us": 90.5788445379585,
+     "total_us": 585.7405514689162
+    },
+    "8": {
+     "dispatch_us": 327.47520017437637,
+     "experts_us": 206.05364406947047,
+     "combine_us": 92.5758999073878,
+     "total_us": 626.1047441512346
+    },
+    "32": {
+     "dispatch_us": 304.6014520805329,
+     "experts_us": 222.3553485237062,
+     "combine_us": 107.0741011062637,
+     "total_us": 634.0309017105028
+    },
+    "128": {
+     "dispatch_us": 357.9098003683612,
+     "experts_us": 206.95645071100444,
+     "combine_us": 93.48395105917007,
+     "total_us": 658.3502021385357
+    },
+    "512": {
+     "dispatch_us": 468.33500382490456,
+     "experts_us": 219.81424652040005,
+     "combine_us": 116.09925131779164,
+     "total_us": 804.2485016630962
+    },
+    "2048": {
+     "dispatch_us": 1054.7677520662546,
+     "experts_us": 303.0818043043837,
+     "combine_us": 199.48850676883012,
+     "total_us": 1557.3380631394684
+    },
+    "8192": {
+     "dispatch_us": 3590.327993151732,
+     "experts_us": 735.8128495980054,
+     "combine_us": 528.1155521515757,
+     "total_us": 4854.256394901313
+    }
+   }
+  }
+ ],
+ "all_ok": true
+}

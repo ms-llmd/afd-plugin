@@ -1,0 +1,120 @@
+{
+ "scenario": "benchmark",
+ "topology": {
+  "ffn_size": 2,
+  "attn_size": 2
+ },
+ "num_nodes": 2,
+ "node_rank": 1,
+ "extra_config": {
+  "capacity_tokens_per_rank": 8192,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32",
+  "cpu_sync_min_tokens": 1024
+ },
+ "ranks": [
+  {
+   "world_rank": 2,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "dispatch_us": 239.6207652054727,
+     "experts_us": 0.0,
+     "combine_us": 253.4548053517938,
+     "total_us": 493.07557055726653
+    },
+    "8": {
+     "dispatch_us": 253.90614755451682,
+     "experts_us": 0.0,
+     "combine_us": 297.36694414168596,
+     "total_us": 551.2730916962028
+    },
+    "32": {
+     "dispatch_us": 247.047352604568,
+     "experts_us": 0.0,
+     "combine_us": 337.9358211532235,
+     "total_us": 584.9831737577915
+    },
+    "128": {
+     "dispatch_us": 219.5001463405788,
+     "experts_us": 0.0,
+     "combine_us": 425.9013687260449,
+     "total_us": 645.4015150666237
+    },
+    "512": {
+     "dispatch_us": 219.4022643379867,
+     "experts_us": 0.0,
+     "combine_us": 877.7295937761664,
+     "total_us": 1097.1318581141531
+    },
+    "2048": {
+     "dispatch_us": 290.18764616921544,
+     "experts_us": 0.0,
+     "combine_us": 2578.903443645686,
+     "total_us": 2869.0910898149014
+    },
+    "8192": {
+     "dispatch_us": 631.6974060609937,
+     "experts_us": 0.0,
+     "combine_us": 9584.562631789595,
+     "total_us": 10216.260037850589
+    }
+   }
+  },
+  {
+   "world_rank": 3,
+   "role": "attention",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "dispatch_us": 322.91251700371504,
+     "experts_us": 0.0,
+     "combine_us": 279.0636965073645,
+     "total_us": 601.9762135110795
+    },
+    "8": {
+     "dispatch_us": 340.7471696846187,
+     "experts_us": 0.0,
+     "combine_us": 324.0275080315769,
+     "total_us": 664.7746777161956
+    },
+    "32": {
+     "dispatch_us": 306.6196455620229,
+     "experts_us": 0.0,
+     "combine_us": 361.2420638091862,
+     "total_us": 667.8617093712091
+    },
+    "128": {
+     "dispatch_us": 339.7589549422264,
+     "experts_us": 0.0,
+     "combine_us": 432.89073510095477,
+     "total_us": 772.6496900431812
+    },
+    "512": {
+     "dispatch_us": 284.9766402505338,
+     "experts_us": 0.0,
+     "combine_us": 882.3485346511006,
+     "total_us": 1167.3251749016345
+    },
+    "2048": {
+     "dispatch_us": 345.41571512818336,
+     "experts_us": 0.0,
+     "combine_us": 2586.8985685519874,
+     "total_us": 2932.314283680171
+    },
+    "8192": {
+     "dispatch_us": 681.0238468460739,
+     "experts_us": 0.0,
+     "combine_us": 9589.058661367744,
+     "total_us": 10270.082508213818
+    }
+   }
+  }
+ ],
+ "all_ok": true
+}

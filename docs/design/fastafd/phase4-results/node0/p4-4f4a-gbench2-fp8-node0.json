@@ -1,0 +1,124 @@
+{
+ "scenario": "graph_benchmark",
+ "topology": {
+  "ffn_size": 4,
+  "attn_size": 4
+ },
+ "num_nodes": 2,
+ "node_rank": 0,
+ "extra_config": {
+  "capacity_tokens_per_rank": 8192,
+  "ib_hca_by_local_rank": [
+   "mlx5_0"
+  ],
+  "payload_format": "fp8_block128_fp32",
+  "num_lanes": 2
+ },
+ "ranks": [
+  {
+   "world_rank": 0,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 398.05629930924624
+    },
+    "8": {
+     "total_us": 479.80160743463784
+    },
+    "32": {
+     "total_us": 523.2655501458794
+    },
+    "128": {
+     "total_us": 799.3422477738932
+    },
+    "512": {
+     "total_us": 1689.667595201172
+    },
+    "2048": {
+     "total_us": 4507.821108563803
+    }
+   }
+  },
+  {
+   "world_rank": 1,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 462.61219831649214
+    },
+    "8": {
+     "total_us": 531.1818968039006
+    },
+    "32": {
+     "total_us": 603.4608551999554
+    },
+    "128": {
+     "total_us": 911.189301405102
+    },
+    "512": {
+     "total_us": 1730.1529995165765
+    },
+    "2048": {
+     "total_us": 4655.224952148274
+    }
+   }
+  },
+  {
+   "world_rank": 2,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 438.50684887729585
+    },
+    "8": {
+     "total_us": 490.32740062102675
+    },
+    "32": {
+     "total_us": 552.985051763244
+    },
+    "128": {
+     "total_us": 838.9414986595511
+    },
+    "512": {
+     "total_us": 1699.870399897918
+    },
+    "2048": {
+     "total_us": 4655.842392821796
+    }
+   }
+  },
+  {
+   "world_rank": 3,
+   "role": "ffn",
+   "ok": true,
+   "error": "",
+   "metrics": {
+    "1": {
+     "total_us": 489.74930250551546
+    },
+    "8": {
+     "total_us": 570.8059528842568
+    },
+    "32": {
+     "total_us": 661.3003031816334
+    },
+    "128": {
+     "total_us": 962.0613040169701
+    },
+    "512": {
+     "total_us": 1804.6588986180723
+    },
+    "2048": {
+     "total_us": 4778.76685326919
+    }
+   }
+  }
+ ],
+ "all_ok": true
+}
