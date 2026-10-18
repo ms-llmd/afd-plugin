@@ -22,9 +22,14 @@ async def main():
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--input-tokens", type=int, nargs="+", default=[32, 128, 512, 1024, 1536]
+    )
     args = parser.parse_args()
+    if not args.input_tokens or min(args.input_tokens) < 1:
+        parser.error("--input-tokens must contain positive token counts")
     generator = random.Random(args.seed)
-    lengths = [32, 128, 512, 1024, 1536]
+    lengths = args.input_tokens
     prompts = [
         [generator.randrange(1000, 50000) for _ in range(lengths[i % len(lengths)])]
         for i in range(args.requests + args.warmup)

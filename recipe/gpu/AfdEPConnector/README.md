@@ -29,6 +29,8 @@ Use `CONNECTOR=P2pNcclAFDConnector` for the baseline; use `EAGER=1` to disable
 graphs for either connector. `PREFILL_GRAPH=0` keeps Attention and decode
 graphs unchanged while disabling only afdEP FFN prefill replay for a matched
 launch-overhead ablation.
+Use `HYBRID=0` on both roles to test direct transfers to expert owners instead
+of RDMA plus local NVLink forwarding. This does not change graph policy.
 
 | Path | Attention prefill | FFN prefill | Decode |
 | --- | --- | --- | --- |
