@@ -3,19 +3,24 @@
 ```mermaid
 flowchart LR
   subgraph P2P["P2P NCCL"]
-    A[Attention] --> F[Paired FFN]
-    F --> E["vLLM EP redistribution → expert shard"]
+    A[Attention] -->|RDMA request| F[Paired FFN]
+    F -->|NVLink all-gather| E[Expert shards]
+    E -->|NVLink reduce-scatter| F
+    F -->|RDMA reply| A
   end
   subgraph afdEP[afdEP]
-    A2["Attention + routing + shared experts"] --> E2["Expert shard → local GEMMs"]
+    A2["Attention + routing + shared experts"] -->|RDMA request| R[FFN rail]
+    R -->|NVLink routing| E2[Expert shards]
+    E2 -->|NVLink partial results| R
+    R -->|RDMA reply| A2
   end
 ```
 
 Run prefill and decode in one deployment: four Attention GPUs and four FFN
 GPUs, DP=4/TP=1 per role, 16 of DeepSeek-V2-Lite's 64 routed experts per FFN
 rank. The current backend requires two separate four-GPU NVLink domains and
-NCCL GIN connectivity. “Single hop” means no second vLLM expert redistribution;
-hybrid transport still uses local NVLink forwarding.
+NCCL GIN connectivity. Both paths use local NVLink movement. afdEP performs it
+inside its transport; P2P uses vLLM's separate EP collectives.
 
 Install the pinned `afdep` extra from this checkout and
 compatible DeepGEMM with its BF16 psum grouped API. Set matching NCCL headers and
@@ -41,8 +46,20 @@ The FFN graph covers all routed layers: receive → local grouped GEMMs → repl
 It is independent of Attention's decode graphs. Capture and JIT warmup are
 excluded from steady-state timing; every timed replay remains included.
 
-Validation is in progress. No serving speedup is established yet. Compare mixed
-prefill sizes and decode under sustained concurrency, preserve outputs and raw
-latencies, and profile separately. This also changes the GEMM implementation
-and moves shared/dense work to Attention; an end-to-end gain cannot be attributed
-solely to removing EP redistribution.
+## H100 serving experiment
+
+![Serving latency and graph controls](itl-h100.svg)
+
+[Measurements and provenance](itl-h100.json): 48 runs on eight H100s, BF16,
+DeepSeek-V2-Lite, matched GPUDirect/NIC settings. Short-request median ITL is
+6.40 ms for P2P, 9.97 ms for afdEP, and 11.42 ms with FFN replay disabled.
+Correcting the compiled shared-expert dependency reduces afdEP to 9.03 ms;
+Nsight verifies shared computation precedes the reply wait on all Attention GPUs.
+The original graph mode reaches 36.11 versus 34.14 requests/s for the
+2,048-token, concurrency-32, one-output prefill case. No overall serving win.
+
+The dependency correction is a separate experiment from the frozen graph
+controls. The implementations also differ in GEMM backend and shared/dense
+compute placement. Generated token sequences sometimes differ, including across
+the dependency correction; these results establish neither accuracy equivalence
+nor a transport-only speedup. Client ITL includes scheduling and buffering.
