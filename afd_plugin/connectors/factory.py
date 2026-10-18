@@ -101,5 +101,11 @@ AFDConnectorFactory.register_connector(
     "CAMAsyncAFDConnector",
 )
 
+AFDConnectorFactory.register_connector(
+    "AfdEPConnector",
+    "afd_plugin.connectors.gpu.afdep.connector",
+    "AfdEPConnector",
+)
+
 
 __all__ = ["AFDConnectorFactory"]

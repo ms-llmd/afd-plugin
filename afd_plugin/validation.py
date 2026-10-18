@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    AFDEP_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFDConfig,
     parse_afd_config,
@@ -58,9 +59,12 @@ def validate_gpu_model_runner_v2_config(
         raise RuntimeError("AFD GPU requires ModelRunnerV2")
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if device_type != "cuda" or afd_config.connector != "P2pNcclAFDConnector":
+    if device_type != "cuda" or afd_config.connector not in (
+        "P2pNcclAFDConnector",
+        AFDEP_CONNECTOR,
+    ):
         raise RuntimeError(
-            "AFD ModelRunnerV2 requires CUDA and synchronous P2pNcclAFDConnector",
+            "AFD ModelRunnerV2 requires CUDA and a supported synchronous GPU connector",
         )
 
     parallel = vllm_config.parallel_config

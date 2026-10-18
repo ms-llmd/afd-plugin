@@ -30,6 +30,7 @@ from afd_plugin.connectors import (
     AFDControlPlane,
     AFDDPMetadata,
 )
+from afd_plugin.connectors.base import ExpertLayoutConnector
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
@@ -107,6 +108,8 @@ class GPUFFNModelRunner:
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
+        if isinstance(self.connector, ExpertLayoutConnector):
+            self.connector.prepare_experts(self.get_model())
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load the vLLM model."""
@@ -163,7 +166,11 @@ class GPUFFNModelRunner:
         step_afd_gpu_profiler(self.prof)
         if dp_metadata_list is None:
             raise RuntimeError("GPUFFNModelRunner requires dp_metadata_list")
-        graph_key = make_ffn_graph_key(dp_metadata_list)
+        graph_key = (
+            ((0, (self.connector.capacity,)),)
+            if isinstance(self.connector, ExpertLayoutConnector)
+            else make_ffn_graph_key(dp_metadata_list)
+        )
         cuda_graph_info = self._cuda_graphs.get(graph_key)
         run_mode = graph_run_mode(
             is_warmup=is_warmup,
@@ -172,7 +179,12 @@ class GPUFFNModelRunner:
             graph_enabled=bool(self.use_cuda_graph),
             graph_exists=cuda_graph_info is not None,
         )
-        if run_mode is AFDGraphRunMode.REPLAY:
+        if (
+            isinstance(self.connector, ExpertLayoutConnector)
+            and cuda_graph_info is not None
+            and not is_warmup
+            and not is_graph_capturing
+        ) or run_mode is AFDGraphRunMode.REPLAY:
             self._cuda_graphs[graph_key]["graph"].replay()
             return None
 
@@ -252,6 +264,12 @@ class GPUFFNModelRunner:
                         uses_remote_experts
                         and self.afd_config.compute_gate_on_attention
                     ):
+                        if isinstance(self.connector, ExpertLayoutConnector):
+                            rank_ffn_output = self.connector.compute_experts(
+                                payload, layer_idx
+                            )
+                            self.connector.send_ffn_output(rank_ffn_output, context)
+                            continue
                         router_logits = payload.router_logits
                         assert router_logits is not None
                         rank_ffn_output = model.compute_experts_output(
@@ -326,7 +344,11 @@ class GPUFFNModelRunner:
         if mode_name == "FULL":
             if self._graph_memory_pool is None:
                 self._graph_memory_pool = torch.cuda.graph_pool_handle()
-            graph_key = make_ffn_graph_key(dp_metadata_list)
+            graph_key = (
+                ((0, (self.connector.capacity,)),)
+                if isinstance(self.connector, ExpertLayoutConnector)
+                else make_ffn_graph_key(dp_metadata_list)
+            )
             cudagraph = torch.cuda.CUDAGraph()
             # DP metadata receive/update is a control-plane side effect and must
             # complete before CUDA graph capture starts.

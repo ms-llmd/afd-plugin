@@ -255,6 +255,29 @@ class AFDConnectorBase(ABC):
         raise NotImplementedError
 
 
+class ExpertLayoutConnector(AFDConnectorBase):
+    """Connector whose receive rows already belong to local experts.
+
+    The FFN runner must use this compute boundary instead of vLLM's MoE
+    dispatch/combine. A fixed capacity makes its graph independent of counts.
+    """
+
+    @property
+    @abstractmethod
+    def capacity(self) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_experts(self, model: torch.nn.Module) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def compute_experts(
+        self, payload: AFDA2FTransferPayload, layer_idx: int
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
 class AFDControlPlane(ABC):
     """DP metadata control plane"""
 

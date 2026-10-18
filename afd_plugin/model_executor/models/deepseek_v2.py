@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDEP_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -281,7 +281,8 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     # through FusedMoEFactory.
     # Patch functionality: preserve the native MoE forward contract while
     # constructing only the gate owned by Attention and a parameter-free proxy.
-    # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
+    # Signature: AFD-owned; adds layer_idx, compute_gate_on_attention,
+    # attention_shared_experts (afdEP keeps shared work on Attention), and omits
     # quant_config because no local expert kernel is constructed.
     # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
     # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
@@ -296,6 +297,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         layer_idx: int,
         prefix: str,
         compute_gate_on_attention: bool,
+        attention_shared_experts: bool = False,
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
@@ -326,9 +328,21 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // ep_size
-        # No local shared-expert MLP is constructed, so fused shared experts
-        # can never be enabled for this shell.
+        # Shared experts, when owned by Attention, use a separate native MLP.
+        # They must never be fused into the parameter-free routed proxy.
         self.is_fused_shared_expert_enabled = False
+        self.shared_experts = (
+            native.DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                hidden_act=config.hidden_act,
+                quant_config=None,
+                prefix=f"{prefix}.shared_experts",
+            )
+            if attention_shared_experts and config.n_shared_experts
+            else None
+        )
         self.experts = AFDAttentionFusedMoE(
             layer_idx=layer_idx,
             external_routing=compute_gate_on_attention,
@@ -358,10 +372,17 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = native.sequence_parallel_chunk(hidden_states)
         router_logits, _ = self.gate(hidden_states)
+        shared_output = (
+            self.shared_experts(hidden_states)
+            if self.shared_experts is not None
+            else None
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = native.tensor_model_parallel_all_gather(
                 final_hidden_states,
@@ -497,6 +518,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     layer_idx=layer_idx,
                     prefix=f"{prefix}.mlp",
                     compute_gate_on_attention=self.compute_gate_on_attention,
+                    attention_shared_experts=afd_config.connector == AFDEP_CONNECTOR,
                 )
             elif self.compute_gate_on_attention and self.is_moe_layer:
                 self.mlp = GateOnlyRemoteMoE(
@@ -528,7 +550,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector == AFD_ASYNC_CONNECTOR:
+                if afd_config.connector in (AFD_ASYNC_CONNECTOR, AFDEP_CONNECTOR):
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
@@ -967,7 +989,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 config=self.config,
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
                 attention_shared_experts=self.afd_config.connector
-                == AFD_ASYNC_CONNECTOR,
+                in (AFD_ASYNC_CONNECTOR, AFDEP_CONNECTOR),
             )
         )
 
