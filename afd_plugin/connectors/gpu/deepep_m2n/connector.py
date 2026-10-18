@@ -891,6 +891,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     post-load checks, NCCL control group and DeepEP buffers).
     """
 
+    BUFFER_TYPE: type = DeepEPElasticBuffer
+
     @classmethod
     def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
         return DeepEPM2NConfig.from_mapping(raw)
@@ -1106,7 +1108,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         try:
             for _ in range(self.num_lanes):
                 self.lanes.append(
-                    DeepEPElasticBuffer(
+                    self.BUFFER_TYPE(
                         group=self.bootstrap_group,
                         capacity_tokens_per_rank=self.capacity_tokens_per_rank,
                         hidden_size=self.hidden_size,

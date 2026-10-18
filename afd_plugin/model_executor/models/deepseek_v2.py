@@ -25,7 +25,7 @@ from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
-    DEEPEP_M2N_CONNECTOR,
+    DEEPEP_M2N_CONNECTORS,
     parse_afd_config,
 )
 from afd_plugin.connectors import (
@@ -62,7 +62,10 @@ _BOTH_ROLES = frozenset(("attention", "ffn"))
 _NO_ROLE: frozenset[str] = frozenset()
 # Connectors whose FFN builds no shared experts: Async CAM runs them on
 # Attention; DeepEP M2N's FFN runs routed experts only.
-_FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS = (AFD_ASYNC_CONNECTOR, DEEPEP_M2N_CONNECTOR)
+_FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS = (
+    AFD_ASYNC_CONNECTOR,
+    *DEEPEP_M2N_CONNECTORS,
+)
 # Expert id of a padding row: a routed-experts connector sends it nowhere.
 UNROUTED_EXPERT_ID = -1
 
@@ -1058,7 +1061,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 attention_shared_experts=self.afd_config.connector
                 == AFD_ASYNC_CONNECTOR,
                 ffn_skips_shared_experts=self.afd_config.connector
-                == DEEPEP_M2N_CONNECTOR,
+                in DEEPEP_M2N_CONNECTORS,
             )
         )
 

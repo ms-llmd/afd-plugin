@@ -1,0 +1,683 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-18",
+  "scope": "Synthetic closed-loop end-to-end serving",
+  "hardware": {
+    "architecture": "Hopper, sm_90",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "gpu_count": 4,
+    "hosts": 1,
+    "interconnect": "One NVLink domain; NV18 between every GPU pair",
+    "ffn_gpu_indices": [
+      0,
+      1
+    ],
+    "attention_gpu_indices": [
+      2,
+      3
+    ]
+  },
+  "model": {
+    "id": "Qwen/Qwen3-30B-A3B-FP8",
+    "revision": "d206ba732169f29bb77fbf80fc2c4b81d4d30782",
+    "weight_quantization": "FP8 block-128",
+    "activation_dtype": "bfloat16",
+    "real_experts": 128,
+    "experts_per_ffn_rank": 64,
+    "top_k": 8
+  },
+  "runtime": {
+    "vllm": "0.30.0",
+    "torch": "2.13.0+cu130",
+    "cuda_toolkit": "13.0",
+    "nccl_runtime_and_headers": "2.30.7",
+    "vllm_model_runner": "v2"
+  },
+  "configuration": {
+    "ffn_ranks": 2,
+    "attention_ranks": 2,
+    "data_parallel_size_per_role": 2,
+    "tensor_parallel_size": 1,
+    "enable_expert_parallel": true,
+    "all2all_backend": "allgather_reducescatter",
+    "moe_backend": "deep_gemm",
+    "max_model_len": 4096,
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 2048,
+    "gpu_memory_utilization": 0.85,
+    "model_seed": 42,
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "requested_cudagraph_capture_sizes": [
+      1,
+      8,
+      32,
+      128
+    ],
+    "max_cudagraph_capture_size": 128,
+    "double_batch_overlap": false,
+    "m2n_and_afdep": {
+      "capacity_tokens_per_rank": 2048,
+      "payload_format": "fp8_block128_fp32",
+      "expert_backend": "deepgemm",
+      "network_preset": "single-node",
+      "gin": "disabled",
+      "cpu_sync_min_tokens": 0,
+      "eager_receive_counts": "CPU synchronized",
+      "logical_expert_slots": 256
+    },
+    "omp_num_threads": 1,
+    "build_max_jobs": 8
+  },
+  "measurement": {
+    "repeats": 3,
+    "mode_order": [
+      "m2n",
+      "p2p",
+      "afdep"
+    ],
+    "startup_capture_and_warmup": "excluded",
+    "graph_replay": "included",
+    "prompt_generation": "Python Random(seed), uniform integer token IDs in [1000,50000), cycling input lengths; same seeds for all modes",
+    "itl": "Client receipt gaps between adjacent singleton-token SSE events, pooled across requests",
+    "tpot": "Per request, (last-token receipt - first-token receipt)/(output_tokens-1)",
+    "summary": "Median of three run metrics; min/max are the observed run range",
+    "raw_hash_order": "repeat indices 0,1,2",
+    "return_token_ids": true,
+    "logprobs": false
+  },
+  "modes": {
+    "p2p": {
+      "label": "P2P NCCL",
+      "connector": "P2pNcclAFDConnector",
+      "dispatch_payload": "BF16",
+      "gate_on_attention": false,
+      "expert_compute": "vLLM native DeepGEMM"
+    },
+    "m2n": {
+      "label": "Masked DeepEP",
+      "connector": "DeepEPM2NAFDConnector",
+      "dispatch_payload": "FP8 + per-128-channel FP32 scales",
+      "gate_on_attention": true,
+      "expert_compute": "Pinned plugin DeepGEMM"
+    },
+    "afdep": {
+      "label": "afdEP, DeepEP backend",
+      "connector": "AfdEPConnector",
+      "dispatch_payload": "FP8 + per-128-channel FP32 scales",
+      "gate_on_attention": true,
+      "expert_compute": "Same pinned plugin DeepGEMM as m2n"
+    }
+  },
+  "cases": {
+    "short": {
+      "input_tokens": [
+        32
+      ],
+      "output_tokens": 64,
+      "concurrency": 1,
+      "requests_per_repeat": 32,
+      "warmup_requests_per_repeat": 8,
+      "seeds": [
+        73342,
+        73343,
+        73344
+      ],
+      "results": {
+        "m2n": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 1.9675981576787842,
+              "min": 1.9675370288549903,
+              "max": 1.9697740163748712
+            },
+            "ttft_median_ms": {
+              "median": 117.15817200000001,
+              "min": 116.5923665,
+              "max": 118.013137
+            },
+            "ttft_p95_ms": {
+              "median": 121.7371222,
+              "min": 121.05584230000001,
+              "max": 123.41490735000001
+            },
+            "itl_median_ms": {
+              "median": 6.2204440000000005,
+              "min": 6.2191025,
+              "max": 6.2375325
+            },
+            "itl_p95_ms": {
+              "median": 6.45051275,
+              "min": 6.43905075,
+              "max": 6.46328625
+            },
+            "tpot_median_ms": {
+              "median": 6.221873619047619,
+              "min": 6.214350738095238,
+              "max": 6.230604079365079
+            },
+            "latency_median_ms": {
+              "median": 507.474022,
+              "min": 506.64160300000003,
+              "max": 508.5256485
+            }
+          }
+        },
+        "p2p": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 1.716837728772992,
+              "min": 1.70650770303333,
+              "max": 1.7185985451085632
+            },
+            "ttft_median_ms": {
+              "median": 111.837973,
+              "min": 111.428698,
+              "max": 117.356878
+            },
+            "ttft_p95_ms": {
+              "median": 121.0490583,
+              "min": 120.60676219999999,
+              "max": 122.9094352
+            },
+            "itl_median_ms": {
+              "median": 7.460901,
+              "min": 7.459449,
+              "max": 7.46981
+            },
+            "itl_p95_ms": {
+              "median": 7.6175645,
+              "min": 7.61454625,
+              "max": 7.6211442499999995
+            },
+            "tpot_median_ms": {
+              "median": 7.4647672698412695,
+              "min": 7.453381682539683,
+              "max": 7.466452428571429
+            },
+            "latency_median_ms": {
+              "median": 582.544463,
+              "min": 580.5953030000001,
+              "max": 587.6087580000001
+            }
+          }
+        },
+        "afdep": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 1.9676226471847202,
+              "min": 1.9528421592934866,
+              "max": 1.9776335028319798
+            },
+            "ttft_median_ms": {
+              "median": 116.7750795,
+              "min": 114.7294105,
+              "max": 120.06418
+            },
+            "ttft_p95_ms": {
+              "median": 122.6765687,
+              "min": 120.04770685,
+              "max": 127.3454592
+            },
+            "itl_median_ms": {
+              "median": 6.212002,
+              "min": 6.208185500000001,
+              "max": 6.2238454999999995
+            },
+            "itl_p95_ms": {
+              "median": 6.483395499999999,
+              "min": 6.4695765000000005,
+              "max": 6.4888205
+            },
+            "tpot_median_ms": {
+              "median": 6.204330595238095,
+              "min": 6.199202341269841,
+              "max": 6.239880992063492
+            },
+            "latency_median_ms": {
+              "median": 507.4347975,
+              "min": 506.04355499999997,
+              "max": 510.947585
+            }
+          }
+        }
+      },
+      "raw_sha256_by_repeat": {
+        "m2n": [
+          "659a5cc9006e1f64a5958dcb59cd5efd6e498c28b496241b647378d14a093332",
+          "5962bfcaad82f1615ef159035579a2d99b8ebbf6ac1cf336878619532ef2cc09",
+          "8c015ae02e66c02c6cd78709d6f96206413563d1270146dd6ae0307456bc891e"
+        ],
+        "p2p": [
+          "55d6497b91e2b58eebc8d90411851d3a76eaf8446d8d726c1e62abcc27f5df72",
+          "bf9f7002569cf47e2e3bb3a5856f5d59950b4b631bbd45ab85db16770979594f",
+          "0a4bad2c0e604b12f3a3c779508921207cd2da8944e2282a3fabb9ff9f47e4c6"
+        ],
+        "afdep": [
+          "4490a77581d65dba8c9dc03b94c29bc797ef448fecbd8d2d0b2ca91a998819f0",
+          "192d6ad8bad4a1d6f8e0060fee72c8a5a55afef60ee155551623f9e7f453d023",
+          "afca93f6d9f6df08b57b99360dbf82ac6b6d99e72c44821395c245709c089c59"
+        ]
+      },
+      "prompt_sha256_by_repeat": [
+        "26bd17e5f6180db046f6a063b3ea596df7816643653f785b04e242faac4f0505",
+        "20c7ddf217c0230abcff1a983a4054885ddfe1303ec220c2750bb6a9e10a49a9",
+        "2d3021155fcacb339b3108cbbba2a9705f3bb2f15b8f8a7bf3f28c7cd9212a21"
+      ]
+    },
+    "mixed": {
+      "input_tokens": [
+        32,
+        128,
+        512,
+        1024,
+        1536,
+        2048
+      ],
+      "output_tokens": 64,
+      "concurrency": 32,
+      "requests_per_repeat": 128,
+      "warmup_requests_per_repeat": 8,
+      "seeds": [
+        76442,
+        76443,
+        76444
+      ],
+      "results": {
+        "m2n": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 17.267151251372436,
+              "min": 17.202106732269943,
+              "max": 18.194240729210982
+            },
+            "ttft_median_ms": {
+              "median": 428.96594749999997,
+              "min": 428.11442650000004,
+              "max": 436.129315
+            },
+            "ttft_p95_ms": {
+              "median": 893.6181225500001,
+              "min": 882.4961176,
+              "max": 950.9353241
+            },
+            "itl_median_ms": {
+              "median": 10.402288500000001,
+              "min": 10.2321135,
+              "max": 10.504996
+            },
+            "itl_p95_ms": {
+              "median": 111.68349269999999,
+              "min": 110.82631214999998,
+              "max": 112.44671645
+            },
+            "tpot_median_ms": {
+              "median": 23.78806265079365,
+              "min": 21.14903641269841,
+              "max": 24.274141960317458
+            },
+            "latency_median_ms": {
+              "median": 1905.8741555,
+              "min": 1784.0605209999999,
+              "max": 1923.9504075
+            }
+          }
+        },
+        "p2p": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 16.586613750563377,
+              "min": 16.446398920198,
+              "max": 16.925791429824066
+            },
+            "ttft_median_ms": {
+              "median": 377.3815885,
+              "min": 323.08623550000004,
+              "max": 386.5573855
+            },
+            "ttft_p95_ms": {
+              "median": 703.73740395,
+              "min": 689.9250934,
+              "max": 789.2429381
+            },
+            "itl_median_ms": {
+              "median": 15.1877025,
+              "min": 15.021278500000001,
+              "max": 15.29568
+            },
+            "itl_p95_ms": {
+              "median": 99.8153895,
+              "min": 97.2352147,
+              "max": 100.61633699999999
+            },
+            "tpot_median_ms": {
+              "median": 25.330234793650796,
+              "min": 24.865343055555556,
+              "max": 25.45119653174603
+            },
+            "latency_median_ms": {
+              "median": 1952.7482865,
+              "min": 1931.5304055000001,
+              "max": 1958.402472
+            }
+          }
+        },
+        "afdep": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 18.59630514354601,
+              "min": 17.333529046980345,
+              "max": 18.64580687171979
+            },
+            "ttft_median_ms": {
+              "median": 433.3780865,
+              "min": 430.2951115,
+              "max": 435.044899
+            },
+            "ttft_p95_ms": {
+              "median": 888.8696501,
+              "min": 884.4732690999999,
+              "max": 895.4538384
+            },
+            "itl_median_ms": {
+              "median": 10.376642499999999,
+              "min": 10.2314965,
+              "max": 10.493030000000001
+            },
+            "itl_p95_ms": {
+              "median": 109.5400785,
+              "min": 109.06155425,
+              "max": 109.60025365
+            },
+            "tpot_median_ms": {
+              "median": 21.206306007936508,
+              "min": 21.016993976190477,
+              "max": 24.34873776190476
+            },
+            "latency_median_ms": {
+              "median": 1765.8074179999999,
+              "min": 1760.2340895000002,
+              "max": 1876.0330635
+            }
+          }
+        }
+      },
+      "raw_sha256_by_repeat": {
+        "m2n": [
+          "1fafdc60e597383b6261369e4ef07c5ffd8f190c6abc037412467600246bbfd9",
+          "c216361b7df9245f5f840f88c126051e23b98fa920e083b4e7469817080b67cb",
+          "0916f55aa23e6a2abaca56c12a84f1ef7452e9c3e811dee259672af065f209f1"
+        ],
+        "p2p": [
+          "31ca6614791b3c4dbeb705a2984b39380e57810affa9efc4290541234bc62524",
+          "c71adc6c000aa5709a83ceccc2d864a588280839a2e178c80337909042701c50",
+          "24a8a4045665378e8d6a41c2396f49324a3248df4bb24a2d0fdd29a38c80d933"
+        ],
+        "afdep": [
+          "03ae28b59e2fe2907f8d98465c870d879df97702b58c21fad6aae63dfad8c8c1",
+          "231d0b7c7205bebf0da44e8f6484c87ec8626bae624cc4618c68e8cd5cbd62f0",
+          "a6201b19325e69177033aef24af6ff075c90a8e32f3605028ea4569e009c9d00"
+        ]
+      },
+      "prompt_sha256_by_repeat": [
+        "70c2dbd22a074798a046213830f16327af06488f098062fa37b5fc6f55287b05",
+        "b989f890c142915a334bca077bfd30260d1e4c8211d1cdbabca89ac9097f2334",
+        "882c67d44c0fc09dd23c5428bcfa87a9876a7c6ae87afd07073fcc16f9234673"
+      ]
+    },
+    "sustained": {
+      "input_tokens": [
+        256
+      ],
+      "output_tokens": 256,
+      "concurrency": 128,
+      "requests_per_repeat": 256,
+      "warmup_requests_per_repeat": 8,
+      "seeds": [
+        278042,
+        278043,
+        278044
+      ],
+      "results": {
+        "m2n": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 26.57917134030727,
+              "min": 26.57180025424718,
+              "max": 26.722266218983275
+            },
+            "ttft_median_ms": {
+              "median": 821.343924,
+              "min": 814.0122425,
+              "max": 828.8526785
+            },
+            "ttft_p95_ms": {
+              "median": 1742.12281375,
+              "min": 1643.5199929999999,
+              "max": 1765.4235835
+            },
+            "itl_median_ms": {
+              "median": 12.513313,
+              "min": 12.3847065,
+              "max": 12.535115000000001
+            },
+            "itl_p95_ms": {
+              "median": 19.0733933,
+              "min": 18.976665599999997,
+              "max": 19.50943395
+            },
+            "tpot_median_ms": {
+              "median": 14.635009139215686,
+              "min": 14.610524001960783,
+              "max": 14.679060562745097
+            },
+            "latency_median_ms": {
+              "median": 4736.0666075,
+              "min": 4735.219179,
+              "max": 4767.166214999999
+            }
+          }
+        },
+        "p2p": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 24.148883811053476,
+              "min": 23.80332304145481,
+              "max": 24.22853053003307
+            },
+            "ttft_median_ms": {
+              "median": 381.966317,
+              "min": 308.35324,
+              "max": 466.661119
+            },
+            "ttft_p95_ms": {
+              "median": 889.2945002499999,
+              "min": 862.552158,
+              "max": 939.10775075
+            },
+            "itl_median_ms": {
+              "median": 17.0127475,
+              "min": 16.9990095,
+              "max": 17.108293500000002
+            },
+            "itl_p95_ms": {
+              "median": 22.987773199999992,
+              "min": 22.834333599999997,
+              "max": 23.678882249999997
+            },
+            "tpot_median_ms": {
+              "median": 18.988219384313723,
+              "min": 18.88325750392157,
+              "max": 19.068790009803923
+            },
+            "latency_median_ms": {
+              "median": 5205.2718515,
+              "min": 5186.603568,
+              "max": 5285.997294
+            }
+          }
+        },
+        "afdep": {
+          "repeats": 3,
+          "metrics": {
+            "requests_per_second": {
+              "median": 26.703003252940853,
+              "min": 26.595201239264387,
+              "max": 27.045064295455493
+            },
+            "ttft_median_ms": {
+              "median": 797.8536314999999,
+              "min": 787.958817,
+              "max": 804.48568
+            },
+            "ttft_p95_ms": {
+              "median": 1741.1112827499999,
+              "min": 1678.0186275,
+              "max": 1854.78826525
+            },
+            "itl_median_ms": {
+              "median": 12.605556,
+              "min": 12.5231105,
+              "max": 12.664874000000001
+            },
+            "itl_p95_ms": {
+              "median": 18.69985239999999,
+              "min": 18.55610875,
+              "max": 18.956553149999998
+            },
+            "tpot_median_ms": {
+              "median": 14.604168343137253,
+              "min": 14.547789,
+              "max": 14.620120164705881
+            },
+            "latency_median_ms": {
+              "median": 4716.871481,
+              "min": 4651.6812995,
+              "max": 4717.7319105
+            }
+          }
+        }
+      },
+      "raw_sha256_by_repeat": {
+        "m2n": [
+          "637c1666230c20173ebb0cd581e8b1b5f0608afee93f14587f6fb1b472a5d7b4",
+          "7658ee66cd0b62f3d30ecf1266c20296c7005b11256e53901f80ec965e12dd92",
+          "ed7425056d353f80dec00b6cc549a2251d5e7bfdc9399807e3fb118f3e408679"
+        ],
+        "p2p": [
+          "6a9901a2c41c12a4f2a0abf568f6899295c5ea69783518f776dc3f9d2b9a502b",
+          "9b667da2f8879b8cd66367c0421de8d618b207bf853e9ec23b3697efa666d9a5",
+          "60f1c02e2df743d6615603086d2228131dfd830b1f53d63afaaf8a863fc08282"
+        ],
+        "afdep": [
+          "f6d1ec145ba586d3c9d6230a90fcdc45378f0e81a48508e16a37f9cc2390c60b",
+          "871ad50c2105ea4190eef6baae8bc0d231988f2f2d968f4e7aceedfcaa849af0",
+          "b79d360fa63c284b0328ac981f62551ca0f54322f2e4f46d7512ce37812ce921"
+        ]
+      },
+      "prompt_sha256_by_repeat": [
+        "a9a7d950a9f75f51e35a03c778e777e625600667d8a3ccef3e4611c6dea29c85",
+        "adb0efcfac0c1fb6f503e5c6e97bfa61e1020fd645a318d2d6f7b50455f5bc67",
+        "b4e667ea386fcc70dc9b1b67a4b3794251a109127aa384cb3a747a8f9bc182d1"
+      ]
+    }
+  },
+  "coverage": {
+    "requests": 3744,
+    "output_tokens": 681984,
+    "observed_intervals": 678240,
+    "possible_intervals": 678240,
+    "coalesced_events": 0
+  },
+  "output_parity": {
+    "m2n_vs_p2p": {
+      "short": {
+        "paired_requests": 96,
+        "same_full_output": 32,
+        "same_first_token": 84
+      },
+      "mixed": {
+        "paired_requests": 384,
+        "same_full_output": 177,
+        "same_first_token": 351
+      },
+      "sustained": {
+        "paired_requests": 768,
+        "same_full_output": 347,
+        "same_first_token": 699
+      }
+    },
+    "m2n_vs_afdep": {
+      "short": {
+        "paired_requests": 96,
+        "same_full_output": 96,
+        "same_first_token": 96
+      },
+      "mixed": {
+        "paired_requests": 384,
+        "same_full_output": 292,
+        "same_first_token": 382
+      },
+      "sustained": {
+        "paired_requests": 768,
+        "same_full_output": 713,
+        "same_first_token": 768
+      }
+    }
+  },
+  "sources": {
+    "plugin_repository": "https://github.com/ms-llmd/afd-plugin",
+    "plugin_baseline_commit": "1198c52f8bed0c20a2b51ff550db5ccf2fda0906",
+    "plugin_baseline_archive_sha256": "df281cfffa09cd1c6904f0fa7c6be8d00d448a408cfc47d33de6019ba2e51fbf",
+    "plugin_afdep_runtime_archive_sha256": "d73d9a2551ee055e0f868f8309049927c13ffed8580c943a143f6fb10bb20446",
+    "plugin_afdep_changed_runtime_sha256": {
+      "afd_plugin/config.py": "33d5f66dc3948d9b5fc5b71c4d99dd3903621dd38c0aa8cf50b28bd220842924",
+      "afd_plugin/connectors/factory.py": "763508a4fcbc2fff8f1b15368fc91e40e75b95e3e3901b42b876a0799e55d22e",
+      "afd_plugin/connectors/gpu/afdep.py": "dc886f64e0837ee6694a0caaaa1af9679c90e020382b23a64f543f78df542392",
+      "afd_plugin/connectors/gpu/deepep_m2n/connector.py": "a25d1c2e048637ffe6165f7eb769108c58fa743b0388a4f0f2fca371de29d692",
+      "afd_plugin/model_executor/models/deepseek_v2.py": "b48a8f9d5a15d48cf583f8bfd2a52342e8a05e63f3936f029c2840ddcf07d186",
+      "afd_plugin/model_executor/models/qwen3_moe.py": "c3de1bb06a964d572faa7de66c3cfc09f2e20d632f7b4eb2fd322075115e237f",
+      "afd_plugin/validation.py": "151e41adccd49bd1e9d90ea7b119f50f5c5410e0d241179c40cd6c1f66bcc75f"
+    },
+    "afdep_repository": "https://github.com/ms-llmd/afdEP",
+    "afdep_commit": "01d4fa6f10ef41a2b266a574b14ef7b5f960a092",
+    "afdep_runtime_archive_sha256": "a97b48c6397e941a241e7af485ba7542ef88b85a7b6a07d154cdfd57f185f946",
+    "afdep_runtime_files_match_published_commit": true,
+    "afdep_adapter_sha256": {
+      "afdep/deepep.py": "375d980bbb77d9f6259ca27ea33a284f37b41f125709d8774773d9eb24f8e025",
+      "afdep/_deepep_build.py": "c4c3ceaca485792a34c634b95ac95e3fc62693691d61297f40ab87fa0866fc72",
+      "afdep/_build.py": "de162db35f6b3bf1fb9d71589d055710d5f7a25c8eea28fac5e0127c2a828555"
+    },
+    "deepep_native_file_count": 50,
+    "deepep_native_manifest_sha256": "a72e7e6aa73998914e6091f0c06c24ba174855cd899c4219215d29415f9508f9",
+    "deepep_provenance": "https://github.com/ms-llmd/afdEP/blob/01d4fa6f10ef41a2b266a574b14ef7b5f960a092/afdep/third_party/deepep_v2/PROVENANCE.json",
+    "deepep_original_revision": "Not recorded by the vendored input; pinned plugin commit and complete native-file hashes identify it",
+    "benchmark_commit": "b5796823edbd3499bfc9cfa5d30590b51b8d7b47",
+    "benchmark_sha256": "47588ebbca752010b635e088fead1fb6c498033a51990201bdaeb9379cdc1265",
+    "audited_aggregate_sha256": "aa26bc79f350556a9aa4aa86aeea1ea1bed73ec9f7707aec8cd97f844711027b",
+    "post_measurement": {
+      "qwen3_moe.py": {
+        "change": "Comments and validation-error labels updated to name afdEP; successful execution unchanged. The measured hash above is retained.",
+        "current_sha256": "4b2d8edba288023420ebb5a8125949b43e91f9a2e86ba24a553c4f123264f1e8"
+      },
+      "repository_additions": "The afdEP dependency pin, documentation and benchmark files were added to the integration worktree after measurement; they are not in its captured runtime source archive. The benchmark hash above identifies the actual measurement client."
+    }
+  },
+  "limitations": [
+    "Natural connector comparison: M2N transports FP8 plus scales; P2P transports BF16, and gate placement differs.",
+    "Same DeepGEMM backend family; integration and vendor versions can select different compute kernels.",
+    "Client receipt ITL includes serving/client scheduling; it is not isolated kernel or network time.",
+    "Three sequential repeats per connector; observed min/max are not confidence intervals.",
+    "This 30B/H100 experiment does not reproduce the 235B/H200 claim exactly.",
+    "Concurrent generated token sequences differ even between m2n and afdep; output parity is reported, not accuracy equivalence.",
+    "Random token-ID prompts and fixed output lengths do not establish production-workload performance.",
+    "Communication payloads, gate placement and expert integration are natural connector defaults; this is not an isolated transport-only comparison."
+  ]
+}

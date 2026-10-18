@@ -20,12 +20,18 @@ AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 DEEPEP_M2N_CONNECTOR: Final[str] = "DeepEPM2NAFDConnector"
+AFDEP_CONNECTOR: Final[str] = "AfdEPConnector"
+DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (
+    DEEPEP_M2N_CONNECTOR,
+    AFDEP_CONNECTOR,
+)
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     DEEPEP_M2N_CONNECTOR,
+    AFDEP_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
 )
