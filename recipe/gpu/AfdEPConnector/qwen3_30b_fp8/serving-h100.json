@@ -83,7 +83,13 @@
     "summary": "Median of three run metrics; min/max are the observed run range",
     "raw_hash_order": "repeat indices 0,1,2",
     "return_token_ids": true,
-    "logprobs": false
+    "logprobs": false,
+    "post_measurement_jit_cache_audit": {
+      "measured_windows": 27,
+      "windows_with_surviving_cache_writes": 0,
+      "artifact_sha256": "846127d8b153589a7aa0fcbad5b61bdb49dea0db4ef466b92de97f7f4cc18916",
+      "limitation": "Filesystem timestamp audit: no evidence of fresh successful DeepGEMM builds during measurements; it cannot exclude failed, redundant or invisible compiler invocations."
+    }
   },
   "modes": {
     "p2p": {
@@ -679,5 +685,12 @@
     "Concurrent generated token sequences differ even between m2n and afdep; output parity is reported, not accuracy equivalence.",
     "Random token-ID prompts and fixed output lengths do not establish production-workload performance.",
     "Communication payloads, gate placement and expert integration are natural connector defaults; this is not an isolated transport-only comparison."
-  ]
+  ],
+  "post_measurement_runtime_validation": {
+    "qwen_construction_tests_passed": 25,
+    "skipped": 0,
+    "factory_and_config_without_native_or_cuda_initialization": true,
+    "source_snapshot_sha256": "6d52f0c0db486ec352aedc7dea9f752eadc7a0c543c27c9c5e3efe35563c466a",
+    "result_artifact_sha256": "fd0a15c3930e96ddbbfd3ded0efef620026b87a28e460dc44076e28a2acf112a"
+  }
 }

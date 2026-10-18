@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-18",
+  "scope": "Nsight Systems 2026.5.1; isolated 2048-input/1-output-token prefill, concurrency 1; diagnostic tracing only",
+  "hardware": "Four H100 80GB, one NVLink domain, 2 FFN and 2 Attention ranks",
+  "source_revision": "1198c52f8bed0c20a2b51ff550db5ccf2fda0906",
+  "model_revision": "d206ba732169f29bb77fbf80fc2c4b81d4d30782",
+  "modes": {
+    "m2n": {
+      "profiled_ttft_ms": [
+        129.049783,
+        132.930195,
+        132.524534,
+        131.159743
+      ],
+      "first_request": {
+        "F0": {
+          "kernel_interval_union_ms": 108.410072,
+          "selected_kernel_families": [
+            {
+              "name": "dispatch_impl",
+              "count": 48,
+              "sum_ms": 49.01973599999999
+            },
+            {
+              "name": "combine_impl",
+              "count": 48,
+              "sum_ms": 45.879265000000004
+            },
+            {
+              "name": "sm90_fp8_gemm_1d2d_impl",
+              "count": 96,
+              "sum_ms": 7.3118180000000015
+            },
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 2,
+              "sum_ms": 4.577465
+            }
+          ]
+        },
+        "F1": {
+          "kernel_interval_union_ms": 97.559451,
+          "selected_kernel_families": [
+            {
+              "name": "dispatch_impl",
+              "count": 48,
+              "sum_ms": 47.98262899999998
+            },
+            {
+              "name": "combine_impl",
+              "count": 48,
+              "sum_ms": 36.80460299999999
+            },
+            {
+              "name": "sm90_fp8_gemm_1d2d_impl",
+              "count": 96,
+              "sum_ms": 6.899196999999998
+            },
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 2,
+              "sum_ms": 4.458914
+            }
+          ]
+        },
+        "A1": {
+          "kernel_interval_union_ms": 13.416329,
+          "selected_kernel_families": []
+        },
+        "A0": {
+          "kernel_interval_union_ms": 19.91813,
+          "selected_kernel_families": [
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 4,
+              "sum_ms": 0.342685
+            }
+          ]
+        }
+      },
+      "source_archive_sha256": "4dec49c671492dc6a3fda8b0e8e423de216fcd6f79fbf52e79bcdf6891920ee7",
+      "instrumentation_patch_sha256": "1151051b9f683a8a922216da9bcf9b77c63218795af00ddc2c2f891ba5796a96",
+      "raw_traces": {
+        "attention.nsys-rep": {
+          "bytes": 14859880,
+          "sha256": "67b906ca5a26c792a9d69596f5ed4d055b2b87cb59ae19c5016fd55e06eac3be"
+        },
+        "ffn.nsys-rep": {
+          "bytes": 6546890,
+          "sha256": "0484cbda2defcf66b551024e41a0af8d46df7a004bbc186b4caf64050e112e61"
+        },
+        "ffn.sqlite": {
+          "bytes": 20328448,
+          "sha256": "9582d508ee4a4e4f62e1a4ccf14ad76f02a4fa063ea831bd65948632a4330eae"
+        },
+        "attention.sqlite": {
+          "bytes": 43843584,
+          "sha256": "b1561d7e26df7659ac84d1f3966a16196ec1c7d18bbb26ee050a7cc1480d5d50"
+        }
+      }
+    },
+    "p2p": {
+      "profiled_ttft_ms": [
+        128.16084,
+        136.485974,
+        138.811925,
+        139.317252
+      ],
+      "first_request": {
+        "F1": {
+          "kernel_interval_union_ms": 103.034535,
+          "selected_kernel_families": [
+            {
+              "name": "ncclDevKernel_AllGatherV_RING_LL",
+              "count": 192,
+              "sum_ms": 47.381704000000006
+            },
+            {
+              "name": "ncclDevKernel_Reduce_Sum_bf16_RING_LL",
+              "count": 48,
+              "sum_ms": 32.29315
+            },
+            {
+              "name": "sm90_fp8_gemm_1d2d_impl",
+              "count": 96,
+              "sum_ms": 10.252012
+            },
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 98,
+              "sum_ms": 8.200147
+            }
+          ]
+        },
+        "F0": {
+          "kernel_interval_union_ms": 38.797236,
+          "selected_kernel_families": [
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 98,
+              "sum_ms": 18.78279400000001
+            },
+            {
+              "name": "sm90_fp8_gemm_1d2d_impl",
+              "count": 96,
+              "sum_ms": 10.199049
+            },
+            {
+              "name": "ncclDevKernel_AllGatherV_RING_LL",
+              "count": 192,
+              "sum_ms": 2.4782329999999986
+            },
+            {
+              "name": "ncclDevKernel_Reduce_Sum_bf16_RING_LL",
+              "count": 48,
+              "sum_ms": 1.6131810000000006
+            }
+          ]
+        },
+        "A0": {
+          "kernel_interval_union_ms": 108.043107,
+          "selected_kernel_families": [
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 98,
+              "sum_ms": 96.08320600000003
+            }
+          ]
+        },
+        "A1": {
+          "kernel_interval_union_ms": 106.391098,
+          "selected_kernel_families": [
+            {
+              "name": "ncclDevKernel_SendRecv",
+              "count": 98,
+              "sum_ms": 104.77504099999999
+            }
+          ]
+        }
+      },
+      "source_archive_sha256": "4dec49c671492dc6a3fda8b0e8e423de216fcd6f79fbf52e79bcdf6891920ee7",
+      "instrumentation_patch_sha256": "1151051b9f683a8a922216da9bcf9b77c63218795af00ddc2c2f891ba5796a96",
+      "raw_traces": {
+        "attention.nsys-rep": {
+          "bytes": 8906941,
+          "sha256": "97d14846d6a10afc98791489bbcde1cd99eab0a1fb103be93b19fd9e69d936a0"
+        },
+        "ffn.nsys-rep": {
+          "bytes": 13055346,
+          "sha256": "5c6b20ddc5d16a55e24aacbbf9e1aac85a89c12bcd5a1d76935b7f17eda0d383"
+        },
+        "ffn.sqlite": {
+          "bytes": 47976448,
+          "sha256": "7310d14958851cdb848d7d47700d6d4eb7009dd7e6d18e9fcc1f9b5014f737d6"
+        },
+        "attention.sqlite": {
+          "bytes": 32804864,
+          "sha256": "833803eff08cecaa1788d0be1f23b2e91480d4c9c61045ab77f0183cbd31e0ae"
+        }
+      }
+    }
+  },
+  "limitations": [
+    "Profiled timings include tracing overhead.",
+    "Kernel intervals include communication polling and waits; they are not useful-compute or SM-utilization measurements.",
+    "GPU rows run concurrently and must not be added.",
+    "Window ends at client first-token receipt; later asynchronous and graph work is excluded.",
+    "Trace timings include Nsight and profile-only NVTX overhead.",
+    "Host NVTX spans include waits and are not entirely removable CPU bookkeeping.",
+    "Do not add overlapping ranks/streams. GPU busy unions include polling kernels.",
+    "No CPU callstack sampling was collected; source-pacing attribution is a hypothesis, not a proven Python bottleneck."
+  ],
+  "input_audit_sha256": "0ff66a5870af45157ec72db2650b4b3cfb0bcc6beaa17ba20d839c15e380384b",
+  "findings": [
+    "Isolated first requests are approximately129ms on each path; these profiled times do not establish a benchmark win.",
+    "Waiting appears on different GPUs: long Attention NCCL waits in P2P versus long FFN dispatch/combine intervals in Masked DeepEP.",
+    "Sustained-load TTFT differences cannot be attributed solely to direct prefill transfer latency."
+  ]
+}

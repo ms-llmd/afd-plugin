@@ -33,6 +33,14 @@ DeepEP and afdEP. This is a performance experiment, not an accuracy-equivalence
 or transport-only claim. Startup, compilation and capture are excluded;
 every timed graph replay is included. Whiskers show run ranges, not confidence intervals.
 
+![Nsight Systems: one isolated prefill request](prefill-trace.png)
+
+[Profiling data and trace hashes](profiling-h100.json): isolated 2,048-token
+prefill takes about 129 ms on each path under tracing. Waiting moves between
+Attention and FFN; colored intervals include communication polling. The larger
+TTFT difference under load needs separate serving/queueing analysis. These traces
+do not measure an afdEP specialization or isolated network-transfer time.
+
 ## Run
 
 Install this checkout with `uv sync --group dev --extra vllm --extra afdep`.
