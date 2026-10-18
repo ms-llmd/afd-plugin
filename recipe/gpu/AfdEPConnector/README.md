@@ -26,7 +26,9 @@ explicitly staged DeepGEMM extension and matching JIT sources.
 On each role's four-GPU host, set `MODEL_PATH`, `ROLE`, and `AFD_HOST` (FFN host),
 then run `bash recipe/gpu/AfdEPConnector/deepseek_v2_lite.sh`.
 Use `CONNECTOR=P2pNcclAFDConnector` for the baseline; use `EAGER=1` to disable
-graphs for either connector.
+graphs for either connector. `PREFILL_GRAPH=0` keeps Attention and decode
+graphs unchanged while disabling only afdEP FFN prefill replay for a matched
+launch-overhead ablation.
 
 | Path | Attention prefill | FFN prefill | Decode |
 | --- | --- | --- | --- |
