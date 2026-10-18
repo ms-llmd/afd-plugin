@@ -73,15 +73,9 @@ timeout. Found in the branch review of 2026-10-16.
     `validate_gpu_model_runner_v2_config`) with a unit test, until DeepSeek
     has a CUDA gate and top-k on Attention and Attention-side shared experts
     (see "Model E2E" below).
-- **DBO with DeepEP M2N.**
-    - **Problem:** validation accepts `enable_dbo` / `use_ubatching` with
-    DeepEP M2N, and `resolve_num_lanes` gives two lanes. Graph mode with DBO
-    hangs in the micro-batched capture warmup ("DeepEP NVLink barrier
-    timeout", then `cudaErrorLaunchFailure`; `afd-deepep-m2n-graph-dbo-2a2f`
-    below). Eager DBO has no E2E run.
-    - **Plan:** reject DBO for DeepEP M2N in
-    `validate_gpu_model_runner_v2_config` (at least with CUDA graphs), with a
-    unit test, and remove the check with the lane-ordering fix.
+- **DBO with DeepEP M2N.** Graph + DBO fixed 2026-10-18 (see
+  `afd-deepep-m2n-graph-dbo-2a2f` under "Model E2E"). Eager DBO still has no
+  E2E run.
 
 ## Also open (from the phase reports)
 
@@ -118,25 +112,29 @@ timeout. Found in the branch review of 2026-10-16.
     strict-match (±0.02), so the 6/7 is small-sample noise.
     - Still open: phase 2 (reduce-scatter after attention instead of the
     all-reduce, residual kept split; saves one all-gather per layer, only
-    if profiling shows a prefill gain), and Attention TP with DBO (DBO
-    itself is open, see below).
+    if profiling shows a prefill gain), and Attention TP with DBO (untested;
+    DBO with TP1 works, see below).
 - Model E2E. Qwen3-30B-A3B, BF16, one node, 2 Attention + 2 FFN ranks
   (`tests/e2e/models/qwen3_moe`, `test_qwen3_moe_deepep_m2n`) on pokprod
   4x H100, no RDMA, 2026-10-15:
     - `afd-deepep-m2n-eager-2a2f`: passed, GSM8K exact match 1.0 (7/7).
     - `afd-deepep-m2n-graph-2a2f`: passed, GSM8K 1.0; every rank replays
     FULL graphs (Attention 511 + 324, FFN 841 each).
-    - `afd-deepep-m2n-graph-dbo-2a2f`: fails, and is skipped for now. Every
-    rank times out ("DeepEP NVLink barrier timeout", then
-    `cudaErrorLaunchFailure`) in the eager warmup forward vLLM runs before
-    capturing the two-micro-batch graph. The same happens with vLLM's
-    CUDA-graph memory profiling skipped (`--kv-cache-memory-bytes`) and with
-    the DeepEP host sync disabled (`cpu_sync_min_tokens` = 1e9), so neither
-    is the cause. The barrier counters differ per role on the failing buffer
-    (Attention 390, FFN 2): under DBO the two roles drive different lanes.
-    Next: log the lane/stage sequence each role issues during that warmup,
-    and compare FFN `_ffn_forward` (layer-major, stage-minor, one thread)
-    with vLLM's two micro-batch threads on Attention.
+    - `afd-deepep-m2n-graph-dbo-2a2f`: passed 2026-10-18 on 4x H100 + RDMA,
+    GSM8K 0.917 (24 samples), two-micro-batch graph replays on every rank.
+    It used to hang every rank in the warmup before the two-micro-batch
+    capture ("DeepEP NVLink barrier timeout"; signal 2 of 4 because each
+    role waited on a different lane's buffer). Two bugs:
+        - torch.compile froze the dispatch/combine ops' `stage_idx` argument,
+        so both of vLLM's micro-batch threads, which share one compiled
+        graph, used stage 0. Micro-batch 1 raised "stage 0 dispatched twice
+        without combine", and vLLM's micro-batch runner hides a non-first
+        micro-batch's error. The op bodies now take the live micro-batch id
+        (`_live_stage_idx`).
+        - The FFN issued `D0 C0 D1 C1` per layer, but Attention's micro-batch
+        threads issue `D0(L) D1(L) C0(L) D0(L+1) C1(L) ...`, and dispatch and
+        combine can block the host. The FFN now sends each stage's result
+        just before that stage's next dispatch.
     - Still open: multi-node E2E; DeepSeek (gate-on-Attention on CUDA and
     Attention-side shared experts).
   Note from `test_graph_and_eager_plans_mixed_across_ranks`: results stay

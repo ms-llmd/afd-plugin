@@ -61,6 +61,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
 
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import AFDControlPlane, ConnectorExtraInfo
@@ -697,6 +698,18 @@ _DISPATCH_OP = "afd_deepep_m2n_dispatch"
 _COMBINE_OP = "afd_deepep_m2n_combine"
 
 
+def _live_stage_idx(traced_stage_idx: int) -> int:
+    """The stage of the calling micro-batch, read when the op body runs.
+
+    ``torch.compile`` freezes the ``stage_idx`` op argument at trace time, and
+    vLLM's DBO micro-batch threads share one compiled graph, so every thread
+    would pass the same stage. Inside a DBO thread the vLLM micro-batch id is
+    the stage (one AFD stage per micro-batch); otherwise, as in direct eager
+    calls, the argument is right.
+    """
+    return dbo_current_ubatch_id() if dbo_enabled() else traced_stage_idx
+
+
 def _dispatch_op_impl(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -705,7 +718,7 @@ def _dispatch_op_impl(
     stage_idx: int,
 ) -> None:
     _CONNECTORS[connector_id].dispatch_attention(
-        hidden_states, topk_ids, topk_weights, stage_idx
+        hidden_states, topk_ids, topk_weights, _live_stage_idx(stage_idx)
     )
 
 
@@ -720,7 +733,7 @@ def _dispatch_op_fake(
 
 
 def _combine_op_impl(out: torch.Tensor, connector_id: int, stage_idx: int) -> None:
-    _CONNECTORS[connector_id].combine_attention(out, stage_idx)
+    _CONNECTORS[connector_id].combine_attention(out, _live_stage_idx(stage_idx))
 
 
 def _combine_op_fake(out: torch.Tensor, connector_id: int, stage_idx: int) -> None:
@@ -1052,7 +1065,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
 
         Args:
             hidden_states: ``[tokens, hidden]`` BF16 Attention output.
-            context: Transfer context; ``metadata.stage_idx`` selects the lane.
+            context: Transfer context; ``metadata.stage_idx`` selects the lane
+                (inside a vLLM DBO micro-batch thread, its micro-batch id does).
             topk_ids: ``[tokens, top_k]`` real expert ids. Required: routing
                 runs on the Attention side with this connector.
             topk_weights: ``[tokens, top_k]`` routing weights. Required.

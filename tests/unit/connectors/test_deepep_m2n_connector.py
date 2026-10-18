@@ -985,6 +985,45 @@ def test_nccl_comm_rank_comes_from_the_afd_group_not_the_default_world(monkeypat
     assert handle.nccl_comm == 7
 
 
+def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):
+    """Under DBO the dispatch/combine op bodies use the calling micro-batch's
+    id, not the ``stage_idx`` argument; outside DBO they use the argument.
+
+    Why: torch.compile froze ``stage_idx=0`` into the graph both DBO
+    micro-batch threads share, so micro-batch 1 dispatched "stage 0" again
+    and raised, and every rank hung at the DeepEP barrier.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import connector as connector_module
+
+    class _RecordingConnector:
+        def __init__(self):
+            self.calls = []
+
+        def dispatch_attention(self, hidden_states, topk_ids, topk_weights, stage):
+            self.calls.append(("dispatch", stage))
+
+        def combine_attention(self, out, stage):
+            self.calls.append(("combine", stage))
+
+    recorder = _RecordingConnector()
+    connector_id = -1
+    monkeypatch.setitem(connector_module._CONNECTORS, connector_id, recorder)
+    tensor = torch.zeros(1)
+    traced_stage_idx = 0
+
+    monkeypatch.setattr(connector_module, "dbo_enabled", lambda: True)
+    monkeypatch.setattr(connector_module, "dbo_current_ubatch_id", lambda: 1)
+    connector_module._dispatch_op_impl(
+        tensor, tensor, tensor, connector_id, traced_stage_idx
+    )
+    connector_module._combine_op_impl(tensor, connector_id, traced_stage_idx)
+
+    monkeypatch.setattr(connector_module, "dbo_enabled", lambda: False)
+    connector_module._dispatch_op_impl(tensor, tensor, tensor, connector_id, 1)
+
+    assert recorder.calls == [("dispatch", 1), ("combine", 1), ("dispatch", 1)]
+
+
 # ---------------------------------------------------------------------------
 # Attention-side combine zeros: sized for the largest receive
 # ---------------------------------------------------------------------------

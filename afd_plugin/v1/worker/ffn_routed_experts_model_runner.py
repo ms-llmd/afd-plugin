@@ -14,6 +14,7 @@ from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDDPMetadata,
     AFDRoutedExpertsConnector,
+    AFDTransferContext,
     FFNLocalExperts,
     LocalExpertWeights,
 )
@@ -62,9 +63,10 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     Routing (gate and top-k) runs on Attention. For each MoE layer and stage,
     in the same order as Attention, the FFN receives the rows routed to its
     local experts, runs those experts with the connector's executor and sends
-    the weighted rows back. vLLM still builds the model and loads and places
-    the expert weights; its MoE forward never runs, so the P2P path's
-    forward-context and DP metadata setup is skipped.
+    the weighted rows back just before that stage's next receive. vLLM still
+    builds the model and loads and places the expert weights; its MoE forward
+    never runs, so the P2P path's forward-context and DP metadata setup is
+    skipped.
 
     The worker selects this runner for an ``AFDRoutedExpertsConnector``
     (DeepEP M2N).
@@ -120,12 +122,24 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         connector = self.routed_connector
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         ffn_output = None
+        # Each stage's combine waits until just before that stage's next
+        # dispatch, matching Attention's DBO micro-batch order
+        # D0(0) D1(0) C0(0) D0(1) C1(0) D1(1) ... C0(n) C1(n). Dispatch and
+        # combine can block the host, so a combine issued earlier would wait
+        # on an Attention combine that only follows the next stage's dispatch.
+        # On the first layer no stage has a result to send back yet.
+        pending_outputs: dict[int, tuple[torch.Tensor, AFDTransferContext]] = {}
         for layer_idx in self.moe_layer_indices:
             weights = self.local_experts[layer_idx].weights
             for stage_idx in stage_ids:
+                if stage_idx in pending_outputs:
+                    connector.send_ffn_output(*pending_outputs.pop(stage_idx))
                 payload = connector.recv_attn_output(ubatch_idx=stage_idx)
                 ffn_output = connector.run_experts(payload, weights)
-                connector.send_ffn_output(ffn_output, payload.context)
+                pending_outputs[stage_idx] = (ffn_output, payload.context)
+        for stage_idx in stage_ids:
+            if stage_idx in pending_outputs:
+                connector.send_ffn_output(*pending_outputs.pop(stage_idx))
         # Lane streams forked by dispatch/combine must rejoin the caller's
         # stream before a CUDA-graph capture ends.
         connector.synchronize_lanes()
