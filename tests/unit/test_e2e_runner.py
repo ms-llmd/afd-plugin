@@ -158,6 +158,29 @@ def test_qwen3_moe_afd_entrypoint_uses_only_the_standard_2a1f_devices(
     assert command[command.index("--ffn-devices") + 1] == "6"
 
 
+@pytest.mark.parametrize("scenario", qwen3_moe_e2e.DEEPEP_M2N_SCENARIOS)
+def test_qwen3_moe_deepep_m2n_entrypoint_uses_2a2f_devices(
+    monkeypatch,
+    tmp_path,
+    scenario,
+):
+    """DeepEP M2N Qwen3 cases run two Attention and two FFN ranks.
+
+    Why: the connector needs EP over the FFN ranks; one FFN rank would make
+    every case a degenerate EP1 deployment.
+    """
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
+    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
+
+    command = qwen3_moe_e2e.build_runner_command(scenario, tmp_path)
+
+    assert command[command.index("--attention-devices") + 1] == "2,4"
+    assert command[command.index("--ffn-devices") + 1] == "6,8"
+    assert command[command.index("--scenario") + 1] == scenario
+    assert "--common-vllm-arg=--max-model-len=4096" in command
+
+
 def test_qwen3_6_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
     monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
@@ -530,6 +553,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-v2-graph-1a1f", (False, True, False, 1, 1, 1, 1, 1)),
         ("afd-v2-graph-dp2", (False, True, False, 2, 2, 1, 1, 1)),
         ("afd-v2-graph-tp2", (False, True, False, 2, 2, 1, 2, 2)),
+        ("afd-deepep-m2n-eager-2a2f", (False, False, False, 2, 2, 1, 1, 1)),
+        ("afd-deepep-m2n-graph-2a2f", (False, True, False, 2, 2, 1, 1, 1)),
+        ("afd-deepep-m2n-graph-dbo-2a2f", (False, True, True, 2, 2, 1, 1, 1)),
     ],
 )
 def test_configure_scenario_overwrites_fixed_topology_and_features(
@@ -602,6 +628,38 @@ def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
     assert attention_config["compute_gate_on_attention"] is True
     assert attention_config["connector_extra_config"]["attn_ranks_per_dp"] == 2
     assert "--enable-expert-parallel" in ffn_command
+
+
+@pytest.mark.parametrize("scenario", runner.DEEPEP_M2N_SCENARIOS)
+def test_deepep_m2n_scenarios_route_on_attention_with_ffn_expert_parallel(
+    scenario,
+):
+    """DeepEP M2N scenarios run gate-on-Attention against an EP FFN; the
+    Attention-TP scenarios run Attention DP1 x TP2, the others DP2 x TP1.
+
+    Why: the connector's handshake rejects a run unless both roles route on
+    Attention and the FFN ranks hold linear EP shards with TP 1.
+    """
+    args = _args()
+    args.scenario = scenario
+    runner.configure_scenario(args)
+    runner.validate_topology(args, ["0", "1"], ["2", "3"])
+    attention_tp = scenario in runner.DEEPEP_M2N_ATTENTION_TP_SCENARIOS
+    expected = {
+        "attention": ("1", "2") if attention_tp else ("2", "1"),
+        "ffn": ("2", "1"),
+    }
+
+    for role, (dp_size, tp_size) in expected.items():
+        command = runner.build_vllm_command(args, role=role)
+        afd_config = json.loads(
+            command[command.index("--additional-config") + 1],
+        )["afd"]
+        assert afd_config["connector"] == runner.DEEPEP_M2N_CONNECTOR
+        assert afd_config["compute_gate_on_attention"] is True
+        assert command[command.index("--data-parallel-size") + 1] == dp_size
+        assert command[command.index("--tensor-parallel-size") + 1] == tp_size
+        assert "--enable-expert-parallel" in command
 
 
 def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():
@@ -728,6 +786,18 @@ def test_v2_scenarios_reject_npu_backend():
 
     with pytest.raises(ValueError, match="require GPU"):
         runner.validate_topology(args, ["0"], ["1"])
+
+
+@pytest.mark.parametrize("scenario", runner.DEEPEP_M2N_SCENARIOS)
+def test_deepep_m2n_scenarios_reject_npu_backend(scenario):
+    """DeepEP M2N scenarios fail validation on NPU, before any launch."""
+    args = _args()
+    args.scenario = scenario
+    args.device_backend = "npu"
+    runner.configure_scenario(args)
+
+    with pytest.raises(ValueError, match="DeepEP M2N E2E scenarios require GPU"):
+        runner.validate_topology(args, ["0", "1"], ["2", "3"])
 
 
 def test_build_baseline_command_uses_native_dp4_graph_server():

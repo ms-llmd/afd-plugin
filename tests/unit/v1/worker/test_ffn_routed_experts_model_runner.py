@@ -55,29 +55,64 @@ def test_routed_runner_reuses_the_connector_driven_ffn_runner():
     assert issubclass(GPUFFNRoutedExpertsModelRunner, GPUFFNModelRunner)
 
 
-def test_forward_runs_local_experts_per_moe_layer_and_stage_then_joins_lanes():
-    """For layers (1, 3) and stages (0, 1): recv, run_experts with that
-    layer's weights, send, in Attention's order; the lanes rejoin once at
-    the end.
+def _recv_and_run(stage, layer):
+    return [("recv", stage), ("run", f"rows{stage}", f"w{layer}")]
 
-    Why: dispatch and combine are collectives in a fixed per-lane order, and
-    a CUDA-graph capture fails if forked lane streams are not joined.
+
+def _send(stage):
+    return [("send", f"out(rows{stage})", stage)]
+
+
+def test_forward_follows_attention_dbo_order_then_joins_lanes():
+    """For layers (1, 3) and stages (0, 1) the FFN issues Attention's DBO
+    micro-batch order: both stages dispatch layer 1, then each stage sends
+    its layer-1 result just before dispatching layer 3, and the last results
+    go back at the end. Each recv runs that layer's experts; the lanes rejoin
+    once at the end.
+
+    Why: Attention's micro-batch threads issue D0 D1 C0 D0' C1 D1' and
+    dispatch/combine can block the host, so sending stage 0 right after its
+    experts (D0 C0 D1) hung every rank in the graph+DBO warmup. A CUDA-graph
+    capture also fails if forked lane streams are not joined.
     """
     runner = _runner()
 
     output = runner._ffn_forward(dp_metadata_list={1: _dp(3), 0: _dp(5)})
 
-    expected = []
-    for layer in MOE_LAYERS:
-        for stage in (0, 1):
-            expected += [
-                ("recv", stage),
-                ("run", f"rows{stage}", f"w{layer}"),
-                ("send", f"out(rows{stage})", stage),
-            ]
-    assert runner.connector.events == [*expected, ("sync",)]
+    first, last = MOE_LAYERS
+    expected = [
+        *_recv_and_run(0, first),
+        *_recv_and_run(1, first),
+        *_send(0),
+        *_recv_and_run(0, last),
+        *_send(1),
+        *_recv_and_run(1, last),
+        *_send(0),
+        *_send(1),
+        ("sync",),
+    ]
+    assert runner.connector.events == expected
     assert output == "out(rows1)"
     assert len(runner.connector.control_updates) == 1
+
+
+def test_forward_with_one_stage_sends_each_layer_before_the_next_recv():
+    """With one stage the order is recv, run, send per MoE layer.
+
+    Why: without DBO, Attention combines a layer before it dispatches the next.
+    """
+    runner = _runner()
+
+    runner._ffn_forward(dp_metadata_list={0: _dp(5)})
+
+    first, last = MOE_LAYERS
+    assert runner.connector.events == [
+        *_recv_and_run(0, first),
+        *_send(0),
+        *_recv_and_run(0, last),
+        *_send(0),
+        ("sync",),
+    ]
 
 
 def test_forward_skips_control_update_inside_capture():

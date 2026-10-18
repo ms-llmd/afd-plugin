@@ -53,6 +53,30 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
     ComputeDomain) and `NCCL_MNNVL_ENABLE`; add a values file once a GB200
     system is available.
 
+## 8. Configurations to reject before load
+
+Both pass validation today and fail only after both roles have loaded
+weights, with the FFN ranks stuck in a DeepEP collective until its 120 s
+timeout. Found in the branch review of 2026-10-16.
+
+- **DeepSeek with DeepEP M2N.**
+    - **Problem:** DeepSeek V2/V3/GLM on CUDA with
+    `connector=DeepEPM2NAFDConnector` and `compute_gate_on_attention=true`
+    passes `validate_gpu_model_runner_v2_config` (Qwen3.5 and DeepSeek-V4
+    already reject gate-on-Attention). Attention builds
+    `AFDDeepseekV2RemoteExpertsMoE`, whose `AFDAttentionFusedMoE` sends
+    `router_logits` only, so the first MoE layer of the first forward raises
+    "DeepEPM2NAFDConnector needs topk_ids and topk_weights". The shared-expert
+    weights are also loaded by no role (`_FFN_WITHOUT_SHARED_EXPERTS_CONNECTORS`
+    in `model_executor/models/deepseek_v2.py`).
+    - **Plan:** reject the pairing in the DeepSeek wrapper (or in
+    `validate_gpu_model_runner_v2_config`) with a unit test, until DeepSeek
+    has a CUDA gate and top-k on Attention and Attention-side shared experts
+    (see "Model E2E" below).
+- **DBO with DeepEP M2N.** Graph + DBO fixed 2026-10-18 (see
+  `afd-deepep-m2n-graph-dbo-2a2f` under "Model E2E"). Eager DBO still has no
+  E2E run.
+
 ## Also open (from the phase reports)
 
 - Teardown when a peer dies. `test_peer_exit_fails_within_timeout` shows
@@ -65,8 +89,55 @@ presets) are implemented; see `phase4b-report.md`. The items below are not.
   (bootstrap gloo group, NCCL control group); re-initializing in the same
   process is untested.
 - BF16 psum-bounded fused SiLU-mul (graph mode at large buckets).
-- Attention TP > 1 (sequence-split dispatch).
-- Runner integration and a model E2E (single and multi-node). Note from
-  `test_graph_and_eager_plans_mixed_across_ranks`: results stay correct when
-  one side plans a step as graph (no host sync) and the other as eager, so
-  an FFN runner may fall back to eager for a step Attention replays.
+- Attention TP > 1, sequence-split dispatch (phase 1): implemented.
+    - Each Attention TP rank pads its DP rank's N tokens to a multiple of
+    TP, routes and dispatches only its `ceil(N/TP)` slice (padding rows get
+    expert id -1, which DeepEP routes nowhere), and the TP group all-gathers
+    the combined slices (`RemoteFFNProxy` with `tp_size`). Before, every TP rank
+    would have dispatched all N tokens, so the FFN would run each token TP
+    times.
+    - Attention reports its TP size in the handshake; the FFN (TP 1) adopts
+    it and Attention's capacity, `ceil(max(max_num_batched_tokens,
+    max_cudagraph_capture_size) / TP)`.
+    - The role rank before vLLM's distributed init takes its TP part from
+    the worker rank (`tp_rank_before_distributed_init`, TP is vLLM's
+    innermost rank dimension); `check_connector_role_rank` re-checks it
+    after init.
+    - Validated on pokprod H100, 2026-10-16: GPU harness 26/26, including
+    1DPx2TP and 2DPx2TP Attention against 2 FFN ranks, BF16 and FP8;
+    Qwen3-30B-A3B E2E `afd-deepep-m2n-eager-tp2-2a2f` GSM8K 1.0 (7/7) and
+    `afd-deepep-m2n-graph-tp2-2a2f` 0.857 (6/7), next to TP1 eager and
+    graph 1.0 (7/7). On 200 GSM8K samples (`AFD_GSM8K_LIMIT=200`) graph
+    TP2 and graph TP1 score the same: 0.91 flexible-extract, 0.94
+    strict-match (±0.02), so the 6/7 is small-sample noise.
+    - Still open: phase 2 (reduce-scatter after attention instead of the
+    all-reduce, residual kept split; saves one all-gather per layer, only
+    if profiling shows a prefill gain), and Attention TP with DBO (untested;
+    DBO with TP1 works, see below).
+- Model E2E. Qwen3-30B-A3B, BF16, one node, 2 Attention + 2 FFN ranks
+  (`tests/e2e/models/qwen3_moe`, `test_qwen3_moe_deepep_m2n`) on pokprod
+  4x H100, no RDMA, 2026-10-15:
+    - `afd-deepep-m2n-eager-2a2f`: passed, GSM8K exact match 1.0 (7/7).
+    - `afd-deepep-m2n-graph-2a2f`: passed, GSM8K 1.0; every rank replays
+    FULL graphs (Attention 511 + 324, FFN 841 each).
+    - `afd-deepep-m2n-graph-dbo-2a2f`: passed 2026-10-18 on 4x H100 + RDMA,
+    GSM8K 0.917 (24 samples), two-micro-batch graph replays on every rank.
+    It used to hang every rank in the warmup before the two-micro-batch
+    capture ("DeepEP NVLink barrier timeout"; signal 2 of 4 because each
+    role waited on a different lane's buffer). Two bugs:
+        - torch.compile froze the dispatch/combine ops' `stage_idx` argument,
+        so both of vLLM's micro-batch threads, which share one compiled
+        graph, used stage 0. Micro-batch 1 raised "stage 0 dispatched twice
+        without combine", and vLLM's micro-batch runner hides a non-first
+        micro-batch's error. The op bodies now take the live micro-batch id
+        (`_live_stage_idx`).
+        - The FFN issued `D0 C0 D1 C1` per layer, but Attention's micro-batch
+        threads issue `D0(L) D1(L) C0(L) D0(L+1) C1(L) ...`, and dispatch and
+        combine can block the host. The FFN now sends each stage's result
+        just before that stage's next dispatch.
+    - Still open: multi-node E2E; DeepSeek (gate-on-Attention on CUDA and
+    Attention-side shared experts).
+  Note from `test_graph_and_eager_plans_mixed_across_ranks`: results stay
+  correct when one side plans a step as graph (no host sync) and the other
+  as eager, so an FFN runner may fall back to eager for a step Attention
+  replays.
