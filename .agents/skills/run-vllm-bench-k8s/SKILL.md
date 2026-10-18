@@ -137,7 +137,7 @@ Export the workload chosen in step 3 -- these are the `balanced` defaults.
 `envsubst` only sees **exported** variables -- an unexported name
 substitutes as empty with no error, so `export` every name in the list
 below, including `TEMPLATE_IMAGE`/`MODEL_ID`/`RUN_ID`/`PVC_NAME` carried
-over from step 2:
+over from step 2, and `VLLM_NODE` too if you will pin the pod (see below):
 
 ```bash
 export DATASET_NAME=random
@@ -149,7 +149,7 @@ export WORKLOAD_ARGS=""                  # e.g. the --prefix-repetition-* flags
 
 kubectl delete pod vllm-bench --ignore-not-found
 
-envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS} ${PVC_NAME}' <<'EOF' | kubectl apply -f -
+envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS} ${PVC_NAME} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -269,10 +269,12 @@ kubectl get pvc "${PVC_NAME}" -o jsonpath='{.spec.accessModes[0]}'
 ```
 
 If that prints `ReadWriteOnce`, a second pod can only attach the PVC from
-the node that already holds it -- add `nodeName: ${VLLM_NODE}` at the pod
-spec level (sibling of `restartPolicy`), otherwise the pod leaves `Pending`
-with `Multi-Attach error for volume ...`. If it prints `ReadWriteMany`, skip
-`nodeName` entirely -- no pinning needed, any node can attach it.
+the node that already holds it. `export VLLM_NODE=<serving node from step
+2>`, add `${VLLM_NODE}` to the `envsubst` variable list above, and add
+`nodeName: ${VLLM_NODE}` at the pod spec level (sibling of `restartPolicy`)
+-- otherwise the pod leaves `Pending` with `Multi-Attach error for volume
+...`. If it prints `ReadWriteMany`, skip `nodeName` entirely -- no pinning
+needed, any node can attach it.
 
 ### 5. Wait for completion, then collect
 
