@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Role/ownership and router contracts without launching distributed workers."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -10,9 +12,18 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("triton")
 
+from torch.fx.experimental.proxy_tensor import make_fx  # noqa: E402
+
 from afd_plugin.config import AFDConfig, validate_afd_config  # noqa: E402
+from afd_plugin.connectors.base import ExpertLayoutConnector  # noqa: E402
 from afd_plugin.connectors.gpu.afdep.config import AfdEPConfig  # noqa: E402
-from afd_plugin.connectors.gpu.afdep.connector import AfdEPConnector  # noqa: E402
+from afd_plugin.connectors.gpu.afdep.connector import (  # noqa: E402
+    AfdEPConnector,
+    attention_ops,
+)
+from afd_plugin.connectors.metadata import AFDDPMetadata  # noqa: E402
+from afd_plugin.v1.worker.cuda_graph import make_ffn_graph_key  # noqa: E402
+from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E402
 
 
 def test_requires_attention_routing_and_real_sharded_roles():
@@ -38,6 +49,7 @@ def test_requires_attention_routing_and_real_sharded_roles():
         {"capacity_tokens_per_rank": 0},
         {"num_sms": True},
         {"allow_hybrid_mode": "false"},
+        {"replay_ffn_graph": "false"},
     ],
 )
 def test_bad_capacity_and_transport_options(raw):
@@ -93,19 +105,62 @@ def test_receive_and_compute_never_use_native_moe_runner():
     assert connector.experts.weights == "local shard"
 
 
+@pytest.mark.parametrize("has_dependency", [False, True])
+def test_collect_op_carries_shared_compute_dependency(has_dependency):
+    connector = AfdEPConnector.__new__(AfdEPConnector)
+    connector._collect_op = Mock()
+    hidden = torch.ones((2, 128))
+    dependency = hidden * 2 if has_dependency else None
+
+    output = connector.recv_ffn_output(hidden, dependency=dependency)
+
+    assert output is hidden
+    connector._collect_op.assert_called_once_with(hidden, dependency)
+
+
+@pytest.mark.parametrize("has_dependency", [False, True])
+def test_collect_fake_accepts_dependency_without_running_transport(has_dependency):
+    connector = AfdEPConnector.__new__(AfdEPConnector)
+    connector.afd_config = SimpleNamespace(host="collect-fake", port=6369)
+    connector.world_rank = 4
+    connector.buffer = SimpleNamespace(source_collect=Mock())
+    _, collect = attention_ops(connector)
+    hidden = torch.empty((2, 128), device="meta")
+    dependency = torch.empty_like(hidden) if has_dependency else None
+
+    collect(hidden, dependency)
+
+    connector.buffer.source_collect.assert_not_called()
+
+
+def test_collect_graph_has_shared_gemm_dependency():
+    connector = AfdEPConnector.__new__(AfdEPConnector)
+    connector.afd_config = SimpleNamespace(host="collect-graph", port=6369)
+    connector.world_rank = 4
+    _, collect = attention_ops(connector)
+
+    def run(hidden, weight):
+        shared = hidden @ weight
+        collect(hidden, shared)
+        return hidden + shared
+
+    traced = make_fx(run)(
+        torch.empty((2, 128), device="meta"),
+        torch.empty((128, 128), device="meta"),
+    )
+
+    wait = next(n for n in traced.graph.nodes if "collect_v2_" in str(n.target))
+    assert wait.args[1].target == torch.ops.aten.mm.default
+
+
 @pytest.mark.parametrize("replay_prefill_graph", [True, False])
 def test_one_ffn_graph_replays_for_changing_prefill_counts(replay_prefill_graph):
-    from unittest.mock import Mock
-
-    from afd_plugin.connectors.base import ExpertLayoutConnector
-    from afd_plugin.connectors.metadata import AFDDPMetadata
-    from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
-
     runner = GPUFFNModelRunner.__new__(GPUFFNModelRunner)
     runner.prof = None
     runner.use_cuda_graph = True
     runner.connector = Mock(spec=ExpertLayoutConnector)
     runner.connector.capacity = 2048
+    runner.connector.replay_ffn_graph = True
     runner.connector.replay_prefill_graph = replay_prefill_graph
     graph = Mock()
     runner._cuda_graphs = {((0, (2048,)),): {"graph": graph}}
@@ -122,3 +177,70 @@ def test_one_ffn_graph_replays_for_changing_prefill_counts(replay_prefill_graph)
     else:
         graph.replay.assert_not_called()
         assert runner._ffn_forward.call_count == 4
+
+
+@pytest.mark.parametrize("attention_graph_replaying", [False, True])
+def test_ffn_eager_preserves_attention_decode_graphs(attention_graph_replaying):
+    runner = GPUFFNModelRunner.__new__(GPUFFNModelRunner)
+    runner.prof = None
+    runner.use_cuda_graph = True
+    runner.connector = AfdEPConnector.__new__(AfdEPConnector)
+    runner.connector.options = AfdEPConfig(replay_ffn_graph=False)
+    graph = Mock()
+    runner._cuda_graphs = {((0, (2048,)),): {"graph": graph}}
+    runner._ffn_forward = Mock()
+    metadata = {0: AFDDPMetadata(torch.tensor([1, 0, 0, 0]))}
+
+    runner.execute_model(
+        dp_metadata_list=metadata,
+        is_graph_replaying=attention_graph_replaying,
+    )
+
+    graph.replay.assert_not_called()
+    runner._ffn_forward.assert_called_once_with(
+        dp_metadata_list=metadata,
+        is_graph_capturing=False,
+        is_warmup=False,
+    )
+    assert runner.use_cuda_graph
+
+
+def test_ffn_eager_keeps_startup_capture_paired_with_attention(monkeypatch):
+    runner = GPUFFNModelRunner.__new__(GPUFFNModelRunner)
+    runner.connector = AfdEPConnector.__new__(AfdEPConnector)
+    runner.connector.options = AfdEPConfig(replay_ffn_graph=False)
+    runner.connector.control_plane = Mock()
+    runner._graph_memory_pool = object()
+    runner._cuda_graphs = {}
+    runner._ffn_forward = Mock()
+    graph = Mock()
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kw: nullcontext())
+    metadata = {0: AFDDPMetadata(torch.tensor([1, 0, 0, 0]))}
+
+    runner._dummy_run(SimpleNamespace(name="FULL"), metadata, True)
+
+    assert runner._cuda_graphs[((0, (2048,)),)]["graph"] is graph
+    runner._ffn_forward.assert_called_once_with(
+        dp_metadata_list=metadata,
+        is_graph_capturing=True,
+        update_connector_state=False,
+    )
+    control = runner.connector.control_plane.update_state_from_dp_metadata.call_args
+    assert control.args[0].is_graph_capturing
+
+
+def test_ffn_replay_gate_does_not_change_other_connectors():
+    runner = GPUFFNModelRunner.__new__(GPUFFNModelRunner)
+    runner.prof = None
+    runner.use_cuda_graph = True
+    runner.connector = SimpleNamespace()
+    graph = Mock()
+    metadata = {0: AFDDPMetadata(torch.tensor([1, 0, 0, 0]))}
+    runner._cuda_graphs = {make_ffn_graph_key(metadata): {"graph": graph}}
+    runner._ffn_forward = Mock()
+
+    runner.execute_model(dp_metadata_list=metadata, is_graph_replaying=True)
+
+    graph.replay.assert_called_once()
+    runner._ffn_forward.assert_not_called()

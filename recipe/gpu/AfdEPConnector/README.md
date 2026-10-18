@@ -17,7 +17,7 @@ rank. The current backend requires two separate four-GPU NVLink domains and
 NCCL GIN connectivity. “Single hop” means no second vLLM expert redistribution;
 hybrid transport still uses local NVLink forwarding.
 
-Install afdEP's fixed-capacity graph branch (`codex/vllm-bootstrap-ranks`) and
+Install the pinned `afdep` extra from this checkout and
 compatible DeepGEMM with its BF16 psum grouped API. Set matching NCCL headers and
 runtime through `AFDEP_NCCL_ROOT`/`LD_LIBRARY_PATH`, and configure NIC affinity.
 The optional `AFDEP_DEEPGEMM_MODULE`/`AFDEP_DEEPGEMM_ROOT` variables accept an
@@ -26,9 +26,9 @@ explicitly staged DeepGEMM extension and matching JIT sources.
 On each role's four-GPU host, set `MODEL_PATH`, `ROLE`, and `AFD_HOST` (FFN host),
 then run `bash recipe/gpu/AfdEPConnector/deepseek_v2_lite.sh`.
 Use `CONNECTOR=P2pNcclAFDConnector` for the baseline; use `EAGER=1` to disable
-graphs for either connector. `PREFILL_GRAPH=0` keeps Attention and decode
-graphs unchanged while disabling only afdEP FFN prefill replay for a matched
-launch-overhead ablation.
+graphs for either connector. `FFN_GRAPH=0` disables steady-state afdEP FFN replay
+while keeping Attention decode graphs and paired startup captures.
+`PREFILL_GRAPH=0` disables only FFN prefill replay; decode still uses its graph.
 Use `HYBRID=0` on both roles to test direct transfers to expert owners instead
 of RDMA plus local NVLink forwarding. This does not change graph policy.
 

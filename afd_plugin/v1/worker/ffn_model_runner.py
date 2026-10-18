@@ -179,13 +179,22 @@ class GPUFFNModelRunner:
             graph_enabled=bool(self.use_cuda_graph),
             graph_exists=cuda_graph_info is not None,
         )
-        if (
-            isinstance(self.connector, ExpertLayoutConnector)
-            and self.connector.replay_prefill_graph
-            and cuda_graph_info is not None
-            and not is_warmup
-            and not is_graph_capturing
-        ) or run_mode is AFDGraphRunMode.REPLAY:
+        replay_ffn_graph = (
+            not isinstance(self.connector, ExpertLayoutConnector)
+            or self.connector.replay_ffn_graph
+        )
+        # Keep startup capture paired with Attention even when steady-state FFN
+        # execution is eager: an eager receive cannot consume a recorded send.
+        if replay_ffn_graph and (
+            (
+                isinstance(self.connector, ExpertLayoutConnector)
+                and self.connector.replay_prefill_graph
+                and cuda_graph_info is not None
+                and not is_warmup
+                and not is_graph_capturing
+            )
+            or run_mode is AFDGraphRunMode.REPLAY
+        ):
             self._cuda_graphs[graph_key]["graph"].replay()
             return None
 

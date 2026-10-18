@@ -103,6 +103,10 @@ class AfdEPConnector(ExpertLayoutConnector):
         self._dispatch_op, self._collect_op = attention_ops(self)
 
     @property
+    def replay_ffn_graph(self) -> bool:
+        return self.options.replay_ffn_graph
+
+    @property
     def replay_prefill_graph(self) -> bool:
         return self.options.replay_prefill_graph
 
@@ -223,9 +227,11 @@ class AfdEPConnector(ExpertLayoutConnector):
         self,
         ref_tensor: torch.Tensor,
         ubatch_idx: int = 0,
+        *,
+        dependency: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        self._collect_op(ref_tensor)
+        self._collect_op(ref_tensor, dependency)
         return ref_tensor
 
     def recv_attn_output(
@@ -290,16 +296,22 @@ def attention_ops(connector: AfdEPConnector) -> tuple:
     def dispatch_fake(hidden: torch.Tensor, logits: torch.Tensor) -> None:
         return None
 
+    # Version the changed schema so cached one-argument collect calls fail
+    # visibly instead of silently omitting the shared-compute dependency.
     @torch.library.custom_op(
-        f"afdep_serving::collect_{suffix}", mutates_args=("out",), device_types="cuda"
+        f"afdep_serving::collect_v2_{suffix}",
+        mutates_args=("out",),
+        device_types="cuda",
     )
-    def collect(out: torch.Tensor) -> None:
+    def collect(out: torch.Tensor, dependency: torch.Tensor | None) -> None:
+        # Read dependency in the op schema to keep its producer before the wait.
+        # Native transport only needs out; no dependency payload is transferred.
         active = owner()
         assert active is not None and active.buffer is not None
         active.buffer.source_collect(out)
 
     @collect.register_fake
-    def collect_fake(out: torch.Tensor) -> None:
+    def collect_fake(out: torch.Tensor, dependency: torch.Tensor | None) -> None:
         return None
 
     return dispatch, collect

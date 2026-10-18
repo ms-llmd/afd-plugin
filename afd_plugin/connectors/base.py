@@ -263,6 +263,11 @@ class ExpertLayoutConnector(AFDConnectorBase):
     """
 
     @property
+    def replay_ffn_graph(self) -> bool:
+        """Replay FFN graphs after completing the normal startup captures."""
+        return True
+
+    @property
     def replay_prefill_graph(self) -> bool:
         """Allow replay even when Attention executes an eager prefill step."""
         return True

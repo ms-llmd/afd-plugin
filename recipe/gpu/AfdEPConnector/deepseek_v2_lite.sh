@@ -9,12 +9,13 @@ CONNECTOR=${CONNECTOR:-AfdEPConnector}
 CAPACITY=${CAPACITY:-2048}
 PORT=${PORT:-18305}
 PREFILL_GRAPH=${PREFILL_GRAPH:-1}
+FFN_GRAPH=${FFN_GRAPH:-1}
 HYBRID=${HYBRID:-1}
 AFD_PORT=${AFD_PORT:-6369}
 export VLLM_USE_V2_MODEL_RUNNER=1
-config=$(python - "$ROLE" "$CONNECTOR" "$AFD_HOST" "$AFD_PORT" "$CAPACITY" "$PREFILL_GRAPH" "$HYBRID" <<'PY'
+config=$(python - "$ROLE" "$CONNECTOR" "$AFD_HOST" "$AFD_PORT" "$CAPACITY" "$PREFILL_GRAPH" "$FFN_GRAPH" "$HYBRID" <<'PY'
 import json, sys
-role, connector, host, port, capacity, prefill_graph, hybrid = sys.argv[1:]
+role, connector, host, port, capacity, prefill_graph, ffn_graph, hybrid = sys.argv[1:]
 cfg = dict(role=role, connector=connector, host=host, port=int(port),
            num_attention_ranks=4, num_ffn_ranks=4,
            compute_gate_on_attention=connector == 'AfdEPConnector',
@@ -22,6 +23,7 @@ cfg = dict(role=role, connector=connector, host=host, port=int(port),
 if connector == 'AfdEPConnector':
     cfg['connector_extra_config'] = dict(capacity_tokens_per_rank=int(capacity),
                                         allow_hybrid_mode=bool(int(hybrid)),
+                                        replay_ffn_graph=bool(int(ffn_graph)),
                                         replay_prefill_graph=bool(int(prefill_graph)))
 print(json.dumps(dict(afd=cfg)))
 PY
