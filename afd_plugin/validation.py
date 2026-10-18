@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Final
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
-    DEEPEP_M2N_CONNECTOR,
+    DEEPEP_M2N_CONNECTORS,
     AFDConfig,
     parse_afd_config,
 )
@@ -44,7 +44,7 @@ VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.Xlit
 GPU_MRV2_NUM_UBATCHES: Final[int] = 2
 GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
-    DEEPEP_M2N_CONNECTOR,
+    *DEEPEP_M2N_CONNECTORS,
 )
 
 
@@ -80,14 +80,14 @@ def validate_gpu_model_runner_v2_config(
     # all2all backend, weight format) run in the connector handshake so that
     # every rank fails together. It routes on Attention, so it requires the
     # gate there.
-    if afd_config.connector == DEEPEP_M2N_CONNECTOR:
+    if afd_config.connector in DEEPEP_M2N_CONNECTORS:
         if expected_role == "ffn" and parallel.tensor_parallel_size != 1:
             raise RuntimeError(
-                f"{DEEPEP_M2N_CONNECTOR} requires FFN tensor_parallel_size=1"
+                f"{afd_config.connector} requires FFN tensor_parallel_size=1"
             )
         if not afd_config.compute_gate_on_attention:
             raise RuntimeError(
-                f"{DEEPEP_M2N_CONNECTOR} requires compute_gate_on_attention=true"
+                f"{afd_config.connector} requires compute_gate_on_attention=true"
             )
     if (
         parallel.pipeline_parallel_size,

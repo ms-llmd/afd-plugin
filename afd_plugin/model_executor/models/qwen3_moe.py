@@ -20,7 +20,11 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models import qwen3_moe as native
 from vllm.platforms import current_platform
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig, parse_afd_config
+from afd_plugin.config import (
+    DEEPEP_M2N_CONNECTORS,
+    AFDConfig,
+    parse_afd_config,
+)
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 
 if TYPE_CHECKING:
@@ -41,13 +45,8 @@ def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
 
 
 def _routes_on_attention(afd_config: AFDConfig) -> bool:
-    """Whether the MoE gate and top-k run on Attention (DeepEP M2N only).
-
-    Selected by connector name, while the FFN worker selects its routed runner
-    by the ``AFDRoutedExpertsConnector`` interface. A second routed-experts
-    connector must be added here too.
-    """
-    return afd_config.connector == DEEPEP_M2N_CONNECTOR
+    """Whether the DeepEP M2N runner performs gate and top-k on Attention."""
+    return afd_config.connector in DEEPEP_M2N_CONNECTORS
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -113,14 +112,13 @@ def _validate_supported_config(
     parallel_config = vllm_config.parallel_config
     if not current_platform.is_cuda():
         raise RuntimeError("AFD Qwen3 MoE currently supports CUDA only")
-    # DeepEP M2N, and only it, routes on Attention; its FFN runs only the
-    # routed experts and keeps the native gate built but unused. The connector
-    # side (DeepEP M2N requires compute_gate_on_attention=true) is checked in
-    # validate_gpu_model_runner_v2_config.
+    # DeepEP M2N and its afdEP transport variant route on Attention. Their FFN
+    # runs only routed experts and keeps the native gate built but unused.
+    # validate_gpu_model_runner_v2_config requires the Attention-side gate.
     if afd_config.compute_gate_on_attention and not _routes_on_attention(afd_config):
         raise RuntimeError(
             "AFD Qwen3 MoE requires compute_gate_on_attention=false, except "
-            f"with {DEEPEP_M2N_CONNECTOR}",
+            f"with {' or '.join(DEEPEP_M2N_CONNECTORS)}",
         )
     if _routes_on_attention(afd_config):
         text_config = vllm_config.model_config.hf_text_config
@@ -131,7 +129,7 @@ def _validate_supported_config(
             for layer_idx in range(text_config.num_hidden_layers)
         ):
             raise RuntimeError(
-                f"AFD Qwen3 MoE with {DEEPEP_M2N_CONNECTOR} requires every "
+                f"AFD Qwen3 MoE with {afd_config.connector} requires every "
                 "layer to be MoE (no mlp_only_layers, decoder_sparse_step=1)",
             )
         # Neither the Attention proxy nor the routed FFN runner computes a
@@ -139,7 +137,7 @@ def _validate_supported_config(
         # optional on Qwen3 configs; native vLLM reads it the same way.
         if getattr(text_config, "shared_expert_intermediate_size", 0) > 0:
             raise RuntimeError(
-                f"AFD Qwen3 MoE with {DEEPEP_M2N_CONNECTOR} does not support "
+                f"AFD Qwen3 MoE with {afd_config.connector} does not support "
                 "shared experts (shared_expert_intermediate_size > 0)",
             )
     if parallel_config.use_sequence_parallel_moe:

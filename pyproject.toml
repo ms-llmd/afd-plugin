@@ -35,6 +35,9 @@ dependencies = []
 # Install the runtime extra only in environments with a compatible vLLM wheel.
 [project.optional-dependencies]
 vllm = ["vllm==0.30.0"]
+afdep = [
+    "afdep @ git+https://github.com/ms-llmd/afdEP.git@01d4fa6f10ef41a2b266a574b14ef7b5f960a092",
+]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/afd-plugin"

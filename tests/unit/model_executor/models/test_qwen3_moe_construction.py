@@ -426,8 +426,10 @@ def test_unsupported_modes_fail_closed(
         adapter._validate_supported_config(vllm_config, afd_config)
 
 
+@pytest.mark.parametrize("connector", ("DeepEPM2NAFDConnector", "AfdEPConnector"))
 def test_gate_on_attention_is_accepted_with_deepep_m2n(
     monkeypatch: pytest.MonkeyPatch,
+    connector: str,
 ) -> None:
     """DeepEP M2N routes on Attention, so Qwen3 accepts the gate there.
 
@@ -437,7 +439,7 @@ def test_gate_on_attention_is_accepted_with_deepep_m2n(
 
     adapter._validate_supported_config(
         _model_config(),
-        AFDConfig(connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True),
+        AFDConfig(connector=connector, compute_gate_on_attention=True),
     )
 
 

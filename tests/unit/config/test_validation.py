@@ -191,6 +191,24 @@ def mrv2_config(monkeypatch):
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("connector", ["DeepEPM2NAFDConnector", "AfdEPConnector"])
+def test_routed_transport_preserves_runner_and_gate_policy(
+    mrv2_config, role, connector
+):
+    mrv2_config.additional_config["afd"].update(
+        role=role, connector=connector, compute_gate_on_attention=True
+    )
+    validate_gpu_model_runner_v2_config(
+        mrv2_config, expected_role=role, device_type="cuda"
+    )
+    mrv2_config.additional_config["afd"]["compute_gate_on_attention"] = False
+    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="cuda"
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize("dp_size, tp_size", [(1, 1), (1, 2), (2, 1), (2, 2)])
 @pytest.mark.parametrize("compute_gate_on_attention", [False, True])
 @pytest.mark.parametrize("enforce_eager", [False, True])
