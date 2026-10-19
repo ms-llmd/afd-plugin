@@ -4,6 +4,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import random
 import statistics
@@ -179,11 +180,33 @@ async def main():
             *(request(i) for i in range(args.warmup, len(prompts)))
         )
         elapsed = time.perf_counter() - started
+    if any(record["output_token_count"] != args.output_tokens for record in records):
+        raise RuntimeError("A completion was truncated; run is not a valid benchmark")
+    if any(
+        record["usage"]["prompt_tokens"] != record["input_tokens"] for record in records
+    ):
+        raise RuntimeError("Server prompt lengths disagree with the workload")
     itls = [interval for record in records for interval in record["itl_ms"]]
     possible_itls = sum(record["output_token_count"] - 1 for record in records)
     result = {
         "config": vars(args),
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": hashlib.sha256(
+            json.dumps(prompts, separators=(",", ":")).encode()
+        ).hexdigest(),
         "elapsed_s": elapsed,
+        "completed_requests": len(records),
+        "output_tokens_per_second": sum(
+            record["output_token_count"] for record in records
+        )
+        / elapsed,
+        "input_tokens_per_second": sum(record["input_tokens"] for record in records)
+        / elapsed,
+        "latency_p95_ms": percentile(
+            [record["latency_ms"] for record in records], 0.95
+        ),
         "requests_per_second": len(records) / elapsed,
         "latency_median_ms": statistics.median(x["latency_ms"] for x in records),
         "ttft_median_ms": statistics.median(

@@ -495,9 +495,11 @@ def local_handshake_info(
     ffn_deployment: dict[str, Any] | None,
     sm: tuple[int, int],
     topology: RankTopology,
+    buffer_protocol: str = "masked_deepep_v2",
 ) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL_VERSION,
+        "buffer_protocol": buffer_protocol,
         "role": role,
         "role_rank": role_rank,
         "world_rank": world_rank,
@@ -522,6 +524,7 @@ def local_handshake_info(
 
 
 _MUST_MATCH = (
+    "buffer_protocol",
     "protocol",
     "payload_format",
     "hidden_size",
@@ -892,6 +895,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     """
 
     BUFFER_TYPE: type = DeepEPElasticBuffer
+    BUFFER_PROTOCOL = "masked_deepep_v2"
 
     @classmethod
     def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -1018,6 +1022,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             role_rank=self.role_rank,
             world_rank=self.world_rank,
             config=self.config,
+            buffer_protocol=self.BUFFER_PROTOCOL,
             hidden_size=self.hidden_size,
             dtype=self.dtype,
             num_experts=self.layout.num_experts,
@@ -1121,6 +1126,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                         rdma_traffic_class=self.network_plan.rdma_traffic_class,
                         cpu_timeout_s=self.config.cpu_timeout_s,
                         gpu_timeout_s=self.config.gpu_timeout_s,
+                        **self._buffer_options(),
                     )
                 )
                 # One lane runs on the caller's stream: no fork/join cost.
@@ -1368,6 +1374,10 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     # ==============================
     # Internals
     # ==============================
+
+    def _buffer_options(self) -> dict[str, int | bool]:
+        """Native constructor options; the masked baseline adds none."""
+        return {}
 
     def _dispatch(
         self,

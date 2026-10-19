@@ -29,8 +29,8 @@ wheels = [
 
 [[package]]
 name = "afdep"
-version = "0.1.0.dev0"
-source = { git = "https://github.com/ms-llmd/afdEP.git?rev=01d4fa6f10ef41a2b266a574b14ef7b5f960a092#01d4fa6f10ef41a2b266a574b14ef7b5f960a092" }
+version = "1.0.0.dev0"
+source = { git = "https://github.com/ms-llmd/afdEP.git?rev=e763e3189398beda24f592d2117e6ade135b0a7f#e763e3189398beda24f592d2117e6ade135b0a7f" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -5875,7 +5875,7 @@ e2e-tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "afdep", marker = "extra == 'afdep'", git = "https://github.com/ms-llmd/afdEP.git?rev=01d4fa6f10ef41a2b266a574b14ef7b5f960a092" },
+    { name = "afdep", marker = "extra == 'afdep'", git = "https://github.com/ms-llmd/afdEP.git?rev=e763e3189398beda24f592d2117e6ade135b0a7f" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.30.0" },
 ]
 provides-extras = ["vllm", "afdep"]

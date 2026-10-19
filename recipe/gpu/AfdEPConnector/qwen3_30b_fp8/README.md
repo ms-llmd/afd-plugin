@@ -1,5 +1,10 @@
 # afdEP · DeepEP transport backend
 
+The current connector uses merged afdEP v1 with role specialization enabled.
+Use the [regression suite](../../../../tools/benchmarks/README.md) for current
+three-way measurements. The figures below are **historical extraction results**
+and do not measure the new v1 specializations.
+
 ![Collocated serving comparison](serving-h100.svg)
 
 `AfdEPConnector` keeps the DeepEP M2N scheduler, Attention-side routing and
