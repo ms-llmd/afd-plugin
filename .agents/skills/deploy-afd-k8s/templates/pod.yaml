@@ -8,7 +8,11 @@ metadata:
     afd-attn-node-role: ${TEMPLATE_ATTN_ROLE}
     afd-ffn-node-role: ${TEMPLATE_FFN_ROLE}
 spec:
-  restartPolicy: Never
+  # Always, not Never: with the livenessProbe below, a dead engine (e.g.
+  # after a peer pod crashes and NCCL tears this pod's workers down)
+  # restarts the container so a restartPolicy-driven deployment
+  # self-heals instead of leaving a Running/Ready zombie pod.
+  restartPolicy: Always
   securityContext:
     fsGroup: ${TEMPLATE_FSGROUP}
   volumes:
@@ -52,9 +56,26 @@ spec:
           sed 's/--host 127\.0\.0\.1/--host 0.0.0.0/' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
 
           cd /work
+          # emptyDir volumes persist across container restarts: markers and
+          # logs from a previous incarnation would immediately satisfy (or
+          # fail) this restart's probes. Clear them; the previous
+          # container's wrapper output stays available via
+          # `kubectl logs --previous`.
+          rm -f /work/ready /work/alive
+          for log in attn.log ffn.log; do
+            [ -f "/work/$log" ] && mv "/work/$log" "/work/$log.previous"
+          done
           bash "$PATCHED_SCRIPT" &
           RECIPE_PID=$!
           echo "$RECIPE_PID" > /work/recipe.pid
+
+          # Liveness marker: exists from container start (so the probe passes
+          # during the long model-load/graph-capture startup) and is removed
+          # the moment the wrapper detects the serving engine died. The
+          # recipe's `wait` outlives a dead engine (the API-server process
+          # lingers after EngineCore death), so process liveness alone can
+          # never detect this -- see the livenessProbe below.
+          touch /work/alive
 
           # Which log(s) this pod will actually produce, and this pod's own
           # readiness marker per log -- both keyed on this pod's node-role
@@ -66,7 +87,7 @@ spec:
 
           fail() {
             echo "ERROR: $*"
-            rm -f /work/ready
+            rm -f /work/ready /work/alive
             for log in $LOGS; do
               echo "----- tail $log -----"
               tail -n 100 "/work/$log" 2>/dev/null || echo "(missing)"
@@ -126,10 +147,28 @@ spec:
           echo "=== pod ${TEMPLATE_POD} READY ==="
           touch /work/ready
 
+          # Fatal signatures that mean the serving engine died even though
+          # the recipe process is still alive. The NCCL watchdog line fires
+          # when a peer pod dies and torch tears this pod's workers down;
+          # the rest are the engine's own fatal-error reports. Scoped to
+          # this pod's own logs (attn.log / ffn.log), never the wrapper's
+          # own output.
+          engine_died() {
+            for log in $LOGS; do
+              if [ -f "/work/$log" ] && grep -qE \
+                'EngineDeadError|encountered a fatal error|Engine core initialization failed|taking the entire process down' \
+                "/work/$log"; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
           echo "=== monitoring serving process (pid $RECIPE_PID) ==="
           while true; do
             sleep 10
             kill -0 "$RECIPE_PID" 2>/dev/null || fail "serving process exited unexpectedly"
+            engine_died && fail "serving engine died (fatal error in $LOGS)"
             if [ "$AFD_ATTN_NODE_ROLE" = "head" ]; then
               curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1 \
                 || fail "attention server health check failed"
@@ -169,6 +208,25 @@ spec:
                 curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1
               fi
         initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+      # Restarts the container when the serving engine dies even though the
+      # recipe process lingers: /work/alive exists from container start and
+      # is only removed by the wrapper's monitor once it observes a fatal
+      # engine error (or the recipe process exiting). Without this probe a
+      # peer-pod crash leaves this pod Running/Ready with a dead engine --
+      # a zombie kubelet will never restart, deadlocking a
+      # restartPolicy: Always deployment whose peer is crash-looping.
+      livenessProbe:
+        exec:
+          command:
+            - /bin/bash
+            - -c
+            - |
+              [ -f /work/alive ] || exit 1
+              kill -0 "$(cat /work/recipe.pid)" 2>/dev/null || exit 1
+        initialDelaySeconds: 30
         periodSeconds: 10
         timeoutSeconds: 5
         failureThreshold: 3
