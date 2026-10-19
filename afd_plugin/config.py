@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+AFDEP_CONNECTOR: Final[str] = "AfdEPConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 AFDRole = Literal["attention", "ffn"]
 
@@ -25,6 +26,7 @@ SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     CAMP2P_CONNECTOR,
+    AFDEP_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
 )
 
@@ -327,6 +329,13 @@ def validate_afd_config(
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
+    if config.connector == AFDEP_CONNECTOR:
+        if not config.compute_gate_on_attention:
+            raise ValueError("AfdEPConnector requires compute_gate_on_attention=true")
+        if config.num_attention_ranks != 4 or config.num_ffn_ranks != 4:
+            raise ValueError(
+                "The current afdEP backend requires 4 Attention and 4 FFN ranks"
+            )
     if not config.host:
         raise ValueError("AFD host must be non-empty")
     if not 0 < config.port < 65536:
