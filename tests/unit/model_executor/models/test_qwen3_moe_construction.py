@@ -426,7 +426,9 @@ def test_unsupported_modes_fail_closed(
         adapter._validate_supported_config(vllm_config, afd_config)
 
 
-@pytest.mark.parametrize("connector", ("DeepEPM2NAFDConnector", "AfdEPConnector"))
+@pytest.mark.parametrize(
+    "connector", ("DeepEPM2NAFDConnector", "AfdEPConnector", "AfdEPV2Connector")
+)
 def test_gate_on_attention_is_accepted_with_deepep_m2n(
     monkeypatch: pytest.MonkeyPatch,
     connector: str,

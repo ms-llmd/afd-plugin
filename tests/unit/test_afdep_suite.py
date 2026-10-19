@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+from afd_plugin.config import DEEPEP_M2N_CONNECTORS, parse_afd_config
 from tools.benchmarks import afdep_suite as suite
 
 
@@ -130,6 +131,8 @@ def test_four_arm_williams_balance_and_shared_serving_policy():
             assert extra["expert_backend"] == "deepgemm"
             assert extra["cpu_sync_min_tokens"] == 0
             assert extra["num_sms"] == (132 if variant == "afdep_v2" else 0)
+            parsed = parse_afd_config({"afd": config})
+            assert parsed.connector in DEEPEP_M2N_CONNECTORS
 
 
 def four_arm_campaign(ratio=1.0):

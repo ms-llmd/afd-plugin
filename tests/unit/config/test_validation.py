@@ -191,7 +191,9 @@ def mrv2_config(monkeypatch):
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
-@pytest.mark.parametrize("connector", ["DeepEPM2NAFDConnector", "AfdEPConnector"])
+@pytest.mark.parametrize(
+    "connector", ["DeepEPM2NAFDConnector", "AfdEPConnector", "AfdEPV2Connector"]
+)
 def test_routed_transport_preserves_runner_and_gate_policy(
     mrv2_config, role, connector
 ):
