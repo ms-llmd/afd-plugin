@@ -5,10 +5,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -33,23 +33,25 @@ from afd_plugin.compat.npu.profiler import (
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
+from afd_plugin.compat.npu.runtime_config import (
+    configure_async_cam_dbo,
+)
+from afd_plugin.compat.patches.npu.mrv2_ubatching import (
+    use_async_cam_dbo_dispatch,
+    use_npu_ubatch_factory,
+)
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
-from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
-from afd_plugin.model_executor.models.npu.async_cam_layout import (
-    ASYNC_MOE_UBATCH_METADATA_KEY,
-    AsyncMoeUbatchMetadata,
-)
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
-from afd_plugin.v1.worker.npu.async_cam_metadata_v2 import use_async_cam_stage_metadata
+from afd_plugin.v1.worker.attention_model_runner_v2 import _use_afd_ubatch_preparation
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -213,6 +215,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        fail_if_unsupported_npu_afd_features(vllm_config)
+        configure_async_cam_dbo(vllm_config)
         validate_npu_model_runner_v2_config(
             vllm_config,
             expected_role="attention",
@@ -244,7 +248,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_is_profile = False
             self._afd_is_graph_replaying = False
             self._afd_pending_metadata: AFDForwardContextMetadata | None = None
-            self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
             self._afd_suppress_metadata_send = False
             self._afd_transaction_counter = 0
             self.prof = create_afd_npu_profiler("attention")
@@ -272,16 +275,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             )
         return int(batch_descriptor.num_tokens)
 
-    def install_afd_metadata_on_forward_context(
-        self, forward_context: ForwardContext
-    ) -> None:
-        super().install_afd_metadata_on_forward_context(forward_context)
-        if self._afd_async_moe_ubatch_metadata is not None:
-            assert forward_context.additional_kwargs is not None
-            forward_context.additional_kwargs[ASYNC_MOE_UBATCH_METADATA_KEY] = (
-                self._afd_async_moe_ubatch_metadata
-            )
-
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
@@ -298,6 +291,19 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         super().load_model(load_dummy_weights, *args, **kwargs)
         if not self.connector.is_initialized:
             self.connector.init_afd_connector()
+
+    # Native MRV2 imports its factory by value; scope that exact binding while
+    # preserving Ascend's KV initialization (too large to copy). Eager DBO only.
+    # Signature matches Ascend 8d4409d6; restore the alias even on failure.
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        # ### PATCH START: create the native NPU ubatch adapter.
+        with use_npu_ubatch_factory(self):
+            super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
+        # ### PATCH END: create the native NPU ubatch adapter.
 
     # Patch reason: vLLM v0.30.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
@@ -460,8 +466,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             and self.cudagraph_manager is not None
         )
         previous_metadata = self._afd_pending_metadata
-        previous_stage_metadata = self._afd_async_moe_ubatch_metadata
-        self._afd_async_moe_ubatch_metadata = None
         previous_suppress_send = self._afd_suppress_metadata_send
         previous_is_warmup = self._is_warmup
         previous_is_graph_capturing = self._afd_is_graph_capturing
@@ -488,12 +492,10 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
                 else nullcontext(),
                 replay_scope,
-                use_async_cam_stage_metadata(self)
-                if self.afd_config.async_dp
-                and cast(
-                    AFDAsyncExtraInfo, self.connector.extra_info
-                ).async_moe_ubatching
+                use_async_cam_dbo_dispatch()
+                if self.afd_config.async_dp and self.ubatch_runner is not None
                 else nullcontext(),
+                _use_afd_ubatch_preparation(self),
                 use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ),
@@ -509,7 +511,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 )
         finally:
             self._afd_pending_metadata = previous_metadata
-            self._afd_async_moe_ubatch_metadata = previous_stage_metadata
             self._afd_suppress_metadata_send = previous_suppress_send
             self._is_warmup = previous_is_warmup
             self._afd_is_graph_capturing = previous_is_graph_capturing

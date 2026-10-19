@@ -18,10 +18,9 @@ from afd_plugin.config import AFDConfig, parse_afd_config, parse_optional_afd_co
 
 def __getattr__(name: str):
     if name in {
-        "AFDAttentionModelRunner",
+        "AFDAttentionModelRunnerV2",
         "AFDAttentionWorker",
         "AFDFFNWorker",
-        "AFDUBatchWrapper",
         "GPUFFNModelRunner",
     }:
         from afd_plugin.v1 import worker
@@ -219,7 +218,7 @@ def register_afd() -> None:
 
 __all__ = [
     "AFDConfig",
-    "AFDAttentionModelRunner",
+    "AFDAttentionModelRunnerV2",
     "AFDAttentionWorker",
     "AFDFFNWorker",
     "GPUFFNModelRunner",

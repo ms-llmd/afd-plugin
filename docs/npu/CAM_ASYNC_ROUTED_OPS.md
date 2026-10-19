@@ -37,9 +37,6 @@ operator symbols and shared headers for AFD isolation while preserving the
 compact routed-only communication layout.
 The complete upstream MIT copyright and permission notice is retained in
 [the repository license](../../LICENSE) and included in package license data.
-The candidate's separate build system,
-generated binaries, placeholder backward functions, and unrelated components
-are not imported.
 
 ## Communication window configuration
 
@@ -56,10 +53,6 @@ process environment. The operators use the host-tiling size for capacity
 checks and a window-tail state slot, so the values must remain aligned.
 The standalone harness sets both settings together via `--window-mb`.
 
-Migrate overrides of the previous LCCL-prefixed environment variable to
-`HCCL_BUFFSIZE`; the previous spelling is no longer read. Rebuild the native
-operator package after updating the source.
-
 ## Build and loading
 
 Use a matching Ascend development environment and the normal package build:
@@ -70,18 +63,16 @@ SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 \
 ```
 
 For 910C, the registry selects A2E/E2A and all four routed-only operators.
-For 950, only A2E/E2A are selected, and the new PyTorch registrations are not
+For 950, only A2E/E2A are selected, and the async PyTorch registrations are not
 compiled. `setup.py` passes the same `SOC_VERSION` to the ACLNN build and
 the extension CMake configuration (`AFD_SOC_VERSION`).
 
-`AFD_SKIP_ACLNN_BUILD=1` still requires an existing, matching AFD vendor
-package. An older package containing only A2E/E2A does not provide the new
-ACLNN symbols. Rebuild the complete operator package after changing this
-source or the SOC. The candidate lists CANN 8.5 / 9.0 and matching
-PyTorch/torch-npu 2.8 as its build environment; the integrated package still
-requires qualification on the actual deployment stack.
+`AFD_SKIP_ACLNN_BUILD=1` requires an existing, matching AFD vendor package
+with all four async ACLNN symbols. Rebuild the complete operator package after
+changing its source or SOC. Use the dependency stack in the
+[installation guide](../../README.md#ascend-npu-installation).
 
-Load the package using the existing lazy loader before accessing the new
+Load the package using the lazy loader before accessing the
 operators:
 
 ```python
@@ -97,10 +88,9 @@ combine_send = torch.ops.afd_ascend.afd_async_combine_send
 combine_recv = torch.ops.afd_ascend.afd_async_combine_recv
 ```
 
-The loader's existing A2E/E2A check is unchanged; loading it is not proof that
-an old installed extension contains the new operators. The new binding tests
-check the four registrations explicitly. Importing the Python plugin remains
-safe without the native extension.
+The general loader checks A2E/E2A availability. Async connector initialization
+and binding tests additionally verify all four async registrations. Importing
+the Python plugin remains safe without the native extension.
 
 ## Compact protocol contract
 
@@ -219,10 +209,29 @@ and computes chunk length from expert counts. Shared activations and outputs
 do not cross the A/F boundary.
 
 DeepSeek-V2 and DeepSeek-V4 Attention roles construct the pinned native shared
-MLP using replicated weights and local model tokens. They load shared weights,
-scales and biases on Attention, then add the shared result after restoring the
-routed output layout. FFN ranks construct routed experts only. Two-stage
-execution keeps shared results separate by stage; interrupted model forwards
-release pending routing references and require process-group teardown.
+MLP or its AFD adapter. They load shared weights, scales and biases on
+Attention, then add the shared result after restoring the routed output
+layout. DeepSeek-V2/V3 with model SP uses replicated shared weights;
+DeepSeek-V4 preserves its native TP-sharded or shared-DP layout through
+`AFDDeepseekV4SharedExperts`. FFN ranks construct routed experts only.
+Native DBO children retain separate shared results. Peer receive hooks reclaim
+the single physical CAM window before another child dispatches; owner-side
+layout restoration and collectives happen after resumption. Interrupted
+transfers require A/F process-group teardown, not an in-place retry.
 
 The synchronous CAMP2P and GPU paths retain their existing ownership contracts.
+
+## Current kernel implementation notes
+
+At the reviewed source revision, dispatch-send batches prefix writes in
+aligned UB rows before copying them to the peer window. Combine-receive
+reuses dispatch statistics for expert prefixes, so their lifetime extends
+through the matching combine. Combine-send skips peer-window resolution for
+unused cells and reuses a destination base while its TP peer remains unchanged.
+These changes preserve the compact protocol and do not add concurrent windows
+or remove empty-expert completion notifications.
+
+Use [the standalone precision and performance harness](../../tests/npu/README.md)
+to compare identical routing, TP width, window size, dtype, quantization and
+chunk capacity before claiming a speedup. A source optimization alone is not
+performance evidence; include sparse/empty peers and repeated window reuse.

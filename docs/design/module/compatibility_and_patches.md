@@ -30,7 +30,7 @@ upstream_refs:
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
   - "vLLM vllm.forward_context.set_forward_context"
   - "vLLM vllm.engine.arg_utils.EngineArgs and vllm.config.VllmConfig"
-  - "vLLM vllm.v1.worker.gpu_model_runner.GPUModelRunner"
+  - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
   - "vLLM-Ascend platform and fused-MoE symbols referenced by NPU patches"
 verified_platform_refs:
   - "CPU/runtime compatibility tests in tests/unit/compat"
@@ -38,7 +38,7 @@ verified_platform_refs:
 related_issues:
   - "#86"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-10-13
 ---
 
 # Compatibility and patches
@@ -79,7 +79,7 @@ compatibility evidence rather than a released package or container tag.
 | CUDA benchmark routing | [`model_executor/routing_simulator.py`](../../../afd_plugin/model_executor/routing_simulator.py) | [`test_routing_simulator.py`](../../../tests/unit/model_executor/test_routing_simulator.py) |
 | NPU adapters | [`compat/npu/`](../../../afd_plugin/compat/npu) | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py), [`test_ascend_ops.py`](../../../tests/unit/compat/test_ascend_ops.py) |
 | NPU patch paths | [`compat/patches/npu/`](../../../afd_plugin/compat/patches/npu) | [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py) |
-| CUDA DBO Attention metadata workaround | [`attention_model_runner.py`](../../../afd_plugin/v1/worker/attention_model_runner.py) | restoration and error-path coverage in [`test_attention_model_runner.py`](../../../tests/unit/v1/worker/test_attention_model_runner.py) |
+| CUDA native V2 DBO preparation | [`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py) | [`test_gpu_mrv2_ubatching.py`](../../../tests/unit/compat/patches/test_gpu_mrv2_ubatching.py) |
 
 ## Patch application lifecycle
 
@@ -103,13 +103,9 @@ installs the MLA graph resolver. CUDA-only plugin registration does not import
 vLLM-Ascend.
 
 To force-balance FFN-side experts, configure vLLM-Ascend's native
-`additional_config.enable_force_eplb`; AFD no longer patches the W8A8
-quantization method. The native policy cycles through all local routed
-experts; it does not implement AFD's former
-`force_load_balance_topn_per_rank` benchmark policy.
-The Attention-side Async CAM `AFD_FORCE_BALANCED_TOPK_IDS` switch remains a
-separate AFD routing path. Recipes pinned to older release branches retain
-their original configuration as historical records.
+`additional_config.enable_force_eplb`. The native policy cycles through all
+local routed experts. The Attention-side Async CAM `AFD_FORCE_BALANCED_TOPK_IDS`
+switch is a separate AFD routing path.
 
 Python module import provides process-level one-time execution in the ordinary
 path. Some patches also preserve originals or set explicit sentinels, but this
@@ -127,11 +123,12 @@ not the package dependency policy.
 | --- | --- | --- | --- | --- |
 | [`async_dp_engine.py`](../../../afd_plugin/compat/patches/async_dp_engine.py): `EngineCoreProc.run_engine_core`, `vllm.v1.engine.utils.launch_core_engines` and its imported client alias, `DPAsyncMPClient.add_request_async` | Async-DP Attention selects regular `EngineCoreProc`; the copied launch gates the DP coordinator's `enable_wave_coordination` to `is_moe and not is_afd_async_dp` so AFD async Attention keeps independent request-count publication while coordinator stats remain; `add_request_async` skips the DP-wave `FIRST_REQ` wakeup for AFD async-DP; other configs run the copied upstream branches. | Imported by `register_afd`; the installer keeps the target/dev guard. Its plugin-owned process target reapplies the engine-core loop in spawn children, and the Ascend late re-apply is scoped to AFD async Attention so vLLM-Ascend's own `run_engine_core` wrap is overridden only there. | [`test_async_dp_engine.py`](../../../tests/unit/compat/patches/test_async_dp_engine.py) covers coordinator-patch removal, async-DP Attention process selection, non-AFD MoE DP preservation, wave-coordination gating, target-version isolation, `FIRST_REQ` skip/preserve, backend-override rebinding, and reload idempotence. | Remove when vLLM exposes role-selectable async-DP engine scheduling, wave policy, and wakeup hooks. |
 | [`async_dp_forward_context.py`](../../../afd_plugin/compat/patches/async_dp_forward_context.py): `vllm.forward_context.set_forward_context` plus already-imported worker aliases | Skips native `DPMetadata` construction/coordination only for AFD async-DP; otherwise uses the copied upstream flow. | Imported by `register_afd`; same target/dev/unknown guard. Rebinds known already-imported aliases so callers do not retain the old function. | [`test_async_dp_forward_context.py`](../../../tests/unit/compat/patches/test_async_dp_forward_context.py) covers async skip and non-async coordination. | Remove when vLLM supports a per-engine-role opt-out from native MoE DP metadata coordination. |
-| [`config_validation.py`](../../../afd_plugin/compat/patches/config_validation.py): `EngineArgs.create_engine_config`, `VllmConfig.__post_init__` | For AFD-owned ubatching with a non-DeepEP backend, temporarily presents `deepep_low_latency` during upstream validation and restores the configured backend. After upstream platform normalization, maps an initial `worker_cls="auto"` to the role-specific CUDA or standard Ascend AFD worker. | Imported by `register_afd`; accepts the target version, development versions, or missing version metadata. Saves originals on upstream modules under AFD-specific attributes before installing wrappers. Explicit worker paths and non-AFD configs are not remapped. | [`test_config_validation.py`](../../../tests/unit/compat/patches/test_config_validation.py) covers backend relaxation, four role/platform mappings, explicit and non-AFD preservation, repeated validation, unsupported platforms, and dev versions. | Remove the backend branch when upstream validation distinguishes plugin-owned ubatching; remove worker mapping when vLLM offers plugin-owned role-aware worker selection. |
+| [`config_validation.py`](../../../afd_plugin/compat/patches/config_validation.py): `EngineArgs.create_engine_config`, `VllmConfig.__post_init__` | For AFD-owned ubatching with a non-DeepEP backend, temporarily presents `deepep_low_latency` during upstream validation and restores the configured backend. After upstream platform normalization, maps an initial `worker_cls="auto"` to the role-specific CUDA or standard Ascend AFD worker. Native hybrid/multimodal DBO rejection remains intact, including Qwen3.5/3.6 GDN models. | Imported by `register_afd`; accepts the target version, development versions, or missing version metadata. Saves originals on upstream modules under AFD-specific attributes before installing wrappers. Explicit worker paths and non-AFD configs are not remapped. | [`test_config_validation.py`](../../../tests/unit/compat/patches/test_config_validation.py) covers backend relaxation, four role/platform mappings, explicit and non-AFD preservation, repeated validation, unsupported platforms, and dev versions. | Remove the backend branch when upstream validation distinguishes plugin-owned ubatching; remove worker mapping when vLLM offers plugin-owned role-aware worker selection. |
 | [`engine_core.py`](../../../afd_plugin/compat/patches/engine_core.py): `EngineCore.__init__`, `_initialize_kv_caches`, `shutdown`; `EngineCoreProc.run_busy_loop`; `DPEngineCoreProc.run_busy_loop` | AFD FFN becomes a connector daemon: construct executor, skip scheduler/KV setup, return an empty KV-shaped result on late paths, start/monitor/stop the FFN worker loop, and use FFN-safe shutdown. Non-FFN branches copy pinned upstream behavior. | Imported by `register_afd`; Installs under the target/dev compatibility check (also permitting missing version metadata); no saved-original sentinel. Direct class assignment remains tied to the pinned upstream implementation. | [`test_engine_core.py`](../../../tests/unit/compat/patches/test_engine_core.py) covers FFN initialization, non-FFN behavior, and daemon start/stop; role runtime tests cover error propagation. | Remove when vLLM offers a headless connector-daemon engine lifecycle or an executor mode that does not require scheduler/KV ownership. |
 | [`npu/ascend_platform.py`](../../../afd_plugin/compat/patches/npu/ascend_platform.py): `NPUPlatform.check_and_update_config` | Snapshots AFD DBO state, runs upstream normalization, and restores configured `enable_dbo`, `ubatch_size`, and `all2all_backend` in `finally`; non-AFD behavior is unchanged. | Installed through the config facade during AFD NPU normalization and verified again by the worker runtime facade; no version guard. Saves the original on the class and uses a class sentinel. The runtime facade caches success only after the wrapper is installed, so an early missing vLLM-Ascend import remains retryable. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) and [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py). | Remove when vLLM-Ascend recognizes plugin-owned DBO workers or no longer clears these fields. |
 | [`npu/ascend_config.py`](../../../afd_plugin/compat/patches/npu/ascend_config.py): `vllm_ascend.ascend_config.init_ascend_config`, loaded factory aliases, and the AFD DP child entry point | Excludes the AFD namespace from native constructor arguments; preserves config identity, validation, singleton publication, and cache refresh. DP children install the factory before native Ascend initialization. | Installed by the NPU config facade; rebinds already-loaded aliases. The DP entry point is selected only for AFD synchronous Attention or FFN. | [`test_ascend_config_lifecycle.py`](../../../tests/unit/compat/npu/test_ascend_config_lifecycle.py), [`test_ascend_engine_core_binding.py`](../../../tests/unit/compat/npu/test_ascend_engine_core_binding.py). | Remove when Ascend accepts plugin namespaces and loads general plugins before config validation in every DP child. |
 | [`npu/mla_graph.py`](../../../afd_plugin/compat/patches/npu/mla_graph.py): `vllm_ascend.attention.mla_v1.get_graph_params` | Resolves an AFD ubatch-owned `GraphParams` registry from the active forward context and otherwise delegates to the saved upstream process-global resolver. | Called through `apply_afd_ascend_patches_if_needed` during NPU worker startup; no version guard. Saves the original on the upstream module and uses a module sentinel. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) covers AFD-context resolution, upstream fallback, and idempotence; [`test_npu_mla_graph.py`](../../../tests/unit/v1/worker/test_npu_mla_graph.py) covers the owning graph lifecycle. | Remove when vLLM-Ascend accepts a forward-context-local MLA graph registry or exposes an equivalent resolver hook. |
+| [`npu/mrv2_ubatching.py`](../../../afd_plugin/compat/patches/npu/mrv2_ubatching.py): native ubatch factory, dispatch, child DP metadata, input slicing, context and stream aliases | Builds `NPUUBatchRunner`, enables Async CAM DBO at DP1, omits Async child DP coordination, applies native truncation to Ascend CPU sequence lengths, and provides NPU stream/failure handling. MRV1 Async also reuses the NPU native contexts. | Scoped to AFD initialization, preparation or execution; every replaced alias is restored in `finally`. The scope temporarily changes module symbols, so it is not an independent concurrent-runner API. | [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py), [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_mrv2_dbo.py`](../../../tests/npu/test_mrv2_dbo.py). | Remove when native vLLM/Ascend supports NPU child builders and streams, optional child DP metadata, DP1 DBO and peer cancellation. |
 
 ## Non-patch compatibility adapters
 
@@ -140,22 +137,35 @@ These modules adapt upstream behavior without replacing a global symbol:
 | Adapter | Current purpose |
 | --- | --- |
 | [`model_executor/routing_simulator.py`](../../../afd_plugin/model_executor/routing_simulator.py) | Registers the opt-in `afd_balanced` strategy through vLLM's public `RoutingSimulator` interface. Select it with `VLLM_MOE_ROUTING_SIMULATION_STRATEGY=afd_balanced`; `AFD_BENCHMARK_FORCE_LB_TOPN_PER_RANK` optionally limits each rank's expert pool. It provides deterministic source-rank phases and normalized weights for controlled CUDA performance tests without replacing router internals. EPLB remains outside the validated scope. |
-| [`compat/npu/runtime_config.py`](../../../afd_plugin/compat/npu/runtime_config.py) | Mirrors vLLM-Ascend's non-SP all-to-all backend rewrite for custom AFD workers and reports the active NPU ubatch count. |
+| [`compat/npu/runtime_config.py`](../../../afd_plugin/compat/npu/runtime_config.py) | Preserves model SP while applying the non-SP backend fallback; normalizes legacy Async CAM ubatching to native Attention DBO, checks thresholds, and derives model/PP tensor layout and active ubatch count. |
 | [`compat/npu/feature_validation.py`](../../../afd_plugin/compat/npu/feature_validation.py) | Parses connector-owned typed extra information through the factory and fails before execution for unsupported NPU connector, quantization, graph, DBO, gate, or async MoE combinations. |
 | [`compat/npu/forward_context.py`](../../../afd_plugin/compat/npu/forward_context.py) | Enters the pinned Ascend forward context for connector-driven FFN compute and installs AFD metadata in `additional_kwargs`. V1 uses `set_ascend_forward_context`; a V2-paired FFN uses native `set_forward_context` plus the Ascend MRV2 profile override so platform state follows the V2 proxy layout. |
 | [`compat/npu/ops.py`](../../../afd_plugin/compat/npu/ops.py) | Discovers plugin-owned CAMP2P and routed-only async CAM operators with explicit missing-runtime errors; operator build/runtime ownership is documented in [execution platforms](execution_platforms.md). |
-| [`v1/worker/attention_model_runner.py`](../../../afd_plugin/v1/worker/attention_model_runner.py) | Disables vLLM's block-table-only Attention metadata cache only while multiple DBO ubatches are built, then restores every affected builder in `finally`. Remove this workaround when [vLLM #48659](https://github.com/vllm-project/vllm/pull/48659), or an equivalent ubatch-aware cache key, reaches the pinned release. |
 
 Several scoped upstream adaptations live with their semantic owners rather
 than this patch directory. Model dummy runs and V2 execution temporarily wrap
-`create_forward_context`; CUDA worker startup temporarily substitutes the V1
-or V2 runner symbol; V2 graph capture temporarily wraps native input
+`create_forward_context`; CUDA worker startup temporarily substitutes the
+native V2 runner symbol; V2 graph capture temporarily wraps native input
 preparation; and full-graph replay installs an instance-local manager hook.
 Every scope restores symbols and runner state in `finally`. Connector process
 groups also call private PyTorch/vLLM helpers as described in
 [connector contracts](connector_contracts.md). All of these seams must be
 included in an upstream upgrade audit even though they are not process-global
 import-time patches.
+
+The NPU V2 runner additionally scopes `_use_camp2p_dp_padding()` around native
+dispatch for many-to-one CAMP2P: eager and graph-fallback token counts are
+padded consistently within FFN receiver groups before input preparation.
+It delegates graph selection and DP agreement to the pinned native function.
+Replace this seam when upstream exposes a pre-input padding callback.
+
+Async-DP queue statistics are a separate audit boundary. Current AFD selects
+ordinary `EngineCoreProc`, retains the native coordinator/stat channels, and
+disables wave coordination. Existing DPLB tests exercise native routing with
+supplied counts;
+they do not prove end-to-end publication from a running async Attention
+scheduler. Audit the v0.30 publisher path before adding another queue-statistics
+patch.
 
 ## Patch review and refresh procedure
 
@@ -222,8 +232,8 @@ path.
 The inventory covers current production patch files, but the document remains
 **draft** because:
 
-- `engine_core` and force-load-balance lack patch-local version/idempotence
-  guards;
+- `engine_core` has a target/dev version check but no saved-original
+  idempotence sentinel; scoped native DBO adapters rely on pinned private APIs;
 - best-effort grouped imports can produce a partially applied patch set;
 - the exact vLLM-Ascend source commit is documented but not pinned as package metadata;
 - owners have not approved the candidate invariants as normative contracts.

@@ -108,12 +108,22 @@ line 442). Reading it top to bottom:
    laid out across pods. `validate_layout()` cross-checks the two: the
    layout's total per-role rank counts must match the topology's, and no
    role's local rank count within a pod may violate that role's TP size
-   (a TP group cannot span pods). It also rejects DBO scenarios (MRV1
-   `afd-graph-dbo-*` and MRV2 `afd-v2-*-dbo-*`): the single-host runner
+   (a TP group cannot span pods). It also rejects DBO scenarios
+   (`afd-graph-dbo-*` and `afd-v2-*-dbo-*`): the single-host runner
    accepts a DBO run only after finding two-ubatch execution evidence in the
    role processes' logs, and no single pod sees every role's logs. **TODO:**
    support multi-pod DBO by having each pod publish its evidence through the
    rendezvous store and checking the merged result before the verdict.
+   For the same reason the runner sets
+   `args.collect_gpu_execution_evidence = False` right after
+   `configure_scenario`. On GPU the single-host runner also proves CUDA graph
+   replay for graph scenarios: it loads the `tests.e2e.mrv2_evidence` worker
+   extension, opens the evaluation window through Attention's
+   `/collective_rpc` and a local marker file the FFN worker polls, and checks
+   every rank's summary line. No pod can drive that window for the others, so
+   multi-pod GPU graph scenarios (e.g. `afd-graph-2a2f`) launch without the
+   extension and pass on accuracy alone. **TODO:** share the window and the
+   per-rank summaries through the rendezvous store, as for DBO.
 
 2. **Resolve this pod's index.** `resolve_pod_index(layout.num_pods)` (from
    `identity.py`) checks, in order: an explicit `AFD_E2E_POD_INDEX`

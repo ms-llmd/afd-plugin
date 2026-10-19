@@ -17,7 +17,6 @@ from afd_plugin.validation import (
     NPU_ATTENTION_WORKER_FQCN,
     NPU_FFN_MODEL_RUNNER_FQCN,
     NPU_FFN_WORKER_FQCN,
-    UBATCH_WRAPPER_FQCN,
     resolve_class_from_qualname,
 )
 
@@ -26,8 +25,8 @@ GPU_RUNTIME_CLASS_PATHS = [
     ATTENTION_MODEL_RUNNER_FQCN,
     FFN_WORKER_FQCN,
     FFN_MODEL_RUNNER_FQCN,
-    UBATCH_WRAPPER_FQCN,
     "afd_plugin.v1.worker:AFDAttentionWorker",
+    "afd_plugin.v1.worker:AFDAttentionModelRunnerV2",
 ]
 
 NPU_WORKER_CLASS_PATHS = [
@@ -75,59 +74,34 @@ RUNTIME_OVERRIDE_CONTRACTS = [
     ("ffn_worker", "AFDFFNWorker", "Worker", "execute_model"),
     ("ffn_worker", "AFDFFNWorker", "Worker", "shutdown"),
     (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
+        "attention_model_runner_v2",
+        "AFDAttentionModelRunnerV2",
+        "GPUModelRunner",
+        "__init__",
+    ),
+    (
+        "attention_model_runner_v2",
+        "AFDAttentionModelRunnerV2",
         "GPUModelRunner",
         "load_model",
     ),
     (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
-        "GPUModelRunner",
-        "_build_attention_metadata",
-    ),
-    (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
-        "GPUModelRunner",
-        "_determine_batch_execution_and_padding",
-    ),
-    (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
-        "GPUModelRunner",
-        "_model_forward",
-    ),
-    (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
+        "attention_model_runner_v2",
+        "AFDAttentionModelRunnerV2",
         "GPUModelRunner",
         "execute_model",
     ),
     (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
+        "attention_model_runner_v2",
+        "AFDAttentionModelRunnerV2",
         "GPUModelRunner",
-        "_dummy_run",
+        "capture_model",
     ),
     (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
-        "GPUModelRunner",
-        "_warmup_and_capture",
-    ),
-    (
-        "attention_model_runner",
-        "AFDAttentionModelRunner",
+        "attention_model_runner_v2",
+        "AFDAttentionModelRunnerV2",
         "GPUModelRunner",
         "shutdown",
-    ),
-    ("ubatch_wrapper", "AFDUBatchWrapper", "UBatchWrapper", "__init__"),
-    (
-        "ubatch_wrapper",
-        "AFDUBatchWrapper",
-        "UBatchWrapper",
-        "_make_ubatch_metadata",
     ),
 ]
 
@@ -137,6 +111,12 @@ def _call_contract(callable_obj):
         (parameter.name, parameter.kind, parameter.default)
         for parameter in inspect.signature(callable_obj).parameters.values()
     ]
+
+
+def test_gpu_attention_class_path_selects_mrv2():
+    assert (
+        ATTENTION_MODEL_RUNNER_FQCN == "afd_plugin.v1.worker.AFDAttentionModelRunnerV2"
+    )
 
 
 @pytest.mark.parametrize(
@@ -164,7 +144,7 @@ def test_gpu_runtime_class_paths_resolve_when_vllm_is_available(qualname):
     ("module_name", "afd_class_name", "native_class_name", "method_name"),
     RUNTIME_OVERRIDE_CONTRACTS,
 )
-def test_gpu_v1_overrides_match_native_call_contract(
+def test_gpu_overrides_match_native_call_contract(
     module_name,
     afd_class_name,
     native_class_name,
@@ -181,14 +161,10 @@ def test_gpu_v1_overrides_match_native_call_contract(
         from vllm.v1.worker import gpu_worker as native_module
 
         from afd_plugin.v1.worker import ffn_worker as afd_module
-    elif module_name == "attention_model_runner":
-        from vllm.v1.worker import gpu_model_runner as native_module
-
-        from afd_plugin.v1.worker import attention_model_runner as afd_module
     else:
-        from vllm.v1.worker import gpu_ubatch_wrapper as native_module
+        from vllm.v1.worker.gpu import model_runner as native_module
 
-        from afd_plugin.v1.worker import ubatch_wrapper as afd_module
+        from afd_plugin.v1.worker import attention_model_runner_v2 as afd_module
 
     afd_method = getattr(getattr(afd_module, afd_class_name), method_name)
     native_method = getattr(getattr(native_module, native_class_name), method_name)

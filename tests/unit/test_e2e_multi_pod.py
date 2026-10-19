@@ -458,7 +458,7 @@ def test_topology_from_args_tracks_the_scenario():
 
 @pytest.mark.parametrize("scenario", ["afd-graph-dbo-2a2f", "afd-v2-eager-dbo-dp2"])
 def test_topology_from_args_marks_dbo_scenarios(scenario):
-    """MRV1 and MRV2 DBO scenarios both reach validate_layout as DBO."""
+    """Graph and eager DBO scenarios both reach validate_layout as DBO."""
     assert Topology.from_args(_single_host_args(scenario)).dbo is True
 
 
@@ -475,6 +475,28 @@ def test_build_env_merges_cluster_specific_variables():
 
     assert environment["NCCL_SOCKET_IFNAME"] == "eth0"
     assert environment["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+def test_disabled_gpu_evidence_launches_no_probe(monkeypatch):
+    """No pod sees another's evidence window, so the probes must stay out.
+
+    The probe extension reads its marker path at import, so loading it without
+    the single-host evidence window would fail every worker at startup.
+    """
+    monkeypatch.delenv("VLLM_SERVER_DEV_MODE", raising=False)
+    args = _single_host_args()
+    assert runner.needs_gpu_execution_evidence(args)
+    args.collect_gpu_execution_evidence = False
+    topology = Topology.from_args(args)
+    pods = plan(topology, PodLayout.parse("1A1F,1A1F"), ["pod-0.svc", "pod-1.svc"])
+
+    for pod in pods:
+        for role in (ATTENTION_ROLE, FFN_ROLE):
+            command = runner.build_vllm_command(args, role=role, slot=_slot(pod, role))
+            assert "--worker-extension-cls" not in command
+    environment = runner.build_env("0", args, role=ATTENTION_ROLE)
+    assert "VLLM_SERVER_DEV_MODE" not in environment
+    assert "AFD_E2E_GPU_EVIDENCE_START" not in environment
 
 
 # -- pod identity and pre-flight ----------------------------------------

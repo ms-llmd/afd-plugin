@@ -1,11 +1,11 @@
 # Weekly — Simple Test + E2E. Uploaded by cuda/bootstrap-upload-steps.yml.
 # Trigger: main + WEEKLY=1, or PR label weekly-test.
-# Runs the Qwen3 MoE and Qwen3.6 MoE suites (six scenarios; the DBO cases
-# are excluded pending the FFN CUDA fault seen in build 68) plus a
+# Runs seven Qwen3 MoE and Qwen3.6 MoE scenarios, including Qwen3 MoE
+# graph+DBO on V2, plus a
 # DeepSeek-V2-Lite 2A1F graph+DBO scenario, with the default GSM8K sample
 # limit (see e2e_testing.md).
 steps:
-  - label: "E2E · Qwen3 MoE"
+  - label: "E2E · Qwen3 MoE · GPU V2"
     timeout_in_minutes: 60
     commands:
       - "export AFD_E2E_BACKEND=gpu"
@@ -14,9 +14,10 @@ steps:
         "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe[baseline-graph]"
         "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe[afd-eager-2a1f]"
         "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe[afd-graph-2a1f]"
+        "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe[afd-graph-dbo-2a1f]"
     mirror_hardwares: h100_4
 
-  - label: "E2E · Qwen3.6 MoE"
+  - label: "E2E · Qwen3.6 MoE · GPU V2"
     timeout_in_minutes: 60
     commands:
       - "export AFD_E2E_BACKEND=gpu"
@@ -27,7 +28,7 @@ steps:
         "tests/e2e/models/qwen3_6/test_qwen3_6.py::test_qwen3_6[afd-graph-2a1f]"
     mirror_hardwares: h100_4
 
-  - label: "E2E · DeepSeekV2-Lite · 2A1F DBO Graph"
+  - label: "E2E · DeepSeekV2-Lite · 2A1F DBO Graph · GPU V2"
     timeout_in_minutes: 60
     commands:
       - "export AFD_E2E_BACKEND=gpu"

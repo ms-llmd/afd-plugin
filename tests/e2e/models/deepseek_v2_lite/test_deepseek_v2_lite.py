@@ -39,19 +39,19 @@ AFD_FFN_DEVICE_COUNT = 1
 AFD_TWO_FFN_DEVICE_COUNT = 2
 BASELINE_DEVICE_COUNT = 4
 TWO_FFN_SCENARIO_SUFFIX = "-2a2f"
-# CI gates select the gate scenarios by pytest node ID (E2E-INV-007); the
-# 2A1F scenarios below are local-only cases.
+# CI selects exact node IDs (E2E-INV-007). GPU uses the V2 cases for the
+# shared 2A2F coverage; NPU retains its existing backend-neutral cases.
 SCENARIOS = (
-    # Gate scenarios: baseline plus the 2A2F AFD cases.
     "baseline-graph",
-    "afd-eager-2a2f",
-    "afd-graph-2a2f",
-    "afd-graph-dbo-2a2f",
-    # Local scenarios: 2 Attention ranks + 1 FFN rank.
+    *(
+        ("afd-eager-2a2f", "afd-graph-2a2f", "afd-graph-dbo-2a2f")
+        if os.environ.get("AFD_E2E_BACKEND") == "npu"
+        else V2_SCENARIOS
+    ),
+    # GPU weekly CI selects Graph + DBO; eager/graph remain local-only.
     "afd-eager-2a1f",
     "afd-graph-2a1f",
     "afd-graph-dbo-2a1f",
-    *V2_SCENARIOS,
 )
 
 

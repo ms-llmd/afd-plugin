@@ -89,6 +89,12 @@ class PodProcess:
 def main() -> int:
     args = parse_args()
     configure_scenario(args)
+    # TODO: support GPU execution evidence across pods. The single-host runner
+    # arms it through Attention RPC and a local marker file the FFN worker
+    # polls, which no other pod sees; the pods would have to share the window
+    # and the per-rank summaries through the rendezvous store. Until then GPU
+    # graph scenarios pass on accuracy alone, so leave the probes out.
+    args.collect_gpu_execution_evidence = False
     layout = PodLayout.parse(args.pod_layout)
     topology = Topology.from_args(args)
     validate_layout(topology, layout)
