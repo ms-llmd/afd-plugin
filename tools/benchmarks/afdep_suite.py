@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib.metadata
 import itertools
@@ -27,6 +28,7 @@ from tools.benchmarks.bench_afdep import percentile
 
 MODEL_REVISION = "d206ba732169f29bb77fbf80fc2c4b81d4d30782"
 AFDEP_REVISION = "e763e3189398beda24f592d2117e6ade135b0a7f"
+NCCL_VERSION_CODE = 23007
 VARIANTS = (
     ("p2p", "P2pNcclAFDConnector"),
     ("masked", "DeepEPM2NAFDConnector"),
@@ -113,6 +115,7 @@ def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
         "model_revision": MODEL_REVISION,
         "afdep_revision": AFDEP_REVISION,
         "vllm_version": "0.30.0",
+        "nccl_runtime_version_code": NCCL_VERSION_CODE,
         "graph_policy": "FULL_DECODE_ONLY; capture sizes 1,8,32,128; eager prefill",
         "scheduler": {
             "max_num_seqs": 128,
@@ -149,7 +152,15 @@ def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
 
 def hardware(profile: str) -> dict:
     import torch
+    from afdep._build import nccl_paths
 
+    _, nccl_lib = nccl_paths()
+    runtime = ctypes.CDLL(str(nccl_lib / "libnccl.so.2"))
+    version = ctypes.c_int()
+    if runtime.ncclGetVersion(ctypes.byref(version)) != 0:
+        raise RuntimeError("NCCL runtime version query failed")
+    if version.value != NCCL_VERSION_CODE:
+        raise RuntimeError("Suite baseline requires NCCL 2.30.7")
     expected = "H100" if profile.startswith("h100") else "H200"
     if torch.cuda.device_count() != 4:
         raise RuntimeError(
@@ -187,7 +198,9 @@ def hardware(profile: str) -> dict:
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             text=True,
         ).splitlines(),
-        "nccl_runtime": torch.cuda.nccl.version(),
+        "torch_nccl_build": torch.cuda.nccl.version(),
+        "nccl_runtime_version_code": version.value,
+        "nccl_library_sha256": digest(nccl_lib / "libnccl.so.2"),
         "vllm": importlib.metadata.version("vllm"),
         "cpu_count": os.cpu_count(),
     }
@@ -600,11 +613,15 @@ def compare(manifest: dict) -> dict:
                         runs[(repeat, "afdep", workload.name)][metric],
                         runs[(repeat, baseline, workload.name)][metric],
                     )
-                    if candidate is None and control is None:
-                        continue  # One-token prefill has no TPOT.
+                    if workload.output_tokens == 1 and metric.startswith("tpot_"):
+                        if candidate is not None or control is not None:
+                            raise ValueError("One-token output cannot have TPOT")
+                        continue
                     if (
                         candidate is None
                         or control is None
+                        or not math.isfinite(candidate)
+                        or not math.isfinite(control)
                         or min(candidate, control) <= 0
                     ):
                         raise ValueError(f"Invalid metric {metric}")

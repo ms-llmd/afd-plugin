@@ -28,6 +28,41 @@ Logical expert slots, collective participation and registered transport capacity
 remain. P2P naturally uses BF16 payloads and FFN routing; the routed paths use
 FP8 plus scales and Attention routing. Their difference is not transport alone.
 
+## Initial baselines · 2026-10-19
+
+Six balanced repeats per SKU, **16,704 measured requests each**. Percentages
+below are paired geometric-mean throughput changes against Masked DeepEP.
+
+| Workload | H100 | H200 |
+| --- | ---: | ---: |
+| Decode | -0.1% | +0.7% |
+| Prefill | +5.5% | +2.8% |
+| Mixed | +3.0% | +2.1% |
+| Sustained | -0.7% (inconclusive) | +2.1% |
+
+**Overall gate: inconclusive on both SKUs.** H100 sustained throughput, median
+TPOT and TTFT intervals cross their budgets; H200 sustained TTFT intervals do
+as well. No primary metric establishes a regression. This is not evidence that
+all latency metrics are unchanged. Both routed paths also have worse sustained
+P95 TTFT than P2P despite higher throughput.
+
+![H100 serving measurements](baselines/h100-nvlink-20261019/serving.svg)
+
+![H200 serving measurements](baselines/h200-nvlink-20261019/serving.svg)
+
+| Evidence | H100 | H200 |
+| --- | --- | --- |
+| Measurements + request hashes | [Manifest](baselines/h100-nvlink-20261019/manifest.json) | [Manifest](baselines/h200-nvlink-20261019/manifest.json) |
+| Ratios + 95% intervals + gates | [Comparison](baselines/h100-nvlink-20261019/comparison.json) | [Comparison](baselines/h200-nvlink-20261019/comparison.json) |
+| Runtime + archive provenance | [Provenance](baselines/h100-nvlink-20261019/provenance.json) | [Provenance](baselines/h200-nvlink-20261019/provenance.json) |
+| Single-request decode parity | [192/192 sequences](baselines/h100-nvlink-20261019/decode-parity.json) | [192/192 sequences](baselines/h200-nvlink-20261019/decode-parity.json) |
+
+Parity covers seeded synthetic decode at concurrency 1, not general model
+accuracy or concurrent-output equivalence. Full request events and role logs
+are retained outside Git; the manifests contain their request-artifact hashes.
+The initial manifest's `nccl_runtime` tuple is PyTorch's **build** version;
+provenance separately verifies the loaded NCCL library as 2.30.7.
+
 ## Matrix
 
 | Architecture | GPU baseline | Topology | Three-way suite |
@@ -60,8 +95,9 @@ graph replay, eager allocation and host-count wait is included. All variants use
 `FULL_DECODE_ONLY`, identical capture sizes and scheduler limits; prefill is eager.
 Prompt token IDs are synthetic and seeded; these are shape/load regression
 profiles, not a production corpus or accuracy evaluation.
-Prefix caching is disabled. The workload is closed-loop, not an offered-load/SLO
-experiment. The common CUDA DBO import guard is applied to all three paths.
+Prefix caching is disabled. Runs are finite and closed-loop, with ramp-up/drain
+included; they do not measure offered-load SLOs or steady state. The common CUDA
+DBO import guard is applied to all three paths.
 
 ## Run and gate
 
@@ -105,7 +141,10 @@ EP_DISABLE_GIN=1 torchrun --standalone --nproc-per-node=4 \
 
 Repeat with `--variant masked` and modes `eager-sync` / `eager-capacity`.
 This includes a weighted identity reply; it is not pure network bandwidth.
-It reports every rank, critical Attention round-trip time, registered transport
-bytes and PyTorch allocation separately. P2P remains in the serving suite so its
+The PyTorch identity reply touches receive capacity, including padding; use the
+serving suite to judge model performance. The untimed expert-weighted check
+preserves the two-stage BF16 reduction rounding. It reports every rank, critical
+Attention round-trip time, registered transport bytes and PyTorch allocation
+separately. P2P remains in the serving suite so its
 second communication stage is preserved. Use separate Nsight Systems runs to
 investigate regressions; never substitute trace timings for uninstrumented results.

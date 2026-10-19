@@ -1,0 +1,43 @@
+{
+  "scope": "Single-concurrent-request synthetic decode only; not general model accuracy or concurrent output equivalence",
+  "rows": [
+    {
+      "repeat": 0,
+      "matched_sequences": 32,
+      "total": 32,
+      "prompt_sha256": "7c5f6b40b7d1634423d086354e639a58b8b86711ee8a9923c8b94ae5eb62ece3"
+    },
+    {
+      "repeat": 1,
+      "matched_sequences": 32,
+      "total": 32,
+      "prompt_sha256": "cbe8a2e0a55ace4076169d33e0bc3250db4cc3c3f0a246a4a9f2b334d8ebd5e3"
+    },
+    {
+      "repeat": 2,
+      "matched_sequences": 32,
+      "total": 32,
+      "prompt_sha256": "2414d6a0d149ad90629df2bc2fffba962085fee9683c800e52e63ba932fc3404"
+    },
+    {
+      "repeat": 3,
+      "matched_sequences": 32,
+      "total": 32,
+      "prompt_sha256": "e3690aa8fc21b4c7d9442a6a7118917c765e7793127b12a9f24144f8a9daacca"
+    },
+    {
+      "repeat": 4,
+      "matched_sequences": 32,
+      "total": 32,
+      "prompt_sha256": "e968acc4bc5f85bce44121f9133ac2d3fcbe1eabd24192b031dff652d395d1d4"
+    },
+    {
+      "repeat": 5,
+      "matched_sequences": 32,
+      "total": 32,
+      "prompt_sha256": "5919b0406d37b66211c1c46fd3715b3deeb4274f8b316e5ed31f38870c247683"
+    }
+  ],
+  "matched_sequences": 192,
+  "total": 192
+}

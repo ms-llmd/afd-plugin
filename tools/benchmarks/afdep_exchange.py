@@ -155,9 +155,22 @@ def run(args) -> None:
         verified = exchange(reference_experts=True)
         torch.cuda.synchronize()
         if source:
-            expected = (
-                x.float() * ((ids + 1).float() * weights).sum(dim=1)[:, None]
-            ).bfloat16()
+            # Combine rounds each FFN's local expert reduction to BF16 before
+            # summing replies on Attention. Preserve those rounding boundaries.
+            partials = [
+                (
+                    x.float()
+                    * (
+                        (ids + 1).float()
+                        * weights
+                        * (ids // config.experts_per_rank == owner)
+                    ).sum(dim=1)[:, None]
+                )
+                .bfloat16()
+                .float()
+                for owner in range(FFN_RANKS)
+            ]
+            expected = torch.stack(partials).sum(dim=0).bfloat16()
             torch.testing.assert_close(verified, expected, rtol=0, atol=0)
         del verified
         for _ in range(args.warmup):
@@ -242,7 +255,8 @@ def run(args) -> None:
             "rows": rows,
             "scope": (
                 "Dispatch + weighted identity reply + combine; no GEMMs; "
-                "critical Attention rank; no network-only claim"
+                "critical Attention rank; PyTorch reply work spans receive capacity; "
+                "no network-only or serving-performance claim"
             ),
         }
         Path(args.output).write_text(json.dumps(result, indent=2) + "\n")

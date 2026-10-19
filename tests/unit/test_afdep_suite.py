@@ -48,6 +48,7 @@ def test_layout_and_graph_policy_preserve_real_p2p_ep():
         if variant != "p2p":
             assert config["connector_extra_config"]["num_sms"] == 0
     assert suite.plan("h200-nvlink", 6)["architecture"] == "Hopper SM90"
+    assert suite.plan("h200-nvlink", 6)["nccl_runtime_version_code"] == 23007
     assert suite.plan("h100-roce", 6)["status"] == "unsupported"
     orders = suite.plan("h100-nvlink", 6)["orders"]
     assert len({tuple(order) for order in orders}) == 6
@@ -91,4 +92,13 @@ def test_invalid_campaigns_cannot_generate_a_baseline(change):
     else:
         data["status"] = "failed"
     with pytest.raises(ValueError):
+        suite.compare(data)
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, float("nan"), float("inf")])
+def test_missing_or_nonfinite_metrics_cannot_pass_vacuously(value):
+    data = campaign()
+    for row in data["runs"]:
+        row["result"]["output_tokens_per_second"] = value
+    with pytest.raises(ValueError, match="Invalid metric"):
         suite.compare(data)

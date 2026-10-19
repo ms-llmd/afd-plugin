@@ -1,0 +1,3921 @@
+{
+  "policy": {
+    "schema_version": 1,
+    "profile": "h100-nvlink",
+    "status": "planned",
+    "reason": null,
+    "architecture": "Hopper SM90",
+    "gpu_model": "H100",
+    "topology": "1-node NVLink",
+    "gpu_count": 4,
+    "roles": {
+      "ffn": [
+        0,
+        1
+      ],
+      "attention": [
+        2,
+        3
+      ]
+    },
+    "variants": {
+      "p2p": "P2pNcclAFDConnector",
+      "masked": "DeepEPM2NAFDConnector",
+      "afdep": "AfdEPConnector"
+    },
+    "repeats": 6,
+    "orders": [
+      [
+        "p2p",
+        "masked",
+        "afdep"
+      ],
+      [
+        "p2p",
+        "afdep",
+        "masked"
+      ],
+      [
+        "masked",
+        "p2p",
+        "afdep"
+      ],
+      [
+        "masked",
+        "afdep",
+        "p2p"
+      ],
+      [
+        "afdep",
+        "p2p",
+        "masked"
+      ],
+      [
+        "afdep",
+        "masked",
+        "p2p"
+      ]
+    ],
+    "workloads": [
+      {
+        "name": "decode",
+        "input_tokens": [
+          32
+        ],
+        "output_tokens": 64,
+        "concurrency": 1,
+        "requests": 32
+      },
+      {
+        "name": "prefill",
+        "input_tokens": [
+          2048
+        ],
+        "output_tokens": 1,
+        "concurrency": 8,
+        "requests": 128
+      },
+      {
+        "name": "mixed",
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ],
+        "output_tokens": 64,
+        "concurrency": 32,
+        "requests": 256
+      },
+      {
+        "name": "sustained",
+        "input_tokens": [
+          256
+        ],
+        "output_tokens": 256,
+        "concurrency": 128,
+        "requests": 512
+      }
+    ],
+    "model_id": "Qwen/Qwen3-30B-A3B-FP8",
+    "model_revision": "d206ba732169f29bb77fbf80fc2c4b81d4d30782",
+    "afdep_revision": "e763e3189398beda24f592d2117e6ade135b0a7f",
+    "vllm_version": "0.30.0",
+    "graph_policy": "FULL_DECODE_ONLY; capture sizes 1,8,32,128; eager prefill",
+    "scheduler": {
+      "max_num_seqs": 128,
+      "max_num_batched_tokens": 2048,
+      "max_model_len": 4096
+    },
+    "parallelism": {
+      "attention_dp": 2,
+      "ffn_dp": 2,
+      "tp": 1,
+      "ffn_ep": 2,
+      "dbo": false
+    },
+    "wire_policy": "P2P BF16 + FFN routing; Masked/afdEP FP8 + Attention routing",
+    "expert_backend": "deep_gemm",
+    "routed_config": {
+      "num_sms": 0,
+      "num_qps": 0,
+      "cpu_sync_min_tokens": 0,
+      "num_lanes": 1
+    },
+    "measurement": "closed-loop; excludes startup/capture/warmup; includes every graph replay",
+    "instrumented": false,
+    "regression_gates": [
+      {
+        "metric": "output_tokens_per_second",
+        "direction": "higher",
+        "budget": 0.03
+      },
+      {
+        "metric": "ttft_median_ms",
+        "direction": "lower",
+        "budget": 0.03
+      },
+      {
+        "metric": "ttft_p95_ms",
+        "direction": "lower",
+        "budget": 0.05
+      },
+      {
+        "metric": "tpot_median_ms",
+        "direction": "lower",
+        "budget": 0.03
+      },
+      {
+        "metric": "tpot_p95_ms",
+        "direction": "lower",
+        "budget": 0.05
+      }
+    ],
+    "minimum_repeats": 6,
+    "confidence": {
+      "method": "paired-repeat bootstrap",
+      "interval": 0.95
+    },
+    "seed": 9242
+  },
+  "environment": {
+    "gpus": [
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "sm": [
+          9,
+          0
+        ],
+        "sms": 132,
+        "memory_bytes": 85017493504
+      },
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "sm": [
+          9,
+          0
+        ],
+        "sms": 132,
+        "memory_bytes": 85017493504
+      },
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "sm": [
+          9,
+          0
+        ],
+        "sms": 132,
+        "memory_bytes": 85017493504
+      },
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "sm": [
+          9,
+          0
+        ],
+        "sms": 132,
+        "memory_bytes": 85017493504
+      }
+    ],
+    "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNV18\tNV18\tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tPIX\t0-79\t0\t\tN/A\nGPU1\tNV18\t X \tNV18\tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\tNODE\t0-79\t0\t\tN/A\nGPU2\tNV18\tNV18\t X \tNV18\tSYS\tSYS\tSYS\tSYS\tNODE\tPIX\tNODE\tNODE\t0-79\t0\t\tN/A\nGPU3\tNV18\tNV18\tNV18\t X \tSYS\tSYS\tSYS\tSYS\tPIX\tNODE\tNODE\tNODE\t0-79\t0\t\tN/A\nNIC0\tSYS\tSYS\tSYS\tSYS\t X \tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC1\tSYS\tSYS\tSYS\tSYS\tNODE\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC2\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tNODE\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC3\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\t X \tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC4\tNODE\tNODE\tNODE\tPIX\tSYS\tSYS\tSYS\tSYS\t X \tNODE\tNODE\tNODE\t\t\t\t\nNIC5\tNODE\tNODE\tPIX\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\t X \tNODE\tNODE\t\t\t\t\nNIC6\tNODE\tPIX\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tNODE\t\t\t\t\nNIC7\tPIX\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4\n  NIC5: mlx5_5\n  NIC6: mlx5_6\n  NIC7: mlx5_7\n\n",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "driver": [
+      "580.126.20",
+      "580.126.20",
+      "580.126.20",
+      "580.126.20"
+    ],
+    "nccl_runtime": [
+      2,
+      29,
+      7
+    ],
+    "vllm": "0.30.0",
+    "cpu_affinity_count": 160
+  },
+  "plugin_source_sha256": "6ca79575207122ec71f46214ccb3f5e106b1fb67150c1d6a8b1c369c36cc822a",
+  "afdep_version": "1.0.0.dev0",
+  "afdep_python_sha256": {
+    "__init__.py": "522b8d1875320e30a76b4163529327f995d1093593d225a82dc107bec6efae23",
+    "__main__.py": "db5ee00bc9b0276c476b247e0dafe11437135531874fdad17442a9892afd64e2",
+    "_build.py": "d6c787e0cbaf51dfbbd98f387d7e0de32fb71fa37663e06ca6ad284aff538edb",
+    "deepep.py": "39031766506edb8c954fa8ea2a0a9b8db267084b62fcbc15039521e3fe5dcf5f"
+  },
+  "afdep_vendor_sha256": "a250acc1a44a43b656a02a106e9e202ff2e8a99e1ed2532a1dc539d4ff30d16c",
+  "status": "complete",
+  "runs": [
+    {
+      "repeat": 0,
+      "variant": "p2p",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-p2p/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "7c5f6b40b7d1634423d086354e639a58b8b86711ee8a9923c8b94ae5eb62ece3",
+        "elapsed_s": 18.50974357998348,
+        "completed_requests": 32,
+        "output_tokens_per_second": 110.64442849520167,
+        "input_tokens_per_second": 55.32221424760083,
+        "latency_p95_ms": 584.09839675,
+        "requests_per_second": 1.728819195237526,
+        "latency_median_ms": 578.6061945,
+        "ttft_median_ms": 105.4105925,
+        "ttft_p95_ms": 111.21635805,
+        "itl_median_ms": 7.4968305,
+        "itl_p95_ms": 7.6292205,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 7.499672365079364,
+        "tpot_p95_ms": 7.5180988214285716,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-p2p/decode.json",
+      "artifact_sha256": "3b76206f497001e71e2041bc56ea61434813c9a627e7c4f1ee47b2640e9fa324",
+      "post_workload_gpu_memory_mib": [
+        "19871",
+        "19871",
+        "70367",
+        "70367"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "p2p",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-p2p/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "07a95e7215406380f2a0da2e07f36b6aeb27deb6a5fad7359da5440a8dedac2f",
+        "elapsed_s": 5.723969996004598,
+        "completed_requests": 128,
+        "output_tokens_per_second": 22.362101843536145,
+        "input_tokens_per_second": 45797.584575562025,
+        "latency_p95_ms": 370.93742854999994,
+        "requests_per_second": 22.362101843536145,
+        "latency_median_ms": 348.950187,
+        "ttft_median_ms": 348.586867,
+        "ttft_p95_ms": 370.63996334999996,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-p2p/prefill.json",
+      "artifact_sha256": "97ead4d6884e0d7cf2ad80c011ca525cf54f9cee6315fe1c26193a20c3aa09ba",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "70367",
+        "70367"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "p2p",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-p2p/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "16aa1adc0b36d17e8b59521fbd06acbc6330aa12966acec6c8cf7bb3a36df292",
+        "elapsed_s": 19.668145615025423,
+        "completed_requests": 256,
+        "output_tokens_per_second": 833.0221018642189,
+        "input_tokens_per_second": 11535.403715268189,
+        "latency_p95_ms": 5667.737008,
+        "requests_per_second": 13.015970341628421,
+        "latency_median_ms": 2033.318178,
+        "ttft_median_ms": 297.7220955,
+        "ttft_p95_ms": 650.6495105,
+        "itl_median_ms": 14.924949999999999,
+        "itl_p95_ms": 96.2325422,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 26.45682334920635,
+        "tpot_p95_ms": 84.23158431746032,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-p2p/mixed.json",
+      "artifact_sha256": "fa7c08e8e2cc931fad950fc1e05823beaa433aff3a5915b2a06d6ea8532d4e37",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19933",
+        "70369",
+        "70369"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "p2p",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-p2p/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "d0c5971ceb1e4e58cf191f3e9cd1cc416801aee1558f0fea5f6609f242f81a7e",
+        "elapsed_s": 20.543730698002037,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6380.145939741476,
+        "input_tokens_per_second": 6380.145939741476,
+        "latency_p95_ms": 5452.803556399999,
+        "requests_per_second": 24.92244507711514,
+        "latency_median_ms": 5102.798078,
+        "ttft_median_ms": 352.8386,
+        "ttft_p95_ms": 718.342704599999,
+        "itl_median_ms": 16.800234500000002,
+        "itl_p95_ms": 22.6734084,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.585769552941176,
+        "tpot_p95_ms": 19.036815325490196,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-p2p/sustained.json",
+      "artifact_sha256": "2f53ad0409295ae0347d44b5d0b459f41a5cdd702af0fa7c19e708bcb5dd055e",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19933",
+        "70369",
+        "70369"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "masked",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-masked/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "7c5f6b40b7d1634423d086354e639a58b8b86711ee8a9923c8b94ae5eb62ece3",
+        "elapsed_s": 13.968216458015377,
+        "completed_requests": 32,
+        "output_tokens_per_second": 146.61857554654352,
+        "input_tokens_per_second": 73.30928777327176,
+        "latency_p95_ms": 451.151074,
+        "requests_per_second": 2.2909152429147426,
+        "latency_median_ms": 437.05175499999996,
+        "ttft_median_ms": 48.209385999999995,
+        "ttft_p95_ms": 53.405306350000004,
+        "itl_median_ms": 6.179257,
+        "itl_p95_ms": 6.42702275,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.155390849206349,
+        "tpot_p95_ms": 6.340239442063492,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-masked/decode.json",
+      "artifact_sha256": "d0dab2a475b1047c9f39c25495031aed67dd8a6f52c2ce152d33287fbec31405",
+      "post_workload_gpu_memory_mib": [
+        "18471",
+        "18497",
+        "70363",
+        "70363"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "masked",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-masked/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "07a95e7215406380f2a0da2e07f36b6aeb27deb6a5fad7359da5440a8dedac2f",
+        "elapsed_s": 2.901524133980274,
+        "completed_requests": 128,
+        "output_tokens_per_second": 44.114745936788474,
+        "input_tokens_per_second": 90346.9996785428,
+        "latency_p95_ms": 182.2601033,
+        "requests_per_second": 44.114745936788474,
+        "latency_median_ms": 177.58321999999998,
+        "ttft_median_ms": 177.2333385,
+        "ttft_p95_ms": 181.66590739999998,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-masked/prefill.json",
+      "artifact_sha256": "5422440a06b5520fd6c9a85647a699f4efbfc8a533a07715f46f6a635423b9ad",
+      "post_workload_gpu_memory_mib": [
+        "19503",
+        "19487",
+        "70363",
+        "70363"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "masked",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-masked/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "16aa1adc0b36d17e8b59521fbd06acbc6330aa12966acec6c8cf7bb3a36df292",
+        "elapsed_s": 9.035309825994773,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1813.3301807606967,
+        "input_tokens_per_second": 25110.37301092449,
+        "latency_p95_ms": 1259.45446325,
+        "requests_per_second": 28.333284074385887,
+        "latency_median_ms": 1137.640644,
+        "ttft_median_ms": 168.39486749999998,
+        "ttft_p95_ms": 303.92095325,
+        "itl_median_ms": 10.176925,
+        "itl_p95_ms": 43.7507079,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.389299849206349,
+        "tpot_p95_ms": 16.723005968253965,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-masked/mixed.json",
+      "artifact_sha256": "0bdd603c6bbd263e61bef7add4bc93bae1f931ee1f15ce5c77d1e81bbb33e447",
+      "post_workload_gpu_memory_mib": [
+        "19503",
+        "19487",
+        "70365",
+        "70365"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "masked",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-masked/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "d0c5971ceb1e4e58cf191f3e9cd1cc416801aee1558f0fea5f6609f242f81a7e",
+        "elapsed_s": 18.32333473302424,
+        "completed_requests": 512,
+        "output_tokens_per_second": 7153.283062813248,
+        "input_tokens_per_second": 7153.283062813248,
+        "latency_p95_ms": 6951.9781049,
+        "requests_per_second": 27.94251196411425,
+        "latency_median_ms": 4208.054005,
+        "ttft_median_ms": 151.791052,
+        "ttft_p95_ms": 2252.109795,
+        "itl_median_ms": 12.5526535,
+        "itl_p95_ms": 43.66184354999997,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.959942105882353,
+        "tpot_p95_ms": 18.47907670490196,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-masked/sustained.json",
+      "artifact_sha256": "1e0fb1ecaedab97b150a8b9b45ff25c18d51c1958781dfbabd50bc69b2449f86",
+      "post_workload_gpu_memory_mib": [
+        "19503",
+        "19487",
+        "70365",
+        "70365"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "afdep",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-afdep/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "7c5f6b40b7d1634423d086354e639a58b8b86711ee8a9923c8b94ae5eb62ece3",
+        "elapsed_s": 13.97685907399864,
+        "completed_requests": 32,
+        "output_tokens_per_second": 146.52791368626768,
+        "input_tokens_per_second": 73.26395684313384,
+        "latency_p95_ms": 448.0495987,
+        "requests_per_second": 2.2894986513479325,
+        "latency_median_ms": 437.108744,
+        "ttft_median_ms": 46.290126,
+        "ttft_p95_ms": 48.924244599999994,
+        "itl_median_ms": 6.2147120000000005,
+        "itl_p95_ms": 6.4433240000000005,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.200461373015873,
+        "tpot_p95_ms": 6.364183396031747,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-afdep/decode.json",
+      "artifact_sha256": "b7d958fcea54dba0037d9059bc4765fb675a8212d02b140de4322bd18449fae6",
+      "post_workload_gpu_memory_mib": [
+        "18419",
+        "18445",
+        "70363",
+        "70363"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "afdep",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-afdep/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "07a95e7215406380f2a0da2e07f36b6aeb27deb6a5fad7359da5440a8dedac2f",
+        "elapsed_s": 2.7935718380031176,
+        "completed_requests": 128,
+        "output_tokens_per_second": 45.819476792655564,
+        "input_tokens_per_second": 93838.2884713586,
+        "latency_p95_ms": 211.0607587,
+        "requests_per_second": 45.819476792655564,
+        "latency_median_ms": 168.30676749999998,
+        "ttft_median_ms": 168.00446499999998,
+        "ttft_p95_ms": 210.63040429999998,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-afdep/prefill.json",
+      "artifact_sha256": "f41ef74219e81bc41b45f256b2a683327802915a37899b882fb9848c4dada5fb",
+      "post_workload_gpu_memory_mib": [
+        "19585",
+        "19435",
+        "70363",
+        "70363"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "afdep",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-afdep/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "16aa1adc0b36d17e8b59521fbd06acbc6330aa12966acec6c8cf7bb3a36df292",
+        "elapsed_s": 8.280222146015149,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1978.6908746022941,
+        "input_tokens_per_second": 27400.231056504424,
+        "latency_p95_ms": 1149.9049475000002,
+        "requests_per_second": 30.917044915660846,
+        "latency_median_ms": 1029.750182,
+        "ttft_median_ms": 132.1791455,
+        "ttft_p95_ms": 291.2391495,
+        "itl_median_ms": 10.077186999999999,
+        "itl_p95_ms": 42.818112400000004,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.165429055555556,
+        "tpot_p95_ms": 15.32529369047619,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-afdep/mixed.json",
+      "artifact_sha256": "e5ad456831ba5cc2febdf310733e34a46b406ad361794a12d86627cd0933ec80",
+      "post_workload_gpu_memory_mib": [
+        "19585",
+        "19435",
+        "70365",
+        "70365"
+      ]
+    },
+    {
+      "repeat": 0,
+      "variant": "afdep",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r0-afdep/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9242,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "d0c5971ceb1e4e58cf191f3e9cd1cc416801aee1558f0fea5f6609f242f81a7e",
+        "elapsed_s": 18.73214236399508,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6997.170822913057,
+        "input_tokens_per_second": 6997.170822913057,
+        "latency_p95_ms": 6841.2048387,
+        "requests_per_second": 27.33269852700413,
+        "latency_median_ms": 4716.1627395,
+        "ttft_median_ms": 133.63245849999998,
+        "ttft_p95_ms": 2139.5868919,
+        "itl_median_ms": 12.6101165,
+        "itl_p95_ms": 42.54613015,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 17.968257225490195,
+        "tpot_p95_ms": 18.455131959607844,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r0-afdep/sustained.json",
+      "artifact_sha256": "760093e296e9109d500daa32f87a933c5875fc3c1d031076240fc9e143cf152d",
+      "post_workload_gpu_memory_mib": [
+        "19585",
+        "19435",
+        "70365",
+        "70365"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "p2p",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-p2p/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "cbe8a2e0a55ace4076169d33e0bc3250db4cc3c3f0a246a4a9f2b334d8ebd5e3",
+        "elapsed_s": 18.008183222002117,
+        "completed_requests": 32,
+        "output_tokens_per_second": 113.72607523771669,
+        "input_tokens_per_second": 56.86303761885834,
+        "latency_p95_ms": 568.2075275,
+        "requests_per_second": 1.7769699255893232,
+        "latency_median_ms": 562.2627620000001,
+        "ttft_median_ms": 106.6778405,
+        "ttft_p95_ms": 113.3863066,
+        "itl_median_ms": 7.212063499999999,
+        "itl_p95_ms": 7.380367,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 7.214286674603175,
+        "tpot_p95_ms": 7.301622292857143,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-p2p/decode.json",
+      "artifact_sha256": "f4b2783c0447c603dea0f1e1e5487ac40e98b488621d6eb5824b135076febc3f",
+      "post_workload_gpu_memory_mib": [
+        "19871",
+        "19871",
+        "70855",
+        "70855"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "p2p",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-p2p/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "41b95048c7ff844e900c7d6b8452d1d1b16ca049c6da39052a6733df5ff5f4fe",
+        "elapsed_s": 5.711220204015262,
+        "completed_requests": 128,
+        "output_tokens_per_second": 22.4120232503047,
+        "input_tokens_per_second": 45899.823616624024,
+        "latency_p95_ms": 363.8629818,
+        "requests_per_second": 22.4120232503047,
+        "latency_median_ms": 355.38532250000003,
+        "ttft_median_ms": 354.94884349999995,
+        "ttft_p95_ms": 363.35998895,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-p2p/prefill.json",
+      "artifact_sha256": "e3802d3d7af2bde33d0acb800d084624900cc4967efab99098a8f5bdfd5e1d6f",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "70943",
+        "70943"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "p2p",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-p2p/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "d11e3bc554a0eeb880744fc8b954f3a12f5715098b08c677092e1ee31ef88cc4",
+        "elapsed_s": 15.854944202990737,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1033.3685057629825,
+        "input_tokens_per_second": 14309.731847381927,
+        "latency_p95_ms": 2244.3921370000003,
+        "requests_per_second": 16.146382902546602,
+        "latency_median_ms": 1996.997217,
+        "ttft_median_ms": 288.68884049999997,
+        "ttft_p95_ms": 578.833171,
+        "itl_median_ms": 14.9737135,
+        "itl_p95_ms": 95.35478875,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 26.35765665079365,
+        "tpot_p95_ms": 29.021684714285712,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-p2p/mixed.json",
+      "artifact_sha256": "30bc0b37a7114b0f3bf045351d7fc7d80e0795dd521e54b3cddbc187e6f159a7",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "71083",
+        "70997"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "p2p",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-p2p/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "1ce19a21b74e697db8c370048058fff40fc197d247786dbc728d880c12b915e9",
+        "elapsed_s": 20.920341557997745,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6265.289676873933,
+        "input_tokens_per_second": 6265.289676873933,
+        "latency_p95_ms": 5590.64044285,
+        "requests_per_second": 24.4737878002888,
+        "latency_median_ms": 5186.2234915,
+        "ttft_median_ms": 349.68141149999997,
+        "ttft_p95_ms": 838.7795435,
+        "itl_median_ms": 16.862155,
+        "itl_p95_ms": 23.608555299999995,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.91027627647059,
+        "tpot_p95_ms": 19.451624288039216,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-p2p/sustained.json",
+      "artifact_sha256": "2b1cd4bd2f644879667247e12cdc12d942db96e1d5b282de9f4c0ba7e74f113e",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19933",
+        "71083",
+        "71041"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "afdep",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-afdep/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "cbe8a2e0a55ace4076169d33e0bc3250db4cc3c3f0a246a4a9f2b334d8ebd5e3",
+        "elapsed_s": 14.04461167100817,
+        "completed_requests": 32,
+        "output_tokens_per_second": 145.82104852550813,
+        "input_tokens_per_second": 72.91052426275407,
+        "latency_p95_ms": 453.02615480000003,
+        "requests_per_second": 2.2784538832110646,
+        "latency_median_ms": 439.7298315,
+        "ttft_median_ms": 44.306265499999995,
+        "ttft_p95_ms": 49.97559685,
+        "itl_median_ms": 6.258929999999999,
+        "itl_p95_ms": 6.491581500000001,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.248108666666666,
+        "tpot_p95_ms": 6.409210767460317,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-afdep/decode.json",
+      "artifact_sha256": "c4e16b39043b7d472b3ff7a188e96c8d61478df38e28b8d0c4e4999ea16cf4bd",
+      "post_workload_gpu_memory_mib": [
+        "18421",
+        "18397",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "afdep",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-afdep/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "41b95048c7ff844e900c7d6b8452d1d1b16ca049c6da39052a6733df5ff5f4fe",
+        "elapsed_s": 2.8096975309890695,
+        "completed_requests": 128,
+        "output_tokens_per_second": 45.556505135604915,
+        "input_tokens_per_second": 93299.72251771887,
+        "latency_p95_ms": 215.16677415,
+        "requests_per_second": 45.556505135604915,
+        "latency_median_ms": 171.97532999999999,
+        "ttft_median_ms": 171.3396945,
+        "ttft_p95_ms": 214.7097651,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-afdep/prefill.json",
+      "artifact_sha256": "9355730c42c4b9ef61041051686dc3129646f9ff1ee70ee0accefc90cab8bb95",
+      "post_workload_gpu_memory_mib": [
+        "19453",
+        "19445",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "afdep",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-afdep/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "d11e3bc554a0eeb880744fc8b954f3a12f5715098b08c677092e1ee31ef88cc4",
+        "elapsed_s": 8.415388111985521,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1946.909611532387,
+        "input_tokens_per_second": 26960.135050321533,
+        "latency_p95_ms": 1150.73595325,
+        "requests_per_second": 30.42046268019355,
+        "latency_median_ms": 1050.3839469999998,
+        "ttft_median_ms": 154.926712,
+        "ttft_p95_ms": 279.30049099999997,
+        "itl_median_ms": 10.356404999999999,
+        "itl_p95_ms": 40.82489035,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.360283912698414,
+        "tpot_p95_ms": 15.18957125,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-afdep/mixed.json",
+      "artifact_sha256": "99a18464bdf5c38021258434b647a88001460092c283a3e6687b6c1f4bc66af9",
+      "post_workload_gpu_memory_mib": [
+        "19453",
+        "19445",
+        "70987",
+        "70963"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "afdep",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-afdep/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "1ce19a21b74e697db8c370048058fff40fc197d247786dbc728d880c12b915e9",
+        "elapsed_s": 18.859360103000654,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6949.970692756725,
+        "input_tokens_per_second": 6949.970692756725,
+        "latency_p95_ms": 6914.68922855,
+        "requests_per_second": 27.148323018580957,
+        "latency_median_ms": 4732.0077095,
+        "ttft_median_ms": 124.7147535,
+        "ttft_p95_ms": 2220.0790002999997,
+        "itl_median_ms": 12.6765365,
+        "itl_p95_ms": 40.1426,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.0082656,
+        "tpot_p95_ms": 18.423111552549017,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-afdep/sustained.json",
+      "artifact_sha256": "449d8175f84afdd054f919d25922e46d357fecbc5c967ab7d51fb1da0a91970f",
+      "post_workload_gpu_memory_mib": [
+        "19453",
+        "19445",
+        "71021",
+        "70995"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "masked",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-masked/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "cbe8a2e0a55ace4076169d33e0bc3250db4cc3c3f0a246a4a9f2b334d8ebd5e3",
+        "elapsed_s": 14.07449760500458,
+        "completed_requests": 32,
+        "output_tokens_per_second": 145.51141060067226,
+        "input_tokens_per_second": 72.75570530033613,
+        "latency_p95_ms": 454.30765515,
+        "requests_per_second": 2.273615790635504,
+        "latency_median_ms": 446.988204,
+        "ttft_median_ms": 48.4355175,
+        "ttft_p95_ms": 56.1019617,
+        "itl_median_ms": 6.225066999999999,
+        "itl_p95_ms": 6.49085525,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.1809904285714286,
+        "tpot_p95_ms": 6.39209185,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-masked/decode.json",
+      "artifact_sha256": "c144e75f4d44cd9fd723c5479d38121ab2440a411ac16385d35d6cd4d66185f5",
+      "post_workload_gpu_memory_mib": [
+        "18473",
+        "18449",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "masked",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-masked/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "41b95048c7ff844e900c7d6b8452d1d1b16ca049c6da39052a6733df5ff5f4fe",
+        "elapsed_s": 2.921693882002728,
+        "completed_requests": 128,
+        "output_tokens_per_second": 43.81020229000174,
+        "input_tokens_per_second": 89723.29428992356,
+        "latency_p95_ms": 221.7223192,
+        "requests_per_second": 43.81020229000174,
+        "latency_median_ms": 176.5270875,
+        "ttft_median_ms": 176.2375175,
+        "ttft_p95_ms": 221.43331404999998,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-masked/prefill.json",
+      "artifact_sha256": "4b842492844bedf10cda7fdffc037773cdc09fb391d087e9658ea57053a8aa23",
+      "post_workload_gpu_memory_mib": [
+        "19505",
+        "19497",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "masked",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-masked/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "d11e3bc554a0eeb880744fc8b954f3a12f5715098b08c677092e1ee31ef88cc4",
+        "elapsed_s": 9.109103825001512,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1798.6401642531812,
+        "input_tokens_per_second": 24906.95071202159,
+        "latency_p95_ms": 1244.963057,
+        "requests_per_second": 28.103752566455956,
+        "latency_median_ms": 1149.6167015,
+        "ttft_median_ms": 165.539287,
+        "ttft_p95_ms": 310.2300785,
+        "itl_median_ms": 10.3495075,
+        "itl_p95_ms": 44.039079199999996,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.67915842857143,
+        "tpot_p95_ms": 16.808188992063492,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-masked/mixed.json",
+      "artifact_sha256": "b657f3fe94b99c74646597a742459d0ccc29fc517b9446dd07a9cd6a389cd98c",
+      "post_workload_gpu_memory_mib": [
+        "19639",
+        "19497",
+        "70965",
+        "70939"
+      ]
+    },
+    {
+      "repeat": 1,
+      "variant": "masked",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r1-masked/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9243,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "1ce19a21b74e697db8c370048058fff40fc197d247786dbc728d880c12b915e9",
+        "elapsed_s": 19.061254326981725,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6876.357544553824,
+        "input_tokens_per_second": 6876.357544553824,
+        "latency_p95_ms": 6949.98325925,
+        "requests_per_second": 26.860771658413373,
+        "latency_median_ms": 4803.076889,
+        "ttft_median_ms": 138.8966265,
+        "ttft_p95_ms": 2189.6505591,
+        "itl_median_ms": 12.649164,
+        "itl_p95_ms": 43.54704769999999,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.311879901960786,
+        "tpot_p95_ms": 18.68545772019608,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r1-masked/sustained.json",
+      "artifact_sha256": "6e3ac52bd93a970cb5ba774254f2702fe6839f610574ae062d732e90b98cbc9f",
+      "post_workload_gpu_memory_mib": [
+        "19639",
+        "19497",
+        "70999",
+        "70971"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "masked",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-masked/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "2414d6a0d149ad90629df2bc2fffba962085fee9683c800e52e63ba932fc3404",
+        "elapsed_s": 14.05264944199007,
+        "completed_requests": 32,
+        "output_tokens_per_second": 145.73764246053602,
+        "input_tokens_per_second": 72.86882123026801,
+        "latency_p95_ms": 453.64592415000004,
+        "requests_per_second": 2.2771506634458754,
+        "latency_median_ms": 441.0359185,
+        "ttft_median_ms": 47.8302415,
+        "ttft_p95_ms": 55.396537800000004,
+        "itl_median_ms": 6.2427575,
+        "itl_p95_ms": 6.48691375,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.22135453968254,
+        "tpot_p95_ms": 6.401198579365079,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-masked/decode.json",
+      "artifact_sha256": "634a2f9e7c9e50a52c810e5cda3b46e71a616b6e7d9629ec824a72deb46a229d",
+      "post_workload_gpu_memory_mib": [
+        "18463",
+        "18473",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "masked",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-masked/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "4f25a4edb650b198a00a555617bfc3c6be5ef3a24b7cc95cd016499e1cbec099",
+        "elapsed_s": 2.918188976997044,
+        "completed_requests": 128,
+        "output_tokens_per_second": 43.86282074566608,
+        "input_tokens_per_second": 89831.05688712413,
+        "latency_p95_ms": 224.41204345,
+        "requests_per_second": 43.86282074566608,
+        "latency_median_ms": 178.5575295,
+        "ttft_median_ms": 178.14921950000002,
+        "ttft_p95_ms": 224.0316657,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-masked/prefill.json",
+      "artifact_sha256": "22b7a8f2f02b5d9dbf4879e3f22e90dd1f8f02c96c29a5b525d35ec8a7d92cdd",
+      "post_workload_gpu_memory_mib": [
+        "19615",
+        "19359",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "masked",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-masked/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "cdd4e87ae7f8d9edc26d5b0732084832d093f8e3e7daba524a323b6a989647f8",
+        "elapsed_s": 8.764307687990367,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1869.400366038131,
+        "input_tokens_per_second": 25886.813662520213,
+        "latency_p95_ms": 1172.8720665,
+        "requests_per_second": 29.2093807193458,
+        "latency_median_ms": 1096.907854,
+        "ttft_median_ms": 138.1568625,
+        "ttft_p95_ms": 295.66612875,
+        "itl_median_ms": 10.1716955,
+        "itl_p95_ms": 44.070719249999996,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.96923842857143,
+        "tpot_p95_ms": 15.820843428571429,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-masked/mixed.json",
+      "artifact_sha256": "93b57a1ecacc49871edf5067498c396f6f20fbf61c248fa1dd6962e22c54ed57",
+      "post_workload_gpu_memory_mib": [
+        "19749",
+        "19469",
+        "70995",
+        "70951"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "masked",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-masked/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "6a2e7bad87dcdf948a446863dc99171739eb6672a2fc7714873594a256d204ed",
+        "elapsed_s": 18.657668461994035,
+        "completed_requests": 512,
+        "output_tokens_per_second": 7025.100712181467,
+        "input_tokens_per_second": 7025.100712181467,
+        "latency_p95_ms": 6817.8903733,
+        "requests_per_second": 27.441799656958857,
+        "latency_median_ms": 4589.3484499999995,
+        "ttft_median_ms": 138.29108100000002,
+        "ttft_p95_ms": 2152.6785979,
+        "itl_median_ms": 12.69415,
+        "itl_p95_ms": 43.790020649999995,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 17.529237850980394,
+        "tpot_p95_ms": 18.508844271960783,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-masked/sustained.json",
+      "artifact_sha256": "3a9617aca27a98083796291db1a3829ad96c61a3bb963fef1130b7eba33af2a6",
+      "post_workload_gpu_memory_mib": [
+        "19749",
+        "19469",
+        "71029",
+        "70951"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "p2p",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-p2p/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "2414d6a0d149ad90629df2bc2fffba962085fee9683c800e52e63ba932fc3404",
+        "elapsed_s": 18.559056449012132,
+        "completed_requests": 32,
+        "output_tokens_per_second": 110.35043756812387,
+        "input_tokens_per_second": 55.17521878406193,
+        "latency_p95_ms": 587.9519295,
+        "requests_per_second": 1.7242255870019354,
+        "latency_median_ms": 579.3083509999999,
+        "ttft_median_ms": 107.9076015,
+        "ttft_p95_ms": 115.0760091,
+        "itl_median_ms": 7.483022,
+        "itl_p95_ms": 7.609239,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 7.481099944444445,
+        "tpot_p95_ms": 7.510318027777778,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-p2p/decode.json",
+      "artifact_sha256": "d1f9d2912956e6f54ff83f7c9252d96a65fa2dc5f886c4e5d4a6c21b37908bbf",
+      "post_workload_gpu_memory_mib": [
+        "19871",
+        "19871",
+        "70855",
+        "70855"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "p2p",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-p2p/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "4f25a4edb650b198a00a555617bfc3c6be5ef3a24b7cc95cd016499e1cbec099",
+        "elapsed_s": 5.6143711030017585,
+        "completed_requests": 128,
+        "output_tokens_per_second": 22.798635439606763,
+        "input_tokens_per_second": 46691.60538031465,
+        "latency_p95_ms": 358.77992665,
+        "requests_per_second": 22.798635439606763,
+        "latency_median_ms": 348.1018215,
+        "ttft_median_ms": 347.72943699999996,
+        "ttft_p95_ms": 358.52106990000004,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-p2p/prefill.json",
+      "artifact_sha256": "2d7390b69db553599d0c6f41cc9bc891aa36a602acb155d23d1374a2783e37b6",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "70943",
+        "70943"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "p2p",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-p2p/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "cdd4e87ae7f8d9edc26d5b0732084832d093f8e3e7daba524a323b6a989647f8",
+        "elapsed_s": 15.507844013016438,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1056.497601229943,
+        "input_tokens_per_second": 14630.015610781827,
+        "latency_p95_ms": 2120.8735662500003,
+        "requests_per_second": 16.50777501921786,
+        "latency_median_ms": 1947.0082065,
+        "ttft_median_ms": 289.957258,
+        "ttft_p95_ms": 575.53732375,
+        "itl_median_ms": 15.1080425,
+        "itl_p95_ms": 95.08529755,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 26.235570674603174,
+        "tpot_p95_ms": 27.84163382142857,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-p2p/mixed.json",
+      "artifact_sha256": "4706decb046de2e6777d8433ad8e71240f9deada44c9459e61ccffe5cabe9259",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19935",
+        "71003",
+        "71003"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "p2p",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-p2p/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "6a2e7bad87dcdf948a446863dc99171739eb6672a2fc7714873594a256d204ed",
+        "elapsed_s": 20.92799406099948,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6262.998719225566,
+        "input_tokens_per_second": 6262.998719225566,
+        "latency_p95_ms": 5642.2504486,
+        "requests_per_second": 24.464838746974866,
+        "latency_median_ms": 5153.4745459999995,
+        "ttft_median_ms": 351.6871625,
+        "ttft_p95_ms": 842.68223245,
+        "itl_median_ms": 17.038825,
+        "itl_p95_ms": 23.722376499999953,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.812086219607842,
+        "tpot_p95_ms": 19.32366049745098,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-p2p/sustained.json",
+      "artifact_sha256": "9c6816d8e344292057af3be0c9198934f96372ed85e3f9a90472cfdba7286251",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19935",
+        "71035",
+        "71003"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "afdep",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-afdep/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "2414d6a0d149ad90629df2bc2fffba962085fee9683c800e52e63ba932fc3404",
+        "elapsed_s": 13.989923336019274,
+        "completed_requests": 32,
+        "output_tokens_per_second": 146.39108098091572,
+        "input_tokens_per_second": 73.19554049045786,
+        "latency_p95_ms": 454.0200434,
+        "requests_per_second": 2.287360640326808,
+        "latency_median_ms": 437.517917,
+        "ttft_median_ms": 47.322106500000004,
+        "ttft_p95_ms": 51.11257405,
+        "itl_median_ms": 6.226115,
+        "itl_p95_ms": 6.486289749999999,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.196229166666667,
+        "tpot_p95_ms": 6.391141386507936,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-afdep/decode.json",
+      "artifact_sha256": "6bdae80398df2a62ae59a17fa186f6e4b9d78223ec9491e155ac217af2bdff32",
+      "post_workload_gpu_memory_mib": [
+        "18411",
+        "18421",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "afdep",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-afdep/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "4f25a4edb650b198a00a555617bfc3c6be5ef3a24b7cc95cd016499e1cbec099",
+        "elapsed_s": 2.782961137010716,
+        "completed_requests": 128,
+        "output_tokens_per_second": 45.994174441648745,
+        "input_tokens_per_second": 94196.06925649663,
+        "latency_p95_ms": 197.6375676999998,
+        "requests_per_second": 45.994174441648745,
+        "latency_median_ms": 170.37915850000002,
+        "ttft_median_ms": 169.9457805,
+        "ttft_p95_ms": 197.1265074999998,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-afdep/prefill.json",
+      "artifact_sha256": "19a60929cdebd1bf6ee0d3c6c101cc1bf53cd984bda6f9dddcbe4fd8a397c566",
+      "post_workload_gpu_memory_mib": [
+        "19563",
+        "19307",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "afdep",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-afdep/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "cdd4e87ae7f8d9edc26d5b0732084832d093f8e3e7daba524a323b6a989647f8",
+        "elapsed_s": 8.840843810001388,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1853.2167689090106,
+        "input_tokens_per_second": 25662.708772587666,
+        "latency_p95_ms": 1217.109435,
+        "requests_per_second": 28.95651201420329,
+        "latency_median_ms": 1111.0870425,
+        "ttft_median_ms": 153.32676850000001,
+        "ttft_p95_ms": 311.70954825,
+        "itl_median_ms": 10.276663,
+        "itl_p95_ms": 40.9049646,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.942021246031747,
+        "tpot_p95_ms": 16.38340851190476,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-afdep/mixed.json",
+      "artifact_sha256": "e8873a5bbae036831d5c06878585beafb59c26d18cd1163d7dae12f782f9d8a6",
+      "post_workload_gpu_memory_mib": [
+        "19697",
+        "19307",
+        "70993",
+        "70937"
+      ]
+    },
+    {
+      "repeat": 2,
+      "variant": "afdep",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r2-afdep/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9244,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "6a2e7bad87dcdf948a446863dc99171739eb6672a2fc7714873594a256d204ed",
+        "elapsed_s": 17.94024942701799,
+        "completed_requests": 512,
+        "output_tokens_per_second": 7306.029970943758,
+        "input_tokens_per_second": 7306.029970943758,
+        "latency_p95_ms": 6537.96263025,
+        "requests_per_second": 28.539179573999053,
+        "latency_median_ms": 4234.4890175,
+        "ttft_median_ms": 155.14336250000002,
+        "ttft_p95_ms": 2343.4339846,
+        "itl_median_ms": 12.5806445,
+        "itl_p95_ms": 39.760640499999994,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 16.113862749019606,
+        "tpot_p95_ms": 18.040105440588235,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r2-afdep/sustained.json",
+      "artifact_sha256": "1c14d26e3aeeb35110845d25e3583137df0c496f7349c12921c7d5b5178ba5fb",
+      "post_workload_gpu_memory_mib": [
+        "19697",
+        "19519",
+        "71053",
+        "70997"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "masked",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-masked/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e3690aa8fc21b4c7d9442a6a7118917c765e7793127b12a9f24144f8a9daacca",
+        "elapsed_s": 14.073823587008519,
+        "completed_requests": 32,
+        "output_tokens_per_second": 145.51837937563033,
+        "input_tokens_per_second": 72.75918968781517,
+        "latency_p95_ms": 455.23914545,
+        "requests_per_second": 2.273724677744224,
+        "latency_median_ms": 439.65227749999997,
+        "ttft_median_ms": 48.4637575,
+        "ttft_p95_ms": 53.39598485,
+        "itl_median_ms": 6.2277255,
+        "itl_p95_ms": 6.501626,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.2038120476190475,
+        "tpot_p95_ms": 6.397928330158731,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-masked/decode.json",
+      "artifact_sha256": "235b804e96464f9155ffb1b47493853bdced89e7b41d86ffde49e9c4579a7868",
+      "post_workload_gpu_memory_mib": [
+        "18459",
+        "18487",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "masked",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-masked/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "4b388b6bee371be246bbf3dd3895d1ca53ebff9f34a179b754aa76f228c29ea7",
+        "elapsed_s": 3.037656232016161,
+        "completed_requests": 128,
+        "output_tokens_per_second": 42.13775036520295,
+        "input_tokens_per_second": 86298.11274793564,
+        "latency_p95_ms": 270.05028355,
+        "requests_per_second": 42.13775036520295,
+        "latency_median_ms": 180.5549175,
+        "ttft_median_ms": 180.227077,
+        "ttft_p95_ms": 269.71371089999997,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-masked/prefill.json",
+      "artifact_sha256": "bcfdd48b954595a681ff6025cd85800f7ac0001898a3ea7bd17d31ba85ffda40",
+      "post_workload_gpu_memory_mib": [
+        "19449",
+        "19675",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "masked",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-masked/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "80922079ca4b8c11c3ad5f076265de6420aaf313ac4aa039acdc43dc1a199079",
+        "elapsed_s": 9.04192172200419,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1812.0041849210345,
+        "input_tokens_per_second": 25092.01107634792,
+        "latency_p95_ms": 1229.15687,
+        "requests_per_second": 28.312565389391164,
+        "latency_median_ms": 1136.2786035,
+        "ttft_median_ms": 167.9635135,
+        "ttft_p95_ms": 304.5771865,
+        "itl_median_ms": 10.280284,
+        "itl_p95_ms": 44.295655249999996,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.480968865079365,
+        "tpot_p95_ms": 16.467962234126986,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-masked/mixed.json",
+      "artifact_sha256": "94286d46990b45c6675bb1266d06a0ac66714870cb41b9469a0ddbb0ae9350e2",
+      "post_workload_gpu_memory_mib": [
+        "19719",
+        "19675",
+        "70995",
+        "70963"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "masked",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-masked/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e31de30f31a3f4d266a2ddde47c5b6df3ef4ea0d3440bb33aa2ec940350dd5be",
+        "elapsed_s": 18.61276526399888,
+        "completed_requests": 512,
+        "output_tokens_per_second": 7042.048730583931,
+        "input_tokens_per_second": 7042.048730583931,
+        "latency_p95_ms": 6779.7555403999995,
+        "requests_per_second": 27.50800285384348,
+        "latency_median_ms": 4497.3829905,
+        "ttft_median_ms": 133.4510545,
+        "ttft_p95_ms": 2270.8748875,
+        "itl_median_ms": 12.7876565,
+        "itl_p95_ms": 42.75627024999999,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 17.150339733333333,
+        "tpot_p95_ms": 18.174493974509804,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-masked/sustained.json",
+      "artifact_sha256": "ff7797fba560e2951af4ae6285e72dbbe313ec6e496b0770777e23a797ba6139",
+      "post_workload_gpu_memory_mib": [
+        "19719",
+        "19675",
+        "71029",
+        "70963"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "afdep",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-afdep/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e3690aa8fc21b4c7d9442a6a7118917c765e7793127b12a9f24144f8a9daacca",
+        "elapsed_s": 14.191036947013345,
+        "completed_requests": 32,
+        "output_tokens_per_second": 144.31644478460916,
+        "input_tokens_per_second": 72.15822239230458,
+        "latency_p95_ms": 459.04944090000004,
+        "requests_per_second": 2.254944449759518,
+        "latency_median_ms": 443.54503,
+        "ttft_median_ms": 46.289739499999996,
+        "ttft_p95_ms": 52.30085575,
+        "itl_median_ms": 6.2765255,
+        "itl_p95_ms": 6.58339275,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.324638642857143,
+        "tpot_p95_ms": 6.470947754761904,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-afdep/decode.json",
+      "artifact_sha256": "b5e8c787c93f0bccbed2741f8402d899054a5bdf7d07f29fcf40781d5e4b0979",
+      "post_workload_gpu_memory_mib": [
+        "18407",
+        "18435",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "afdep",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-afdep/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "4b388b6bee371be246bbf3dd3895d1ca53ebff9f34a179b754aa76f228c29ea7",
+        "elapsed_s": 2.8599682170024607,
+        "completed_requests": 128,
+        "output_tokens_per_second": 44.755742122951666,
+        "input_tokens_per_second": 91659.75986780501,
+        "latency_p95_ms": 217.93876024999997,
+        "requests_per_second": 44.755742122951666,
+        "latency_median_ms": 173.9236225,
+        "ttft_median_ms": 173.40675249999998,
+        "ttft_p95_ms": 217.48099455,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-afdep/prefill.json",
+      "artifact_sha256": "886b40e7101eb1324686193aefb9c62fe880943ce67bd3cc90b374c5eaeadc83",
+      "post_workload_gpu_memory_mib": [
+        "19397",
+        "19623",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "afdep",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-afdep/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "80922079ca4b8c11c3ad5f076265de6420aaf313ac4aa039acdc43dc1a199079",
+        "elapsed_s": 8.76564721899922,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1869.1146917809194,
+        "input_tokens_per_second": 25882.85774360687,
+        "latency_p95_ms": 1181.391104,
+        "requests_per_second": 29.204917059076866,
+        "latency_median_ms": 1099.667013,
+        "ttft_median_ms": 150.791481,
+        "ttft_p95_ms": 286.69450800000004,
+        "itl_median_ms": 10.404933,
+        "itl_p95_ms": 42.9156209,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.049685547619047,
+        "tpot_p95_ms": 15.827410420634921,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-afdep/mixed.json",
+      "artifact_sha256": "b87af959e552350e5a15999961e88255bd095775288cbe562dc7752ed62e00e0",
+      "post_workload_gpu_memory_mib": [
+        "19667",
+        "19623",
+        "70991",
+        "70931"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "afdep",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-afdep/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e31de30f31a3f4d266a2ddde47c5b6df3ef4ea0d3440bb33aa2ec940350dd5be",
+        "elapsed_s": 19.372647979005706,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6765.827786787009,
+        "input_tokens_per_second": 6765.827786787009,
+        "latency_p95_ms": 7208.810065649999,
+        "requests_per_second": 26.429014792136755,
+        "latency_median_ms": 4815.316527999999,
+        "ttft_median_ms": 148.55970200000002,
+        "ttft_p95_ms": 2390.4690513999994,
+        "itl_median_ms": 12.8973215,
+        "itl_p95_ms": 43.0816258,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.40565512745098,
+        "tpot_p95_ms": 18.943693327058824,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-afdep/sustained.json",
+      "artifact_sha256": "c1995b735bafbb5ef42c45bcecc8ef30cdf774d48b0d86a0c9a10d039a670728",
+      "post_workload_gpu_memory_mib": [
+        "19667",
+        "19623",
+        "71025",
+        "71061"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "p2p",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-p2p/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e3690aa8fc21b4c7d9442a6a7118917c765e7793127b12a9f24144f8a9daacca",
+        "elapsed_s": 18.329453054990154,
+        "completed_requests": 32,
+        "output_tokens_per_second": 111.73273931610504,
+        "input_tokens_per_second": 55.86636965805252,
+        "latency_p95_ms": 583.04978105,
+        "requests_per_second": 1.7458240518141412,
+        "latency_median_ms": 573.1204715,
+        "ttft_median_ms": 113.34962150000001,
+        "ttft_p95_ms": 125.34201795,
+        "itl_median_ms": 7.257664500000001,
+        "itl_p95_ms": 7.4246995,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 7.263591357142857,
+        "tpot_p95_ms": 7.315545813492063,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-p2p/decode.json",
+      "artifact_sha256": "6deaab8aed8ee6495f8922d1ea883292486026e7a9745768331e3d42fedfb477",
+      "post_workload_gpu_memory_mib": [
+        "19871",
+        "19871",
+        "70855",
+        "70855"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "p2p",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-p2p/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "4b388b6bee371be246bbf3dd3895d1ca53ebff9f34a179b754aa76f228c29ea7",
+        "elapsed_s": 5.72923781699501,
+        "completed_requests": 128,
+        "output_tokens_per_second": 22.34154072297458,
+        "input_tokens_per_second": 45755.47540065194,
+        "latency_p95_ms": 365.1915969,
+        "requests_per_second": 22.34154072297458,
+        "latency_median_ms": 355.8197325,
+        "ttft_median_ms": 355.506248,
+        "ttft_p95_ms": 364.61255765,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-p2p/prefill.json",
+      "artifact_sha256": "9df63b62785d9d9f1fe49c3e388191933858f0566ce6e999c34585af81d32738",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "70943",
+        "70943"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "p2p",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-p2p/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "80922079ca4b8c11c3ad5f076265de6420aaf313ac4aa039acdc43dc1a199079",
+        "elapsed_s": 15.97105268901214,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1025.8559857655446,
+        "input_tokens_per_second": 14205.701052886154,
+        "latency_p95_ms": 2201.69175825,
+        "requests_per_second": 16.028999777586634,
+        "latency_median_ms": 2032.4371449999999,
+        "ttft_median_ms": 290.22697300000004,
+        "ttft_p95_ms": 592.7690627500001,
+        "itl_median_ms": 14.890977,
+        "itl_p95_ms": 96.37234425,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 26.380010301587298,
+        "tpot_p95_ms": 29.03434962301587,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-p2p/mixed.json",
+      "artifact_sha256": "52aa6a288ddf1e99327a8519d8f2103744699dc2c23cd0ce6d014daf4183ec3e",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19935",
+        "71021",
+        "70999"
+      ]
+    },
+    {
+      "repeat": 3,
+      "variant": "p2p",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r3-p2p/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9245,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e31de30f31a3f4d266a2ddde47c5b6df3ef4ea0d3440bb33aa2ec940350dd5be",
+        "elapsed_s": 22.179918270994676,
+        "completed_requests": 512,
+        "output_tokens_per_second": 5909.489764504979,
+        "input_tokens_per_second": 5909.489764504979,
+        "latency_p95_ms": 6401.09905625,
+        "requests_per_second": 23.083944392597573,
+        "latency_median_ms": 5512.323007999999,
+        "ttft_median_ms": 292.0663195,
+        "ttft_p95_ms": 1083.9336038,
+        "itl_median_ms": 16.827748999999997,
+        "itl_p95_ms": 24.54551775,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 20.503844164705882,
+        "tpot_p95_ms": 21.168966260392157,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r3-p2p/sustained.json",
+      "artifact_sha256": "844f701c28d3ea280fa04baa40d67da9e7084d33a1244784945b4362753a38d4",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19935",
+        "71067",
+        "70999"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "afdep",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-afdep/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e968acc4bc5f85bce44121f9133ac2d3fcbe1eabd24192b031dff652d395d1d4",
+        "elapsed_s": 13.997665975010023,
+        "completed_requests": 32,
+        "output_tokens_per_second": 146.3101065317808,
+        "input_tokens_per_second": 73.1550532658904,
+        "latency_p95_ms": 454.76482895,
+        "requests_per_second": 2.286095414559075,
+        "latency_median_ms": 437.9504285,
+        "ttft_median_ms": 46.720298,
+        "ttft_p95_ms": 53.60218975,
+        "itl_median_ms": 6.218273,
+        "itl_p95_ms": 6.4824737500000005,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.196144031746032,
+        "tpot_p95_ms": 6.39973988015873,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-afdep/decode.json",
+      "artifact_sha256": "754414fb3ce26a360978b8c5ca7b1c379fe8d75e494ab49d5d206e9f8be5c5e5",
+      "post_workload_gpu_memory_mib": [
+        "18419",
+        "18419",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "afdep",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-afdep/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "343354729c9fbdae043d2782f0c9be28c79950cce0332212d986d663101fffc9",
+        "elapsed_s": 2.72598520500469,
+        "completed_requests": 128,
+        "output_tokens_per_second": 46.95550062597635,
+        "input_tokens_per_second": 96164.86528199956,
+        "latency_p95_ms": 207.4885443,
+        "requests_per_second": 46.95550062597635,
+        "latency_median_ms": 166.29616049999998,
+        "ttft_median_ms": 165.800125,
+        "ttft_p95_ms": 206.94097785,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-afdep/prefill.json",
+      "artifact_sha256": "50649e178caf7f0e1cad1a34a4339c820ffc592562c16e25eedea7f956db93aa",
+      "post_workload_gpu_memory_mib": [
+        "19577",
+        "19405",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "afdep",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-afdep/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "7fc93426228c80fe9e3eea8fe4d19e7023b62f1ec5540d0f6b6b514f130a6ac5",
+        "elapsed_s": 8.540755583991995,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1918.3314449026805,
+        "input_tokens_per_second": 26564.394422578134,
+        "latency_p95_ms": 1218.9852845,
+        "requests_per_second": 29.973928826604382,
+        "latency_median_ms": 1052.873435,
+        "ttft_median_ms": 140.538096,
+        "ttft_p95_ms": 309.743764,
+        "itl_median_ms": 10.2553345,
+        "itl_p95_ms": 42.193554999999996,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.400841968253967,
+        "tpot_p95_ms": 16.10608277777778,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-afdep/mixed.json",
+      "artifact_sha256": "93aa65470df78752566990c36a42873ae3784ee0bea4d3e02e0cfda060e55b26",
+      "post_workload_gpu_memory_mib": [
+        "19577",
+        "19405",
+        "70981",
+        "70933"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "afdep",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-afdep/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "08c64caa2ce7e731c3a471601f8d78119b34644201809dd4900f5e04f250c578",
+        "elapsed_s": 19.12697372099501,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6852.730699165799,
+        "input_tokens_per_second": 6852.730699165799,
+        "latency_p95_ms": 7092.1731454,
+        "requests_per_second": 26.7684792936164,
+        "latency_median_ms": 4846.7568855,
+        "ttft_median_ms": 135.467588,
+        "ttft_p95_ms": 2298.5837568499996,
+        "itl_median_ms": 12.701971,
+        "itl_p95_ms": 41.83278224999998,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.394567209803924,
+        "tpot_p95_ms": 18.79183109176471,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-afdep/sustained.json",
+      "artifact_sha256": "aaebc12d215b2e169dabd285572f648981d4e679899a18548a0f771201ddf6f3",
+      "post_workload_gpu_memory_mib": [
+        "19577",
+        "19405",
+        "71073",
+        "70965"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "p2p",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-p2p/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e968acc4bc5f85bce44121f9133ac2d3fcbe1eabd24192b031dff652d395d1d4",
+        "elapsed_s": 18.385779459989863,
+        "completed_requests": 32,
+        "output_tokens_per_second": 111.39043653040366,
+        "input_tokens_per_second": 55.69521826520183,
+        "latency_p95_ms": 581.1821255,
+        "requests_per_second": 1.7404755707875572,
+        "latency_median_ms": 574.2555475,
+        "ttft_median_ms": 101.118795,
+        "ttft_p95_ms": 108.28907705,
+        "itl_median_ms": 7.4935855,
+        "itl_p95_ms": 7.6299150000000004,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 7.483735984126984,
+        "tpot_p95_ms": 7.535032934126984,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-p2p/decode.json",
+      "artifact_sha256": "c25465fb3cc89a459495b4ea9d21e96583627d5101572075d046ef9edd59e16c",
+      "post_workload_gpu_memory_mib": [
+        "19871",
+        "19871",
+        "70855",
+        "70855"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "p2p",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-p2p/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "343354729c9fbdae043d2782f0c9be28c79950cce0332212d986d663101fffc9",
+        "elapsed_s": 5.408128356008092,
+        "completed_requests": 128,
+        "output_tokens_per_second": 23.668077304008513,
+        "input_tokens_per_second": 48472.222318609434,
+        "latency_p95_ms": 359.8976813,
+        "requests_per_second": 23.668077304008513,
+        "latency_median_ms": 334.5324895,
+        "ttft_median_ms": 334.203062,
+        "ttft_p95_ms": 359.32665275,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-p2p/prefill.json",
+      "artifact_sha256": "56a775ef7c7bcade691ceff81ad3f1f3b32b2e6f0b0f051aaaf828099e34303d",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "70943",
+        "70943"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "p2p",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-p2p/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "7fc93426228c80fe9e3eea8fe4d19e7023b62f1ec5540d0f6b6b514f130a6ac5",
+        "elapsed_s": 15.813502706994768,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1036.0765924903458,
+        "input_tokens_per_second": 14347.232501477642,
+        "latency_p95_ms": 2129.1636175000003,
+        "requests_per_second": 16.188696757661653,
+        "latency_median_ms": 1986.6588849999998,
+        "ttft_median_ms": 280.7500745,
+        "ttft_p95_ms": 548.566303,
+        "itl_median_ms": 15.2022695,
+        "itl_p95_ms": 90.73264925000001,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 26.84433053174603,
+        "tpot_p95_ms": 29.058102424603174,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-p2p/mixed.json",
+      "artifact_sha256": "4661a8d1107489c1d800240cae1043fea2dfbcf6942f0f9faeb435e9128f6c66",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "71019",
+        "70945"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "p2p",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-p2p/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "08c64caa2ce7e731c3a471601f8d78119b34644201809dd4900f5e04f250c578",
+        "elapsed_s": 20.839994760986883,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6289.444959236307,
+        "input_tokens_per_second": 6289.444959236307,
+        "latency_p95_ms": 5465.2276720499995,
+        "requests_per_second": 24.568144372016825,
+        "latency_median_ms": 5176.577413999999,
+        "ttft_median_ms": 339.05679,
+        "ttft_p95_ms": 721.4802207,
+        "itl_median_ms": 17.060152000000002,
+        "itl_p95_ms": 23.122909499999988,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.90983261372549,
+        "tpot_p95_ms": 19.349169904313726,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-p2p/sustained.json",
+      "artifact_sha256": "72f0a46945059b5041fb001631da71601f7ede3870ab65039a4c6afdfd81acf4",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19933",
+        "71051",
+        "70945"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "masked",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-masked/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "e968acc4bc5f85bce44121f9133ac2d3fcbe1eabd24192b031dff652d395d1d4",
+        "elapsed_s": 14.05992498199339,
+        "completed_requests": 32,
+        "output_tokens_per_second": 145.66222811450865,
+        "input_tokens_per_second": 72.83111405725433,
+        "latency_p95_ms": 451.062066,
+        "requests_per_second": 2.2759723142891977,
+        "latency_median_ms": 440.5210165,
+        "ttft_median_ms": 46.327695000000006,
+        "ttft_p95_ms": 50.9391061,
+        "itl_median_ms": 6.2316905,
+        "itl_p95_ms": 6.46915575,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.2537109285714285,
+        "tpot_p95_ms": 6.396478854761905,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-masked/decode.json",
+      "artifact_sha256": "06502d7a7ff9d6d46bd4dcc91993b81629a4112186c756267afe3df5561b7c6c",
+      "post_workload_gpu_memory_mib": [
+        "18471",
+        "18471",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "masked",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-masked/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "343354729c9fbdae043d2782f0c9be28c79950cce0332212d986d663101fffc9",
+        "elapsed_s": 2.922143698990112,
+        "completed_requests": 128,
+        "output_tokens_per_second": 43.80345841453197,
+        "input_tokens_per_second": 89709.48283296147,
+        "latency_p95_ms": 232.86673539999992,
+        "requests_per_second": 43.80345841453197,
+        "latency_median_ms": 173.103488,
+        "ttft_median_ms": 172.7100785,
+        "ttft_p95_ms": 232.54757349999994,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-masked/prefill.json",
+      "artifact_sha256": "c0913f22e4527f9cf9c03b6a4c1e133c341bf8c21fd052a1e01444ca87bfb38f",
+      "post_workload_gpu_memory_mib": [
+        "19629",
+        "19457",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "masked",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-masked/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "7fc93426228c80fe9e3eea8fe4d19e7023b62f1ec5540d0f6b6b514f130a6ac5",
+        "elapsed_s": 8.353168896021089,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1961.411316345379,
+        "input_tokens_per_second": 27160.949673610816,
+        "latency_p95_ms": 1140.3383912499999,
+        "requests_per_second": 30.647051817896546,
+        "latency_median_ms": 1044.9564995,
+        "ttft_median_ms": 136.358118,
+        "ttft_p95_ms": 289.87549449999995,
+        "itl_median_ms": 10.288165,
+        "itl_p95_ms": 43.64155785,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.06449969047619,
+        "tpot_p95_ms": 15.098136337301588,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-masked/mixed.json",
+      "artifact_sha256": "babd7de6531630311179e223eae040c33dc5b415b7b132d8b48bf2bd408d032f",
+      "post_workload_gpu_memory_mib": [
+        "19629",
+        "19567",
+        "70955",
+        "70909"
+      ]
+    },
+    {
+      "repeat": 4,
+      "variant": "masked",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r4-masked/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9246,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "08c64caa2ce7e731c3a471601f8d78119b34644201809dd4900f5e04f250c578",
+        "elapsed_s": 18.17745920800371,
+        "completed_requests": 512,
+        "output_tokens_per_second": 7210.6887161813975,
+        "input_tokens_per_second": 7210.6887161813975,
+        "latency_p95_ms": 6702.214282049999,
+        "requests_per_second": 28.166752797583584,
+        "latency_median_ms": 4196.2503035,
+        "ttft_median_ms": 141.7156475,
+        "ttft_p95_ms": 2092.9982252,
+        "itl_median_ms": 12.6397425,
+        "itl_p95_ms": 42.116999699999994,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.970449456862745,
+        "tpot_p95_ms": 18.196981773333334,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r4-masked/sustained.json",
+      "artifact_sha256": "46ca995da41d880a95ee45d428c6c468ee997205f8441ed41f9bf4fdd95456a9",
+      "post_workload_gpu_memory_mib": [
+        "19629",
+        "19567",
+        "70987",
+        "71023"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "afdep",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-afdep/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "5919b0406d37b66211c1c46fd3715b3deeb4274f8b316e5ed31f38870c247683",
+        "elapsed_s": 14.113058432994876,
+        "completed_requests": 32,
+        "output_tokens_per_second": 145.1138326765506,
+        "input_tokens_per_second": 72.5569163382753,
+        "latency_p95_ms": 455.82768645,
+        "requests_per_second": 2.267403635571103,
+        "latency_median_ms": 441.22774100000004,
+        "ttft_median_ms": 44.499082,
+        "ttft_p95_ms": 50.447362150000004,
+        "itl_median_ms": 6.3099295,
+        "itl_p95_ms": 6.52629425,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.274521373015872,
+        "tpot_p95_ms": 6.459174991269841,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-afdep/decode.json",
+      "artifact_sha256": "7fbbb0598d2a910db0faccefb780605e74c4ae63df03fc3d10ec2f0e593c905b",
+      "post_workload_gpu_memory_mib": [
+        "18377",
+        "18405",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "afdep",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-afdep/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "407a32ee78c55998317250107ff6979326a41430ee8c3acb6d8361ca68e04f2c",
+        "elapsed_s": 2.7344080439943355,
+        "completed_requests": 128,
+        "output_tokens_per_second": 46.81086287802961,
+        "input_tokens_per_second": 95868.64717420464,
+        "latency_p95_ms": 209.49987075,
+        "requests_per_second": 46.81086287802961,
+        "latency_median_ms": 166.98942499999998,
+        "ttft_median_ms": 166.53570000000002,
+        "ttft_p95_ms": 208.9396584,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-afdep/prefill.json",
+      "artifact_sha256": "bfb4d25a5db4e85b0b477fc9ca3671ad5c8688e39b3f93be28b8fd421a58aff9",
+      "post_workload_gpu_memory_mib": [
+        "19679",
+        "19481",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "afdep",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-afdep/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "82832c788411261cdda84bd3895e538e71557d4697d9f1f05d829924719ba669",
+        "elapsed_s": 8.706827231973875,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1881.7417141152664,
+        "input_tokens_per_second": 26057.712408353982,
+        "latency_p95_ms": 1175.31955375,
+        "requests_per_second": 29.402214283051038,
+        "latency_median_ms": 1098.1791015,
+        "ttft_median_ms": 127.635529,
+        "ttft_p95_ms": 275.67468125,
+        "itl_median_ms": 10.544703,
+        "itl_p95_ms": 40.65508515,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 15.048109222222223,
+        "tpot_p95_ms": 16.0145939484127,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-afdep/mixed.json",
+      "artifact_sha256": "8ede791a8626c9c97c2e5c7000fa803d54d8ddda7a6f6cd6d1904eb7137a81fa",
+      "post_workload_gpu_memory_mib": [
+        "19679",
+        "19481",
+        "70933",
+        "70935"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "afdep",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-afdep/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "2884a69ae6281265dd358d79086dd2440090f254abf4fb4b7dede3b896595e13",
+        "elapsed_s": 18.634879307996016,
+        "completed_requests": 512,
+        "output_tokens_per_second": 7033.691918989703,
+        "input_tokens_per_second": 7033.691918989703,
+        "latency_p95_ms": 6865.15448615,
+        "requests_per_second": 27.475359058553526,
+        "latency_median_ms": 4645.9841575,
+        "ttft_median_ms": 125.127723,
+        "ttft_p95_ms": 2218.4655497,
+        "itl_median_ms": 12.7148585,
+        "itl_p95_ms": 40.371562049999994,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 17.830637558823533,
+        "tpot_p95_ms": 18.325203828039214,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-afdep/sustained.json",
+      "artifact_sha256": "33df97b49f3437209e76abc5bbd19d638085a60316201f7794eae63324044724",
+      "post_workload_gpu_memory_mib": [
+        "19679",
+        "19481",
+        "70999",
+        "71031"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "masked",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-masked/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "5919b0406d37b66211c1c46fd3715b3deeb4274f8b316e5ed31f38870c247683",
+        "elapsed_s": 14.008304016984766,
+        "completed_requests": 32,
+        "output_tokens_per_second": 146.19899721742505,
+        "input_tokens_per_second": 73.09949860871252,
+        "latency_p95_ms": 450.78610585,
+        "requests_per_second": 2.2843593315222663,
+        "latency_median_ms": 440.663491,
+        "ttft_median_ms": 47.61065,
+        "ttft_p95_ms": 56.14950065,
+        "itl_median_ms": 6.224569000000001,
+        "itl_p95_ms": 6.459815,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 6.196787666666667,
+        "tpot_p95_ms": 6.388267067460317,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-masked/decode.json",
+      "artifact_sha256": "82fafd9b64710abcf3f62377878ae655fd01883483921dbf431cf748fc913060",
+      "post_workload_gpu_memory_mib": [
+        "18429",
+        "18457",
+        "70819",
+        "70819"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "masked",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-masked/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "407a32ee78c55998317250107ff6979326a41430ee8c3acb6d8361ca68e04f2c",
+        "elapsed_s": 2.9247880099865142,
+        "completed_requests": 128,
+        "output_tokens_per_second": 43.76385555566819,
+        "input_tokens_per_second": 89628.37617800845,
+        "latency_p95_ms": 219.96345755,
+        "requests_per_second": 43.76385555566819,
+        "latency_median_ms": 178.03004299999998,
+        "ttft_median_ms": 177.616387,
+        "ttft_p95_ms": 219.4620677,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-masked/prefill.json",
+      "artifact_sha256": "6d3c669659ab4cdbda3fdd0e85759dbbe00ad9db4f47ef87cf95b8a1d175c9cb",
+      "post_workload_gpu_memory_mib": [
+        "19731",
+        "19643",
+        "70907",
+        "70907"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "masked",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-masked/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "82832c788411261cdda84bd3895e538e71557d4697d9f1f05d829924719ba669",
+        "elapsed_s": 8.782498265005415,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1865.5284072509746,
+        "input_tokens_per_second": 25833.196108221502,
+        "latency_p95_ms": 1196.40338425,
+        "requests_per_second": 29.14888136329648,
+        "latency_median_ms": 1101.5315704999998,
+        "ttft_median_ms": 141.089314,
+        "ttft_p95_ms": 290.80631074999997,
+        "itl_median_ms": 10.405311000000001,
+        "itl_p95_ms": 44.135550599999995,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 14.7986395,
+        "tpot_p95_ms": 16.131824785714286,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-masked/mixed.json",
+      "artifact_sha256": "c014af299ab3bcdf7da59f77b24563b38f2efe0658fca2822ecc88e561bb5e66",
+      "post_workload_gpu_memory_mib": [
+        "19867",
+        "19643",
+        "70977",
+        "70933"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "masked",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-masked/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "2884a69ae6281265dd358d79086dd2440090f254abf4fb4b7dede3b896595e13",
+        "elapsed_s": 19.014599661983084,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6893.229535726662,
+        "input_tokens_per_second": 6893.229535726662,
+        "latency_p95_ms": 7120.9473023,
+        "requests_per_second": 26.926677873932274,
+        "latency_median_ms": 4593.773881,
+        "ttft_median_ms": 135.21889850000002,
+        "ttft_p95_ms": 2314.4667455,
+        "itl_median_ms": 12.67375,
+        "itl_p95_ms": 43.443067649999996,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 17.53741365098039,
+        "tpot_p95_ms": 18.880423404901958,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-masked/sustained.json",
+      "artifact_sha256": "8871b64e237fe7b00298ad47583a51fa91e7c80f7070514d94d72126b502f292",
+      "post_workload_gpu_memory_mib": [
+        "19867",
+        "19643",
+        "70977",
+        "70993"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "p2p",
+      "workload": "decode",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-p2p/decode.json",
+          "requests": 32,
+          "concurrency": 1,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            32
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "5919b0406d37b66211c1c46fd3715b3deeb4274f8b316e5ed31f38870c247683",
+        "elapsed_s": 18.480018381989794,
+        "completed_requests": 32,
+        "output_tokens_per_second": 110.82240058786599,
+        "input_tokens_per_second": 55.41120029393299,
+        "latency_p95_ms": 584.98164055,
+        "requests_per_second": 1.731600009185406,
+        "latency_median_ms": 576.190201,
+        "ttft_median_ms": 103.8945775,
+        "ttft_p95_ms": 112.17942835,
+        "itl_median_ms": 7.5006070000000005,
+        "itl_p95_ms": 7.6363242499999995,
+        "itl_observed_intervals": 2016,
+        "itl_possible_intervals": 2016,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 7.497809317460318,
+        "tpot_p95_ms": 7.554172204761905,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-p2p/decode.json",
+      "artifact_sha256": "7e1b36a1df66b0ca9c7d87e5c8a021d3f780266142aa9cd6916a9495c5f8b10b",
+      "post_workload_gpu_memory_mib": [
+        "19871",
+        "19871",
+        "70855",
+        "70855"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "p2p",
+      "workload": "prefill",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-p2p/prefill.json",
+          "requests": 128,
+          "concurrency": 8,
+          "output_tokens": 1,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "407a32ee78c55998317250107ff6979326a41430ee8c3acb6d8361ca68e04f2c",
+        "elapsed_s": 5.768161391984904,
+        "completed_requests": 128,
+        "output_tokens_per_second": 22.190779921286744,
+        "input_tokens_per_second": 45446.71727879525,
+        "latency_p95_ms": 437.7717975,
+        "requests_per_second": 22.190779921286744,
+        "latency_median_ms": 349.95265600000005,
+        "ttft_median_ms": 349.5992,
+        "ttft_p95_ms": 437.3351732,
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "itl_observed_intervals": 0,
+        "itl_possible_intervals": 0,
+        "itl_observed_fraction": null,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-p2p/prefill.json",
+      "artifact_sha256": "829821a73c352670776c61c7172ed8ef6a4a7cf5017d1bb7f3f498daa46f3c04",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19933",
+        "70943",
+        "70943"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "p2p",
+      "workload": "mixed",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-p2p/mixed.json",
+          "requests": 256,
+          "concurrency": 32,
+          "output_tokens": 64,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            32,
+            128,
+            512,
+            1024,
+            1536,
+            2048
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "82832c788411261cdda84bd3895e538e71557d4697d9f1f05d829924719ba669",
+        "elapsed_s": 15.344701513997279,
+        "completed_requests": 256,
+        "output_tokens_per_second": 1067.7301207230837,
+        "input_tokens_per_second": 14785.559679544265,
+        "latency_p95_ms": 2130.2483817499997,
+        "requests_per_second": 16.683283136298183,
+        "latency_median_ms": 1925.760318,
+        "ttft_median_ms": 286.290792,
+        "ttft_p95_ms": 554.7003972499999,
+        "itl_median_ms": 15.1921045,
+        "itl_p95_ms": 95.03025774999999,
+        "itl_observed_intervals": 16128,
+        "itl_possible_intervals": 16128,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 25.141469373015873,
+        "tpot_p95_ms": 27.954962535714287,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-p2p/mixed.json",
+      "artifact_sha256": "07f78a3cd393906262d04fcf09d5b5f5e4d1639e3bf83160993cf92270e319ff",
+      "post_workload_gpu_memory_mib": [
+        "19933",
+        "19935",
+        "70991",
+        "70967"
+      ]
+    },
+    {
+      "repeat": 5,
+      "variant": "p2p",
+      "workload": "sustained",
+      "result": {
+        "config": {
+          "url": "http://127.0.0.1:18305",
+          "model": "afdep-regression",
+          "output": "/work/results-v2/r5-p2p/sustained.json",
+          "requests": 512,
+          "concurrency": 128,
+          "output_tokens": 256,
+          "warmup": 8,
+          "seed": 9247,
+          "input_tokens": [
+            256
+          ]
+        },
+        "schema_version": 1,
+        "status": "complete",
+        "load_mode": "closed_loop",
+        "prompt_sha256": "2884a69ae6281265dd358d79086dd2440090f254abf4fb4b7dede3b896595e13",
+        "elapsed_s": 20.86360884399619,
+        "completed_requests": 512,
+        "output_tokens_per_second": 6282.326369328856,
+        "input_tokens_per_second": 6282.326369328856,
+        "latency_p95_ms": 5533.2316018,
+        "requests_per_second": 24.540337380190845,
+        "latency_median_ms": 5142.133991,
+        "ttft_median_ms": 348.15289199999995,
+        "ttft_p95_ms": 756.7400924,
+        "itl_median_ms": 16.8047695,
+        "itl_p95_ms": 23.24289309999999,
+        "itl_observed_intervals": 130560,
+        "itl_possible_intervals": 130560,
+        "itl_observed_fraction": 1.0,
+        "tpot_median_ms": 18.644765286274513,
+        "tpot_p95_ms": 19.513674984705883,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      },
+      "artifact": "r5-p2p/sustained.json",
+      "artifact_sha256": "757b2494d0efbe6f73a136218f74c85a756cd16f950f263af0097707346bc0ff",
+      "post_workload_gpu_memory_mib": [
+        "19935",
+        "19935",
+        "70991",
+        "70999"
+      ]
+    }
+  ]
+}

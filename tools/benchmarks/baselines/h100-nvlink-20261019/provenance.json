@@ -1,0 +1,20 @@
+{
+  "date": "2026-10-19",
+  "scope": "Synthetic closed-loop serving; one NVLink domain; no RoCE or production SLO claim",
+  "runtime_image": "ghcr.io/ronenkat/afd-plugin-e2e:e2e-f82ab8a",
+  "runtime_source_archive_sha256": "63f32ad0b9f5f60e524c3b9f4f945b468431c83ab9a2afbf221f486df477534d",
+  "manifest_sha256": "97ca66ddb43fc72eb8df8f97f685416bd63c1f2b024769f6392982f11cdc6fd1",
+  "raw_serving_archive_sha256": "de31d6f4dd0df0b92841f695b1d2233ac0244bcb256e597fa92797094bf75973",
+  "raw_artifacts": "Request token events, launch commands and role logs retained outside Git; per-file request hashes are in manifest",
+  "verified_request_artifacts": 72,
+  "measured_requests": 16704,
+  "nccl_observation": {
+    "nccl_runtime_version_code": 23007,
+    "nccl_library_sha256": "618968ee277041751512e619190132a9bdf351c3ce7129c73484f6ef441ad692",
+    "scope": "Post-campaign observation of unchanged NCCL library; Torch-reported tuple in manifest is its build version"
+  },
+  "runtime_unit_tests": {
+    "returncode": 0
+  },
+  "reporting_note": "Campaign source was frozen before reporting/metadata guards and untimed BF16 reference corrections; native connector and serving launch settings match this branch"
+}
