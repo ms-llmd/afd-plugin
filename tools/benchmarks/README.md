@@ -64,11 +64,42 @@ match Masked on all **256/256** tested C1 sequences per setup.
 | All controls + confidence intervals | [Comparison](baselines/h100-nvlink-v2-20261019/comparison.json) | [Comparison](baselines/h200-nvlink-v2-20261019/comparison.json) |
 | Frozen runtime + backup provenance | [Provenance](baselines/h100-nvlink-v2-20261019/provenance.json) | [Provenance](baselines/h200-nvlink-v2-20261019/provenance.json) |
 | Scoped decode token parity | [256 sequences](baselines/h100-nvlink-v2-20261019/decode-parity.json) | [256 sequences](baselines/h200-nvlink-v2-20261019/decode-parity.json) |
+| Fresh exchange + memory sweeps | [18 configurations](baselines/h100-nvlink-v2-20261019/exchange-index.json) | [18 configurations](baselines/h200-nvlink-v2-20261019/exchange-index.json) |
+| Nsight kernel/host metrics + coverage | [Profile](baselines/h100-nvlink-v2-20261019/profiling.json) | [Profile](baselines/h200-nvlink-v2-20261019/profiling.json) |
 
 All four use decode graphs and eager prefill. Startup/capture/warmup are excluded;
 runtime replay is included. These finite synthetic loads include ramp-up/drain.
 P2P uses BF16/FFN routing; routed connectors use FP8/Attention routing. Full raw
 streams and logs are retained outside Git with verified archive/file hashes.
+
+<details>
+<summary>Communication allocations and serving traces</summary>
+
+![Fresh three-connector memory comparison](baselines/routed-v2-diagnostics-20261019/memory.png)
+
+V2 registered capacity is **63–69% smaller than Masked** here. Its PyTorch
+allocator peak is higher than v1's; these columns measure different quantities
+and are not total serving VRAM.
+
+![FP8 exchange across all execution modes](baselines/routed-v2-diagnostics-20261019/exchange-fp8.png)
+
+The 36 fresh jobs cover BF16/FP8 × graph/count-synchronized eager/capacity eager
+for all three routed connectors. Six blocks per process show observed ranges,
+not independent confidence intervals. Weighted identity touches receive capacity;
+these timings exclude expert GEMMs and are not pure network bandwidth.
+
+![H100 common-window serving trace](baselines/h100-nvlink-v2-20261019/nsight-timeline.png)
+
+![H200 common-window serving trace](baselines/h200-nvlink-v2-20261019/nsight-timeline.png)
+
+FFN CUDA records end early in sustained captures. Analysis uses the common
+four-GPU recorded extent: **88–92% H100 / 87–90% H200** of those client windows.
+Omitted tails are explicit. Long reply/receive kernels include waits for expert
+compute and peer progress; shared blocking metadata calls remain. Their spans
+are not removable CPU costs, additive phases or utilization measurements.
+Sustained serving mixes decode graphs with new eager prefill work.
+
+</details>
 
 <details>
 <summary>Earlier three-way baselines and v1 diagnosis</summary>
