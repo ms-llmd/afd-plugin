@@ -1,0 +1,102 @@
+{
+  "scope": "Supplementary dispatch + PyTorch weighted identity reply + combine, not network-only or serving performance; reply work spans receive capacity including padding",
+  "source_sha256": "0bd32437fd6fc39cbc5abb4763d78bd93f75b1cc9f7fd48c1928d7c4b431a7fd",
+  "runs": [
+    {
+      "mode": "graph",
+      "payload": "fp8",
+      "variant": "masked",
+      "artifact": "exchange/graph-fp8-masked.json",
+      "sha256": "770010336b5c846617a1483ca62a8a873f412b173c2dc552a9c5c0b90fb37563",
+      "returncode": 0
+    },
+    {
+      "mode": "graph",
+      "payload": "fp8",
+      "variant": "afdep",
+      "artifact": "exchange/graph-fp8-afdep.json",
+      "sha256": "c7827aee33062f16b0266c0cdc9d79c701062fc9674bad607d213e021858c02f",
+      "returncode": 0
+    },
+    {
+      "mode": "graph",
+      "payload": "bf16",
+      "variant": "masked",
+      "artifact": "exchange/graph-bf16-masked.json",
+      "sha256": "70f87420710d3b0dc6bc39bca4d8b502432e5ec9a016ac30ee6f8f56fa055c15",
+      "returncode": 0
+    },
+    {
+      "mode": "graph",
+      "payload": "bf16",
+      "variant": "afdep",
+      "artifact": "exchange/graph-bf16-afdep.json",
+      "sha256": "e545db2a2b9d546c8e5bcb5b0fc99595519c7cdd01869b597ff8b6e5c18d2c1c",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-sync",
+      "payload": "fp8",
+      "variant": "masked",
+      "artifact": "exchange/eager-sync-fp8-masked.json",
+      "sha256": "5eb1e914e971b06d5000afe5836a0515bfc305d51dbc67a4c2043d501a810613",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-sync",
+      "payload": "fp8",
+      "variant": "afdep",
+      "artifact": "exchange/eager-sync-fp8-afdep.json",
+      "sha256": "f89c9dac889c1a865e80adc4b44c3efe4e85defe26d78ab2ce1e4c5a02343c12",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-sync",
+      "payload": "bf16",
+      "variant": "masked",
+      "artifact": "exchange/eager-sync-bf16-masked.json",
+      "sha256": "0f216300e4a646b9a36bfaafb6684992985bf86e8518a898db62a1eaafad1885",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-sync",
+      "payload": "bf16",
+      "variant": "afdep",
+      "artifact": "exchange/eager-sync-bf16-afdep.json",
+      "sha256": "b412070be2779547b9cec6455c938142e278874fd251560449babae01abd5465",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-capacity",
+      "payload": "fp8",
+      "variant": "masked",
+      "artifact": "exchange/eager-capacity-fp8-masked.json",
+      "sha256": "ef4e8699c13bbac3a5211552e17cd96e5cba1f3fcc84c100def47ff5895d1199",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-capacity",
+      "payload": "fp8",
+      "variant": "afdep",
+      "artifact": "exchange/eager-capacity-fp8-afdep.json",
+      "sha256": "f7d734d246d97d707b9774558660af93d8fe8d6afc5a3c9f0c90bbba68c21319",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-capacity",
+      "payload": "bf16",
+      "variant": "masked",
+      "artifact": "exchange/eager-capacity-bf16-masked.json",
+      "sha256": "ca4bad19059564cd24614c84a331feddd7d0c08431a95c853c81f339e7649f2b",
+      "returncode": 0
+    },
+    {
+      "mode": "eager-capacity",
+      "payload": "bf16",
+      "variant": "afdep",
+      "artifact": "exchange/eager-capacity-bf16-afdep.json",
+      "sha256": "8d0fac5d291899e229d127e6779b25e1622cc2ff8be60c7e72470b9507718273",
+      "returncode": 0
+    }
+  ]
+}

@@ -55,6 +55,7 @@ P95 TTFT than P2P despite higher throughput.
 | Measurements + request hashes | [Manifest](baselines/h100-nvlink-20261019/manifest.json) | [Manifest](baselines/h200-nvlink-20261019/manifest.json) |
 | Ratios + 95% intervals + gates | [Comparison](baselines/h100-nvlink-20261019/comparison.json) | [Comparison](baselines/h200-nvlink-20261019/comparison.json) |
 | Runtime + archive provenance | [Provenance](baselines/h100-nvlink-20261019/provenance.json) | [Provenance](baselines/h200-nvlink-20261019/provenance.json) |
+| Exchange diagnostics | [12 passing jobs](baselines/h100-nvlink-20261019/exchange-index.json) | [12 passing jobs](baselines/h200-nvlink-20261019/exchange-index.json) |
 | Single-request decode parity | [192/192 sequences](baselines/h100-nvlink-20261019/decode-parity.json) | [192/192 sequences](baselines/h200-nvlink-20261019/decode-parity.json) |
 
 Parity covers seeded synthetic decode at concurrency 1, not general model
@@ -62,6 +63,11 @@ accuracy or concurrent-output equivalence. Full request events and role logs
 are retained outside Git; the manifests contain their request-artifact hashes.
 The initial manifest's `nccl_runtime` tuple is PyTorch's **build** version;
 provenance separately verifies the loaded NCCL library as 2.30.7.
+
+In the 2,048-token FP8 graph diagnostic, v1 removes **576 MiB** of unused
+Attention payload arenas across two ranks. Registered transport capacity remains
+**130 MiB** across four ranks. PyTorch allocation and registered capacity are
+separate measurements; the serving GPU-memory snapshots are neither of these.
 
 ## Matrix
 
