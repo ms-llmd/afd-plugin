@@ -7,7 +7,7 @@ import json
 import statistics
 from pathlib import Path
 
-from tools.benchmarks.afdep_suite import VARIANTS, WORKLOADS
+from tools.benchmarks.afdep_suite import WORKLOADS
 
 
 def main() -> None:
@@ -29,11 +29,17 @@ def main() -> None:
         ("ttft_p95_ms", "P95 TTFT (ms)", True),
         ("tpot_median_ms", "Median TPOT (ms)", False),
     )
-    colors = ("#778295", "#2864a3", "#218457")
-    labels = ("P2P", "Masked DeepEP", "afdEP v1")
+    styles = {
+        "p2p": ("#778295", "P2P"),
+        "masked": ("#2864a3", "Masked DeepEP"),
+        "afdep": ("#218457", "afdEP v1"),
+        "afdep_v2": ("#8b4caa", "afdEP v2"),
+    }
+    variants = list(manifest["policy"]["variants"])
+    step = 0.72 / len(variants)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     for axis, (metric, title, logarithmic) in zip(axes, figures, strict=True):
-        for index, (variant, _) in enumerate(VARIANTS):
+        for index, variant in enumerate(variants):
             for case, workload in enumerate(WORKLOADS):
                 values = [
                     row["result"][metric]
@@ -46,11 +52,11 @@ def main() -> None:
                     continue
                 median = statistics.median(values)
                 axis.bar(
-                    case + (index - 1) * 0.24,
+                    case + (index - (len(variants) - 1) / 2) * step,
                     median,
-                    width=0.22,
-                    color=colors[index],
-                    label=labels[index] if case == 0 else None,
+                    width=step * 0.92,
+                    color=styles[variant][0],
+                    label=styles[variant][1] if case == 0 else None,
                     yerr=[[median - min(values)], [max(values) - median]],
                     capsize=3,
                     error_kw={"linewidth": 1},

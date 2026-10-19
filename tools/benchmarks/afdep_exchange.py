@@ -37,7 +37,12 @@ def run(args) -> None:
 
     from afd_plugin.connectors.gpu.deepep_m2n.buffer import DeepEPElasticBuffer
 
-    buffer_type = DeepEPElasticBuffer if args.variant == "masked" else ElasticBuffer
+    if args.variant == "afdep_v2":
+        from afd_plugin.connectors.gpu.afdep_v2_buffer import DirectionalLane
+
+        buffer_type = DirectionalLane
+    else:
+        buffer_type = DeepEPElasticBuffer if args.variant == "masked" else ElasticBuffer
     from afdep import Config
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -59,6 +64,13 @@ def run(args) -> None:
     options = (
         {"role_aware": True, "ffn_ranks": FFN_RANKS} if args.variant == "afdep" else {}
     )
+    if args.variant == "afdep_v2":
+        options = {
+            "real_num_experts": EXPERTS,
+            "ffn_ranks": FFN_RANKS,
+            "attention_ranks": ATTENTION_RANKS,
+            "expert_alignment": ALIGNMENT,
+        }
     buffer = buffer_type(
         group=dist.group.WORLD,
         capacity_tokens_per_rank=max(args.tokens),
@@ -97,7 +109,12 @@ def run(args) -> None:
         )
         zero = (
             torch.zeros(
-                (0 if args.variant == "afdep" else config.receive_rows(tokens), HIDDEN),
+                (
+                    0
+                    if args.variant in {"afdep", "afdep_v2"}
+                    else config.receive_rows(tokens),
+                    HIDDEN,
+                ),
                 dtype=torch.bfloat16,
                 device="cuda",
             )
@@ -264,7 +281,9 @@ def run(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=("masked", "afdep"), required=True)
+    parser.add_argument(
+        "--variant", choices=("masked", "afdep", "afdep_v2"), required=True
+    )
     parser.add_argument("--payload", choices=("bf16", "fp8"), default="fp8")
     parser.add_argument(
         "--mode", choices=("eager-sync", "eager-capacity", "graph"), default="graph"

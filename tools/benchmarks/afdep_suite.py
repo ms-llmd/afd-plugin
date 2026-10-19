@@ -28,11 +28,30 @@ from tools.benchmarks.bench_afdep import percentile
 
 MODEL_REVISION = "d206ba732169f29bb77fbf80fc2c4b81d4d30782"
 AFDEP_REVISION = "e763e3189398beda24f592d2117e6ade135b0a7f"
+DIRECTIONAL_REVISION = "01630a4825d2171b5873f1bfa1845207589d81c4"
+DIRECTIONAL_NATIVE_SHA256 = (
+    "d2be70cd645c87b086f6bb15af76f176f5b855edd648c3965d86432fc89045a6"
+)
 NCCL_VERSION_CODE = 23007
 VARIANTS = (
     ("p2p", "P2pNcclAFDConnector"),
     ("masked", "DeepEPM2NAFDConnector"),
     ("afdep", "AfdEPConnector"),
+)
+V2_VARIANT = ("afdep_v2", "AfdEPV2Connector")
+# Williams design: each directed predecessor pair once in the first four rows.
+V2_ORDERS = tuple(
+    tuple(("p2p", "masked", "afdep", "afdep_v2")[index] for index in order)
+    for order in (
+        (0, 1, 3, 2),
+        (1, 2, 0, 3),
+        (2, 3, 1, 0),
+        (3, 0, 2, 1),
+        (2, 3, 1, 0),
+        (3, 0, 2, 1),
+        (0, 1, 3, 2),
+        (1, 2, 0, 3),
+    )
 )
 ORDERS = tuple(itertools.permutations(name for name, _ in VARIANTS))
 MIN_REPEATS = 6
@@ -94,7 +113,11 @@ def write_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
-def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
+def plan(
+    profile: str, repeats: int, *, instrumented: bool = False, include_v2: bool = False
+) -> dict:
+    variants = (*VARIANTS, V2_VARIANT) if include_v2 else VARIANTS
+    orders = V2_ORDERS if include_v2 else ORDERS
     return {
         "schema_version": 1,
         "profile": profile,
@@ -107,13 +130,16 @@ def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
         "topology": "2-node RoCE" if profile.endswith("roce") else "1-node NVLink",
         "gpu_count": 4,
         "roles": {"ffn": [0, 1], "attention": [2, 3]},
-        "variants": dict(VARIANTS),
+        "variants": dict(variants),
+        "directional_revision": DIRECTIONAL_REVISION if include_v2 else None,
+        "directional_native_sha256": DIRECTIONAL_NATIVE_SHA256 if include_v2 else None,
         "repeats": repeats,
-        "orders": [list(ORDERS[index % len(ORDERS)]) for index in range(repeats)],
+        "orders": [list(orders[index % len(orders)]) for index in range(repeats)],
         "workloads": [asdict(workload) for workload in WORKLOADS],
         "model_id": "Qwen/Qwen3-30B-A3B-FP8",
         "model_revision": MODEL_REVISION,
-        "afdep_revision": AFDEP_REVISION,
+        "afdep_revision": DIRECTIONAL_REVISION if include_v2 else AFDEP_REVISION,
+        "v1_reference_revision": AFDEP_REVISION,
         "vllm_version": "0.30.0",
         "nccl_runtime_version_code": NCCL_VERSION_CODE,
         "graph_policy": "FULL_DECODE_ONLY; capture sizes 1,8,32,128; eager prefill",
@@ -129,7 +155,9 @@ def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
             "ffn_ep": 2,
             "dbo": False,
         },
-        "wire_policy": ("P2P BF16 + FFN routing; Masked/afdEP FP8 + Attention routing"),
+        "wire_policy": (
+            "P2P BF16 + FFN routing; Masked/afdEP v1/v2 FP8 + Attention routing"
+        ),
         "expert_backend": "deep_gemm",
         "routed_config": {
             "num_sms": 0,
@@ -146,6 +174,10 @@ def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
             for metric, direction, budget in METRICS
         ],
         "minimum_repeats": MIN_REPEATS,
+        "balanced_block_repeats": 8 if include_v2 else 6,
+        "transport_grid_policy": (
+            "v2=132; Masked/v1=0 (round(device_sms*24/132)); P2P unchanged"
+        ),
         "confidence": {"method": "paired-repeat bootstrap", "interval": 0.95},
     }
 
@@ -209,7 +241,7 @@ def hardware(profile: str) -> dict:
 def server_command(model: Path, variant: str, role: str, port: int) -> list[str]:
     routed = variant != "p2p"
     afd = {
-        "connector": dict(VARIANTS)[variant],
+        "connector": dict((*VARIANTS, V2_VARIANT))[variant],
         "role": role,
         "host": "127.0.0.1",
         "port": port + 100,
@@ -229,6 +261,8 @@ def server_command(model: Path, variant: str, role: str, port: int) -> list[str]
             "num_sms": 0,
             "num_qps": 0,
         }
+    if variant == "afdep_v2":
+        afd["connector_extra_config"]["num_sms"] = 132
     return [
         sys.executable,
         "-m",
@@ -308,6 +342,49 @@ def wait_ready(processes: list[subprocess.Popen], url: str, folder: Path) -> Non
     raise RuntimeError("Servers did not become ready before the startup deadline")
 
 
+def collect_v2_runtime(folder: Path) -> list[dict]:
+    """Require all four actual native instances, not just the controller's pin."""
+    records = [
+        json.loads((folder / "runtime" / f"rank-{rank}.json").read_text())
+        for rank in range(4)
+    ]
+    validate_v2_runtime(records)
+    return records
+
+
+def validate_v2_runtime(records: list[dict]) -> None:
+    if len(records) != 4:
+        raise ValueError("Directional runtime needs four rank records")
+    for rank, record in enumerate(records):
+        config = record["config"]
+        if (
+            record["rank"] != rank
+            or record["protocol"] != "afdep_v2_directional"
+            or record["native_source_sha256"] != DIRECTIONAL_NATIVE_SHA256
+            or record["nccl_runtime_version"] != NCCL_VERSION_CODE
+            or record["registered_bytes"] <= 0
+            or config != records[0]["config"]
+            or config["transport"] != "nvlink"
+            or config["ffn_ranks"] != 2
+            or config["attention_ranks"] != 2
+            or config["payload"] != "fp8"
+            or config["num_sms"] != 132
+            or config["hidden_size"] != 2048
+            or config["num_experts"] != 128
+            or config["top_k"] != 8
+            or config["capacity_tokens_per_rank"] != 2048
+        ):
+            raise ValueError(
+                "Directional runtime differs from the frozen serving policy"
+            )
+    binary_hashes = {record["native_binary_sha256"] for record in records}
+    if len(binary_hashes) != 1 or any(
+        len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+        for value in binary_hashes
+    ):
+        raise ValueError("Directional ranks loaded different native binaries")
+
+
 def owned_processes(tag: str) -> list[int]:
     """Include detached workers, excluding zombies and unrelated processes."""
     owned = []
@@ -359,6 +436,7 @@ def run(args) -> None:
     policy = plan(
         args.profile,
         args.repeats,
+        include_v2=args.include_v2,
         instrumented=args.instrumented
         or any(
             os.environ.get(name)
@@ -369,6 +447,10 @@ def run(args) -> None:
             )
         ),
     )
+    if args.include_v2 and args.repeats % len(V2_ORDERS):
+        raise ValueError(
+            "Four-arm serving requires complete eight-repeat Williams blocks"
+        )
     if policy["status"] == "unsupported":
         raise ValueError(policy["reason"])
     headers = (
@@ -442,6 +524,14 @@ def run(args) -> None:
         "status": "running",
         "runs": [],
     }
+    if args.include_v2:
+        from afdep._directional_build import source_digest as directional_digest
+
+        if directional_digest() != DIRECTIONAL_NATIVE_SHA256:
+            raise RuntimeError(
+                "Directional native sources differ from the frozen suite revision"
+            )
+        manifest["afdep_directional_sha256"] = directional_digest()
     write_json(output / "manifest.json", manifest)
     old_handler = signal.signal(signal.SIGTERM, cancel_run)
     try:
@@ -459,6 +549,7 @@ def run(args) -> None:
                             **env,
                             "CUDA_VISIBLE_DEVICES": devices,
                             "AFDEP_BENCH_RUN_ID": tag,
+                            "AFDEP_RUNTIME_METADATA_DIR": str(folder / "runtime"),
                         }
                         command = server_command(model, variant, role, args.port)
                         commands[role] = command
@@ -476,6 +567,11 @@ def run(args) -> None:
                     write_json(folder / "launch.json", commands)
                     url = f"http://127.0.0.1:{args.port}"
                     wait_ready(processes, url, folder)
+                    if variant == "afdep_v2":
+                        manifest.setdefault("directional_runtime", {})[folder.name] = (
+                            collect_v2_runtime(folder)
+                        )
+                        write_json(output / "manifest.json", manifest)
                     for workload in WORKLOADS:
                         target = folder / f"{workload.name}.json"
                         command = [
@@ -588,7 +684,17 @@ def compare(manifest: dict) -> dict:
         for row in manifest["runs"]
     }
     repeats = manifest["policy"]["repeats"]
-    expected = repeats * len(VARIANTS) * len(WORKLOADS)
+    variants = manifest["policy"]["variants"]
+    if variants != dict(VARIANTS) and variants != dict((*VARIANTS, V2_VARIANT)):
+        raise ValueError("Unknown connector matrix")
+    candidates = ("afdep", "afdep_v2") if "afdep_v2" in variants else ("afdep",)
+    if "afdep_v2" in variants:
+        runtime = manifest.get("directional_runtime", {})
+        if set(runtime) != {f"r{repeat}-afdep_v2" for repeat in range(repeats)}:
+            raise ValueError("Missing or duplicate directional runtime proof")
+        for records in runtime.values():
+            validate_v2_runtime(records)
+    expected = repeats * len(variants) * len(WORKLOADS)
     if len(runs) != expected or len(manifest["runs"]) != expected:
         raise ValueError("Missing or duplicate run cells")
     comparisons = []
@@ -597,59 +703,81 @@ def compare(manifest: dict) -> dict:
             reference = runs[(repeat, "masked", workload.name)]["prompt_sha256"]
             if any(
                 runs[(repeat, variant, workload.name)]["prompt_sha256"] != reference
-                for variant, _ in VARIANTS
+                for variant in variants
             ):
                 raise ValueError("Prompt sets differ between paired variants")
-        for baseline in ("p2p", "masked"):
-            for gate in manifest["policy"]["regression_gates"]:
-                metric, direction, budget = (
-                    gate["metric"],
-                    gate["direction"],
-                    gate["budget"],
-                )
-                ratios = []
-                for repeat in range(repeats):
-                    candidate, control = (
-                        runs[(repeat, "afdep", workload.name)][metric],
-                        runs[(repeat, baseline, workload.name)][metric],
+        for candidate_name in candidates:
+            for baseline in (
+                ("p2p", "masked", "afdep")
+                if candidate_name == "afdep_v2"
+                else ("p2p", "masked")
+            ):
+                for gate in manifest["policy"]["regression_gates"]:
+                    metric, direction, budget = (
+                        gate["metric"],
+                        gate["direction"],
+                        gate["budget"],
                     )
-                    if workload.output_tokens == 1 and metric.startswith("tpot_"):
-                        if candidate is not None or control is not None:
-                            raise ValueError("One-token output cannot have TPOT")
+                    ratios = []
+                    for repeat in range(repeats):
+                        candidate, control = (
+                            runs[(repeat, candidate_name, workload.name)][metric],
+                            runs[(repeat, baseline, workload.name)][metric],
+                        )
+                        if workload.output_tokens == 1 and metric.startswith("tpot_"):
+                            if candidate is not None or control is not None:
+                                raise ValueError("One-token output cannot have TPOT")
+                            continue
+                        if (
+                            candidate is None
+                            or control is None
+                            or not math.isfinite(candidate)
+                            or not math.isfinite(control)
+                            or min(candidate, control) <= 0
+                        ):
+                            raise ValueError(f"Invalid metric {metric}")
+                        ratios.append(candidate / control)
+                    if not ratios:
                         continue
-                    if (
-                        candidate is None
-                        or control is None
-                        or not math.isfinite(candidate)
-                        or not math.isfinite(control)
-                        or min(candidate, control) <= 0
+                    estimate, lower, upper = paired_interval(ratios)
+                    boundary = 1 - budget if direction == "higher" else 1 + budget
+                    if repeats < MIN_REPEATS:
+                        status = "provisional"
+                    elif (
+                        lower >= boundary
+                        if direction == "higher"
+                        else upper <= boundary
                     ):
-                        raise ValueError(f"Invalid metric {metric}")
-                    ratios.append(candidate / control)
-                if not ratios:
-                    continue
-                estimate, lower, upper = paired_interval(ratios)
-                boundary = 1 - budget if direction == "higher" else 1 + budget
-                if repeats < MIN_REPEATS:
-                    status = "provisional"
-                elif lower >= boundary if direction == "higher" else upper <= boundary:
-                    status = "noninferior"
-                elif upper < boundary if direction == "higher" else lower > boundary:
-                    status = "regression"
-                else:
-                    status = "inconclusive"
-                comparisons.append(
-                    {
-                        "workload": workload.name,
-                        "baseline": baseline,
-                        "metric": metric,
-                        "candidate_over_baseline": estimate,
-                        "bootstrap_95pct": [lower, upper],
-                        "budget": budget,
-                        "status": status,
-                    }
-                )
-    primary = [row["status"] for row in comparisons if row["baseline"] == "masked"]
+                        status = "noninferior"
+                    elif (
+                        upper < boundary if direction == "higher" else lower > boundary
+                    ):
+                        status = "regression"
+                    else:
+                        status = "inconclusive"
+                    comparisons.append(
+                        {
+                            "workload": workload.name,
+                            "baseline": baseline,
+                            **(
+                                {"candidate": candidate_name}
+                                if "afdep_v2" in variants
+                                else {}
+                            ),
+                            "metric": metric,
+                            "candidate_over_baseline": estimate,
+                            "bootstrap_95pct": [lower, upper],
+                            "budget": budget,
+                            "status": status,
+                        }
+                    )
+    primary_candidate = "afdep_v2" if "afdep_v2" in variants else "afdep"
+    primary = [
+        row["status"]
+        for row in comparisons
+        if row["baseline"] == "masked"
+        and row.get("candidate", "afdep") == primary_candidate
+    ]
     verdict = (
         "regression"
         if "regression" in primary
@@ -684,6 +812,7 @@ def main() -> None:
             required=True,
         )
         command.add_argument("--repeats", type=int, default=6)
+        command.add_argument("--include-v2", action="store_true")
         command.add_argument(
             "--instrumented",
             action="store_true",
@@ -702,7 +831,12 @@ def main() -> None:
     if args.action == "plan":
         print(
             json.dumps(
-                plan(args.profile, args.repeats, instrumented=args.instrumented),
+                plan(
+                    args.profile,
+                    args.repeats,
+                    instrumented=args.instrumented,
+                    include_v2=args.include_v2,
+                ),
                 indent=2,
             )
         )

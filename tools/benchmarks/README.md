@@ -168,3 +168,40 @@ Attention round-trip time, registered transport bytes and PyTorch allocation
 separately. P2P remains in the serving suite so its
 second communication stage is preserved. Use separate Nsight Systems runs to
 investigate regressions; never substitute trace timings for uninstrumented results.
+
+## Directional v2 · fresh four-arm campaign
+
+`AfdEPV2Connector` keeps the routed connector's Attention quantization, DeepGEMM
+experts, control plane and graph policy. It replaces collective dispatch/combine
+with directional `source_dispatch → worker_receive → worker_reply → source_collect`.
+It passes 128 real experts to afdEP; Attention has no native expert slots.
+Eager prefill still synchronizes counts and allocates exact receives. Decode
+uses fixed graph buffers. This comparison does not enable full prefill graphs.
+
+Use the library revision emitted by `plan --include-v2` (currently `01630a4`),
+which includes both v1 and v2. Install that exact source with `pip install
+--no-deps /path/to/afdEP` after the plugin/runtime dependencies. The runner rejects
+a different directional native source digest. V2 initially requires 2F2A in one
+NVLink domain, one lane and no DBO. Its grid is 132; Masked/v1 retain their natural
+`num_sms=0` default, resolved from the device SM count. These flags control
+different kernel schedules; equal numeric settings are not a fairness rule.
+
+```bash
+python -m tools.benchmarks.afdep_suite plan --profile h100-nvlink \
+  --include-v2 --repeats 8
+python -m tools.benchmarks.afdep_suite run --profile h100-nvlink \
+  --include-v2 --repeats 8 --model-path "$MODEL_PATH" --output results/h100-four-arm
+```
+
+Eight Williams-balanced repeats give every connector each position twice and
+balance directed predecessor pairs. Per SKU: **128 workload cells, 29,696 measured
+requests**. Repeat with `h200-nvlink` only on H200; keep results separate.
+Restart all four arms on the same allocation with matched prompts; preserve the
+old three-arm baselines. Compare v2 against P2P, Masked and v1 individually.
+The existing 3% median/throughput and 5% tail budgets and paired-repeat intervals
+remain unchanged. Profiling is separate. Runtime graph replay stays timed.
+
+Before the full campaign: validate the connector in the pinned Linux/vLLM
+runtime, run weighted transport correctness and single-request decode parity
+against Masked, then smoke all four workloads. A successful CPU adapter test or
+communication microbenchmark is not an end-to-end serving result.

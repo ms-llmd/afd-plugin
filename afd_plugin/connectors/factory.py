@@ -142,6 +142,11 @@ AFDConnectorFactory.register_connector(
     "AfdEPConnector",
 )
 AFDConnectorFactory.register_connector(
+    "AfdEPV2Connector",
+    "afd_plugin.connectors.gpu.afdep_v2",
+    "AfdEPV2Connector",
+)
+AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",
