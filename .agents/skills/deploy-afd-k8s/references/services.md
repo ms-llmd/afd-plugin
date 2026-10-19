@@ -5,8 +5,10 @@ Create as step 4d of [deploy.md](deploy.md) -- **before** deploying any Pod
 headless Services below are what a role's head Pod *binds* its own
 rendezvous/DP-RPC server to during its own startup, within seconds of the
 container starting; if that Service doesn't exist yet, the bind/resolve
-fails fast and, since every pod has `restartPolicy: Never`, it never gets a
-second chance. Which of the four to create is derived from the plan parsed
+fails fast. Pods do restart under the template's `restartPolicy: Always`
+if the container dies, but a restart burns minutes of model load and graph
+capture, so creating the Services first is still the cheap and correct
+order. Which of the four to create is derived from the plan parsed
 in [resolve-recipe.md](resolve-recipe.md), never asked.
 
 ## `vllm-service` -- always
