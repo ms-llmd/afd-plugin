@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-19",
+  "scope": "Synthetic finite closed-loop serving, 4 GPUs / 2 Attention + 2 FFN / one NVLink domain; no network, production SLO or general accuracy claim.",
+  "runtime_image": "ghcr.io/ronenkat/afd-plugin-e2e@sha256:dc14e1ac83e3ab6ffca1863699ea9134599551901adf1848d8ea1092e765c21c",
+  "runtime_image_evidence": "Observed status.containerStatuses.imageID in the hash-bound live pod snapshot; deployment spec used a tag, not a digest pin. Private snapshot retained locally.",
+  "plugin_commit": "dca1441041275969283201a93d9417bced3ad1eb",
+  "plugin_source_sha256": "5e4e5875176721a14815ae0528c30e29a9ad18f153975424491f73f8f051091e",
+  "plugin_archive_sha256": "66d605e709ea3a61b9ba2c9406c35a08167f4f8efffa9868a07c07bd8ecb014e",
+  "model_revision": "d206ba732169f29bb77fbf80fc2c4b81d4d30782",
+  "library_revision": "01630a4825d2171b5873f1bfa1845207589d81c4",
+  "directional_native_sha256": "d2be70cd645c87b086f6bb15af76f176f5b855edd648c3965d86432fc89045a6",
+  "wire_policy": "P2P BF16 + FFN routing; Masked/afdEP v1/v2 FP8 + Attention routing",
+  "graph_policy": "FULL_DECODE_ONLY; capture sizes 1,8,32,128; eager prefill",
+  "measurement": "closed-loop; excludes startup/capture/warmup; includes every graph replay",
+  "policy_sha256": "06eef8c69b5fb6314f3bda15cf6729edf0b95eadf4deb6e51378917251518680",
+  "repeats": 8,
+  "unique_cells": 128,
+  "measured_requests": 29696,
+  "source_manifest_sha256": "7cf775e3947305b12fcf057ecfd6ffcb0268936c3cb81c04252549abae3372b9",
+  "public_manifest_sha256": "7cf775e3947305b12fcf057ecfd6ffcb0268936c3cb81c04252549abae3372b9",
+  "comparison_sha256": "f5f713da4d8c3ffe4e6d6b165e158f42fa3732bbd8ce5f3d798de297a5b996e8",
+  "freeze_sha256": "754c387ff847e8a2256b0aeff121bdcf6ffbc841e51d39188ae4bffcae57c344",
+  "backup_verification_sha256": "19570ada70e1843015152cafdae2ae851303896b895b46b56d189ebc310c1241",
+  "verification_sha256": "c565b02fc5bebb8e61dbe7dbd8d2bc25f23ed2923ca486fa421fb542882c0cff",
+  "raw_serving_archive": {
+    "bytes": 142648424,
+    "sha256": "e47f36524976b748412ed9e38011b5f29c6244a5f471f43ec11956e3326dbddc"
+  },
+  "raw_artifacts": "Raw token streams and role logs retained locally; request artifact SHA256 ledger exported, no raw copies.",
+  "terminal_verifier_recovery": {
+    "reason": "Original supervisor compared Python tuples with JSON lists after all timing completed. Canonical JSON equals original frozen policy; no source/config/data change or timing rerun.",
+    "script_sha256": "dcffac202e81913fa951f8815ba51ad0ec9869730221d4e4fb81dce0b8ae6a47",
+    "original_supervisor_script_sha256": "c0b682db8faad221c25f64b5c282a8f2d3afc348a9109b8376919b0b3f432267",
+    "original_supervisor_log_sha256": "c95c5d473ece7144e1cc502252faa305feb1d109c1370bd84d993d8b3521886a",
+    "proof_sha256": "61aaa4327d6bcdb345328f04c767d700fc4c3308c4665b90d28abf6e2fa253df"
+  },
+  "exporter_sha256": "88d8cf984d7cfd1987ce1552313e2dd53208f148b13e57b1237cbc383dc3d2aa",
+  "runtime_image_observation": {
+    "observed_image_id": "ghcr.io/ronenkat/afd-plugin-e2e@sha256:dc14e1ac83e3ab6ffca1863699ea9134599551901adf1848d8ea1092e765c21c",
+    "private_snapshot_sha256": "139ac9dfcd63caff207f902d9d62c90d994654e97a4aca8ecf593896c55f2396"
+  }
+}

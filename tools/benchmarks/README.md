@@ -1,6 +1,6 @@
 # AFD connector regression suite
 
-Compare **P2P → Masked DeepEP → afdEP v1** on the same GPUs and requests.
+Compare **P2P → Masked DeepEP → afdEP v1 → afdEP v2** on the same GPUs and requests.
 The primary regression control is Masked DeepEP; the P2P comparison measures
 complete serving paths, including its FFN expert-parallel exchange.
 
@@ -19,6 +19,10 @@ flowchart LR
     AA[Attention routing] --> AF[Owning FFN experts]
     AF --> AA
   end
+  subgraph afdEP_v2
+    VA[Attention routing] -->|Directional request| VF[Owning FFN experts]
+    VF -->|Directional reply| VA
+  end
 ```
 
 Masked DeepEP and v1 share scheduling, payload precision, expert compute and
@@ -27,6 +31,47 @@ and empty-side epilogues, and bounds FFN receives by Attention source count.
 Logical expert slots, collective participation and registered transport capacity
 remain. P2P naturally uses BF16 payloads and FFN routing; the routed paths use
 FP8 plus scales and Attention routing. Their difference is not transport alone.
+
+## Four-way results · 2026-10-19
+
+Eight balanced repeats, **128 cells and 29,696 measured requests per GPU setup**.
+Paired geometric-mean output-throughput gains for v2 against Masked DeepEP:
+
+| Workload | H100 | H200 |
+| --- | ---: | ---: |
+| Decode · C1 | +2.9% | +1.3% |
+| Prefill · C8 | +12.4% | +10.5% |
+| Mixed · C32 | +11.1% | +7.9% |
+| Sustained · C128 | +5.7% | +6.8% |
+
+All eight throughput intervals favor v2. **H200 meets the preset gate; H100 is
+inconclusive** because sustained median TTFT's interval extends to +4.0%, beyond
+the 3% budget. P2P has better sustained P95 TTFT despite lower throughput.
+H200 decode median/P95 TPOT are slightly slower, within budget. Both v1 and v2
+match Masked on all **256/256** tested C1 sequences per setup.
+
+![H100 four-way serving](baselines/h100-nvlink-v2-20261019/overview.png)
+
+![H200 four-way serving](baselines/h200-nvlink-v2-20261019/overview.png)
+
+![H100 paired gains and confidence intervals](baselines/h100-nvlink-v2-20261019/relative-to-masked.png)
+
+![H200 paired gains and confidence intervals](baselines/h200-nvlink-v2-20261019/relative-to-masked.png)
+
+| Evidence | H100 | H200 |
+| --- | --- | --- |
+| Measurements + hashes | [Manifest](baselines/h100-nvlink-v2-20261019/manifest.json) | [Manifest](baselines/h200-nvlink-v2-20261019/manifest.json) |
+| All controls + confidence intervals | [Comparison](baselines/h100-nvlink-v2-20261019/comparison.json) | [Comparison](baselines/h200-nvlink-v2-20261019/comparison.json) |
+| Frozen runtime + backup provenance | [Provenance](baselines/h100-nvlink-v2-20261019/provenance.json) | [Provenance](baselines/h200-nvlink-v2-20261019/provenance.json) |
+| Scoped decode token parity | [256 sequences](baselines/h100-nvlink-v2-20261019/decode-parity.json) | [256 sequences](baselines/h200-nvlink-v2-20261019/decode-parity.json) |
+
+All four use decode graphs and eager prefill. Startup/capture/warmup are excluded;
+runtime replay is included. These finite synthetic loads include ramp-up/drain.
+P2P uses BF16/FFN routing; routed connectors use FP8/Attention routing. Full raw
+streams and logs are retained outside Git with verified archive/file hashes.
+
+<details>
+<summary>Earlier three-way baselines and v1 diagnosis</summary>
 
 ## Initial baselines · 2026-10-19
 
@@ -83,9 +128,11 @@ with frontend/engine attribution. These traces do not resolve the admission gate
 Capture uses [Nsight process-tree/NVTX controls](https://docs.nvidia.com/nsight-systems/UserGuide/index.html);
 model loading, CUDA graph capture and warmup precede the measured request window.
 
+</details>
+
 ## Matrix
 
-| Architecture | GPU baseline | Topology | Three-way suite |
+| Architecture | GPU baseline | Topology | Serving profiles |
 | --- | --- | --- | --- |
 | Hopper SM90 | H100 80 GB | 4 GPUs, one NVLink domain | Supported profile |
 | Hopper SM90 | H200 | 4 GPUs, one NVLink domain | Supported profile |

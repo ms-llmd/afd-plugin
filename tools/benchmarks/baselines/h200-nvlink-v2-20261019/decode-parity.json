@@ -1,0 +1,21 @@
+{
+  "scope": "Eight frozen seeds \u00d732 C1 synthetic prompts, I32/O64; scoped token parity, not general accuracy.",
+  "source_file_sha256": "668e9e92dd8bc2970541188b22ca9a493872a2ccb28b4c2f80f567eacaec6805",
+  "source_manifest_sha256": "7cf775e3947305b12fcf057ecfd6ffcb0268936c3cb81c04252549abae3372b9",
+  "comparisons": [
+    {
+      "variant": "afdep_v2",
+      "baseline": "masked",
+      "sequences": 256,
+      "matches": 256,
+      "mismatches": []
+    },
+    {
+      "variant": "afdep",
+      "baseline": "masked",
+      "sequences": 256,
+      "matches": 256,
+      "mismatches": []
+    }
+  ]
+}
