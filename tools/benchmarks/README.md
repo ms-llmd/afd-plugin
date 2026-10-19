@@ -69,6 +69,20 @@ Attention payload arenas across two ranks. Registered transport capacity remains
 **130 MiB** across four ranks. PyTorch allocation and registered capacity are
 separate measurements; the serving GPU-memory snapshots are neither of these.
 
+### Focused H100 profile
+
+[Paired Nsight evidence](baselines/h100-nvlink-20261019/profiling.json) verifies
+all four GPUs and graph nodes. The Attention dispatch-copy and FFN combine-reduce
+epilogues disappear in v1; required opposite-side epilogues remain. Dispatch and
+combine spans include peer waits, not just transfer time.
+
+In this one traced C128 pair, client mean TTFT is 634/639 ms (Masked/v1), while
+vLLM reports 183/181 ms. Different timing boundaries prevent assigning that gap
+to communication. The next sign-off step is longer uninstrumented C128 validation
+with frontend/engine attribution. These traces do not resolve the admission gate.
+Capture uses [Nsight process-tree/NVTX controls](https://docs.nvidia.com/nsight-systems/UserGuide/index.html);
+model loading, CUDA graph capture and warmup precede the measured request window.
+
 ## Matrix
 
 | Architecture | GPU baseline | Topology | Three-way suite |
