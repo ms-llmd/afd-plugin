@@ -92,7 +92,7 @@ def write_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
-def plan(profile: str, repeats: int) -> dict:
+def plan(profile: str, repeats: int, *, instrumented: bool = False) -> dict:
     return {
         "schema_version": 1,
         "profile": profile,
@@ -137,7 +137,7 @@ def plan(profile: str, repeats: int) -> dict:
         "measurement": (
             "closed-loop; excludes startup/capture/warmup; includes every graph replay"
         ),
-        "instrumented": False,
+        "instrumented": instrumented,
         "regression_gates": [
             {"metric": metric, "direction": direction, "budget": budget}
             for metric, direction, budget in METRICS
@@ -343,7 +343,19 @@ def cancel_run(signum, frame) -> None:
 
 def run(args) -> None:
     root = Path(__file__).resolve().parents[2]
-    policy = plan(args.profile, args.repeats)
+    policy = plan(
+        args.profile,
+        args.repeats,
+        instrumented=args.instrumented
+        or any(
+            os.environ.get(name)
+            for name in (
+                "CUDA_INJECTION64_PATH",
+                "NVTX_INJECTION64_PATH",
+                "NSYS_PROFILING_SESSION_ID",
+            )
+        ),
+    )
     if policy["status"] == "unsupported":
         raise ValueError(policy["reason"])
     headers = (
@@ -655,6 +667,11 @@ def main() -> None:
             required=True,
         )
         command.add_argument("--repeats", type=int, default=6)
+        command.add_argument(
+            "--instrumented",
+            action="store_true",
+            help="Mark profiling data; comparison cannot accept it as a baseline",
+        )
     running.add_argument("--model-path", required=True)
     running.add_argument("--output", required=True)
     running.add_argument("--port", type=int, default=18305)
@@ -666,7 +683,12 @@ def main() -> None:
     if args.action in {"plan", "run"} and args.repeats < 1:
         parser.error("repeats must be positive")
     if args.action == "plan":
-        print(json.dumps(plan(args.profile, args.repeats), indent=2))
+        print(
+            json.dumps(
+                plan(args.profile, args.repeats, instrumented=args.instrumented),
+                indent=2,
+            )
+        )
     elif args.action == "run":
         run(args)
     else:

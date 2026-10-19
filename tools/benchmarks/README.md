@@ -58,6 +58,8 @@ after a workload, not peak memory or registered communication capacity.
 Startup, compilation, graph capture and request warmup are excluded. Every timed
 graph replay, eager allocation and host-count wait is included. All variants use
 `FULL_DECODE_ONLY`, identical capture sizes and scheduler limits; prefill is eager.
+Prompt token IDs are synthetic and seeded; these are shape/load regression
+profiles, not a production corpus or accuracy evaluation.
 Prefix caching is disabled. The workload is closed-loop, not an offered-load/SLO
 experiment. The common CUDA DBO import guard is applied to all three paths.
 
@@ -76,6 +78,9 @@ python -m tools.benchmarks.afdep_suite compare \
   results/h100-v1/manifest.json --output results/h100-v1/comparison.json
 ```
 
+For charts, install Matplotlib and run
+`python -m tools.benchmarks.afdep_plot results/h100-v1/manifest.json --output h100.svg`.
+
 Use `h200-nvlink` for H200. Six repeats cover all connector-order permutations;
 paired variants receive the same seeded prompts. Each server pair restarts between
 variants. Keep raw request artifacts and role logs with the manifest and hashes.
@@ -86,8 +91,9 @@ The manifest records initial budgets: **3%** for throughput/median latency and
 **5%** for tail latency. The gate resamples paired *repeats*, not individual
 requests, with a 95% bootstrap interval. Fewer than six repeats are provisional;
 intervals crossing the budget are inconclusive. Neither passes the gate.
-A regression exits 2; inconclusive/provisional exits 3. Profiling runs must be kept
-separate and cannot create an accepted baseline.
+A regression exits 2; inconclusive/provisional exits 3. Mark profiling runs with
+`--instrumented`; known Nsight injection variables are detected automatically.
+They cannot create an accepted baseline.
 
 For transport diagnosis, exclude model GEMMs and compare the actual two backends:
 

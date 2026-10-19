@@ -87,7 +87,7 @@ def test_invalid_campaigns_cannot_generate_a_baseline(change):
     elif change == "prompt":
         data["runs"][0]["result"]["prompt_sha256"] = "changed"
     elif change == "profiled":
-        data["policy"]["instrumented"] = True
+        data["policy"] = suite.plan("h100-nvlink", 6, instrumented=True)
     else:
         data["status"] = "failed"
     with pytest.raises(ValueError):

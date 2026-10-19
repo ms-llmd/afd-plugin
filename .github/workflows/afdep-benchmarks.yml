@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+name: afdEP benchmark contracts
+
+on:
+  pull_request:
+    paths:
+      - 'afd_plugin/connectors/gpu/**'
+      - 'tools/benchmarks/**'
+      - 'tests/unit/test_afdep_suite.py'
+      - 'tests/unit/test_bench_afdep.py'
+      - '.github/workflows/afdep-benchmarks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pytest httpx
+      - run: >-
+          python -m pytest tests/unit/test_afdep_suite.py
+          tests/unit/test_bench_afdep.py
