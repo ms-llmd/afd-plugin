@@ -178,11 +178,9 @@ It passes 128 real experts to afdEP; Attention has no native expert slots.
 Eager prefill still synchronizes counts and allocates exact receives. Decode
 uses fixed graph buffers. This comparison does not enable full prefill graphs.
 
-Use the library revision emitted by `plan --include-v2` (currently `01630a4`),
-which includes both v1 and v2. Install that exact source with `pip install
---no-deps /path/to/afdEP` after the plugin/runtime dependencies. The runner rejects
-a different directional native source digest. V2 initially requires 2F2A in one
-NVLink domain, one lane and no DBO. Its grid is 132; Masked/v1 retain their natural
+The plugin's `[afdep]` extra pins `01630a4`, providing both v1 and v2. The runner
+rejects a different directional native source digest. V2 initially requires 2F2A
+in one NVLink domain, one lane and no DBO. Its grid is 132; Masked/v1 retain their natural
 `num_sms=0` default, resolved from the device SM count. These flags control
 different kernel schedules; equal numeric settings are not a fairness rule.
 

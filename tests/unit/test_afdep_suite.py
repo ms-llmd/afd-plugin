@@ -4,6 +4,7 @@
 
 import copy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -35,8 +36,6 @@ def campaign(repeats=6, ratio=1.0):
 
 
 def test_layout_and_graph_policy_preserve_real_p2p_ep():
-    from pathlib import Path
-
     for variant, _ in suite.VARIANTS:
         command = suite.server_command(Path("model"), variant, "ffn", 18305)
         assert (
@@ -53,6 +52,15 @@ def test_layout_and_graph_policy_preserve_real_p2p_ep():
     assert suite.plan("h100-roce", 6)["status"] == "unsupported"
     orders = suite.plan("h100-nvlink", 6)["orders"]
     assert len({tuple(order) for order in orders}) == 6
+
+
+@pytest.mark.parametrize("include_v2", [False, True])
+def test_planned_sdk_matches_install_extra(include_v2):
+    policy = suite.plan("h100-nvlink", 8 if include_v2 else 6, include_v2=include_v2)
+    requirement = (Path(__file__).parents[2] / "pyproject.toml").read_text()
+    assert f"afdEP.git@{policy['afdep_revision']}" in requirement
+    assert policy["afdep_revision"] == suite.DIRECTIONAL_REVISION
+    assert policy["v1_reference_revision"] == suite.AFDEP_REVISION
 
 
 def test_short_campaign_cannot_pass_noninferiority(monkeypatch):

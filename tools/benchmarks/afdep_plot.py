@@ -75,15 +75,17 @@ def main() -> None:
     )
     fig.text(
         0.5,
-        0.025,
+        0.04,
         f"{manifest['policy']['repeats']} balanced repeats · bars: repeat medians · "
         "whiskers: observed ranges\n"
-        "Natural serving paths. Startup/capture excluded; graph replay included. "
+        "P2P: BF16 wire + FFN routing; "
+        "routed connectors: FP8 dispatch + Attention routing.\n"
+        "Startup/capture excluded; graph replay included. "
         "One-token prefill has no TPOT.",
         ha="center",
         fontsize=10,
     )
-    fig.tight_layout(rect=(0, 0.10, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.15, 1, 0.95))
     fig.savefig(args.output, dpi=160)
     plt.close(fig)
 

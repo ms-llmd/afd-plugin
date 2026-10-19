@@ -138,7 +138,7 @@ def plan(
         "workloads": [asdict(workload) for workload in WORKLOADS],
         "model_id": "Qwen/Qwen3-30B-A3B-FP8",
         "model_revision": MODEL_REVISION,
-        "afdep_revision": DIRECTIONAL_REVISION if include_v2 else AFDEP_REVISION,
+        "afdep_revision": DIRECTIONAL_REVISION,
         "v1_reference_revision": AFDEP_REVISION,
         "vllm_version": "0.30.0",
         "nccl_runtime_version_code": NCCL_VERSION_CODE,
