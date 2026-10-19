@@ -189,7 +189,7 @@ def hardware(profile: str) -> dict:
         ).splitlines(),
         "nccl_runtime": torch.cuda.nccl.version(),
         "vllm": importlib.metadata.version("vllm"),
-        "cpu_affinity_count": len(os.sched_getaffinity(0)),
+        "cpu_count": os.cpu_count(),
     }
 
 
@@ -373,7 +373,7 @@ def run(args) -> None:
     )
     # Isolate CUDA inspection so the controller never holds a GPU context.
     cache_root = Path(env.get("XDG_CACHE_HOME", output / "cache"))
-    for name, folder in (
+    for name, cache_folder in (
         ("AFDEP_CACHE_DIR", "afdep"),
         ("AFD_DEEPEP_BUILD_DIR", "deepep-build"),
         ("AFD_DEEPGEMM_BUILD_DIR", "deepgemm-build"),
@@ -384,7 +384,7 @@ def run(args) -> None:
         ("VLLM_CACHE_ROOT", "vllm"),
         ("FLASHINFER_WORKSPACE_BASE", "flashinfer"),
     ):
-        env.setdefault(name, str(cache_root / folder))
+        env.setdefault(name, str(cache_root / cache_folder))
     identity = json.loads(
         subprocess.check_output(
             [
@@ -401,6 +401,7 @@ def run(args) -> None:
         )
     )
     from afdep import __version__
+    from afdep._build import PACKAGE_ROOT
     from afdep._build import source_digest as vendor_digest
 
     policy["seed"] = args.seed
@@ -410,8 +411,7 @@ def run(args) -> None:
         "plugin_source_sha256": source_digest(root),
         "afdep_version": __version__,
         "afdep_python_sha256": {
-            path.name: digest(path)
-            for path in Path(sys.modules["afdep"].__file__).parent.glob("*.py")
+            path.name: digest(path) for path in PACKAGE_ROOT.glob("*.py")
         },
         "afdep_vendor_sha256": vendor_digest(),
         "status": "running",

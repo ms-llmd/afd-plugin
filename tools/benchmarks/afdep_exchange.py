@@ -33,12 +33,11 @@ SCALE_GROUP = 128
 
 def run(args) -> None:
     # Runtime imports are isolated from the CPU-only planner/report tools.
-    if args.variant == "masked":
-        from afd_plugin.connectors.gpu.deepep_m2n.buffer import (
-            DeepEPElasticBuffer as Buffer,
-        )
-    else:
-        from afdep.deepep import ElasticBuffer as Buffer
+    from afdep.deepep import ElasticBuffer
+
+    from afd_plugin.connectors.gpu.deepep_m2n.buffer import DeepEPElasticBuffer
+
+    buffer_type = DeepEPElasticBuffer if args.variant == "masked" else ElasticBuffer
     from afdep import Config
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -60,7 +59,7 @@ def run(args) -> None:
     options = (
         {"role_aware": True, "ffn_ranks": FFN_RANKS} if args.variant == "afdep" else {}
     )
-    buffer = Buffer(
+    buffer = buffer_type(
         group=dist.group.WORLD,
         capacity_tokens_per_rank=max(args.tokens),
         hidden_size=HIDDEN,
@@ -75,16 +74,16 @@ def run(args) -> None:
         gpu_timeout_s=120,
         **options,
     )
+    resolved_sms = buffer._num_sms()
     dtype = torch.float8_e4m3fn if args.payload == "fp8" else torch.bfloat16
     rows = []
     for tokens in args.tokens:
         n = tokens if source else 0
-        x = torch.full(
-            (n, HIDDEN),
-            (rank - FFN_RANKS + 1) / 8 if source else 0,
-            dtype=dtype,
-            device="cuda",
-        )
+        row_ids = torch.arange(n, device="cuda", dtype=torch.int64)
+        columns = torch.arange(HIDDEN, device="cuda", dtype=torch.int64)
+        signature = (row_ids + 1) | (rank << 16)
+        signs = 2 * ((signature[:, None] >> (columns[None, :] % 24)) & 1) - 1
+        x = (signs.float() * (2.0 ** (columns % 4).float()) / 16).to(dtype)
         ids = (
             torch.arange(n, device="cuda")[:, None]
             + torch.arange(TOP_K, device="cuda")[None, :]
@@ -107,7 +106,13 @@ def run(args) -> None:
         )
 
         def exchange(
-            x=x, scale=scale, ids=ids, weights=weights, tokens=tokens, zero=zero
+            x=x,
+            scale=scale,
+            ids=ids,
+            weights=weights,
+            tokens=tokens,
+            zero=zero,
+            reference_experts=False,
         ):
             received = buffer.dispatch(
                 x,
@@ -127,9 +132,34 @@ def run(args) -> None:
                         decoded.view(-1, HIDDEN // SCALE_GROUP, SCALE_GROUP)
                         * received.recv_scale[:, :, None]
                     ).reshape_as(decoded)
-                reply = (decoded * received.recv_topk_weights[:, None]).bfloat16()
+                weighted = decoded * received.recv_topk_weights[:, None]
+                if reference_experts:
+                    # Untimed correctness check: expert e applies (e+1)*identity.
+                    # Distinct rows/channels catch permutations and wrong ownership.
+                    ends = received.recv_count_psum
+                    previous = torch.cat((ends.new_zeros(1), ends[:-1]))
+                    starts = ((previous + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
+                    positions = torch.arange(decoded.shape[0], device="cuda")[:, None]
+                    belongs = (positions >= starts[None, :]) & (
+                        positions < ends[None, :]
+                    )
+                    factors = torch.arange(config.experts_per_rank, device="cuda")
+                    factors = factors + rank * config.experts_per_rank + 1
+                    factor = (belongs.float() * factors).sum(dim=1)
+                    weighted = torch.where(
+                        belongs.any(dim=1)[:, None], weighted * factor[:, None], 0
+                    )
+                reply = weighted.bfloat16()
             return buffer.combine(reply, received.handle)
 
+        verified = exchange(reference_experts=True)
+        torch.cuda.synchronize()
+        if source:
+            expected = (
+                x.float() * ((ids + 1).float() * weights).sum(dim=1)[:, None]
+            ).bfloat16()
+            torch.testing.assert_close(verified, expected, rtol=0, atol=0)
+        del verified
         for _ in range(args.warmup):
             output = exchange()
         torch.cuda.synchronize()
@@ -176,7 +206,7 @@ def run(args) -> None:
             else 0,
             "pytorch_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
         }
-        gathered = [None] * world
+        gathered: list[dict] = [{} for _ in range(world)]
         dist.all_gather_object(gathered, local)
         if rank == 0:
             critical = [
@@ -207,6 +237,8 @@ def run(args) -> None:
             "schema_version": 1,
             "config": vars(args),
             "gpu": torch.cuda.get_device_name(),
+            "resolved_comm_sms": resolved_sms,
+            "expert_weighted_identity_check": "passed",
             "rows": rows,
             "scope": (
                 "Dispatch + weighted identity reply + combine; no GEMMs; "

@@ -31,7 +31,7 @@ FP8 plus scales and Attention routing. Their difference is not transport alone.
 ## Matrix
 
 | Architecture | GPU baseline | Topology | Three-way suite |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Hopper SM90 | H100 80 GB | 4 GPUs, one NVLink domain | Supported profile |
 | Hopper SM90 | H200 | 4 GPUs, one NVLink domain | Supported profile |
 | Hopper SM90 | H100 / H200 | Multiple domains over RoCE | Blocked: v1 role specialization rejects this topology |
@@ -43,7 +43,7 @@ GPUs. Each role uses DP2/TP1; FFN EP2 owns 64 of Qwen's 128 experts per rank.
 ## Measure
 
 | Workload | Input tokens | Output | Concurrency | Requests/repeat |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Decode | 32 | 64 | 1 | 32 |
 | Prefill | 2,048 | 1 | 8 | 128 |
 | Mixed | 32–2,048 | 64 | 32 | 256 |
