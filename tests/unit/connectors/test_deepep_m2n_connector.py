@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -1319,3 +1321,169 @@ def test_attention_combine_zeros_cover_the_largest_no_sync_receive():
     assert connector._combine_zero_rows((0, HIDDEN_SIZE)).shape == (0, HIDDEN_SIZE)
     with pytest.raises(RuntimeError, match="no_sync_bucket_limit"):
         connector._combine_zero_rows((expected_rows + 1, HIDDEN_SIZE))
+
+
+class _LoggedEvent:
+    """CPU stand-in for ``torch.cuda.Event``: logs where it was recorded."""
+
+    _ids = itertools.count()
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        self.name = f"ev{next(self._ids)}"
+
+    def record(self, stream) -> None:
+        self._log.append(("record", self.name, stream.name))
+
+
+class _LoggedStream:
+    def __init__(self, name: str, log: list) -> None:
+        self.name = name
+        self._log = log
+
+    def wait_event(self, event) -> None:
+        self._log.append(("wait_event", self.name, event.name))
+
+    def wait_stream(self, other) -> None:
+        self._log.append(("wait_stream", self.name, other.name))
+
+
+class _FFNLane:
+    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
+        rows = torch.zeros((0, HIDDEN_SIZE))
+        return SimpleNamespace(
+            recv_x=rows,
+            recv_scale=None,
+            recv_topk_weights=torch.zeros(0),
+            recv_count_psum=torch.zeros(0, dtype=torch.int32),
+            recv_counts_host=[],
+            handle=SimpleNamespace(recv_shape=(0, HIDDEN_SIZE)),
+        )
+
+    def combine(self, expert_output, handle):
+        return expert_output
+
+
+def _logged_ffn_connector(monkeypatch, num_lanes: int):
+    """FFN connector whose streams and events log every record and wait."""
+    from afd_plugin.connectors.gpu.deepep_m2n import connector as m2n
+
+    log: list = []
+    main = _LoggedStream("main", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: main)
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: _LoggedEvent(log))
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(m2n, "_keep_alive_on", lambda stream, *tensors: None)
+
+    connector = _connector("ffn", 0, Topology(ffn_size=2, attn_size=2))
+    connector.device = torch.device("cpu")
+    connector._initialized = True
+    connector.lanes = [_FFNLane() for _ in range(num_lanes)]
+    connector.lane_streams = (
+        [_LoggedStream(f"lane{i}", log) for i in range(num_lanes)]
+        if num_lanes > 1
+        else []
+    )
+    connector.stage_plans = {
+        lane: SimpleNamespace(bucket=8, do_cpu_sync=False) for lane in range(num_lanes)
+    }
+
+    def experts(x, scale, weights, psum, local):
+        log.append(("experts", "main", None))
+        return torch.zeros((0, HIDDEN_SIZE))
+
+    connector.experts = experts
+    return connector, log
+
+
+def _ffn_dbo_step(connector, num_layers: int, num_stages: int) -> None:
+    """The routed FFN runner's order: deferred sends, then join lanes."""
+    pending = {}
+    for _layer in range(num_layers):
+        for stage in range(num_stages):
+            if stage in pending:
+                connector.send_ffn_output(*pending.pop(stage))
+            payload = connector.recv_attn_output(stage)
+            out = connector.run_experts(payload, None)
+            pending[stage] = (out, payload.context)
+    for stage in range(num_stages):
+        connector.send_ffn_output(*pending.pop(stage))
+    connector.synchronize_lanes()
+
+
+def test_ffn_lane_combine_waits_only_for_its_own_experts(monkeypatch):
+    """Under DBO each lane's combine waits on the event recorded right after
+    that lane's experts, and no lane waits on the whole caller stream.
+
+    Why: waiting on the whole stream also waited for the other micro-batch's
+    experts, which serialized Attention and FFN compute (no DBO overlap).
+    """
+    connector, log = _logged_ffn_connector(monkeypatch, num_lanes=2)
+
+    _ffn_dbo_step(connector, num_layers=3, num_stages=2)
+
+    assert not [e for e in log if e[0] == "wait_stream"]
+    # The event each experts launch is followed by on the caller stream.
+    experts_events = []
+    for i, entry in enumerate(log):
+        if entry[0] == "experts":
+            record = log[i + 1]
+            assert record[0] == "record" and record[2] == "main"
+            experts_events.append(record[1])
+    # Experts run E0(L0) E1(L0) E0(L1) E1(L1) ...; combine C_s(L) waits E_s(L).
+    lane_waits = {
+        lane: [e[2] for e in log if e[0] == "wait_event" and e[1] == lane]
+        for lane in ("lane0", "lane1")
+    }
+    step_fork = lane_waits["lane0"][0]
+    assert lane_waits["lane1"][0] == step_fork
+    assert lane_waits["lane0"][1:] == experts_events[0::2]
+    assert lane_waits["lane1"][1:] == experts_events[1::2]
+    # The step fork is recorded before any experts of the step.
+    fork_at = log.index(("record", step_fork, "main"))
+    assert fork_at < next(i for i, e in enumerate(log) if e[0] == "experts")
+
+
+def test_ffn_lanes_join_each_step_once(monkeypatch):
+    """Each lane joins the caller stream once per step; synchronize_lanes
+    starts a new step (a new fork event).
+
+    Why: the per-step join orders a lane after the previous step and, while
+    capturing a CUDA graph, joins the lane to the capture.
+    """
+    connector, log = _logged_ffn_connector(monkeypatch, num_lanes=2)
+
+    _ffn_dbo_step(connector, num_layers=1, num_stages=2)
+    first = len(log)
+    _ffn_dbo_step(connector, num_layers=1, num_stages=2)
+
+    def forks(entries):
+        return [
+            e
+            for e in entries
+            if e[0] == "wait_event"
+            and e[1].startswith("lane")
+            and e[2] not in experts_ids
+        ]
+
+    experts_ids = {log[i + 1][1] for i, e in enumerate(log) if e[0] == "experts"}
+    first_forks, second_forks = forks(log[:first]), forks(log[first:])
+    assert [e[1] for e in first_forks] == ["lane0", "lane1"]
+    assert [e[1] for e in second_forks] == ["lane0", "lane1"]
+    assert first_forks[0][2] != second_forks[0][2]
+
+
+def test_single_lane_ffn_has_no_cross_stream_waits(monkeypatch):
+    """One lane runs on the caller stream: no events, no waits.
+
+    Why: the single-lane path must keep its zero fork/join cost.
+    """
+    connector, log = _logged_ffn_connector(monkeypatch, num_lanes=1)
+
+    _ffn_dbo_step(connector, num_layers=2, num_stages=1)
+
+    assert not [e for e in log if e[0] == "wait_stream"]
+    assert not [e for e in log if e[0] == "wait_event" and e[1] != "main"]
+    # One ready event per receive and one done event per send; no experts event.
+    assert len([e for e in log if e[0] == "record"]) == 2 + 2

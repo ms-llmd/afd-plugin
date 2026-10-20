@@ -1147,6 +1147,208 @@ def graph_scenario(
     return checker.finish()
 
 
+def run_attention_dbo_layers(
+    connector: Any,
+    inputs: list[list[Inputs]],
+    outs: list[list[torch.Tensor]],
+) -> None:
+    """Attention side of vLLM's DBO order over two micro-batches:
+    D0(0) D1(0) C0(0) D0(1) C1(0) D1(1) C0(1) ... C1(last)."""
+    num_layers = len(inputs)
+    for layer in range(num_layers):
+        for stage in (0, 1):
+            if stage == 1 and layer > 0:
+                connector.recv_ffn_output(outs[layer - 1][1], 1)
+            x, ids, w = inputs[layer][stage]
+            connector.send_attn_output(
+                x,
+                attention_context(layer, stage, x.shape[0]),
+                topk_ids=ids,
+                topk_weights=w,
+            )
+        connector.recv_ffn_output(outs[layer][0], 0)
+    connector.recv_ffn_output(outs[-1][1], 1)
+
+
+@dataclass
+class FFNPipelineStep:
+    payloads: list[list[Any]]
+    outs: list[list[torch.Tensor]]
+    # (layer, C1(layer-1) end, E0(layer) end) timing events when stretched.
+    timings: list[tuple[int, Any, Any]]
+    start: Any
+
+
+def run_ffn_dbo_layers(
+    connector: Any, weights: Any, num_layers: int, sleep_cycles: int = 0
+) -> FFNPipelineStep:
+    """FFN side in the routed runner's order: each stage's send waits until
+    just before that stage's next receive, then the lanes join.
+
+    ``sleep_cycles`` stretches every E0 with a GPU sleep queued right after
+    it on the caller stream, and records when C1 of the previous layer and
+    the stretched E0 end.
+    """
+    # Timing events only in the stretched eager variant (not while capturing).
+    start = None
+    if sleep_cycles:
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+    payloads: list[list[Any]] = [[None, None] for _ in range(num_layers)]
+    outs: list[list[Any]] = [[None, None] for _ in range(num_layers)]
+    timings: list[tuple[int, Any, Any]] = []
+    pending: dict[int, tuple[torch.Tensor, Any]] = {}
+    c1_end = None
+    for layer in range(num_layers):
+        for stage in (0, 1):
+            if stage in pending:
+                connector.send_ffn_output(*pending.pop(stage))
+                if stage == 1 and sleep_cycles:
+                    c1_end = torch.cuda.Event(enable_timing=True)
+                    c1_end.record(connector.lane_streams[1])
+            payload = connector.recv_attn_output(stage)
+            out = connector.run_experts(payload, weights)
+            if stage == 0 and sleep_cycles:
+                torch.cuda._sleep(sleep_cycles)
+                e0_end = torch.cuda.Event(enable_timing=True)
+                e0_end.record()
+                if layer > 0:
+                    timings.append((layer, None, e0_end))
+            if stage == 1 and sleep_cycles and layer > 0:
+                prev_layer, _, prev_e0 = timings[-1]
+                timings[-1] = (prev_layer, c1_end, prev_e0)
+            pending[stage] = (out, payload.context)
+            payloads[layer][stage] = payload
+            outs[layer][stage] = out
+    for stage in (0, 1):
+        connector.send_ffn_output(*pending.pop(stage))
+    connector.synchronize_lanes()
+    return FFNPipelineStep(payloads=payloads, outs=outs, timings=timings, start=start)
+
+
+def dbo_pipeline_scenario(
+    connector: Any, topology: Topology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Several MoE layers in vLLM's two-micro-batch DBO order, with the FFN's
+    deferred sends, checked layer by layer; eager or captured and replayed.
+
+    Args: ``num_layers``, ``tokens`` (per Attention rank and stage),
+    ``graph`` (capture once, replay ``replays`` times with fresh inputs) and,
+    eager only, ``sleep_cycles``: stretch every E0 on the FFN and require
+    C1(L-1) to finish before the stretched E0(L) does, i.e. one lane's
+    combine must not wait for the other lane's experts.
+    """
+    if connector.num_lanes != 2:
+        raise RuntimeError("dbo_pipeline_scenario needs two lanes")
+    checker = Checker(connector)
+    weights = checker.weights if connector.is_ffn else None
+    num_layers = args["num_layers"]
+    tokens = (args["tokens"],) * topology.attn_size
+    stages = [tokens, tokens]
+    graph = args.get("graph", False)
+    sleep_cycles = args.get("sleep_cycles", 0)
+    limit = NUM_EXPERTS
+    overlap: list[float] = []
+
+    def fresh_inputs(first_step: int) -> list[list[Inputs]]:
+        return [
+            [
+                make_inputs(
+                    stage_seed(first_step + layer, stage),
+                    connector.role_rank,
+                    tokens[connector.role_rank],
+                    limit,
+                )
+                for stage in (0, 1)
+            ]
+            for layer in range(num_layers)
+        ]
+
+    def check(first_step: int, ffn_step: Any, inputs: Any, outs: Any, label: str):
+        if connector.is_ffn:
+            for layer in range(num_layers):
+                for stage in (0, 1):
+                    payload = ffn_step.payloads[layer][stage]
+                    checker.check_ffn_receive(
+                        payload,
+                        tokens,
+                        stage_seed(first_step + layer, stage),
+                        f"{label} L{layer} S{stage}",
+                        limit,
+                    )
+                    checker.check_ffn_experts(payload, ffn_step.outs[layer][stage])
+        else:
+            for layer_inputs, layer_outs in zip(inputs, outs, strict=True):
+                for (x, ids, w), out in zip(layer_inputs, layer_outs, strict=True):
+                    checker.check_combined(out, x, ids, w)
+
+    step = 0
+    if not graph:
+        for _ in range(args.get("steps", 2)):
+            control_step(connector, stages)
+            first_step = step + 1
+            step += num_layers
+            inputs = outs = None
+            ffn_step = None
+            if connector.is_ffn:
+                ffn_step = run_ffn_dbo_layers(
+                    connector, weights, num_layers, sleep_cycles
+                )
+            else:
+                inputs = fresh_inputs(first_step)
+                outs = [[torch.empty_like(x) for x, _, _ in layer] for layer in inputs]
+                run_attention_dbo_layers(connector, inputs, outs)
+            torch.cuda.synchronize()
+            check(first_step, ffn_step, inputs, outs, "dbo eager")
+            if ffn_step is not None and sleep_cycles:
+                for layer, c1_end, e0_end in ffn_step.timings:
+                    c1_ms = ffn_step.start.elapsed_time(c1_end)
+                    e0_ms = ffn_step.start.elapsed_time(e0_end)
+                    overlap.append(e0_ms - c1_ms)
+                    if c1_ms >= e0_ms:
+                        raise RuntimeError(
+                            f"C1(L{layer - 1}) ended at {c1_ms:.3f} ms, after "
+                            f"the stretched E0(L{layer}) at {e0_ms:.3f} ms: the "
+                            "lane-1 combine waited for lane 0's experts"
+                        )
+        result = checker.finish()
+        if overlap:
+            result["min_c1_lead_ms"] = min(overlap)
+        return result
+
+    # Graph: warm up uncaptured, capture once, then replay with fresh inputs.
+    inputs = outs = None
+    if not connector.is_ffn:
+        inputs = fresh_inputs(0)
+        outs = [[torch.empty_like(x) for x, _, _ in layer] for layer in inputs]
+    cuda_graph = torch.cuda.CUDAGraph()
+    ffn_step = None
+    for capture in (False, True):
+        control_step(connector, stages, graph_mode=True)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(cuda_graph) if capture else nullcontext():
+            if connector.is_ffn:
+                ffn_step = run_ffn_dbo_layers(connector, weights, num_layers)
+            else:
+                run_attention_dbo_layers(connector, inputs, outs)
+        torch.cuda.synchronize()
+    for _ in range(args.get("replays", 3)):
+        first_step = step + 1
+        step += num_layers
+        if not connector.is_ffn:
+            for static_layer, new_layer in zip(
+                inputs, fresh_inputs(first_step), strict=True
+            ):
+                for static, new in zip(static_layer, new_layer, strict=True):
+                    for static_tensor, new_tensor in zip(static, new, strict=True):
+                        static_tensor.copy_(new_tensor)
+        control_step(connector, stages, graph_mode=True)
+        cuda_graph.replay()
+        torch.cuda.synchronize()
+        check(first_step, ffn_step, inputs, outs, "dbo graph")
+    return checker.finish()
+
+
 def peer_exit_scenario(
     connector: Any, topology: Topology, args: dict[str, Any]
 ) -> dict[str, Any]:

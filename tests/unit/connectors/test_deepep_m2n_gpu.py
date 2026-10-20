@@ -34,6 +34,7 @@ from tests.unit.connectors.deepep_m2n_harness import (  # noqa: E402
     available_gpus,
     compile_scenario,
     correctness_scenario,
+    dbo_pipeline_scenario,
     graph_scenario,
     hot_cases,
     lane_cases,
@@ -217,6 +218,50 @@ def test_two_lanes_dbo_order(ffn_size, attn_size, payload_format, tmp_path):
         {"payload_format": payload_format, "num_lanes": 2},
         tmp_path,
         scenario_args={"cases": _cases(lane_cases(attn_size, CAPACITY))},
+    )
+
+
+# GPU sleep long enough (~5 ms on H100) to dwarf a combine.
+DBO_SLEEP_CYCLES = 10_000_000
+
+
+@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
+def test_dbo_pipeline_eager_lanes_do_not_wait_for_each_other(payload_format, tmp_path):
+    """Four MoE layers in vLLM's DBO order with the FFN's deferred sends; every
+    E0 on the FFN is stretched by a GPU sleep, and C1(L-1) must still finish
+    before the stretched E0(L).
+
+    Why: a lane's combine that waited for the other lane's experts serialized
+    Attention and FFN compute, so DBO overlapped nothing.
+    """
+    _run(
+        Topology(2, 2),
+        {"payload_format": payload_format, "num_lanes": 2},
+        tmp_path,
+        scenario=dbo_pipeline_scenario,
+        scenario_args={
+            "num_layers": 4,
+            "tokens": 64,
+            "steps": 2,
+            "sleep_cycles": DBO_SLEEP_CYCLES,
+        },
+    )
+
+
+@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
+def test_dbo_pipeline_cuda_graph_capture_and_replay(payload_format, tmp_path):
+    """The same DBO order captured in one graph per side and replayed with fresh
+    inputs; every layer checked after each replay.
+
+    Why: the per-lane waits become graph edges; a lane that never joined the
+    capture or a missing edge would corrupt rows only in replays.
+    """
+    _run(
+        Topology(2, 2),
+        {"payload_format": payload_format, "num_lanes": 2},
+        tmp_path,
+        scenario=dbo_pipeline_scenario,
+        scenario_args={"num_layers": 4, "tokens": 64, "graph": True, "replays": 3},
     )
 
 

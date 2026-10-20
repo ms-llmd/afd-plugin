@@ -782,6 +782,9 @@ class DeepEPM2NTransferState(AFDTransferState):
     lane: int
     # Recorded on the lane stream after dispatch; experts wait on it.
     ready_event: torch.cuda.Event
+    # Recorded on the caller's stream after this lane's experts; the combine
+    # waits on it instead of on everything the caller queued.
+    experts_done: torch.cuda.Event | None = None
 
 
 # Custom ops cannot take Python objects, so they find their connector by id
@@ -973,6 +976,11 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._pending_combines: dict[int, DeepEPHandle] = {}
         # FFN side: combine completion per lane, joined by synchronize_lanes.
         self._lane_done: dict[int, torch.cuda.Event] = {}
+        # FFN side: lanes join the caller's stream once per step, at an event
+        # recorded before any experts of the step (see _join_step).
+        self._step_fork: torch.cuda.Event | None = None
+        self._step_fork_capturing = False
+        self._lanes_joined: set[int] = set()
         # Attention side: the zero rows combine takes from Attention ranks,
         # sized for the largest receive (see _allocate_combine_zeros).
         self._combine_zeros: torch.Tensor | None = None
@@ -1146,6 +1154,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.lane_streams = []
         self._pending_combines.clear()
         self._lane_done.clear()
+        self._reset_step_fork()
         self._combine_zeros = None
         self._initialized = False
 
@@ -1265,11 +1274,14 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         """Dispatch with no tokens; return the rows routed to local experts.
 
         The dispatch runs on the stage's lane; ``run_experts`` waits for it, so
-        a later lane's dispatch can overlap this lane's experts.
+        a later lane's dispatch can overlap this lane's experts. The lane does
+        not wait for the caller's stream: its inputs are empty, and this
+        lane's previous combine, which waits for the experts that read the
+        lane's last rows, is ahead of it on the lane (see _join_step).
         """
         self._check_initialized()
         lane_stream = self._lane_stream(ubatch_idx)
-        self._fork_to(lane_stream)
+        self._join_step(ubatch_idx, lane_stream)
         with torch.cuda.stream(lane_stream):
             empty = torch.empty(
                 (0, self.hidden_size), dtype=self.payload_dtype, device=self.device
@@ -1325,14 +1337,20 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if self.experts is None:
             raise RuntimeError("run_experts is only available on FFN ranks")
         state = self._transfer_state(payload.context)
-        torch.cuda.current_stream(self.device).wait_event(state.ready_event)
-        return self.experts(
+        current = torch.cuda.current_stream(self.device)
+        current.wait_event(state.ready_event)
+        out = self.experts(
             payload.hidden_states,
             state.recv_scale,
             state.recv_topk_weights,
             state.recv_count_psum,
             weights,
         )
+        if self.lane_streams:
+            experts_done = torch.cuda.Event()
+            experts_done.record(current)
+            state.experts_done = experts_done
+        return out
 
     def send_ffn_output(
         self,
@@ -1340,11 +1358,23 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        """Combine on the lane: send each weighted row back to its token's rank."""
+        """Combine on the lane: send each weighted row back to its token's rank.
+
+        The lane waits only for this lane's experts (``run_experts``), not for
+        other lanes' experts queued after them on the caller's stream; under
+        DBO that wait would hold the other micro-batch's Attention.
+        """
         self._check_initialized()
         state = self._transfer_state(context)
         lane_stream = self._lane_stream(state.lane)
-        self._fork_to(lane_stream)
+        if state.experts_done is not None and lane_stream != torch.cuda.current_stream(
+            self.device
+        ):
+            lane_stream.wait_event(state.experts_done)
+            self._lanes_joined.add(state.lane)
+        else:
+            # Output not produced by run_experts: order after everything.
+            self._fork_to(lane_stream)
         _keep_alive_on(lane_stream, ffn_output)
         with torch.cuda.stream(lane_stream):
             self._lanes(state.lane).combine(ffn_output, state.handle)
@@ -1362,6 +1392,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         for done in self._lane_done.values():
             current.wait_event(done)
         self._lane_done.clear()
+        self._reset_step_fork()
 
     # ==============================
     # Internals
@@ -1407,6 +1438,35 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         current = torch.cuda.current_stream(self.device)
         if lane_stream != current:
             lane_stream.wait_stream(current)
+
+    def _join_step(self, lane: int, lane_stream: torch.cuda.Stream) -> None:
+        """Order ``lane_stream`` after the caller's work from before this step.
+
+        The first FFN lane operation of a step records one event on the
+        caller's stream, before any of the step's experts; each lane waits on
+        it once. This orders the lane after the previous step and, while
+        capturing, joins the lane to the capture. Later operations on the lane
+        are ordered by the lane itself. A change of capture mode starts over.
+        """
+        current = torch.cuda.current_stream(self.device)
+        if lane_stream == current:
+            return
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self._step_fork is not None and capturing != self._step_fork_capturing:
+            self._reset_step_fork()
+        if lane in self._lanes_joined:
+            return
+        if self._step_fork is None:
+            self._step_fork = torch.cuda.Event()
+            self._step_fork.record(current)
+            self._step_fork_capturing = capturing
+        lane_stream.wait_event(self._step_fork)
+        self._lanes_joined.add(lane)
+
+    def _reset_step_fork(self) -> None:
+        self._step_fork = None
+        self._step_fork_capturing = False
+        self._lanes_joined.clear()
 
     def _precompile_dispatch_kernels(self) -> None:
         """Compile every eager dispatch/combine variant before serving.
