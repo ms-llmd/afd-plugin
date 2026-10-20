@@ -192,6 +192,7 @@ def _v2_config(
         parallel_config=parallel_config,
         compilation_config=compilation_config,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kernel_config=SimpleNamespace(moe_backend="auto"),
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=False,
             async_scheduling=False,
@@ -2424,6 +2425,9 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
     assert events == ["bootstrap", "vllm_init", "role_rank_check"]
     assert _ConnectorRunnerRecorder.adopted == [connector]
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
+    # The routed FFN pins vLLM's MoE backend to one that keeps the expert layout.
+    expected_backend = "triton" if worker_cls is AFDFFNWorker else "auto"
+    assert config.kernel_config.moe_backend == expected_backend
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E40
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
     GPUFFNRoutedExpertsModelRunner,
     local_experts_from_vllm,
+    select_routed_moe_backend,
 )
 from tests.unit.connectors.fake_routed_connector import (  # noqa: E402
     FakeRoutedConnector,
@@ -211,10 +212,16 @@ def test_ffn_runner_adopts_bootstrapped_connector_and_closes_placeholder():
     assert events == ["close"]
 
 
-def _routed_experts(*, fp8: bool, expert_ids=(4, 5)):
+def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):
     num_experts = len(expert_ids)
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    selected = SimpleNamespace(name=backend)
     experts = SimpleNamespace(
+        quant_method=(
+            SimpleNamespace(fp8_backend=selected)
+            if fp8
+            else SimpleNamespace(unquantized_backend=selected)
+        ),
         w13_weight=torch.nn.Parameter(
             torch.zeros(num_experts, 2 * INTERMEDIATE, HIDDEN, dtype=dtype),
             requires_grad=False,
@@ -261,3 +268,45 @@ def test_local_experts_are_views_of_vllm_parameters(fp8):
         )
     else:
         assert local.weights.w13_scale is None
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "backend", ["FLASHINFER_CUTLASS", "FLASHINFER_TRTLLM", "MARLIN"]
+)
+def test_local_experts_reject_backends_that_reorder_weights(fp8, backend):
+    """Experts processed for a backend that reorders them in place are refused.
+
+    Why: FlashInfer swaps w13 to [up; gate] (TRT-LLM and Marlin also shuffle)
+    without changing dtype or shape; the executor would read [gate; up] and
+    every MoE layer would compute silu(up) * gate, with no error.
+    """
+    with pytest.raises(RuntimeError, match="moe-backend triton"):
+        local_experts_from_vllm(_routed_experts(fp8=fp8, backend=backend))
+
+
+def _kernel_config(moe_backend: str) -> SimpleNamespace:
+    return SimpleNamespace(kernel_config=SimpleNamespace(moe_backend=moe_backend))
+
+
+def test_routed_ffn_pins_auto_moe_backend_to_triton():
+    """``auto`` becomes ``triton``; an explicit ``triton`` stays.
+
+    Why: auto picks FlashInfer CUTLASS on Hopper with EP > 1 for block FP8,
+    which reorders the experts; the FFN never runs vLLM's MoE forward, so the
+    backend only decides the weight layout.
+    """
+    for configured in ("auto", "triton"):
+        vllm_config = _kernel_config(configured)
+        select_routed_moe_backend(vllm_config)
+        assert vllm_config.kernel_config.moe_backend == "triton"
+
+
+@pytest.mark.parametrize("configured", ["flashinfer_cutlass", "deep_gemm", "marlin"])
+def test_routed_ffn_rejects_other_explicit_moe_backends(configured):
+    """An explicit backend other than triton fails before the weights load.
+
+    Why: the failure must be loud at startup, not wrong tokens at serving.
+    """
+    with pytest.raises(RuntimeError, match="moe-backend triton"):
+        select_routed_moe_backend(_kernel_config(configured))

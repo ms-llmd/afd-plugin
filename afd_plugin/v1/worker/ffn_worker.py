@@ -103,12 +103,6 @@ class AFDFFNWorker(Worker):
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
-        connector = AFDConnectorFactory.create_bootstrapped_connector(
-            self.rank,
-            connector_device_index(self.vllm_config, self.local_rank),
-            self.vllm_config,
-            afd_config,
-        )
         runner_cls: type[GPUFFNModelRunner] = GPUFFNModelRunner
         connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
         if issubclass(connector_cls, AFDRoutedExpertsConnector):
@@ -116,9 +110,18 @@ class AFDFFNWorker(Worker):
             # routed-experts runner.
             from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
                 GPUFFNRoutedExpertsModelRunner,
+                select_routed_moe_backend,
             )
 
             runner_cls = GPUFFNRoutedExpertsModelRunner
+            # Before bootstrap: a rejected backend fails before any collective.
+            select_routed_moe_backend(self.vllm_config)
+        connector = AFDConnectorFactory.create_bootstrapped_connector(
+            self.rank,
+            connector_device_index(self.vllm_config, self.local_rank),
+            self.vllm_config,
+            afd_config,
+        )
         native_runner_cls = gpu_model_runner_v2.GPUModelRunner
         gpu_model_runner_v2.GPUModelRunner = runner_cls
         try:

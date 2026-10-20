@@ -25,15 +25,59 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 
+# vLLM MoE backends whose ``process_weights_after_loading`` keeps the FusedMoE
+# layout the connector's executor reads: w13 as [gate; up] with block-128
+# scales. Others reorder in place without changing dtype or shape (FlashInfer
+# swaps w13 to [up; gate]; TRT-LLM and Marlin also shuffle), which yields wrong
+# outputs with no error.
+ROUTED_MOE_BACKEND = "triton"
+_LAYOUT_PRESERVING_BACKENDS = frozenset({"TRITON"})
+
+
+def select_routed_moe_backend(vllm_config: VllmConfig) -> None:
+    """Pin the FFN's vLLM MoE backend to one that keeps the expert layout.
+
+    vLLM's MoE forward never runs on a routed-experts FFN; its backend only
+    decides how the expert weights are processed at load. ``auto`` picks
+    FlashInfer CUTLASS on Hopper with EP > 1 for block FP8, which reorders
+    w13, so ``auto`` becomes ``triton`` and any other explicit choice fails.
+    """
+    kernel_config = vllm_config.kernel_config
+    backend = str(kernel_config.moe_backend)
+    if backend == "auto":
+        kernel_config.moe_backend = ROUTED_MOE_BACKEND
+    elif backend != ROUTED_MOE_BACKEND:
+        raise RuntimeError(
+            f"routed-experts AFD FFN needs --moe-backend {ROUTED_MOE_BACKEND} (or "
+            f"auto); moe_backend={backend!r} reorders the expert weights the "
+            "connector reads"
+        )
+
+
+def _check_expert_layout(routed_experts: RoutedExperts) -> None:
+    quant_method = routed_experts.quant_method
+    backend = getattr(quant_method, "fp8_backend", None) or getattr(
+        quant_method, "unquantized_backend", None
+    )
+    name = getattr(backend, "name", None)
+    if name not in _LAYOUT_PRESERVING_BACKENDS:
+        raise RuntimeError(
+            f"vLLM processed the FFN experts for MoE backend {name or backend!r}, "
+            f"which may reorder them; the routed-experts connector reads them "
+            f"as [gate; up] FusedMoE weights (supported: "
+            f"{sorted(_LAYOUT_PRESERVING_BACKENDS)}; set --moe-backend "
+            f"{ROUTED_MOE_BACKEND})"
+        )
+
+
 def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
     """This rank's experts of one vLLM MoE layer, as views of its parameters.
 
-    Read after ``process_weights_after_loading``. With vLLM's default FP8
-    backend on DeepGEMM, that step may requantize the weights in place to
-    power-of-two (UE8M0) block scales; dtypes and shapes stay the same, so the
-    connector's executor reads them as they are. A backend that changes the
-    layout fails the connector's post-load check instead.
+    Read after ``process_weights_after_loading``, which must have kept the
+    FusedMoE layout (``select_routed_moe_backend``); checked here because a
+    reordered layout keeps dtypes and shapes.
     """
+    _check_expert_layout(routed_experts)
     w13 = routed_experts.w13_weight.data
     w2 = routed_experts.w2_weight.data
     w13_scale = w2_scale = None
