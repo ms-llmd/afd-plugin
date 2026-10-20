@@ -13,25 +13,10 @@ from torch import Tensor  # noqa: E402
 
 pytest.importorskip("vllm")
 
-from vllm.config import ParallelConfig  # noqa: E402
-
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
     deepseek_v2_async_cam_forward as schedule,
 )
-
-
-@pytest.mark.parametrize("dp_size,expected", [(1, False), (2, True)])
-def test_target_sp_requires_dp_and_tp(dp_size, expected):
-    # Exercise the pinned property's derivation without starting distributed
-    # groups or running ParallelConfig's environment-dependent initialization.
-    config = SimpleNamespace(
-        data_parallel_size=dp_size,
-        tensor_parallel_size=2,
-        enable_expert_parallel=True,
-        all2all_backend="allgather_reducescatter",
-    )
-    assert ParallelConfig.use_sequence_parallel_moe.fget(config) is expected
 
 
 @pytest.mark.parametrize("num_tokens", [1, 3, 4])

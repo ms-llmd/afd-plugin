@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-import inspect
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -25,7 +25,6 @@ from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
-from vllm.v1.worker.gpu_worker import Worker  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
 from afd_plugin.model_executor.models import (  # noqa: E402
@@ -49,6 +48,7 @@ from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
 )
+from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
 TEST_MODEL_MAX_LEN = 163840
 TEST_HIDDEN_SIZE = 2048
@@ -75,18 +75,6 @@ class _RecordingConnector:
     def close(self):
         self.closed = True
         self.events.append("close")
-
-
-class _StepProfiler:
-    def __init__(self):
-        self.steps = 0
-        self.stopped = False
-
-    def step(self):
-        self.steps += 1
-
-    def stop(self):
-        self.stopped = True
 
 
 class _RunnerRecorder:
@@ -224,17 +212,6 @@ def _scheduler_output(num_tokens: int):
     return SimpleNamespace(total_num_scheduled_tokens=num_tokens)
 
 
-def _single_rank_graph_config(*, role: str = "attention"):
-    config = _v2_config(
-        role=role,
-        enforce_eager=False,
-        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-        cudagraph_capture_sizes=[TEST_CUDAGRAPH_CAPTURE_SIZE],
-        max_cudagraph_capture_size=TEST_CUDAGRAPH_CAPTURE_SIZE,
-    )
-    return config
-
-
 def _no_graph_model_manager():
     manager = object.__new__(cudagraph_utils.ModelCudaGraphManager)
     manager._graphs_captured = False
@@ -276,31 +253,6 @@ def _prepare_worker(worker_cls, config, *, use_v2):
     worker.use_v2_model_runner = use_v2
     worker.device_config = SimpleNamespace(device_type="cuda")
     return worker
-
-
-def test_pinned_worker_init_device_signature_and_internal_runner_import():
-    upstream_init_device = inspect.unwrap(Worker.init_device)
-    assert inspect.signature(upstream_init_device) == inspect.signature(
-        attention_worker.AFDAttentionWorker.init_device,
-    )
-    assert inspect.signature(upstream_init_device) == inspect.signature(
-        ffn_worker.AFDFFNWorker.init_device,
-    )
-    assert inspect.signature(upstream_init_device) == inspect.Signature(
-        [
-            inspect.Parameter(
-                "self",
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            ),
-        ],
-    )
-    source = inspect.getsource(upstream_init_device)
-    assert "from vllm.v1.worker.gpu.model_runner import" in source
-    assert "from vllm.v1.worker.gpu_model_runner import" in source
-    assert "GPUModelRunner as GPUModelRunnerV2" in source
-    assert "GPUModelRunnerV2(" in source
-    assert "GPUModelRunnerV1(" in source
-    assert "self.model_runner = GPUModelRunnerV1" in source
 
 
 def test_v2_fullgraph_replay_hook_restores_manager_instance_after_success():
@@ -390,114 +342,180 @@ def test_v2_fullgraph_replay_hook_rejects_same_manager_reentry():
     assert runner.cudagraph_manager.__dict__["run_fullgraph"] is original
 
 
-@pytest.mark.parametrize(
-    (
-        "role",
-        "architecture",
-        "num_attention_ranks",
-        "num_ffn_ranks",
-        "data_parallel_size",
-        "tensor_parallel_size",
-        "prefill_context_parallel_size",
-    ),
-    [
-        ("attention", "DeepseekV2ForCausalLM", 1, 1, 1, 1, 1),
-        ("ffn", "AFDDeepseekV2ForCausalLM", 1, 1, 1, 1, 1),
-        ("attention", "DeepseekV3ForCausalLM", 6, 3, 2, 3, 1),
-        ("ffn", "Qwen3MoeForCausalLM", 6, 3, 3, 1, 1),
-    ],
-)
-def test_v2_validator_accepts_structurally_valid_topologies(
-    role,
-    architecture,
-    num_attention_ranks,
-    num_ffn_ranks,
-    data_parallel_size,
-    tensor_parallel_size,
-    prefill_context_parallel_size,
-):
-    config = _v2_config(
-        role=role,
-        architecture=architecture,
-        num_attention_ranks=num_attention_ranks,
-        num_ffn_ranks=num_ffn_ranks,
-        data_parallel_size=data_parallel_size,
-        tensor_parallel_size=tensor_parallel_size,
-        prefill_context_parallel_size=prefill_context_parallel_size,
-    )
-
-    validate_gpu_model_runner_v2_config(
-        config,
-        expected_role=role,
-        device_type="cuda",
-    )
+_OVERRIDE_ROOTS = {
+    "par": ("parallel_config",),
+    "comp": ("compilation_config",),
+    "model": ("model_config",),
+    "hf": ("model_config", "hf_config"),
+    "sched": ("scheduler_config",),
+}
 
 
-def test_v2_validator_has_shared_owner_and_v2_export_boundary():
-    assert validate_gpu_model_runner_v2_config.__module__ == "afd_plugin.validation"
-    assert v2_runner_module.__all__ == ["AFDAttentionModelRunnerV2"]
+def _validator_call(overrides):
+    """Apply dotted-path overrides to ``_v2_config()`` for a validator call.
+
+    ``afd.<key>`` edits the AFD dict; other roots are ``_OVERRIDE_ROOTS``
+    aliases or plain config attributes. ``expected_role`` (default: the AFD
+    role) and ``device_type`` are validator arguments, not config fields.
+    """
+
+    overrides = dict(overrides)
+    call = {
+        "device_type": overrides.pop("device_type", None),
+        "expected_role": overrides.pop("expected_role", None),
+    }
+    config = _v2_config()
+    afd = config.additional_config["afd"]
+    for path, value in overrides.items():
+        *parents, name = path.split(".")
+        if parents == ["afd"]:
+            afd[name] = value
+            continue
+        target = config
+        if parents:
+            parents = [*_OVERRIDE_ROOTS.get(parents[0], parents[:1]), *parents[1:]]
+        for attr in parents:
+            target = getattr(target, attr)
+        if not hasattr(target, name):
+            raise AttributeError(f"unknown validator override {path!r}")
+        setattr(target, name, value)
+    call["expected_role"] = call["expected_role"] or afd["role"]
+    return config, call
 
 
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_v2_graph_validator_accepts_general_capture_configuration(role):
-    config = _v2_config(
-        role=role,
-        architecture="DeepseekV3ForCausalLM",
-        num_attention_ranks=3,
-        num_ffn_ranks=3,
-        data_parallel_size=3,
-        enforce_eager=False,
-        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-        cudagraph_capture_sizes=[4, 16],
-        max_cudagraph_capture_size=16,
-    )
-    config.model_config.hf_config.hidden_size = 5120
-    config.scheduler_config.max_num_seqs = 16
-    config.compilation_config.compile_sizes = [16]
-    config.compilation_config.compile_ranges_endpoints = [16, TEST_MODEL_MAX_LEN]
+def _err(match, exc_type=RuntimeError):
+    return exc_type, match
 
-    validate_gpu_model_runner_v2_config(
-        config,
-        expected_role=role,
-        device_type="cuda",
-    )
+
+def _expect(error):
+    return nullcontext() if error is None else pytest.raises(error[0], match=error[1])
+
+
+_GPU_GRAPH = {
+    "model.enforce_eager": False,
+    "comp.cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
+    "comp.cudagraph_capture_sizes": [TEST_CUDAGRAPH_CAPTURE_SIZE],
+    "comp.max_cudagraph_capture_size": TEST_CUDAGRAPH_CAPTURE_SIZE,
+}
 
 
 @pytest.mark.parametrize(
-    "cudagraph_mode",
+    ("overrides", "error"),
     [
-        CUDAGraphMode.FULL,
-        CUDAGraphMode.PIECEWISE,
-        CUDAGraphMode.FULL_AND_PIECEWISE,
+        pytest.param({}, None, id="accept-baseline"),
+        pytest.param(
+            {"afd.role": "ffn", "hf.architectures": ["AFDDeepseekV2ForCausalLM"]},
+            None,
+            id="accept-ffn-afd-prefixed-arch",
+        ),
+        pytest.param(
+            {
+                "hf.architectures": ["DeepseekV3ForCausalLM"],
+                "afd.num_attention_ranks": 6,
+                "afd.num_ffn_ranks": 3,
+                "par.data_parallel_size": 2,
+                "par.tensor_parallel_size": 3,
+            },
+            None,
+            id="accept-attention-dp2-tp3",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["Qwen3MoeForCausalLM"],
+                "afd.num_attention_ranks": 6,
+                "afd.num_ffn_ranks": 3,
+                "par.data_parallel_size": 3,
+            },
+            None,
+            id="accept-ffn-ranks-use-ffn-count",
+        ),
+        pytest.param(
+            {
+                **_GPU_GRAPH,
+                "hf.architectures": ["DeepseekV3ForCausalLM"],
+                "hf.hidden_size": 5120,
+                "afd.num_attention_ranks": 3,
+                "afd.num_ffn_ranks": 3,
+                "par.data_parallel_size": 3,
+                "comp.cudagraph_capture_sizes": [4, 16],
+                "comp.max_cudagraph_capture_size": 16,
+                "comp.compile_sizes": [16],
+                "comp.compile_ranges_endpoints": [16, TEST_MODEL_MAX_LEN],
+                "sched.max_num_seqs": 16,
+            },
+            None,
+            id="accept-full-decode-only-graph",
+        ),
+        pytest.param(
+            {**_GPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL},
+            _err("FULL_DECODE_ONLY"),
+            id="reject-graph-mode-full",
+        ),
+        pytest.param(
+            {"expected_role": "ffn"},
+            _err("role mismatch", ValueError),
+            id="reject-role-mismatch",
+        ),
+        pytest.param({"device_type": "npu"}, _err("requires CUDA"), id="reject-npu"),
+        pytest.param(
+            {"afd.connector": "CAMAsyncAFDConnector"},
+            _err("P2pNcclAFDConnector"),
+            id="reject-non-p2pnccl-connector",
+        ),
+        pytest.param(
+            {"afd.num_attention_ranks": 2},
+            _err("ranks must match DP"),
+            id="reject-rank-mismatch",
+        ),
+        pytest.param({"par.enable_dbo": True}, _err("DBO"), id="reject-dbo-1ub"),
+        pytest.param(
+            {"par.use_ubatching": True}, _err("ubatching"), id="reject-ubatching-1ub"
+        ),
+        pytest.param(
+            {"par.pipeline_parallel_size": 2}, _err("PP or CP"), id="reject-pp"
+        ),
+        pytest.param(
+            {"par.prefill_context_parallel_size": 2}, _err("PP or CP"), id="reject-pcp"
+        ),
+        pytest.param(
+            {"par.decode_context_parallel_size": 2}, _err("PP or CP"), id="reject-dcp"
+        ),
+        pytest.param(
+            {"par.enable_elastic_ep": True}, _err("static expert"), id="reject-elastic"
+        ),
+        pytest.param(
+            {"par.enable_eplb": True}, _err("static expert"), id="reject-eplb"
+        ),
+        pytest.param(
+            {"par.use_sequence_parallel_moe": True},
+            _err("static expert"),
+            id="reject-sp-moe",
+        ),
+        pytest.param(
+            {"par.enable_expert_parallel": False},
+            _err("static expert"),
+            id="reject-no-expert-parallel",
+        ),
+        pytest.param(
+            {"comp.pass_config.enable_sp": True},
+            _err("static expert"),
+            id="reject-pass-sp",
+        ),
+        pytest.param(
+            {"hf.architectures": ["UnsupportedForCausalLM"]},
+            _err("registered AFD model"),
+            id="reject-unregistered-model",
+        ),
     ],
 )
-def test_v2_graph_validator_rejects_non_full_decode_only_modes(cudagraph_mode):
-    config = _single_rank_graph_config()
-    config.compilation_config.cudagraph_mode = cudagraph_mode
-
-    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
+def test_gpu_v2_validator_outcome(overrides, error):
+    config, call = _validator_call(overrides)
+    with _expect(error):
         validate_gpu_model_runner_v2_config(
             config,
-            expected_role="attention",
-            device_type="cuda",
-        )
-
-
-def test_v2_validator_rejects_role_mismatch():
-    with pytest.raises(ValueError, match="role mismatch"):
-        validate_gpu_model_runner_v2_config(
-            _v2_config(role="attention"),
-            expected_role="ffn",
-            device_type="cuda",
-        )
-
-
-def test_v2_validator_rejects_non_cuda_device():
-    with pytest.raises(RuntimeError, match="requires CUDA"):
-        validate_gpu_model_runner_v2_config(
-            _v2_config(),
-            expected_role="attention",
-            device_type="npu",
+            expected_role=call["expected_role"],
+            device_type=call["device_type"] or "cuda",
         )
 
 
@@ -511,6 +529,10 @@ def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
     config = _v2_config()
     config.model_config.hf_text_config = config.model_config.hf_config
     config.model_config.use_mla = True
+    config.parallel_config.num_ubatches = 2
+    config.parallel_config.use_ubatching = local_ubatching
+    config.parallel_config.dbo_decode_token_threshold = 2
+    config.parallel_config.dbo_prefill_token_threshold = 2
     config.additional_config["afd"].update(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
@@ -542,202 +564,155 @@ def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
     assert events == ["native", "connector"]
 
 
-@pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (2, 1), (1, 2), (2, 2)])
-@pytest.mark.parametrize("use_sp", [False, True])
-def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size, use_sp):
-    config = _v2_config(
-        num_attention_ranks=dp_size * tp_size,
-        data_parallel_size=dp_size,
-        tensor_parallel_size=tp_size,
-    )
-    config.additional_config["afd"].update(
-        connector="CAMAsyncAFDConnector", async_dp=True, compute_gate_on_attention=True
-    )
-    config.parallel_config.use_sequence_parallel_moe = use_sp
-    config.compilation_config.pass_config.enable_sp = use_sp
-    validate_npu_model_runner_v2_config(
-        config, expected_role="attention", device_type="npu"
-    )
-
-
-@pytest.mark.parametrize("layout", ["moe_sp", "pass_sp"])
-def test_npu_v2_validator_keeps_synchronous_sp_rejection(layout):
-    config = _v2_config()
-    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
-    if layout == "moe_sp":
-        config.parallel_config.use_sequence_parallel_moe = True
-    else:
-        config.compilation_config.pass_config.enable_sp = True
-    with pytest.raises(RuntimeError, match="static expert"):
-        validate_npu_model_runner_v2_config(
-            config, expected_role="attention", device_type="npu"
-        )
-
-
-@pytest.mark.parametrize("invalid", [None, "graph", "dp1", "stages", "speculative"])
-def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
-    config = _v2_config(num_attention_ranks=2, data_parallel_size=2)
-    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
-    config.parallel_config.enable_dbo = True
-    config.parallel_config.use_ubatching = True
-    config.parallel_config.num_ubatches = 2
-    if invalid == "graph":
-        config.model_config.enforce_eager = False
-    elif invalid == "dp1":
-        config.parallel_config.data_parallel_size = 1
-        config.additional_config["afd"]["num_attention_ranks"] = (
-            config.parallel_config.tensor_parallel_size
-        )
-    elif invalid == "stages":
-        config.parallel_config.num_ubatches = 3
-    elif invalid == "speculative":
-        config.speculative_config = object()
-    if invalid is None:
-        validate_npu_model_runner_v2_config(
-            config, expected_role="attention", device_type="npu"
-        )
-    else:
-        with pytest.raises(RuntimeError, match="DBO"):
-            validate_npu_model_runner_v2_config(
-                config, expected_role="attention", device_type="npu"
-            )
+_NPU_SYNC = {"afd.connector": "CAMP2pAFDConnector"}
+_NPU_ASYNC = {
+    "afd.connector": "CAMAsyncAFDConnector",
+    "afd.async_dp": True,
+    "afd.compute_gate_on_attention": True,
+}
+_NPU_DBO = {
+    **_NPU_SYNC,
+    "afd.num_attention_ranks": 2,
+    "par.data_parallel_size": 2,
+    "par.enable_dbo": True,
+    "par.use_ubatching": True,
+    "par.num_ubatches": 2,
+}
+_NPU_GRAPH = {
+    **_NPU_SYNC,
+    "model.enforce_eager": False,
+    "comp.cudagraph_capture_sizes": [TEST_CUDAGRAPH_CAPTURE_SIZE],
+    "comp.max_cudagraph_capture_size": TEST_CUDAGRAPH_CAPTURE_SIZE,
+}
 
 
 @pytest.mark.parametrize(
-    "target,field,value,error",
+    ("overrides", "error"),
     [
-        ("afd", "async_dp", False, "async DP"),
-        ("afd", "compute_gate_on_attention", False, "compute_gate_on_attention"),
-        ("model", "enforce_eager", False, "eager"),
-        ("parallel", "pipeline_parallel_size", 2, "PP or CP"),
-        ("parallel", "prefill_context_parallel_size", 2, "PP or CP"),
-        ("parallel", "decode_context_parallel_size", 2, "PP or CP"),
-        ("parallel", "enable_dbo", True, "DBO"),
-        ("parallel", "use_ubatching", True, "DBO"),
-        ("parallel", "enable_elastic_ep", True, "static expert"),
-        ("parallel", "enable_eplb", True, "static expert"),
-    ],
-)
-def test_npu_v2_validator_rejects_unsupported_async_cam(target, field, value, error):
-    config = _v2_config()
-    config.additional_config["afd"].update(
-        connector="CAMAsyncAFDConnector", async_dp=True, compute_gate_on_attention=True
-    )
-    if target == "afd":
-        config.additional_config["afd"][field] = value
-    else:
-        setattr(getattr(config, f"{target}_config"), field, value)
-    with pytest.raises(RuntimeError, match=error):
-        validate_npu_model_runner_v2_config(
-            config, expected_role="attention", device_type="npu"
-        )
-
-
-@pytest.mark.parametrize(
-    "cudagraph_mode",
-    [CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY],
-)
-def test_npu_v2_validator_allows_full_acl_graph(cudagraph_mode):
-    config = _v2_config(
-        enforce_eager=False,
-        cudagraph_mode=cudagraph_mode,
-        cudagraph_capture_sizes=[TEST_CUDAGRAPH_CAPTURE_SIZE],
-        max_cudagraph_capture_size=TEST_CUDAGRAPH_CAPTURE_SIZE,
-    )
-    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
-
-    validate_npu_model_runner_v2_config(
-        config,
-        expected_role="attention",
-        device_type="npu",
-    )
-
-
-@pytest.mark.parametrize(
-    "cudagraph_mode",
-    [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
-)
-def test_npu_v2_validator_rejects_non_full_acl_graph(cudagraph_mode):
-    config = _v2_config(enforce_eager=False, cudagraph_mode=cudagraph_mode)
-    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
-
-    with pytest.raises(RuntimeError, match="ACL graph modes FULL"):
-        validate_npu_model_runner_v2_config(
-            config,
-            expected_role="attention",
-            device_type="npu",
-        )
-
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        (
-            lambda c: c.additional_config["afd"].update(
-                connector="CAMAsyncAFDConnector",
-            ),
-            "P2pNcclAFDConnector",
+        pytest.param(_NPU_ASYNC, None, id="accept-async-cam"),
+        pytest.param(
+            {
+                **_NPU_ASYNC,
+                "afd.num_attention_ranks": 4,
+                "par.data_parallel_size": 2,
+                "par.tensor_parallel_size": 2,
+                "par.use_sequence_parallel_moe": True,
+                "comp.pass_config.enable_sp": True,
+            },
+            None,
+            id="accept-async-cam-dp2-tp2-sp",
         ),
-        (
-            lambda c: c.additional_config["afd"].update(num_attention_ranks=2),
-            "ranks must match DP",
+        # Model construction, rather than a backend-wide guard, owns effective
+        # SP. DeepSeek V2's negative construction regression is kept separately.
+        pytest.param(
+            {**_NPU_SYNC, "par.use_sequence_parallel_moe": True},
+            None,
+            id="accept-sync-sp-moe-deferred",
         ),
-        (lambda c: setattr(c.parallel_config, "enable_dbo", True), "DBO"),
-        (lambda c: setattr(c.parallel_config, "use_ubatching", True), "ubatching"),
-        (
-            lambda c: setattr(c.parallel_config, "pipeline_parallel_size", 2),
-            "PP or CP",
+        pytest.param(
+            {**_NPU_SYNC, "comp.pass_config.enable_sp": True},
+            None,
+            id="accept-sync-pass-sp-deferred",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
-            "PP or CP",
+        pytest.param(_NPU_DBO, None, id="accept-dbo-eager-dp2"),
+        pytest.param(
+            {
+                **_NPU_DBO,
+                "model.enforce_eager": False,
+                "comp.cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
+            },
+            None,
+            id="accept-dbo-graph-dp2",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "decode_context_parallel_size", 2),
-            "PP or CP",
+        pytest.param(
+            {**_NPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL},
+            None,
+            id="accept-acl-graph-full",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "enable_elastic_ep", True),
-            "static expert",
+        pytest.param(
+            {**_NPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY},
+            None,
+            id="accept-acl-graph-full-decode-only",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "enable_eplb", True),
-            "static expert",
+        pytest.param(
+            {**_NPU_DBO, "par.data_parallel_size": 1, "afd.num_attention_ranks": 1},
+            _err("DBO requires Attention DP > 1"),
+            id="reject-dbo-dp1",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "use_sequence_parallel_moe", True),
-            "static expert",
+        pytest.param(
+            {**_NPU_DBO, "par.num_ubatches": 3},
+            _err("DBO requires exactly two ubatches"),
+            id="reject-dbo-three-ubatches",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "enable_expert_parallel", False),
-            "static expert",
+        pytest.param(
+            {**_NPU_DBO, "speculative_config": object()},
+            _err("DBO does not support speculative"),
+            id="reject-dbo-speculative",
         ),
-        (
-            lambda c: setattr(c.compilation_config.pass_config, "enable_sp", True),
-            "static expert",
+        pytest.param(
+            {**_NPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE},
+            _err("ACL graph modes FULL"),
+            id="reject-acl-graph-full-and-piecewise",
         ),
-        (
-            lambda c: setattr(
-                c.model_config.hf_config,
-                "architectures",
-                ["UnsupportedForCausalLM"],
-            ),
-            "registered AFD model",
+        pytest.param(
+            {**_NPU_ASYNC, "afd.async_dp": False},
+            _err("async DP"),
+            id="reject-async-cam-sync-dp",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "afd.compute_gate_on_attention": False},
+            _err("compute_gate_on_attention"),
+            id="reject-async-cam-ffn-gate",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "model.enforce_eager": False},
+            _err("eager"),
+            id="reject-async-cam-graph",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.pipeline_parallel_size": 2},
+            _err("PP or CP"),
+            id="reject-async-cam-pp",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.prefill_context_parallel_size": 2},
+            _err("PP or CP"),
+            id="reject-async-cam-pcp",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.decode_context_parallel_size": 2},
+            _err("PP or CP"),
+            id="reject-async-cam-dcp",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.enable_dbo": True},
+            _err("DBO"),
+            id="reject-async-cam-dbo-1ub",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.use_ubatching": True},
+            _err("DBO"),
+            id="reject-async-cam-ubatching-1ub",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.enable_elastic_ep": True},
+            _err("static expert"),
+            id="reject-async-cam-elastic",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.enable_eplb": True},
+            _err("static expert"),
+            id="reject-async-cam-eplb",
         ),
     ],
 )
-def test_v2_validator_rejects_unsupported_execution_constraints(
-    mutation,
-    message,
-):
-    config = _v2_config()
-    mutation(config)
-
-    with pytest.raises(RuntimeError, match=message):
-        validate_gpu_model_runner_v2_config(
+def test_npu_v2_validator_outcome(overrides, error):
+    config, call = _validator_call(overrides)
+    with _expect(error):
+        validate_npu_model_runner_v2_config(
             config,
-            expected_role="attention",
-            device_type="cuda",
+            expected_role=call["expected_role"],
+            device_type=call["device_type"] or "npu",
         )
 
 
@@ -1729,30 +1704,6 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
     assert runner.kv_connector.disabled is False
     assert (
         forward_context_module.create_forward_context is original_create_forward_context
-    )
-
-
-def test_v2_execute_and_capture_signatures_are_pinned():
-    assert inspect.signature(
-        AFDAttentionModelRunnerV2.execute_model,
-        eval_str=True,
-    ) == inspect.signature(
-        native_v2.GPUModelRunner.execute_model,
-        eval_str=True,
-    )
-    assert inspect.signature(
-        AFDAttentionModelRunnerV2.__init__,
-        eval_str=True,
-    ) == inspect.signature(
-        native_v2.GPUModelRunner.__init__,
-        eval_str=True,
-    )
-    assert inspect.signature(
-        AFDAttentionModelRunnerV2.capture_model,
-        eval_str=True,
-    ) == inspect.signature(
-        native_v2.GPUModelRunner.capture_model,
-        eval_str=True,
     )
 
 

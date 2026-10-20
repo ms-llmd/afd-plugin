@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Scoped Ascend seams for vLLM ced6857a's native eager UBatchRunner.
+"""Scoped Ascend seams for vLLM ced6857a's native UBatchRunner.
 
 Ascend baseline: 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6.
-MRV2 uses native preparation; MRV1 Async shares the native NPU contexts.
+MRV2 owns preparation, threads, handoff and graph lifecycle.
 All bindings are scoped to AFD runners and restored on exit.
 Remove when upstream supports Ascend child inputs, streams and cancellation.
 """
@@ -12,7 +12,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import ParallelConfig, VllmConfig
@@ -302,3 +302,45 @@ def use_npu_ubatch_contexts() -> Iterator[None]:
         ubatching.UBatchContext = original_context
         ubatching.current_stream = original_stream
         ubatch_utils.current_stream = original_runner_stream
+
+
+def cat_ubatch_outputs(
+    outputs: list[torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]],
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    """Keep Ascend's nested auxiliary-output contract when native threads merge."""
+    first = outputs[0]
+    if isinstance(first, tuple):
+        pairs = [output for output in outputs if isinstance(output, tuple)]
+        assert len(pairs) == len(outputs)
+        assert all(len(pair[1]) == len(first[1]) for pair in pairs)
+        return (
+            torch.cat([pair[0] for pair in pairs], dim=0),
+            [
+                torch.cat([pair[1][index] for pair in pairs], dim=0)
+                for index in range(len(first[1]))
+            ],
+        )
+    tensors = [output for output in outputs if isinstance(output, torch.Tensor)]
+    assert len(tensors) == len(outputs)
+    return torch.cat(tensors, dim=0)
+
+
+@contextmanager
+def use_npu_ubatch_output_merge() -> Iterator[None]:
+    """Adapt only Ascend auxiliary-output merging; keep native input slicing."""
+    previous_merge = ubatch_utils.merge_ubatch_outputs
+
+    # Patch reason: Ascend auxiliary outputs are (Tensor, list[Tensor]), which
+    # native torch.cat(parts) cannot concatenate. Preserve the tensor merge,
+    # adapting only that nested contract. Signature matches
+    # merge_ubatch_outputs at ced6857. Remove when upstream handles nested aux.
+    def merge_ubatch_outputs(outputs: list[Any]) -> Any:
+        # ### PATCH START: Ascend nested auxiliary outputs.
+        return cat_ubatch_outputs(outputs)
+        # ### PATCH END: Ascend nested auxiliary outputs.
+
+    try:
+        ubatch_utils.merge_ubatch_outputs = merge_ubatch_outputs
+        yield
+    finally:
+        ubatch_utils.merge_ubatch_outputs = previous_merge

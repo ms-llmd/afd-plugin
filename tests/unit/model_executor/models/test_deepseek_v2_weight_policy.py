@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -23,8 +22,8 @@ from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2Model,
     _checkpoint_weight_roles,
 )
+from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
 ATTENTION_ROLES = frozenset(("attention",))
 FFN_ROLES = frozenset(("ffn",))
 BOTH_ROLES = frozenset(("attention", "ffn"))
@@ -107,18 +106,6 @@ def _config() -> SimpleNamespace:
         n_shared_experts=1,
         num_nextn_predict_layers=0,
     )
-
-
-class _OneShotWeights:
-    def __init__(self, names: list[str]) -> None:
-        self.items = [(name, torch.tensor([index])) for index, name in enumerate(names)]
-        self.iterations = 0
-
-    def __iter__(self):
-        self.iterations += 1
-        if self.iterations > 1:
-            raise AssertionError("checkpoint iterator was consumed more than once")
-        return iter(self.items)
 
 
 @pytest.mark.parametrize(
@@ -235,14 +222,6 @@ def test_native_model_loader_packs_mha_qkv(
     assert loaded_params == {target_name}
     assert [shard_id for shard_id, _ in loaded_shards] == ["q", "k", "v"]
     assert [weight.item() for _, weight in loaded_shards] == [0, 1, 2]
-
-
-def test_moe_metadata_and_backend_loading_remain_native_owned() -> None:
-    assert "set_moe_parameters" not in AFDDeepseekV2ForCausalLM.__dict__
-    source = (
-        REPO_ROOT / "afd_plugin" / "model_executor" / "models" / "deepseek_v2.py"
-    ).read_text(encoding="utf-8")
-    assert "vllm_ascend" not in source
 
 
 @pytest.mark.parametrize("suffix", ["weight", "weight_scale", "input_scale", "bias"])

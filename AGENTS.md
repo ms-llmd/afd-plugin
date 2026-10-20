@@ -75,6 +75,82 @@ consistent.
   only when they reduce meaningful complexity, avoid real duplication, or match
   an established local pattern.
 
+## Test Conventions
+
+Unit tests protect behavior at module seams. A test that cannot fail when the
+behavior regresses is not coverage; delete it.
+
+### What a test asserts
+
+Assert the seam, not the plumbing.
+
+- **Allowed**: return values, raised errors and their messages, protocol
+  messages sent to a peer (connector payloads, metadata structures), final
+  file or environment state, config-validation outcomes.
+- **Forbidden**: private attributes of the object under test, arguments passed
+  to an internal collaborator, call counts of an internal helper. Call order is
+  a valid assertion only when the order is itself the contract (connector
+  handshakes, service announce, DBO stage order).
+
+The refactor test: if the implementation is restructured without changing a
+protocol, the test MUST stay green.
+
+### Setup and fakes
+
+- Shared fakes live in `tests/unit/fakes/`, one module per upstream concept
+  (`vllm_config`, `afd_config`, `connector`, `dp_metadata`). A builder defined
+  in two test modules is a layout bug.
+- Do not rebuild an object graph inside a test. Setup over ~15 lines belongs in
+  a fixture or a factory.
+- A test that patches more than ~4 attributes of the module under test is
+  testing its own mocks. Raise the patch target or split the test.
+
+### Size and shape
+
+- One behavior per test. The name states the observable behavior
+  (`test_ffn_worker_stops_loop_before_parent_shutdown`), not the internal call
+  chain (`test_ffn_worker_calls_x_then_y`).
+- A test body over ~50 lines needs `# long-test: <reason>` on the `def` line.
+- The third test with the same prefix and setup becomes a `parametrize` table.
+  Do not copy-paste a body a third time.
+- Tests are deterministic: no sleeps, no wall-clock assertions, no reliance on
+  set iteration order.
+
+### Lifecycle
+
+- A PR that removes behavior deletes the tests in the same PR. Skipping is not
+  a retirement mechanism; a skip needs an issue link.
+- A new test file MUST fall under an existing `validation_paths` entry in
+  `docs/design/module/`. If no module owns it, it is an E2E test.
+- Test files mirror the source tree
+  (`tests/unit/<mirrored path>/test_<module>.py`). Do not create a file per
+  feature or per acceptance bullet.
+- `tests/unit` covers `afd_plugin` only. Harness code under `tests/e2e` is
+  validated by running the E2E cases, not by unit tests.
+
+### Boundaries
+
+- `tests/unit` MUST collect on a CPU-only host without `torch` or vLLM.
+  Runtime imports are gated with `pytest.importorskip` before the guarded
+  module is imported.
+- Device behavior is verified in `tests/npu` or `tests/e2e`. Never simulate
+  device behavior with fakes and then treat it as evidence.
+- Text artifacts (build manifests, patch markers, docs links) may be asserted
+  as text. Production Python modules may not: no test reads
+  `afd_plugin/**/*.py` and asserts on a substring.
+
+### Upstream contract checks
+
+Exactly one module owns upstream signature alignment, as a single parametrized
+table covering patch functions. Inheritance alignment is mypy's job, not
+pytest's.
+
+### Test budget
+
+`tests/unit` total lines are baselined in `tests/unit/.loc-baseline` and may
+only decrease without an approved reason in the PR body. A new feature should
+not add more test lines than source lines; a bug fix has no such cap.
+
 ## Patching Requirement
 
 **Strict Review Required**: All new patches must undergo thorough architectural

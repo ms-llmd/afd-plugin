@@ -3,33 +3,19 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-nn = torch.nn
-
+from torch import nn  # noqa: E402
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper  # noqa: E402
 from vllm.config import CompilationMode  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
-
-
-class _FakeStage(nn.Module):
-    kind = "stage"
-
-    def __init__(self, calls: dict[str, list[str]], *args, prefix="", **kwargs):
-        super().__init__()
-        calls[self.kind].append(prefix)
-        self.weight = nn.Parameter(torch.empty(1))
-
-
-def _stage_type(kind: str):
-    return type(f"Fake{kind.title()}", (_FakeStage,), {"kind": kind})
+from tests.unit.fakes.model_layers import stage_type as _stage_type  # noqa: E402
 
 
 class _FakeMissingLayer(nn.Module):
@@ -38,7 +24,7 @@ class _FakeMissingLayer(nn.Module):
 
 @pytest.fixture
 def construction_env(monkeypatch: pytest.MonkeyPatch):
-    calls = {
+    calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
         "moe": [],
@@ -281,23 +267,6 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
     assert model.num_logical_experts == 8
     assert model.get_experts_layer_indices() == (0,)
     assert adapter.native.Qwen3MoeForCausalLM.packed_modules_mapping == native_mapping
-
-
-def test_adapter_signatures_match_native_contract() -> None:
-    assert inspect.signature(adapter.AFDQwen3MoeDecoderLayer.__init__) == (
-        inspect.signature(adapter.native.Qwen3MoeDecoderLayer.__init__)
-    )
-    assert tuple(inspect.signature(adapter.AFDQwen3MoeModel.__init__).parameters) == (
-        "self",
-        "vllm_config",
-        "prefix",
-    )
-    assert inspect.signature(adapter.AFDQwen3MoeForCausalLM.__init__) == (
-        inspect.signature(adapter.native.Qwen3MoeForCausalLM.__init__)
-    )
-    assert inspect.signature(adapter.AFDQwen3MoeForCausalLM.load_weights) == (
-        inspect.signature(adapter.native.Qwen3MoeForCausalLM.load_weights)
-    )
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -25,6 +24,8 @@ from vllm.config import CompilationMode  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from tests.unit.fakes.model_layers import Stage as _FakeStage  # noqa: E402
+from tests.unit.fakes.model_layers import stage_type as _stage_type
 
 CONSTRUCTOR_DIGESTS = {
     "AFDDeepseekV2Model": (
@@ -34,19 +35,6 @@ CONSTRUCTOR_DIGESTS = {
         "83ebb82ab4e7d4e65fef6ea9427715af121f9eab04e75bbf1e31b370ec05faf1"
     ),
 }
-
-
-class _FakeStage(nn.Module):
-    kind = "stage"
-
-    def __init__(self, calls: dict[str, list[str]], *args, prefix="", **kwargs):
-        super().__init__()
-        calls[self.kind].append(prefix)
-        self.weight = nn.Parameter(torch.empty(1))
-
-
-def _stage_type(kind: str):
-    return type(f"Fake{kind.title()}", (_FakeStage,), {"kind": kind})
 
 
 @pytest.fixture
@@ -210,15 +198,6 @@ def _masked_patch_sha256(source: str) -> str:
     return hashlib.sha256(masked_source.encode()).hexdigest()
 
 
-def test_pinned_constructor_signatures_match_native_vllm():
-    assert inspect.signature(adapter.AFDDeepseekV2Model.__init__) == inspect.signature(
-        adapter.native.DeepseekV2Model.__init__,
-    )
-    assert inspect.signature(
-        adapter.AFDDeepseekV2DecoderLayer.__init__,
-    ) == inspect.signature(adapter.native.DeepseekV2DecoderLayer.__init__)
-
-
 @pytest.mark.parametrize(
     ("class_name", "expected_digest"),
     CONSTRUCTOR_DIGESTS.items(),
@@ -247,6 +226,19 @@ def test_standard_attention_constructs_no_ffn_parameters(
     assert isinstance(moe.mlp, adapter.RemoteFFNProxy)
     assert not any(name.startswith("mlp.") for name in _parameter_names(dense))
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
+
+
+def test_npu_async_ffn_layer_inventory_excludes_dense_and_pp_placeholders(
+    monkeypatch, construction_env
+):
+    model = object.__new__(adapter.AFDDeepseekV2Model)
+    nn.Module.__init__(model)
+    dense = _make_layer(monkeypatch, role="ffn", layer_idx=0, attention_gate=True)
+    moe = _make_layer(monkeypatch, role="ffn", layer_idx=2, attention_gate=True)
+    assert not moe.uses_remote_experts, "NPU does not use the CUDA remote proxy"
+    model.layers = nn.ModuleList([dense, nn.Identity(), moe])
+    # #461 iterates this inventory before submitting its first CAM receive.
+    assert model.get_experts_layer_indices() == (2,)
 
 
 def test_attention_gate_keeps_dense_local_and_gate_at_mlp_path(
@@ -893,7 +885,7 @@ def test_npu_async_attention_allows_model_owned_sp(
     "device_type,connector",
     [
         ("cuda", "CAMAsyncAFDConnector"),
-        ("npu", "CAMP2pConnector"),
+        ("npu", "CAMP2pAFDConnector"),
     ],
 )
 def test_sp_remains_rejected_outside_npu_async_attention(

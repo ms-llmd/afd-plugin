@@ -14,18 +14,24 @@ from afd_plugin.compat.npu.runtime_config import fix_all2all_backend_for_afd
 
 
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize(
     "worker_cls",
     ["auto", "afd_plugin.v1.worker.npu.attention_worker.AFDNPUAttentionWorker"],
 )
-def test_target_config_switch_survives_afd_worker_fix(monkeypatch, enabled, worker_cls):
+def test_target_config_switch_survives_afd_worker_fix(
+    monkeypatch, enabled, dp_size, worker_cls
+):
+    # Load the runtime's platform patches explicitly: Ascend supports MoE SP
+    # with DP=1, unlike native vLLM. Collection order must not select the rule.
+    pytest.importorskip("vllm_ascend.patch.platform")
     ascend = pytest.importorskip("vllm_ascend.ascend_config")
     from vllm.config import ParallelConfig
 
     parallel = ParallelConfig(
         enable_expert_parallel=True,
         tensor_parallel_size=4,
-        data_parallel_size=2,
+        data_parallel_size=dp_size,
         all2all_backend="allgather_reducescatter",
         worker_cls=worker_cls,
     )

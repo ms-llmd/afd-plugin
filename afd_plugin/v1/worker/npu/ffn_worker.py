@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_world_group
 from vllm.platforms import current_platform
 from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -22,7 +24,11 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.connectors import AFDConnectorFactory
+from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
@@ -38,6 +44,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
+
+
+def create_npu_ffn_model_runner(
+    vllm_config: VllmConfig, device: torch.device
+) -> AFDNPUFFNModelRunner | AsyncNPUFFNModelRunner:
+    """Select the execution owner from the connector, with no MRV1 fallback."""
+    validate_npu_model_runner_v2_config(
+        vllm_config, expected_role="ffn", device_type=device.type
+    )
+    afd_config = parse_afd_config(vllm_config, expected_role="ffn")
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        connector = AFDConnectorFactory.create_connector(
+            int(get_world_group().rank), int(device.index), vllm_config, afd_config
+        )
+        return AsyncNPUFFNModelRunner(
+            vllm_config, device, cast(CAMAsyncAFDConnector, connector)
+        )
+    return AFDNPUFFNModelRunner(vllm_config, device)
 
 
 class AFDNPUFFNWorker(NPUWorker):
@@ -62,12 +86,11 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
-        if self.use_v2_model_runner:
-            validate_npu_model_runner_v2_config(
-                self.vllm_config,
-                expected_role="ffn",
-                device_type="npu",
-            )
+        validate_npu_model_runner_v2_config(
+            self.vllm_config,
+            expected_role="ffn",
+            device_type="npu",
+        )
 
         self.device = self._init_device()
         init_workspace_manager(
@@ -78,7 +101,7 @@ class AFDNPUFFNWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
-        self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
+        self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -120,7 +143,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 self._run_ffn_server_loop()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
-                if shutdown_event is not None and shutdown_event.is_set():
+                if (
+                    not self._uses_async_full_graph()
+                    and shutdown_event is not None
+                    and shutdown_event.is_set()
+                ):
                     logger.debug(
                         "AFD NPU FFN receive loop stopped during shutdown",
                         exc_info=True,
@@ -128,6 +155,10 @@ class AFDNPUFFNWorker(NPUWorker):
                     return
                 self._ffn_loop_error = exc
                 logger.exception("AFD NPU FFN worker loop failed")
+            else:
+                if self._uses_async_full_graph():
+                    assert isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    self.model_runner._graph_receiver_exited = True
 
         self._ffn_thread = threading.Thread(
             target=ffn_worker_loop,
@@ -163,12 +194,15 @@ class AFDNPUFFNWorker(NPUWorker):
 
         torch.npu.set_device(self.device)
         while not event.is_set():
-            if self.model_runner.connector.control_plane is None:
-                self.model_runner.execute_connector_driven_step()
-                torch.npu.synchronize()
+            if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+                if not self.model_runner.execute_connector_driven_step():
+                    return
+                if self.model_runner.effective_mode == "eager":
+                    torch.npu.synchronize()
                 continue
-
-            payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            control_plane = self.model_runner.connector.control_plane
+            assert control_plane is not None
+            payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -184,14 +218,36 @@ class AFDNPUFFNWorker(NPUWorker):
             )
             torch.npu.synchronize()
 
+    def _uses_async_full_graph(self) -> bool:
+        return (
+            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            and self.model_runner.effective_mode == "full"
+        )
+
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            self._ffn_loop_error = None
+            if not self._uses_async_full_graph():
+                self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
+        if self._uses_async_full_graph():
+            if event is not None:
+                event.set()
+            thread = self._ffn_thread
+            if thread is not None:
+                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                if thread.is_alive():
+                    raise RuntimeError(
+                        "Async graph receive is pending; retain resources"
+                    )
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.shutdown()
+            self._ffn_thread = None
+            self._ffn_shutdown_event = None
+            return
         if event is not None:
             event.set()
 

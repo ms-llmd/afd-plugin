@@ -22,14 +22,11 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
-  - "tests/unit/test_e2e_runner.py"
-  - "tests/unit/test_e2e_process_utils.py"
+  - "tests/e2e/test_runner.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
-  - "tests/unit/test_dsv4_e2e.py"
-  - "tests/unit/test_dsv4_sync_e2e.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
@@ -264,10 +261,23 @@ of 24; the lower threshold applies only at sample counts up to 24.
 2. Choose one stable case ID and one fixed configuration.
 3. Confirm platforms, devices, ports, CI tier, and runtime budget.
 4. Reuse `runner.py`; add a task adapter only for a new evaluation task.
-5. Add focused unit tests for new commands, topology, flags, and failure paths.
+5. Do not add unit tests for harness code under `tests/e2e`; running the case
+   validates commands, topology, flags, and result checks.
 6. Run the case on every selected platform. Record versions, duration, result.
 7. Update `tests/e2e/README.md`. Update the `run-e2e` skill only when commands,
    variables, prerequisites, or the default suite change.
 
 Model entrypoints reuse the subprocess and download helpers in
 `tests/conftest.py`.
+
+## Unit test maintenance
+
+`tests/unit/.loc-baseline` limits physical lines in every unit Python file,
+including shared fakes, comments and blank lines. The `unit-test-budget`
+pre-commit hook checks the budget. Lower it after a cleanup; an increase
+requires an approved reason in the PR body. Report tests moved out of unit
+separately from deleted code.
+
+Run host-only process/signal integration coverage explicitly with
+`pytest tests/e2e/test_runner.py`; it launches local processes and sockets
+without model weights or accelerators.
