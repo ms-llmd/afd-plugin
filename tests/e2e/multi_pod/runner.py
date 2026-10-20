@@ -93,7 +93,7 @@ def main() -> int:
     # arms it through Attention RPC and a local marker file the FFN worker
     # polls, which no other pod sees; the pods would have to share the window
     # and the per-rank summaries through the rendezvous store. Until then
-    # graph scenarios pass on accuracy alone, so leave the probes out.
+    # graph and DBO scenarios pass on accuracy alone, so leave the probes out.
     args.collect_mrv2_execution_evidence = False
     layout = PodLayout.parse(args.pod_layout)
     topology = Topology.from_args(args)

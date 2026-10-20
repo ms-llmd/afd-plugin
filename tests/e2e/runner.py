@@ -722,16 +722,20 @@ def build_vllm_command(
             [
                 "--data-parallel-size-local",
                 str(slot.dp_size_local),
-                "--data-parallel-start-rank",
-                str(slot.dp_start_rank),
                 "--data-parallel-address",
                 slot.dp_address,
                 "--data-parallel-rpc-port",
                 str(slot.dp_rpc_port),
             ],
         )
+        # The leader always starts at DP rank 0, so it omits the flag: vLLM
+        # treats any explicit start rank on a non-headless engine as hybrid LB
+        # (external LB when its local size is 1), and then rejects the
+        # headless peers (vllm/engine/arg_utils.py:2262).
         if slot.headless:
-            cmd.append("--headless")
+            cmd.extend(
+                ["--data-parallel-start-rank", str(slot.dp_start_rank), "--headless"],
+            )
     elif role == "attention" and args.attention_data_parallel_address is not None:
         # A scenario-pinned Attention DP address is emitted exactly once; in a
         # multi-pod run only the slot knows the pod that leads the role.

@@ -29,6 +29,8 @@ POD_LAYOUTS = {
 MULTI_POD_CASES = [
     ("afd-graph-2a2f", "2pod-role-split"),
     ("afd-graph-2a2f", "2pod-interleaved"),
+    ("afd-graph-dbo-2a2f", "2pod-role-split"),
+    ("afd-graph-dbo-2a2f", "2pod-interleaved"),
 ]
 DEEPSEEK_V2_LITE_MAX_MODEL_LEN = 4096
 

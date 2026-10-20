@@ -108,22 +108,18 @@ line 442). Reading it top to bottom:
    laid out across pods. `validate_layout()` cross-checks the two: the
    layout's total per-role rank counts must match the topology's, and no
    role's local rank count within a pod may violate that role's TP size
-   (a TP group cannot span pods). It also rejects DBO scenarios
-   (`afd-graph-dbo-*` and `afd-v2-*-dbo-*`): the single-host runner
-   accepts a DBO run only after finding two-ubatch execution evidence in the
-   role processes' logs, and no single pod sees every role's logs. **TODO:**
-   support multi-pod DBO by having each pod publish its evidence through the
-   rendezvous store and checking the merged result before the verdict.
-   For the same reason the runner sets
-   `args.collect_gpu_execution_evidence = False` right after
-   `configure_scenario`. On GPU the single-host runner also proves CUDA graph
-   replay for graph scenarios: it loads the `tests.e2e.mrv2_evidence` worker
-   extension, opens the evaluation window through Attention's
+   (a TP group cannot span pods).
+   The runner then sets `args.collect_mrv2_execution_evidence = False`. For
+   graph and DBO scenarios the single-host runner proves the requested
+   execution path, not just accuracy: it loads the `tests.e2e.mrv2_evidence`
+   worker extension, opens the evaluation window through Attention's
    `/collective_rpc` and a local marker file the FFN worker polls, and checks
-   every rank's summary line. No pod can drive that window for the others, so
-   multi-pod GPU graph scenarios (e.g. `afd-graph-2a2f`) launch without the
-   extension and pass on accuracy alone. **TODO:** share the window and the
-   per-rank summaries through the rendezvous store, as for DBO.
+   every rank's summary line for graph replays or two-stage DBO steps. No pod
+   can drive that window for the others, so multi-pod graph and DBO scenarios
+   (e.g. `afd-graph-2a2f`, `afd-graph-dbo-2a2f`) launch without the extension
+   and pass on accuracy alone. **TODO:** share the window and the per-rank
+   summaries through the rendezvous store and check the merged result before
+   the verdict.
 
 2. **Resolve this pod's index.** `resolve_pod_index(layout.num_pods)` (from
    `identity.py`) checks, in order: an explicit `AFD_E2E_POD_INDEX`
@@ -248,9 +244,12 @@ Builds and starts exactly one role's process for this pod. It picks
 slot=slot)` — both imported unchanged from the single-host runner — and
 passes the `RoleSlot` through so `build_vllm_command` can add the
 multi-pod-only flags (`--data-parallel-size-local`,
-`--data-parallel-start-rank`, `--data-parallel-address`,
-`--data-parallel-rpc-port`, `--headless`) *only* when
-`slot.spans_pods` is true. That property is what keeps a one-pod layout
+`--data-parallel-address`, `--data-parallel-rpc-port`, plus
+`--data-parallel-start-rank` and `--headless` on non-leader slots) *only*
+when `slot.spans_pods` is true. The leader omits its start rank (always 0):
+vLLM 0.30 reads an explicit start rank on a non-headless engine as hybrid
+load balancing, which turns external when the local DP size is 1 and then
+rejects the headless peers. `slot.spans_pods` is what keeps a one-pod layout
 producing the exact same argv, character for character, as the single-host
 runner — making a 1-pod layout a genuine control case rather than a
 different code path pretending to be one. After starting the process, it is
