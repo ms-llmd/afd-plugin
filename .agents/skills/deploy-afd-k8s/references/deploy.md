@@ -2,10 +2,20 @@
 
 ## 2. GPU_COUNT
 
-All pods of a role share one StatefulSet template, so GPU count is per
-role: count the devices in the literal `CUDA_VISIBLE_DEVICES=` inside the
-recipe's role block (attention or FFN). Every pod sharing a role shares
-that literal, so this is a plain text extraction:
+Plain single-pod recipe (`PLAN_IS_PLAIN=1` from
+[resolve-recipe.md](resolve-recipe.md)): union of every literal
+`CUDA_VISIBLE_DEVICES=` in the script -- one pod runs every role block.
+
+```bash
+GPU_COUNT="$(grep -oE 'CUDA_VISIBLE_DEVICES=[0-9,]+' "$RECIPE_SCRIPT_PATH" \
+  | cut -d= -f2 | tr ',' '\n' | sort -u | wc -l)"
+```
+
+Placement-driven recipe: all pods of a role share one StatefulSet
+template, so GPU count is per role -- count the devices in the literal
+`CUDA_VISIBLE_DEVICES=` inside the recipe's role block (attention or
+FFN). Every pod sharing a role shares that literal, so this is a plain
+text extraction:
 
 ```bash
 role_block() {  # $1=script $2=ATTENTION|FFN
@@ -182,7 +192,7 @@ deploy_role_sts() {
 Plain recipe, one both-roles StatefulSet:
 
 ```bash
-deploy_role_sts both "$GPU_COUNT" 1
+deploy_role_sts both 1 "$GPU_COUNT"
 ```
 
 Placement-driven recipe, e.g. the qwen3.5 3-pod plan (2 attention pods,
