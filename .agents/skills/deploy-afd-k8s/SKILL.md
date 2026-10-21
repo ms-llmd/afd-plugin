@@ -21,6 +21,16 @@ On success this skill guarantees, in the target namespace:
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs |
 
+Recovery scope: a crashed pod's container restarts and a deleted pod is
+recreated automatically, and a role-per-pod deployment (each role on its
+own pod) recovers from a peer-pod crash with no operator action. A
+**split-role** deployment (one role across multiple pods, e.g. a headless
+attention shard) does **not** recover automatically from the loss of its
+head pod: an idle surviving shard never detects the peer loss and never
+rejoins the restarted peer's rendezvous. Remediation is restarting that
+role's pods together (delete the role's pods; the StatefulSet recreates
+them). Root cause is connector-level peer-loss detection, not this skill.
+
 Whenever a recipe's header spans more than one pod, two more internal-only
 Services may also exist (`${DEPLOY_NAME}-ffn-p2p-service` always;
 `${DEPLOY_NAME}-attn-dp-service` and/or `${DEPLOY_NAME}-ffn-dp-service` only

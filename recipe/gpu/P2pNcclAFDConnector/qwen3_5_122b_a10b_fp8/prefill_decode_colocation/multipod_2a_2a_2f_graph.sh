@@ -14,8 +14,10 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-1239}
 
 # Per-ordinal conventions, derived from the pod's StatefulSet ordinal:
-# POD>0 shards run headless and start at data-parallel rank POD*2.
-ATTENTION_DP_START_RANK=${ATTENTION_DP_START_RANK:-$(( ${POD:-0} * 2 ))}
+# POD>0 shards run headless and start at data-parallel rank
+# POD*ATTENTION_DP_RANKS_PER_POD.
+ATTENTION_DP_RANKS_PER_POD=2
+ATTENTION_DP_START_RANK=${ATTENTION_DP_START_RANK:-$(( ${POD:-0} * ATTENTION_DP_RANKS_PER_POD ))}
 ATTENTION_HEADLESS=${ATTENTION_HEADLESS:-$([ "${POD:-0}" -gt 0 ] && echo 1 || echo 0)}
 : "${ATTENTION_DP_ADDRESS:?not set -- deploy via the deploy-afd-k8s skill, which provides this pod env}"
 ATTENTION_DP_RPC_PORT=${ATTENTION_DP_RPC_PORT:-13345}
@@ -33,7 +35,7 @@ fi
 if [ "$AFD_ROLE" == "attention" ]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 4 \
-      --data-parallel-size-local 2 \
+      --data-parallel-size-local "$ATTENTION_DP_RANKS_PER_POD" \
       "${DP_START_RANK_ARGS[@]}" \
       --data-parallel-address "$ATTENTION_DP_ADDRESS" \
       --data-parallel-rpc-port "$ATTENTION_DP_RPC_PORT" \
