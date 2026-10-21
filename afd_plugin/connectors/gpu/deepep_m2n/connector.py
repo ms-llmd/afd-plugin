@@ -863,11 +863,13 @@ def _register_custom_ops() -> None:
 def _keep_alive_on(stream: torch.cuda.Stream, *tensors: torch.Tensor | None) -> None:
     """Tell the caching allocator ``tensors`` are used on ``stream``.
 
-    Skipped while capturing a CUDA graph: graph-pool memory lives as long as
-    the graph.
+    Also while capturing a CUDA graph: within one capture the allocator reuses
+    a freed graph-pool block for the next allocation on the freeing stream,
+    which would overwrite data a lane still reads on replay (a micro-batch's
+    hidden states under its dispatch, combine output under the copy). PyTorch
+    tracks stream uses recorded during capture and keeps such blocks out of
+    reuse until the capture ends.
     """
-    if torch.cuda.is_current_stream_capturing():
-        return
     for tensor in tensors:
         if tensor is not None:
             tensor.record_stream(stream)

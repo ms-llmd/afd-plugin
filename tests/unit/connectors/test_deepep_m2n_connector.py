@@ -1487,3 +1487,25 @@ def test_single_lane_ffn_has_no_cross_stream_waits(monkeypatch):
     assert not [e for e in log if e[0] == "wait_event" and e[1] != "main"]
     # One ready event per receive and one done event per send; no experts event.
     assert len([e for e in log if e[0] == "record"]) == 2 + 2
+
+
+def test_keep_alive_records_stream_uses_while_capturing(monkeypatch):
+    """Cross-stream uses are recorded also during CUDA graph capture.
+
+    Why: skipping them let the allocator reuse a freed graph-pool block on the
+    freeing stream while a DeepEP lane still read it on replay (a micro-batch's
+    hidden states under its dispatch); Qwen3-235B graph+DBO died with an
+    illegal instruction on the first concurrent requests.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import connector as m2n
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    recorded = []
+
+    class _Tensor:
+        def record_stream(self, stream):
+            recorded.append(stream)
+
+    m2n._keep_alive_on("lane0", _Tensor(), None, _Tensor())
+
+    assert recorded == ["lane0", "lane0"]
