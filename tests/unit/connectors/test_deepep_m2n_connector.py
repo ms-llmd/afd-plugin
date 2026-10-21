@@ -1365,16 +1365,38 @@ class _FFNLane:
 
 
 def _logged_ffn_connector(monkeypatch, num_lanes: int):
-    """FFN connector whose streams and events log every record and wait."""
+    """FFN connector whose streams and events log every record and wait, and
+    every allocation (with the stream it is made under) and keep-alive."""
     from afd_plugin.connectors.gpu.deepep_m2n import connector as m2n
 
     log: list = []
     main = _LoggedStream("main", log)
+    active: list[str] = []
+
+    @contextlib.contextmanager
+    def stream_context(stream):
+        active.append(stream.name)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    real_empty = torch.empty
+
+    def logged_empty(*args, **kwargs):
+        log.append(("alloc", active[-1] if active else "main"))
+        return real_empty(*args, **kwargs)
+
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: main)
     monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: _LoggedEvent(log))
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(m2n, "_keep_alive_on", lambda stream, *tensors: None)
+    monkeypatch.setattr(torch, "empty", logged_empty)
+    monkeypatch.setattr(
+        m2n,
+        "_keep_alive_on",
+        lambda stream, *tensors: log.append(("keep_alive", stream.name)),
+    )
 
     connector = _connector("ffn", 0, Topology(ffn_size=2, attn_size=2))
     connector.device = torch.device("cpu")
@@ -1389,9 +1411,9 @@ def _logged_ffn_connector(monkeypatch, num_lanes: int):
         lane: SimpleNamespace(bucket=8, do_cpu_sync=False) for lane in range(num_lanes)
     }
 
-    def experts(x, scale, weights, psum, local):
+    def experts(x, scale, weights, psum, local, out=None):
         log.append(("experts", "main", None))
-        return torch.zeros((0, HIDDEN_SIZE))
+        return out
 
     connector.experts = experts
     return connector, log
@@ -1472,6 +1494,30 @@ def test_ffn_lanes_join_each_step_once(monkeypatch):
     assert [e[1] for e in first_forks] == ["lane0", "lane1"]
     assert [e[1] for e in second_forks] == ["lane0", "lane1"]
     assert first_forks[0][2] != second_forks[0][2]
+
+
+def test_ffn_rows_and_expert_output_stay_in_the_lane_pool(monkeypatch):
+    """Under DBO every FFN allocation of a stage (its dispatch inputs and the
+    expert output) is made on that stage's lane, and nothing is kept alive on
+    the caller stream.
+
+    Why: rows allocated on a lane and recorded on the caller stream (or an
+    output allocated on the caller stream and recorded on the lane) cannot be
+    reused within one CUDA-graph capture; every MoE layer's rows stayed
+    allocated, and Qwen3-235B graph+DBO ran out of FFN memory at startup.
+    """
+    connector, log = _logged_ffn_connector(monkeypatch, num_lanes=2)
+
+    _ffn_dbo_step(connector, num_layers=3, num_stages=2)
+
+    assert {e[1] for e in log if e[0] == "keep_alive"} <= {"lane0", "lane1"}
+    assert {e[1] for e in log if e[0] == "alloc"} == {"lane0", "lane1"}
+    # The expert output is the last allocation before each experts launch.
+    output_lanes = []
+    for i, entry in enumerate(log):
+        if entry[0] == "experts":
+            output_lanes.append(next(e for e in reversed(log[:i]) if e[0] == "alloc"))
+    assert [e[1] for e in output_lanes] == ["lane0", "lane1"] * 3
 
 
 def test_single_lane_ffn_has_no_cross_stream_waits(monkeypatch):

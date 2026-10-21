@@ -891,6 +891,14 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     the same bucket (it JIT-compiles the kernels and caches the Attention-side
     zero buffer). FFN ranks call ``synchronize_lanes`` before the capture ends.
 
+    FFN memory: a lane's received rows and its expert output live in that
+    lane's caching-allocator pool, without ``record_stream`` on the caller's
+    stream. The caller's stream uses them only in that lane's experts, which
+    the lane's combine waits for, and the lane's next allocation is used only
+    by work issued after that combine. So the lane can reuse a freed block at
+    once, also within one CUDA-graph capture: a capture holds about two
+    layers' rows per lane, not every layer's.
+
     Lifecycle: ``bootstrap`` (before vLLM's distributed init: handshake and
     NCCL environment), then ``init_afd_connector`` (after weights load:
     post-load checks, NCCL control group and DeepEP buffers).
@@ -1279,7 +1287,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         a later lane's dispatch can overlap this lane's experts. The lane does
         not wait for the caller's stream: its inputs are empty, and this
         lane's previous combine, which waits for the experts that read the
-        lane's last rows, is ahead of it on the lane (see _join_step).
+        lane's last rows, is ahead of it on the lane (see _join_step). The
+        same order lets the rows stay in the lane's allocator pool (see the
+        class docstring).
         """
         self._check_initialized()
         lane_stream = self._lane_stream(ubatch_idx)
@@ -1305,13 +1315,6 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             )
             ready_event = torch.cuda.Event()
             ready_event.record(lane_stream)
-        _keep_alive_on(
-            torch.cuda.current_stream(self.device),
-            result.recv_x,
-            result.recv_scale,
-            result.recv_topk_weights,
-            result.recv_count_psum,
-        )
         state = DeepEPM2NTransferState(
             handle=result.handle,
             recv_topk_weights=result.recv_topk_weights,
@@ -1341,12 +1344,18 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         state = self._transfer_state(payload.context)
         current = torch.cuda.current_stream(self.device)
         current.wait_event(state.ready_event)
+        # In the lane's pool, like the rows (see the class docstring).
+        with torch.cuda.stream(self._lane_stream(state.lane)):
+            out = torch.empty(
+                payload.hidden_states.shape, dtype=torch.bfloat16, device=self.device
+            )
         out = self.experts(
             payload.hidden_states,
             state.recv_scale,
             state.recv_topk_weights,
             state.recv_count_psum,
             weights,
+            out=out,
         )
         if self.lane_streams:
             experts_done = torch.cuda.Event()

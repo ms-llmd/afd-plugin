@@ -15,6 +15,7 @@ ranks compare the combined output against a dense MoE reference.
 from __future__ import annotations
 
 import functools
+import gc
 import json
 import os
 import random
@@ -1180,14 +1181,23 @@ class FFNPipelineStep:
 
 
 def run_ffn_dbo_layers(
-    connector: Any, weights: Any, num_layers: int, sleep_cycles: int = 0
+    connector: Any,
+    weights: Any,
+    num_layers: int,
+    sleep_cycles: int = 0,
+    *,
+    retain: bool = True,
+    stretch_cycles: int = 0,
 ) -> FFNPipelineStep:
     """FFN side in the routed runner's order: each stage's send waits until
     just before that stage's next receive, then the lanes join.
 
     ``sleep_cycles`` stretches every E0 with a GPU sleep queued right after
     it on the caller stream, and records when C1 of the previous layer and
-    the stretched E0 end.
+    the stretched E0 end. ``stretch_cycles`` queues the same sleep after
+    every experts launch without timing events (capturable). ``retain=False``
+    drops each layer's rows and output once sent, as the routed runner does,
+    so the allocator may reuse them (nothing is returned to check).
     """
     # Timing events only in the stretched eager variant (not while capturing).
     start = None
@@ -1208,6 +1218,8 @@ def run_ffn_dbo_layers(
                     c1_end.record(connector.lane_streams[1])
             payload = connector.recv_attn_output(stage)
             out = connector.run_experts(payload, weights)
+            if stretch_cycles:
+                torch.cuda._sleep(stretch_cycles)
             if stage == 0 and sleep_cycles:
                 torch.cuda._sleep(sleep_cycles)
                 e0_end = torch.cuda.Event(enable_timing=True)
@@ -1218,8 +1230,10 @@ def run_ffn_dbo_layers(
                 prev_layer, _, prev_e0 = timings[-1]
                 timings[-1] = (prev_layer, c1_end, prev_e0)
             pending[stage] = (out, payload.context)
-            payloads[layer][stage] = payload
-            outs[layer][stage] = out
+            if retain:
+                payloads[layer][stage] = payload
+                outs[layer][stage] = out
+            del payload, out
     for stage in (0, 1):
         connector.send_ffn_output(*pending.pop(stage))
     connector.synchronize_lanes()
@@ -1237,6 +1251,12 @@ def dbo_pipeline_scenario(
     eager only, ``sleep_cycles``: stretch every E0 on the FFN and require
     C1(L-1) to finish before the stretched E0(L) does, i.e. one lane's
     combine must not wait for the other lane's experts.
+
+    Graph only, ``growth_layers=(short, long)``: also capture a short and a
+    long step whose FFN drops each layer's rows once sent (as the routed
+    runner does) and stretches every experts launch; replay both and check
+    Attention's outputs, and require the memory the FFN's capture reserves
+    not to grow with the layer count (``GRAPH_GROWTH_LIMIT``).
     """
     if connector.num_lanes != 2:
         raise RuntimeError("dbo_pipeline_scenario needs two lanes")
@@ -1250,7 +1270,7 @@ def dbo_pipeline_scenario(
     limit = NUM_EXPERTS
     overlap: list[float] = []
 
-    def fresh_inputs(first_step: int) -> list[list[Inputs]]:
+    def fresh_inputs(first_step: int, layers: int = num_layers) -> list[list[Inputs]]:
         return [
             [
                 make_inputs(
@@ -1261,7 +1281,7 @@ def dbo_pipeline_scenario(
                 )
                 for stage in (0, 1)
             ]
-            for layer in range(num_layers)
+            for layer in range(layers)
         ]
 
     def check(first_step: int, ffn_step: Any, inputs: Any, outs: Any, label: str):
@@ -1346,7 +1366,81 @@ def dbo_pipeline_scenario(
         cuda_graph.replay()
         torch.cuda.synchronize()
         check(first_step, ffn_step, inputs, outs, "dbo graph")
-    return checker.finish()
+    result = checker.finish()
+    if args.get("growth_layers"):
+        result["capture_pool_mib"] = _dbo_capture_growth(
+            connector, stages, weights, fresh_inputs, args
+        )
+    return result
+
+
+# The memory a capture whose FFN drops sent rows reserves (its graph pool) may
+# grow with the layer count by at most this factor (a capture that keeps every
+# layer's rows grows linearly).
+GRAPH_GROWTH_LIMIT = 1.5
+
+
+def _dbo_capture_growth(
+    connector: Any,
+    stages: list[tuple[int, ...]],
+    weights: Any,
+    fresh_inputs: Any,
+    args: dict[str, Any],
+) -> dict[int, float]:
+    """See ``dbo_pipeline_scenario`` (``growth_layers``)."""
+    pools: dict[int, float] = {}
+    checker = None if connector.is_ffn else Checker(connector)
+    for layers in args["growth_layers"]:
+        inputs = outs = None
+        if not connector.is_ffn:
+            inputs = fresh_inputs(0, layers)
+            outs = [[torch.empty_like(x) for x, _, _ in layer] for layer in inputs]
+        control_step(connector, stages, graph_mode=True)
+        torch.cuda.synchronize()
+        # Reserved, not allocated: a block freed during capture but kept out
+        # of reuse leaves the allocated count at once and stays reserved.
+        # torch.cuda.graph empties the cache on entry; do it before the base.
+        gc.collect()
+        torch.cuda.empty_cache()
+        base = torch.cuda.memory_reserved()
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cuda_graph):
+            if connector.is_ffn:
+                run_ffn_dbo_layers(
+                    connector,
+                    weights,
+                    layers,
+                    retain=False,
+                    stretch_cycles=args.get("stretch_cycles", 0),
+                )
+            else:
+                run_attention_dbo_layers(connector, inputs, outs)
+        torch.cuda.synchronize()
+        pools[layers] = (torch.cuda.memory_reserved() - base) / 2**20
+        for replay in range(args.get("replays", 3)):
+            if not connector.is_ffn:
+                for static_layer, new_layer in zip(
+                    inputs, fresh_inputs(1000 * (replay + 1), layers), strict=True
+                ):
+                    for static, new in zip(static_layer, new_layer, strict=True):
+                        for static_tensor, new_tensor in zip(static, new, strict=True):
+                            static_tensor.copy_(new_tensor)
+            control_step(connector, stages, graph_mode=True)
+            cuda_graph.replay()
+            torch.cuda.synchronize()
+            if checker is not None:
+                for layer_inputs, layer_outs in zip(inputs, outs, strict=True):
+                    for (x, ids, w), out in zip(layer_inputs, layer_outs, strict=True):
+                        checker.check_combined(out, x, ids, w)
+        del cuda_graph
+        torch.cuda.empty_cache()
+    short, long = args["growth_layers"]
+    if connector.is_ffn and pools[long] > GRAPH_GROWTH_LIMIT * pools[short]:
+        raise RuntimeError(
+            f"FFN capture pool grew from {pools[short]:.1f} MiB ({short} layers) "
+            f"to {pools[long]:.1f} MiB ({long} layers): sent rows are not reused"
+        )
+    return pools
 
 
 def peer_exit_scenario(

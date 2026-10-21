@@ -265,6 +265,34 @@ def test_dbo_pipeline_cuda_graph_capture_and_replay(payload_format, tmp_path):
     )
 
 
+@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
+def test_dbo_graph_capture_reuses_sent_rows(payload_format, tmp_path):
+    """DBO steps of 2 and 8 MoE layers captured with an FFN that drops each
+    layer's rows once sent (as the routed runner does), every experts launch
+    stretched; Attention's outputs are checked after each replay, and the
+    memory the FFN's capture reserves must not grow with the layer count.
+
+    Why: rows kept alive across streams during capture were never reused
+    within it, so every layer's rows stayed allocated and Qwen3-235B
+    graph+DBO (94 MoE layers) ran out of FFN memory at startup. Reusing them
+    early must still not let a lane overwrite rows the experts read.
+    """
+    _run(
+        Topology(2, 2),
+        {"payload_format": payload_format, "num_lanes": 2},
+        tmp_path,
+        scenario=dbo_pipeline_scenario,
+        scenario_args={
+            "num_layers": 2,
+            "tokens": 64,
+            "graph": True,
+            "replays": 2,
+            "growth_layers": (2, 8),
+            "stretch_cycles": DBO_SLEEP_CYCLES // 10,
+        },
+    )
+
+
 @pytest.mark.parametrize(
     ("num_lanes", "payload_format", "hot"),
     [(1, BF16, False), (1, FP8, False), (2, FP8, False), (1, FP8, True)],

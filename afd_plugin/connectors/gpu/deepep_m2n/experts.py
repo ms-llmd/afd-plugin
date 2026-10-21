@@ -88,7 +88,10 @@ class DeepEPM2NExperts:
         recv_topk_weights: torch.Tensor,
         recv_count_psum: torch.Tensor,
         weights: LocalExpertWeights,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``out``, if given, receives the rows (bf16, ``recv_x``'s shape); the
+        caller then picks the allocator pool (stream) they live in."""
         if recv_count_psum.shape[0] != weights.num_experts:
             raise ValueError(
                 f"received rows for {recv_count_psum.shape[0]} local experts, "
@@ -102,18 +105,25 @@ class DeepEPM2NExperts:
                 f"payload dtype {recv_x.dtype} does not match the expert weights "
                 f"({weights.w13.dtype}) or the presence of scales"
             )
+        if out is None:
+            out = torch.empty(recv_x.shape, dtype=torch.bfloat16, device=recv_x.device)
+        elif out.shape != recv_x.shape or out.dtype != torch.bfloat16:
+            raise ValueError(
+                f"expert output must be bf16 {tuple(recv_x.shape)}, got "
+                f"{out.dtype} {tuple(out.shape)}"
+            )
         if recv_x.shape[0] == 0:
-            return torch.empty(recv_x.shape, dtype=torch.bfloat16, device=recv_x.device)
+            return out
         if self.backend == "fused_experts":
             return self._run_fused_experts(
-                recv_x, recv_scale, recv_topk_weights, recv_count_psum, weights
+                recv_x, recv_scale, recv_topk_weights, recv_count_psum, weights, out
             )
         if recv_scale is not None:
             return self._run_deepgemm_fp8(
-                recv_x, recv_scale, recv_topk_weights, recv_count_psum, weights
+                recv_x, recv_scale, recv_topk_weights, recv_count_psum, weights, out
             )
         return self._run_deepgemm_bf16(
-            recv_x, recv_topk_weights, recv_count_psum, weights
+            recv_x, recv_topk_weights, recv_count_psum, weights, out
         )
 
     def _run_deepgemm_bf16(
@@ -122,8 +132,9 @@ class DeepEPM2NExperts:
         recv_topk_weights: torch.Tensor,
         recv_count_psum: torch.Tensor,
         weights: LocalExpertWeights,
+        out: torch.Tensor,
     ) -> torch.Tensor:
-        num_rows, hidden_size = recv_x.shape
+        num_rows = recv_x.shape[0]
         intermediate_x2 = weights.w13.shape[1]
         expected_m = max(1, num_rows // weights.num_experts)
         gate_up = torch.empty(
@@ -136,9 +147,6 @@ class DeepEPM2NExperts:
             (num_rows, intermediate_x2 // 2), dtype=torch.bfloat16, device=recv_x.device
         )
         torch.ops._C.silu_and_mul(activated, gate_up)
-        out = torch.empty(
-            (num_rows, hidden_size), dtype=torch.bfloat16, device=recv_x.device
-        )
         deepgemm.m_grouped_bf16_gemm_nt_psum(
             activated, weights.w2, out, recv_count_psum, expected_m
         )
@@ -153,9 +161,10 @@ class DeepEPM2NExperts:
         recv_topk_weights: torch.Tensor,
         recv_count_psum: torch.Tensor,
         weights: LocalExpertWeights,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         assert weights.w13_scale is not None and weights.w2_scale is not None
-        num_rows, hidden_size = recv_x.shape
+        num_rows = recv_x.shape[0]
         expected_m = max(1, num_rows // weights.num_experts)
         gate_up = torch.empty(
             (num_rows, weights.w13.shape[1]), dtype=torch.bfloat16, device=recv_x.device
@@ -172,9 +181,6 @@ class DeepEPM2NExperts:
         # Fold the top-k weight into the second GEMM's (linear) input.
         activated, activated_scale = silu_mul_fp8_quant(
             gate_up, recv_count_psum, recv_topk_weights
-        )
-        out = torch.empty(
-            (num_rows, hidden_size), dtype=torch.bfloat16, device=recv_x.device
         )
         deepgemm.m_grouped_fp8_gemm_nt_psum(
             activated,
@@ -194,8 +200,9 @@ class DeepEPM2NExperts:
         recv_topk_weights: torch.Tensor,
         recv_count_psum: torch.Tensor,
         weights: LocalExpertWeights,
+        out: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.zeros(recv_x.shape, dtype=torch.bfloat16, device=recv_x.device)
+        out.zero_()
         ranges = expert_row_ranges(recv_count_psum, self.expert_alignment)
         rows = [
             torch.arange(start, end, device=recv_x.device)
