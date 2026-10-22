@@ -48,6 +48,9 @@ ROLE=attention bash recipe/gpu/AfdEPConnector/qwen3_30b_fp8/serve.sh
 
 Set `CONNECTOR=DeepEPM2NAFDConnector` or `CONNECTOR=P2pNcclAFDConnector` on
 both roles for each baseline. Stop both servers before changing connector.
+`AfdEPConnector` runs afdEP's AFD role path; `ROLE_AWARE=0` runs its Masked
+DeepEP protocol on the same build. `DBO=1` enables two micro-batches, one
+connector lane each; set it on both roles.
 The single-node network preset selects local transport; these runs do not
 exercise NCCL GIN across nodes. `cpu_sync_min_tokens=0` enables exact receive
 counts via CPU synchronization during eager prefill; captured decode uses GPU counts.

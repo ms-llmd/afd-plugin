@@ -12,6 +12,12 @@ case "$ROLE" in
   *) echo "ROLE must be ffn or attention" >&2; exit 1 ;;
 esac
 export ROLE
+# DBO=1 runs two micro-batches per step, one connector lane (afdEP buffer) each.
+# Both roles must use the same setting.
+dbo_args=()
+if [[ "${DBO:-0}" == 1 ]]; then
+  dbo_args=(--enable-dbo --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 12)
+fi
 export VLLM_USE_V2_MODEL_RUNNER=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MAX_JOBS="${MAX_JOBS:-8}"
@@ -45,6 +51,12 @@ if routed:
         expert_backend="deepgemm", network={"preset": "single-node"},
         cpu_sync_min_tokens=0,
     )
+if connector == "AfdEPConnector":
+    # ROLE_AWARE=0 runs afdEP's Masked DeepEP protocol on the same build.
+    role_aware = os.environ.get("ROLE_AWARE", "1")
+    if role_aware not in ("0", "1"):
+        raise ValueError("ROLE_AWARE must be 0 or 1")
+    config["connector_extra_config"]["role_aware"] = role_aware == "1"
 print(json.dumps({"afd": config}))
 PY
 )
@@ -57,4 +69,5 @@ exec vllm serve "$MODEL_PATH" \
   --max-num-batched-tokens 2048 --gpu-memory-utilization 0.85 --seed 42 \
   --max-cudagraph-capture-size 128 \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,8,32,128]}' \
+  ${dbo_args[@]+"${dbo_args[@]}"} \
   --additional-config "$afd_config" --host 127.0.0.1 --port "$api_port"
