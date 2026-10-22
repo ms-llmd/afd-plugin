@@ -5,8 +5,32 @@
 `AfdEPConnector` keeps the DeepEP M2N scheduler, Attention-side routing and
 DeepGEMM runner, and loads communication through the standalone
 [afdEP library](https://github.com/ms-llmd/afdEP).
-This backend retains Masked DeepEP's union-rank protocol and dummy expert slots.
-These results do not measure the earlier directional afdEP kernels.
+By default it runs afdEP v2.1's AFD role path (directional counts and exits,
+role-sized buffers and kernels); `role_aware: false` keeps Masked DeepEP's
+union-rank protocol and dummy expert slots on the same build.
+The H100 experiment below predates the role path: it measured the Masked
+protocol (ms-llmd/afdEP#6).
+
+## H200: role path vs Masked on the same build
+
+Same recipe, workloads and seeds as the H100 experiment, on 4 x H200 (one
+NVLink domain, 2 Attention + 2 FFN, no DBO). Arms differ only in
+`ROLE_AWARE` (afdEP `c6dc53f`, native digest `958652a3`; plugin `e5b027f`).
+Two sessions per arm, interleaved, 3 repeats each; paired change of the
+role path against Masked, with the number of pairs where the role path is
+higher:
+
+| Workload | ITL median | TPOT median | TTFT median | Throughput |
+| --- | --- | --- | --- | --- |
+| Short | 5.28 vs 5.72 ms, -7.6% (0/6) | -7.5% (0/6) | -1.8% (0/6) | +7.0% (6/6) |
+| Mixed | 8.49 vs 8.94 ms, -4.6% (0/6) | -1.9% (2/6) | +2.6% (3/6) | +2.1% (6/6) |
+| Sustained | 10.37 vs 10.82 ms, -4.1% (0/6) | -3.8% (0/6) | +33% (4/6) | -1.7% (3/6) |
+
+Short outputs are identical (192/192); the other workloads differ only after
+the first token, as concurrent batches do. Sustained TTFT is bimodal in both
+arms (the second request wave); in controlled prefill bursts (128 concurrent
+256-token prompts from an idle server, 12 bursts per arm) the role path's
+median TTFT is 461 ms against 547 ms. [Per-run results](serving-h200.json).
 
 ## H100 experiment
 
@@ -55,7 +79,8 @@ ROLE=attention bash recipe/gpu/AfdEPConnector/qwen3_30b_fp8/serve.sh
 ```
 
 Set `CONNECTOR=DeepEPM2NAFDConnector` or `CONNECTOR=P2pNcclAFDConnector` on
-both roles for each baseline. Stop both servers before changing connector.
+both roles for each baseline, or `ROLE_AWARE=0` for afdEP's Masked protocol.
+Stop both servers before changing connector.
 The single-node network preset selects local transport; these runs do not
 exercise NCCL GIN across nodes. `cpu_sync_min_tokens=0` enables exact receive
 counts via CPU synchronization during eager prefill; captured decode uses GPU counts.
