@@ -61,11 +61,13 @@ print(json.dumps({"afd": config}))
 PY
 )
 
+# The routed-experts FFN reads vLLM's expert weights in Triton's [gate; up]
+# layout; its own runner computes the experts, so the backend sets only layout.
 exec vllm serve "$MODEL_PATH" \
   --served-model-name qwen3-30b-afdep --dtype bfloat16 \
   --data-parallel-size 2 --api-server-count 1 --tensor-parallel-size 1 \
   --enable-expert-parallel --all2all-backend allgather_reducescatter \
-  --moe-backend deep_gemm --max-model-len 4096 --max-num-seqs 128 \
+  --moe-backend triton --max-model-len 4096 --max-num-seqs 128 \
   --max-num-batched-tokens 2048 --gpu-memory-utilization 0.85 --seed 42 \
   --max-cudagraph-capture-size 128 \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,8,32,128]}' \
