@@ -45,6 +45,12 @@ if routed:
         expert_backend="deepgemm", network={"preset": "single-node"},
         cpu_sync_min_tokens=0,
     )
+if connector == "AfdEPConnector":
+    # ROLE_AWARE=0 runs afdEP's Masked DeepEP protocol on the same build.
+    role_aware = os.environ.get("ROLE_AWARE", "1")
+    if role_aware not in ("0", "1"):
+        raise ValueError("ROLE_AWARE must be 0 or 1")
+    config["connector_extra_config"]["role_aware"] = role_aware == "1"
 print(json.dumps({"afd": config}))
 PY
 )

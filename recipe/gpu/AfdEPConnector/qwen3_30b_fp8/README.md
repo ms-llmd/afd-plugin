@@ -5,8 +5,11 @@
 `AfdEPConnector` keeps the DeepEP M2N scheduler, Attention-side routing and
 DeepGEMM runner, and loads communication through the standalone
 [afdEP library](https://github.com/ms-llmd/afdEP).
-This backend retains Masked DeepEP's union-rank protocol and dummy expert slots.
-These results do not measure the earlier directional afdEP kernels.
+By default it runs afdEP v2.1's AFD role path (directional counts and exits,
+role-sized buffers and kernels); `role_aware: false` keeps Masked DeepEP's
+union-rank protocol and dummy expert slots on the same build.
+The H100 experiment below predates the role path: it measured the Masked
+protocol (ms-llmd/afdEP#6).
 
 ## H100 experiment
 
@@ -55,7 +58,8 @@ ROLE=attention bash recipe/gpu/AfdEPConnector/qwen3_30b_fp8/serve.sh
 ```
 
 Set `CONNECTOR=DeepEPM2NAFDConnector` or `CONNECTOR=P2pNcclAFDConnector` on
-both roles for each baseline. Stop both servers before changing connector.
+both roles for each baseline, or `ROLE_AWARE=0` for afdEP's Masked protocol.
+Stop both servers before changing connector.
 The single-node network preset selects local transport; these runs do not
 exercise NCCL GIN across nodes. `cpu_sync_min_tokens=0` enables exact receive
 counts via CPU synchronization during eager prefill; captured decode uses GPU counts.
