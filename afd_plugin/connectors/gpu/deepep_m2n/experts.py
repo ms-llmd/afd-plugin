@@ -68,13 +68,25 @@ def expert_row_ranges(
 class DeepEPM2NExperts:
     """Runs local experts on received rows; output rows are top-k weighted."""
 
-    def __init__(self, backend: ExpertBackend, expert_alignment: int) -> None:
+    def __init__(
+        self, backend: ExpertBackend, expert_alignment: int, num_sms: int = 0
+    ) -> None:
         if backend not in EXPERT_BACKENDS:
             raise ValueError(f"expert backend must be one of {EXPERT_BACKENDS}")
         self.backend = backend
         self.expert_alignment = expert_alignment
         if backend == "deepgemm":
             deepgemm.set_contiguous_m_alignment(expert_alignment)
+            if num_sms:
+                device_sms = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+                if num_sms > device_sms:
+                    raise ValueError(
+                        f"expert_num_sms={num_sms} exceeds the device's "
+                        f"{device_sms} SMs"
+                    )
+                deepgemm.set_num_sms(num_sms)
 
     @staticmethod
     def deepgemm_alignment() -> int:

@@ -88,6 +88,11 @@ def set_contiguous_m_alignment(alignment: int) -> None:
     load_deepgemm().set_mk_alignment_for_contiguous_layout(alignment)
 
 
+def set_num_sms(num_sms: int) -> None:
+    """Size DeepGEMM's persistent grid (process-wide) to ``num_sms`` SMs."""
+    load_deepgemm().set_num_sms(num_sms)
+
+
 def m_grouped_bf16_gemm_nt_psum(
     a: torch.Tensor,
     b: torch.Tensor,

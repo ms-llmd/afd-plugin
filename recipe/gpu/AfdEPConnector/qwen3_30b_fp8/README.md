@@ -50,7 +50,29 @@ Set `CONNECTOR=DeepEPM2NAFDConnector` or `CONNECTOR=P2pNcclAFDConnector` on
 both roles for each baseline. Stop both servers before changing connector.
 `AfdEPConnector` runs afdEP's AFD role path; `ROLE_AWARE=0` runs its Masked
 DeepEP protocol on the same build. `DBO=1` enables two micro-batches, one
-connector lane each; set it on both roles.
+connector lane each; set it on both roles. `EXPERT_NUM_SMS` sizes the FFN's
+DeepGEMM grid (even, on the FFN role).
+
+### DBO: size the expert GEMM to the SMs transport leaves free
+
+DeepGEMM splits its tiles statically over a persistent grid of every SM. Under
+DBO the other lane's receive kernel waits on the GPU while a GEMM runs, so an
+overlapping GEMM leaves one CTA without an SM and finishes a share late (1.4x
+on afdEP, about 1.8x on DeepEP M2N, same graph node overlapped vs alone).
+afdEP's role-path receive holds one SM while it waits, DeepEP M2N's holds 24.
+4 x H200, this recipe with `DBO=1`, 3 runs per cell, ITL median in ms:
+
+| Connector, `EXPERT_NUM_SMS` | Short | Sustained |
+| --- | --- | --- |
+| `DeepEPM2NAFDConnector`, all (132) | 6.09 | 12.13 |
+| `DeepEPM2NAFDConnector`, 108 | 6.20 | 11.52 |
+| `AfdEPConnector`, all (132) | 5.66 | 11.54 |
+| `AfdEPConnector`, 130 | 5.65 | 10.90 |
+
+Under DBO with this recipe, decode at 60 requests per Attention engine
+(concurrency 120) falls back from CUDA graphs to eager steps at about 78 ms per
+token on every connector; 64 to 68 per engine replay graphs. Runs in that mode
+are excluded above.
 The single-node network preset selects local transport; these runs do not
 exercise NCCL GIN across nodes. `cpu_sync_min_tokens=0` enables exact receive
 counts via CPU synchronization during eager prefill; captured decode uses GPU counts.

@@ -50,6 +50,8 @@ if routed:
         capacity_tokens_per_rank=2048, payload_format="fp8_block128_fp32",
         expert_backend="deepgemm", network={"preset": "single-node"},
         cpu_sync_min_tokens=0,
+        # EXPERT_NUM_SMS sizes the FFN's DeepGEMM grid (even; unset = all SMs).
+        expert_num_sms=int(os.environ.get("EXPERT_NUM_SMS", "0")),
     )
 if connector == "AfdEPConnector":
     # ROLE_AWARE=0 runs afdEP's Masked DeepEP protocol on the same build.

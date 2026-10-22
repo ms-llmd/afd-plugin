@@ -169,6 +169,12 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         num_sms: SMs DeepEP kernels use; ``0`` = a fixed fraction of the
             device's SMs (24 on H100).
         num_qps: RDMA queue pairs per DeepEP buffer; ``0`` = DeepEP's default.
+        expert_num_sms: SMs the FFN's DeepGEMM expert kernels use; ``0`` = all.
+            DeepGEMM splits its tiles statically over a persistent grid, so a
+            transport kernel of the other DBO lane holding even one SM delays
+            a share of every overlapping GEMM. Size the grid to the SMs that
+            transport leaves free while it waits. Must be even (DeepGEMM
+            launches 2-CTA clusters).
         cpu_timeout_s / gpu_timeout_s: DeepEP host-wait and kernel-spin
             timeouts.
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
@@ -191,6 +197,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     bucket_granularity: int = 1
     num_sms: int = 0
     num_qps: int = 0
+    expert_num_sms: int = 0
     cpu_timeout_s: int = DEFAULT_TIMEOUT_S
     gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
@@ -224,6 +231,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("bucket_granularity must be positive")
         if self.num_sms < 0:
             raise ValueError("num_sms must be non-negative")
+        if self.expert_num_sms < 0 or self.expert_num_sms % 2:
+            raise ValueError("expert_num_sms must be a non-negative even number")
         if self.cpu_sync_min_tokens < 0:
             raise ValueError("cpu_sync_min_tokens must be non-negative")
         if self.num_qps < 0:
@@ -1136,7 +1145,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                     self.lane_streams.append(torch.cuda.Stream(self.device))
             if self.is_ffn:
                 self.experts = DeepEPM2NExperts(
-                    self.config.expert_backend, self.expert_alignment
+                    self.config.expert_backend,
+                    self.expert_alignment,
+                    self.config.expert_num_sms,
                 )
             else:
                 self._allocate_combine_zeros()

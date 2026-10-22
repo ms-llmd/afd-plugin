@@ -173,6 +173,8 @@ def test_config_defaults_and_round_trip():
         ({"control_backend": "mpi"}, "control_backend"),
         ({"network": {"preset": "token-ring"}}, "network.preset"),
         ({"num_qps": -1}, "num_qps"),
+        ({"expert_num_sms": -2}, "expert_num_sms"),
+        ({"expert_num_sms": 131}, "expert_num_sms"),
         ({"cpu_timeout_s": 0}, "cpu_timeout_s"),
     ],
 )
@@ -198,6 +200,37 @@ def test_config_accepts_fp8_payload_and_sync_threshold():
 
     assert config.payload_format == "fp8_block128_fp32"
     assert config.cpu_sync_min_tokens == 512
+
+
+def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
+    """``expert_num_sms`` defaults to all SMs and, when set, sizes DeepGEMM's
+    persistent grid once, at expert construction; above the device's SM count
+    it is rejected.
+
+    Why: under DBO a grid that needs every SM straggles behind the other
+    lane's waiting transport kernel.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import experts as experts_module
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        experts_module.deepgemm, "set_contiguous_m_alignment", lambda a: None
+    )
+    monkeypatch.setattr(experts_module.deepgemm, "set_num_sms", calls.append)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=132),
+    )
+
+    assert DeepEPM2NConfig.from_mapping({}).expert_num_sms == 0
+    experts_module.DeepEPM2NExperts("deepgemm", 128)
+    assert calls == []
+    experts_module.DeepEPM2NExperts("deepgemm", 128, 130)
+    assert calls == [130]
+    with pytest.raises(ValueError, match="exceeds the device"):
+        experts_module.DeepEPM2NExperts("deepgemm", 128, 134)
 
 
 def test_plan_stage_skips_host_sync_below_threshold():
