@@ -15,16 +15,27 @@ On success this skill guarantees, in the target namespace:
 
 | | |
 |---|---|
-| Endpoint | `http://vllm-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `CLIENT_PORT` defaults to `18305`) |
+| Endpoint | `http://${DEPLOY_NAME}-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `DEPLOY_NAME` defaults to `vllm`, `CLIENT_PORT` to `18305`) |
 | Serving | the model named by `MODEL_ID` |
-| Pod(s) / Service | `vllm-pod`, or one pod per pod the recipe's header comment describes (named `vllm-pod-<pod>`); Service `vllm-service`, labels `app=afd-recipe,role=serve` |
+| StatefulSet(s) / Service | one StatefulSet per role (`${DEPLOY_NAME}-pod-<role>`, `replicas` = that role's pod count, pods `<name>-<ordinal>`); plain recipes use one both-roles StatefulSet `${DEPLOY_NAME}-pod`; client Service `${DEPLOY_NAME}-service` (an ExternalName at the attention head pod), labels `app=afd-recipe,afd-deployment=<DEPLOY_NAME>,role=serve` |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs |
 
+Recovery scope: a crashed pod's container restarts and a deleted pod is
+recreated automatically, and a role-per-pod deployment (each role on its
+own pod) recovers from a peer-pod crash with no operator action. A
+**split-role** deployment (one role across multiple pods, e.g. a headless
+attention shard) does **not** recover automatically from the loss of its
+head pod: an idle surviving shard never detects the peer loss and never
+rejoins the restarted peer's rendezvous. Remediation is restarting that
+role's pods together (delete the role's pods; the StatefulSet recreates
+them). Root cause is connector-level peer-loss detection, not this skill.
+
 Whenever a recipe's header spans more than one pod, two more internal-only
-Services may also exist (`vllm-ffn-p2p-service` always; `vllm-attn-dp-service`
-and/or `vllm-ffn-dp-service` only if that role is itself split across more
-than one pod) -- callers never talk to these directly. See
+Services may also exist (`${DEPLOY_NAME}-ffn-p2p-service` always;
+`${DEPLOY_NAME}-attn-dp-service` and/or `${DEPLOY_NAME}-ffn-dp-service` only
+if that role is itself split across more than one pod). All but the
+governing Service are ExternalName pointers at head pods -- callers never talk to these directly. See
 [services.md](references/services.md).
 
 ## Scope
@@ -80,7 +91,7 @@ exist **before** any Pod is deployed -- see
 | Reference | Covers |
 |---|---|
 | [resolve-recipe.md](references/resolve-recipe.md) | Step 1: read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), pod(s) via `templates/pod.yaml`, wait for Running and for each pod's own readiness line. |
+| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait with `kubectl rollout status`. |
 | [report-and-teardown.md](references/report-and-teardown.md) | Step 5: report the endpoint/model/nodes. Step 6: teardown (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl
