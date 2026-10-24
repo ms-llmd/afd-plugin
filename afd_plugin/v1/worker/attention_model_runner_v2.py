@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,11 @@ from afd_plugin.model_executor.models.forward_context import use_afd_metadata_pr
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
+)
+from afd_plugin.v1.worker.step_stats import (
+    AttentionStepStats,
+    attention_step_stats_from_env,
+    classify_attention_step,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
@@ -228,6 +234,27 @@ def _use_afd_capture_input_preparation(
         v2_cudagraph_utils.prepare_inputs_to_capture = original_prepare
 
 
+def _run_fullgraph_with_step_stats(
+    step_stats: AttentionStepStats,
+    run_fullgraph: Callable[
+        [v2_cudagraph_utils.BatchExecutionDescriptor],
+        torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors,
+    ],
+    desc: v2_cudagraph_utils.BatchExecutionDescriptor,
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
+    """Replay one FULL graph between the AFD_STEP_STATS launch events."""
+
+    step_stats.begin_launch(
+        classify_attention_step(
+            full_graph=desc.cg_mode == CUDAGraphMode.FULL,
+            num_ubatches=desc.num_ubatches,
+        ),
+    )
+    result = run_fullgraph(desc)
+    step_stats.end_launch()
+    return result
+
+
 @contextmanager
 def _use_afd_fullgraph_replay_hook(
     runner: AFDAttentionModelRunnerV2,
@@ -247,6 +274,14 @@ def _use_afd_fullgraph_replay_hook(
     had_instance_override = "run_fullgraph" in manager_state
     previous_instance_override = manager_state.get("run_fullgraph")
     original_run_fullgraph = manager.run_fullgraph
+    # With AFD_STEP_STATS off, replay calls the native bound method directly.
+    replay_fullgraph = original_run_fullgraph
+    if runner._afd_step_stats is not None:
+        replay_fullgraph = partial(
+            _run_fullgraph_with_step_stats,
+            runner._afd_step_stats,
+            original_run_fullgraph,
+        )
     manager_state[_AFD_FULLGRAPH_HOOK_MARKER] = True
 
     # Patch reason: native FULL replay bypasses ForwardContext creation, so the
@@ -271,7 +306,7 @@ def _use_afd_fullgraph_replay_hook(
             # prepare seam sent their complete control payload.
             assert runner._afd_pending_metadata is not None
             assert runner._afd_pending_metadata.num_stages == desc.num_ubatches
-            return original_run_fullgraph(desc)
+            return replay_fullgraph(desc)
         previous_is_graph_replaying = getattr(
             runner,
             "_afd_is_graph_replaying",
@@ -290,7 +325,7 @@ def _use_afd_fullgraph_replay_hook(
                 runner.build_capture_dp_metadata(padded_tokens),
                 None,
             )
-            result = original_run_fullgraph(desc)
+            result = replay_fullgraph(desc)
         finally:
             runner._afd_is_graph_replaying = previous_is_graph_replaying
         # ### PATCH END: publish one AFD pre-replay payload.
@@ -307,6 +342,31 @@ def _use_afd_fullgraph_replay_hook(
         del manager_state[_AFD_FULLGRAPH_HOOK_MARKER]
 
 
+def _install_afd_metadata_and_begin_eager_launch(
+    runner: AFDAttentionModelRunnerV2,
+    step_stats: AttentionStepStats,
+    forward_context: ForwardContext,
+) -> None:
+    """Install AFD metadata, then open the step-stats launch of an eager forward.
+
+    Native eager execution creates its model context, the only one with a
+    batch descriptor, right before the forward; ubatch child and KV-only
+    contexts have none, and FULL replay creates no context. The launch closes
+    when native execute_model returns.
+    """
+
+    runner.install_afd_metadata_on_forward_context(forward_context)
+    if forward_context.batch_descriptor is None:
+        return
+    ubatch_slices = forward_context.ubatch_slices
+    step_stats.begin_launch(
+        classify_attention_step(
+            full_graph=forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL,
+            num_ubatches=1 if ubatch_slices is None else len(ubatch_slices),
+        ),
+    )
+
+
 @contextmanager
 def _use_afd_execution_context(
     runner: AFDAttentionModelRunnerV2,
@@ -314,6 +374,14 @@ def _use_afd_execution_context(
 ) -> Iterator[None]:
     """Scope AFD replay, metadata-provider, and runner sidecar state."""
 
+    step_stats = runner._afd_step_stats
+    metadata_installer = runner.install_afd_metadata_on_forward_context
+    if step_stats is not None:
+        metadata_installer = partial(
+            _install_afd_metadata_and_begin_eager_launch,
+            runner,
+            step_stats,
+        )
     use_fullgraph_replay_hook = (
         runner.vllm_config.compilation_config.cudagraph_mode
         == CUDAGraphMode.FULL_DECODE_ONLY
@@ -336,11 +404,12 @@ def _use_afd_execution_context(
             use_gpu_mrv2_dbo_dispatch(),
             replay_scope,
             _use_afd_ubatch_preparation(runner),
-            use_afd_metadata_provider(
-                runner.install_afd_metadata_on_forward_context,
-            ),
+            use_afd_metadata_provider(metadata_installer),
         ):
             yield
+        if step_stats is not None:
+            # Closes an eager launch; a FULL replay closed its own.
+            step_stats.end_launch()
     finally:
         runner._afd_pending_metadata = previous_metadata
         runner._afd_suppress_metadata_send = previous_suppress_send
@@ -359,6 +428,8 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     """
 
     afd_expected_role = "attention"
+    # AFD_STEP_STATS recorder; None keeps the execution seams unchanged.
+    _afd_step_stats: AttentionStepStats | None = None
 
     def __init__(
         self,
@@ -396,6 +467,11 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             self._afd_suppress_metadata_send = False
             self._afd_transaction_counter = 0
             self.prof = create_afd_gpu_profiler("attention")
+            self._afd_step_stats = attention_step_stats_from_env(
+                self.vllm_config,
+                connector,
+                partial(torch.cuda.Event, enable_timing=True),
+            )
         except BaseException:
             try:
                 if connector is not None:
