@@ -299,7 +299,9 @@ def _use_afd_fullgraph_replay_hook(
     # ModelCudaGraphManager.run_fullgraph; commit
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
     # Delegation exception: native replay remains wholly in the saved bound
-    # method; this scope owns only the AFD pre-replay control seam.
+    # method; this scope owns only the AFD pre-replay control seam. With
+    # AFD_STEP_STATS=1 the native replay is bracketed by step-stats CUDA
+    # events and host timers (replay_fullgraph); otherwise it is called as is.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
     # callback immediately before FULL graph replay.
     def run_fullgraph(
