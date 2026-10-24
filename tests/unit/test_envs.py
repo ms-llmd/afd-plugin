@@ -5,9 +5,11 @@ from __future__ import annotations
 from afd_plugin.envs import (
     AFD_ASYNC_CAM_LAYERED_GMM,
     AFD_DBO_GUARD_FALLBACK,
+    AFD_FINAL_PREFILL_GRAPH,
     AFD_FORCE_BALANCED_TOPK_IDS,
     async_cam_layered_gmm_enabled,
     dbo_guard_fallback_enabled,
+    final_prefill_graph_enabled,
     force_balanced_topk_ids_enabled,
 )
 
@@ -45,3 +47,14 @@ def test_dbo_guard_fallback_defaults_on_and_false_values_disable(monkeypatch):
     for value in ("0", "false", "no", "off", "OFF"):
         monkeypatch.setenv(AFD_DBO_GUARD_FALLBACK, value)
         assert dbo_guard_fallback_enabled() is False
+
+
+def test_final_prefill_graph_defaults_on_and_false_values_disable(monkeypatch):
+    monkeypatch.delenv(AFD_FINAL_PREFILL_GRAPH, raising=False)
+    assert final_prefill_graph_enabled() is True
+    for value in ("", "1", "true", "yes", "on", "TRUE"):
+        monkeypatch.setenv(AFD_FINAL_PREFILL_GRAPH, value)
+        assert final_prefill_graph_enabled() is True
+    for value in ("0", "false", "no", "off", "OFF"):
+        monkeypatch.setenv(AFD_FINAL_PREFILL_GRAPH, value)
+        assert final_prefill_graph_enabled() is False

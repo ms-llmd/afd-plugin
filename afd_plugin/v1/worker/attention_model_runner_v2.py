@@ -10,6 +10,7 @@ from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import ForwardContext
@@ -21,9 +22,13 @@ from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+from vllm.v1.worker.gpu.model_runner import BatchReqState, sort_batch_req_ids
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
+from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 from afd_plugin.compat.patches.gpu_mrv2_ubatching import (
     use_gpu_mrv2_dbo_dispatch,
@@ -41,6 +46,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDRoutedExpertsConnector,
 )
+from afd_plugin.envs import final_prefill_graph_enabled
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
@@ -57,6 +63,14 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
+# vLLM KV connectors, by registered name, that do no work inside the forward
+# (wait_for_layer_load and save_kv_layer are no-ops) and whose start_load_kv
+# reads no forward context, so a FULL replay runs every hook an eager step
+# runs: DecodeBenchConnector fills the KV cache on the current stream before
+# the forward; NIXL loads asynchronously, outside the forward.
+FORWARD_INDEPENDENT_KV_CONNECTORS = frozenset(
+    {"DecodeBenchConnector", "NixlConnector", "NixlPullConnector", "NixlPushConnector"}
+)
 
 
 class _AFDCaptureEventTracker:
@@ -647,6 +661,142 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_is_graph_replaying = previous_is_graph_replaying
         # ### PATCH END: publish AFD FULL graph warmup/capture control.
+
+    # Patch reason: vLLM 0.30.0 reports a uniform decode token count only for a
+    # batch without prefill, so a step that admits a request whose prompt KV a
+    # KV connector supplied (num_computed = prefill_len - 1, one token
+    # scheduled) dispatches no FULL decode graph; one such rank makes every DP
+    # rank, and the FFN ranks with them, run the step eager.
+    # Patch functionality: when every prefilling request is scheduled for
+    # exactly its remaining prompt tokens, that count is the decode query
+    # length, and _afd_prefills_run_as_decodes finds nothing a FULL decode
+    # graph cannot serve, compute the uniform count as if the batch had no
+    # prefill, so the step can dispatch the FULL decode graph or its DBO twin.
+    # BatchReqState.has_prefill stays True, so prepare_inputs still writes the
+    # prompt token through prepare_prefill_inputs before replay.
+    # AFD_FINAL_PREFILL_GRAPH=0 restores the upstream classification.
+    # Signature: matches vLLM v0.30.0 GPUModelRunner.gather_batch_req_state
+    # exactly (the return annotation is unquoted here only because this module
+    # uses postponed annotations).
+    # Upstream source: vllm/v1/worker/gpu/model_runner.py,
+    # GPUModelRunner.gather_batch_req_state; commit
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # Removal/upstream plan: delete this override when vLLM classifies a final
+    # prompt chunk of decode query length as a decode for graph dispatch, as
+    # its V1 runner does (GPUModelRunner._is_uniform_decode is shape-based).
+    def gather_batch_req_state(
+        self, scheduler_output: SchedulerOutput, dummy_run: bool
+    ) -> tuple[BatchReqState | None, int | None]:
+        """Gather CPU request state for the scheduled batch, in batch order.
+        Returns (batch_state, uniform_decode_token_count)
+        """
+        num_tokens_per_req = scheduler_output.num_scheduled_tokens
+        num_reqs = len(num_tokens_per_req)
+        num_toks = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+
+        if dummy_run:
+            # Dummy batches are uniform by construction.
+            return None, get_uniform_decode_token_count(
+                num_reqs, num_toks, max_query_len, has_prefill=False
+            )
+
+        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        # batch_idx -> req_id
+        req_ids = sort_batch_req_ids(
+            num_tokens_per_req, draft_tokens, self.decode_query_len
+        )
+
+        numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
+        num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
+
+        idx_mapping_iter = map(self.req_states.req_id_to_index.__getitem__, req_ids)
+        idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.intp, count=num_reqs)
+        prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+        num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
+            idx_mapping_np
+        ]
+        is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+
+        if self.adaptive_verification is not None and draft_tokens:
+            num_toks = self.adaptive_verification.get_num_tokens(
+                num_tokens_per_req, draft_tokens
+            )
+
+        batch_state = BatchReqState(
+            req_ids=req_ids,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_tokens=num_toks,
+            idx_mapping_np=idx_mapping_np,
+            prefill_len_np=prefill_len_np,
+            num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+            is_prefilling_np=is_prefilling_np,
+            has_prefill=bool(is_prefilling_np.any()),
+        )
+        # ### PATCH START: classify final decode-sized prompt chunks as decodes.
+        has_prefill = batch_state.has_prefill
+        if has_prefill and self._afd_prefills_run_as_decodes(batch_state):
+            has_prefill = False
+        return batch_state, get_uniform_decode_token_count(
+            num_reqs, num_toks, max_query_len, has_prefill
+        )
+        # ### PATCH END: classify final decode-sized prompt chunks as decodes.
+
+    def _afd_prefills_run_as_decodes(self, batch_state: BatchReqState) -> bool:
+        """Whether a FULL decode graph computes every prefilling request exactly.
+
+        A prefilling request scheduled for exactly its remaining prompt tokens,
+        when that count is the decode query length, has the inputs of a decode
+        request: prepare_inputs writes its prompt token, positions, seq len,
+        slot mapping and block table into the persistent buffers the graph
+        reads, before replay, and its logits index is its last query row. The
+        runner checks exclude what such a graph does not cover: drafts (and a
+        drafter reusing this step's DP agreement), pooling, KV-sharing fast
+        prefill, embedding and M-RoPE inputs, model states whose attention
+        metadata reads is_prefilling or keeps per-request state (Mamba, KDA,
+        encoder-decoder, model-defined states), and KV connectors with work
+        inside the forward or a forward-context-dependent load, which FULL
+        replay skips. A prefilling request that asks for prompt logprobs keeps
+        the eager step. PP and CP are rejected at construction.
+        """
+        if not final_prefill_graph_enabled():
+            return False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            self.speculative_config is not None
+            or self.is_pooling_model
+            or self.fast_prefill is not None
+            or self.uses_inputs_embeds
+            or self.model_config.uses_mrope
+            or type(self.model_state) is not DefaultModelState
+            or (
+                isinstance(self.kv_connector, ActiveKVConnector)
+                and (
+                    kv_transfer_config is None
+                    or kv_transfer_config.kv_connector_module_path is not None
+                    or kv_transfer_config.kv_connector
+                    not in FORWARD_INDEPENDENT_KV_CONNECTORS
+                )
+            )
+        ):
+            return False
+        is_prefilling = batch_state.is_prefilling_np
+        num_scheduled = batch_state.num_scheduled_tokens[is_prefilling]
+        num_remaining = (
+            batch_state.prefill_len_np[is_prefilling]
+            - batch_state.num_computed_prefill_tokens_np[is_prefilling]
+        )
+        if not (
+            np.array_equal(num_scheduled, num_remaining)
+            and bool(np.all(num_scheduled == self.decode_query_len))
+        ):
+            return False
+        prompt_logprobs_worker = self.prompt_logprobs_worker
+        return prompt_logprobs_worker is None or not bool(
+            prompt_logprobs_worker.uses_prompt_logprobs[
+                batch_state.idx_mapping_np[is_prefilling]
+            ].any()
+        )
 
     # Patch reason: native V2 creates ForwardContext inside execute_model, so
     # AFD must install its sidecar at that exact context-construction seam.

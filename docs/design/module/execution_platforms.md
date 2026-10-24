@@ -33,6 +33,8 @@ validation_paths:
   - "tests/unit/v1/worker/test_cuda_graph.py"
   - "tests/unit/v1/worker/test_dbo.py"
   - "tests/unit/v1/worker/test_dbo_guard_fallback.py"
+  - "tests/unit/v1/worker/test_final_prefill_graph.py"
+  - "tests/unit/v1/worker/test_final_prefill_graph_vllm.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_mla_graph.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
@@ -166,6 +168,28 @@ children and sends the complete layout before eager execution or graph replay.
 Single-stage full replay bypasses context creation, so an instance-scoped
 `run_fullgraph` hook publishes its padded shape; two-stage replay reuses the
 already-published layout. Temporary symbols and state are restored in `finally`.
+
+vLLM 0.30.0 reports a uniform decode count only for a batch without prefill.
+A step that admits a request whose prompt KV a KV connector supplied
+(DecodeBenchConnector, or NIXL on a decode instance: one prompt token left)
+therefore matches no FULL decode graph, and that one rank makes every Attention
+DP rank and every FFN rank run the step eager. The Attention runner's
+`gather_batch_req_state` override reports the decode count when every
+prefilling request is scheduled for exactly its remaining prompt tokens, that
+count is the decode query length, and none asks for prompt logprobs. The step
+then replays the FULL decode graph or its DBO twin. `has_prefill` stays true,
+so `prepare_prefill_inputs` still writes the prompt token into the input buffer
+before replay; positions, sequence lengths, slot mapping, block tables and
+attention metadata come from the same code as for a decode step. Such a rank
+reports the count decode-only ranks report, so the DP all-reduce agrees and
+FFN receives the payload and graph key of a decode step of that size. vLLM's
+classification is kept with speculative decoding, pooling, KV-sharing fast
+prefill, embedding or M-RoPE inputs, a model state other than
+`DefaultModelState` (Mamba, KDA, encoder-decoder or model-defined), and a KV
+connector outside `FORWARD_INDEPENDENT_KV_CONNECTORS` (DecodeBench and NIXL):
+FULL replay runs no connector hook inside the forward, and it starts a
+synchronous load with no attention metadata in the forward context.
+`AFD_FINAL_PREFILL_GRAPH=0` restores vLLM's eager step.
 
 FFN uses the Attention payload's warmup/capture flags. It creates a shared
 CUDA graph memory pool, uses `connector.control_plane` to update the owning
