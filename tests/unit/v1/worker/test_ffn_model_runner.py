@@ -17,6 +17,7 @@ from vllm.forward_context import get_forward_context  # noqa: E402
 from vllm.v1.worker import gpu_worker as gpu_worker_module  # noqa: E402
 
 import afd_plugin.v1.worker.ffn_model_runner as ffn_model_runner_module  # noqa: E402
+import afd_plugin.v1.worker.step_stats as step_stats_module  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
     AFDControlPayload,
@@ -33,6 +34,7 @@ from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     _set_moe_layer_index,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from afd_plugin.v1.worker.step_stats import FFNStepStats  # noqa: E402
 from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
 )
@@ -717,6 +719,25 @@ def test_ffn_runner_cuda_graph_miss_falls_back_to_eager():
     ]
 
 
+def test_ffn_runner_reports_run_mode_and_graph_key_to_step_stats():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.use_cuda_graph = True
+    runner.afd_step_stats = FFNStepStats("role=ffn dp_rank=0 role_rank=0", every=1000)
+    dp_metadata = {0: _FakeDPMetadata([1])}
+    graph_key = make_ffn_graph_key(dp_metadata)
+    runner._cuda_graphs = {graph_key: {"graph": _FakeGraph()}}
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list=dp_metadata, is_graph_replaying=True)
+    runner.execute_model(dp_metadata_list=dp_metadata)
+
+    assert runner.afd_step_stats.window.modes == {"replay": 1, "eager": 1}
+    assert runner.afd_step_stats.window.graph_keys == {
+        ("replay", graph_key): 1,
+        ("eager", graph_key): 1,
+    }
+
+
 def test_ffn_runner_steps_gpu_profiler():
     runner = _runner_with_connector_and_model(_FakeModel())
     runner.prof = _StepProfiler()
@@ -812,10 +833,59 @@ def test_ffn_worker_loop_rejects_connector_without_control_plane():
     worker.device = SimpleNamespace(type="cpu")
     worker.model_runner = SimpleNamespace(
         connector=_ConnectorDrivenFakeConnector(),
+        afd_step_stats=None,
     )
 
     with pytest.raises(NotImplementedError, match="control-plane-driven"):
         worker._run_ffn_server_loop()
+
+
+def test_ffn_worker_loop_times_each_step_for_step_stats(monkeypatch):
+    lines = []
+    monkeypatch.setattr(
+        step_stats_module,
+        "logger",
+        SimpleNamespace(info=lambda msg, *args: lines.append(msg % args)),
+    )
+    worker = object.__new__(AFDFFNWorker)
+    event = threading.Event()
+    payload = SimpleNamespace(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_graph_capturing=False,
+        is_warmup=False,
+        is_graph_replaying=True,
+    )
+    executed = []
+
+    def recv_dp_metadata_list():
+        event.set()
+        return payload
+
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="cpu")
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(
+            control_plane=SimpleNamespace(recv_dp_metadata_list=recv_dp_metadata_list),
+        ),
+        use_cuda_graph=False,
+        execute_model=lambda **kwargs: executed.append(kwargs),
+        afd_step_stats=FFNStepStats("role=ffn dp_rank=0 role_rank=0", every=1),
+    )
+
+    worker._run_ffn_server_loop()
+
+    assert executed == [
+        {
+            "dp_metadata_list": payload.dp_metadata_list,
+            "is_graph_capturing": False,
+            "is_warmup": False,
+            "is_graph_replaying": True,
+        }
+    ]
+    assert len(lines) == 1
+    assert lines[0].startswith("AFD step stats role=ffn dp_rank=0 role_rank=0 steps=1 ")
+    for timing in ("recv_wait_ms", "execute_ms", "sync_wait_ms"):
+        assert f" {timing} p50=" in lines[0]
 
 
 def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
