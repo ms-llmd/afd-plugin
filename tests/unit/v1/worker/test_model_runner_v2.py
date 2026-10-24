@@ -47,6 +47,7 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from afd_plugin.v1.worker.step_stats import AttentionStepStats  # noqa: E402
 from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
@@ -81,6 +82,28 @@ class _RecordingConnector:
     def close(self):
         self.closed = True
         self.events.append("close")
+
+
+class _RecordingTimingEvent:
+    def __init__(self, events: list[str]):
+        self.events = events
+
+    def record(self):
+        self.events.append("event_record")
+
+    def query(self):
+        return True
+
+    def elapsed_time(self, end_event):
+        return 0.0
+
+
+def _attention_step_stats(events: list[str]) -> AttentionStepStats:
+    return AttentionStepStats(
+        "role=attention dp_rank=0 role_rank=0",
+        every=1000,
+        event_factory=lambda: _RecordingTimingEvent(events),
+    )
 
 
 class _RunnerRecorder:
@@ -290,6 +313,56 @@ def test_v2_fullgraph_replay_hook_restores_manager_instance_after_success():
     assert runner.cudagraph_manager.__dict__["run_fullgraph"] is native_bound_replay
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
     assert events == ["control_update", "control_send", "native_replay"]
+
+
+@pytest.mark.parametrize(
+    ("num_ubatches", "expected_mode", "expected_events"),
+    [
+        (
+            1,
+            "full_single",
+            [
+                "control_update",
+                "control_send",
+                "event_record",
+                "native_replay",
+                "event_record",
+            ],
+        ),
+        # The DBO prepare seam sent control before replay.
+        (2, "full_dbo", ["event_record", "native_replay", "event_record"]),
+    ],
+)
+def test_v2_fullgraph_replay_step_stats_bracket_only_the_native_replay(
+    num_ubatches,
+    expected_mode,
+    expected_events,
+):
+    events: list[str] = []
+    runner = _runner_for_metadata(events)
+    runner._afd_step_stats = _attention_step_stats(events)
+    if num_ubatches > 1:
+        runner._afd_pending_metadata = SimpleNamespace(num_stages=num_ubatches)
+    descriptor = SimpleNamespace(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=8,
+        num_ubatches=num_ubatches,
+    )
+
+    def native_replay(self, desc):
+        events.append("native_replay")
+        return desc.num_tokens
+
+    runner.cudagraph_manager.run_fullgraph = MethodType(
+        native_replay,
+        runner.cudagraph_manager,
+    )
+
+    with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 3):
+        assert runner.cudagraph_manager.run_fullgraph(descriptor) == 8
+
+    assert events == expected_events
+    assert runner._afd_step_stats.window.modes == {expected_mode: 1}
 
 
 def test_v2_fullgraph_replay_hook_removes_temporary_instance_override():
@@ -1476,6 +1549,55 @@ def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
     )
     assert events == ["control_update", "control_send", "data"]
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
+
+
+def test_v2_eager_step_stats_bracket_the_forward_after_control(monkeypatch):
+    events: list[str] = []
+    runner = _runner_for_metadata(events)
+    runner._afd_step_stats = _attention_step_stats(events)
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={},
+        dp_metadata=None,
+        ubatch_slices=None,
+        batch_descriptor=BatchDescriptor(num_tokens=3),
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    def native_execute(self, *args, **kwargs):
+        native_context = (
+            afd_forward_context.forward_context_module.create_forward_context()
+        )
+        native_context.additional_kwargs["afd_metadata"].connector.send_attn_output(
+            None,
+            None,
+        )
+        return "eager-result"
+
+    monkeypatch.setattr(
+        afd_forward_context.forward_context_module,
+        "create_forward_context",
+        lambda: context,
+    )
+    monkeypatch.setattr(native_v2.GPUModelRunner, "execute_model", native_execute)
+
+    assert (
+        AFDAttentionModelRunnerV2.execute_model(
+            runner,
+            _scheduler_output(3),
+        )
+        == "eager-result"
+    )
+    assert events == [
+        "control_update",
+        "control_send",
+        "event_record",
+        "data",
+        "event_record",
+    ]
+    assert runner._afd_step_stats.window.modes == {"eager_single": 1}
 
 
 def test_v2_eager_execute_does_not_replace_fullgraph_replay(monkeypatch):

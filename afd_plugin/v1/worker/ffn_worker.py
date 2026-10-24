@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -206,6 +207,9 @@ class AFDFFNWorker(Worker):
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
 
+        # AFD_STEP_STATS times the receive wait, the execute or capture call and
+        # the synchronize wait; with stats off no clock is read.
+        step_stats = self.model_runner.afd_step_stats
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
                 raise NotImplementedError(
@@ -214,7 +218,9 @@ class AFDFFNWorker(Worker):
                     "are not supported.",
                 )
 
+            recv_start = time.perf_counter() if step_stats is not None else 0.0
             payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            execute_start = time.perf_counter() if step_stats is not None else 0.0
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -236,8 +242,15 @@ class AFDFFNWorker(Worker):
                     is_graph_replaying=is_graph_replaying,
                 )
 
+            sync_start = time.perf_counter() if step_stats is not None else 0.0
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
+            if step_stats is not None:
+                step_stats.finish_step(
+                    recv_wait_s=execute_start - recv_start,
+                    execute_s=sync_start - execute_start,
+                    sync_wait_s=time.perf_counter() - sync_start,
+                )
 
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error

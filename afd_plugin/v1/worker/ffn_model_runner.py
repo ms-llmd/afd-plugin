@@ -42,6 +42,7 @@ from afd_plugin.v1.worker.ffn_metadata import (
     aggregate_ffn_token_counts,
     project_ffn_token_counts_to_dp,
 )
+from afd_plugin.v1.worker.step_stats import FFNStepStats, ffn_step_stats_from_env
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -60,6 +61,9 @@ class GPUFFNModelRunner:
     """
 
     afd_expected_role = "ffn"
+    # AFD_STEP_STATS recorder, also fed by the worker's server loop; None keeps
+    # execution unchanged.
+    afd_step_stats: FFNStepStats | None = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         self.vllm_config = vllm_config
@@ -98,6 +102,7 @@ class GPUFFNModelRunner:
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
         self.prof = create_afd_gpu_profiler("ffn")
+        self.afd_step_stats = ffn_step_stats_from_env(vllm_config, self.connector)
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -182,6 +187,8 @@ class GPUFFNModelRunner:
             graph_enabled=bool(self.use_cuda_graph),
             graph_exists=cuda_graph_info is not None,
         )
+        if self.afd_step_stats is not None:
+            self.afd_step_stats.record_run(run_mode, graph_key)
         if run_mode is AFDGraphRunMode.REPLAY:
             self._cuda_graphs[graph_key]["graph"].replay()
             return None
@@ -396,6 +403,11 @@ class GPUFFNModelRunner:
             return 0
         if dp_metadata_list is None:
             raise RuntimeError("GPUFFNModelRunner.capture_model requires metadata")
+        if self.afd_step_stats is not None:
+            self.afd_step_stats.record_run(
+                AFDGraphRunMode.WARMUP if is_warmup else AFDGraphRunMode.CAPTURE,
+                make_ffn_graph_key(dp_metadata_list),
+            )
 
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
         if self._graph_memory_pool is None:
