@@ -8,7 +8,11 @@ import os
 
 AFD_FORCE_BALANCED_TOPK_IDS = "AFD_FORCE_BALANCED_TOPK_IDS"
 AFD_ASYNC_CAM_LAYERED_GMM = "AFD_ASYNC_CAM_LAYERED_GMM"
+# Default on; a false value restores vLLM's eager two-micro-batch step when the
+# empty-micro-batch guard rejects a FULL DBO graph (gpu_mrv2_ubatching.py).
+AFD_DBO_GUARD_FALLBACK = "AFD_DBO_GUARD_FALLBACK"
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def force_balanced_topk_ids_enabled() -> bool:
@@ -19,9 +23,15 @@ def async_cam_layered_gmm_enabled() -> bool:
     return os.environ.get(AFD_ASYNC_CAM_LAYERED_GMM, "").lower() in ENV_TRUE_VALUES
 
 
+def dbo_guard_fallback_enabled() -> bool:
+    return os.environ.get(AFD_DBO_GUARD_FALLBACK, "").lower() not in ENV_FALSE_VALUES
+
+
 __all__ = [
     "AFD_FORCE_BALANCED_TOPK_IDS",
     "AFD_ASYNC_CAM_LAYERED_GMM",
+    "AFD_DBO_GUARD_FALLBACK",
     "async_cam_layered_gmm_enabled",
+    "dbo_guard_fallback_enabled",
     "force_balanced_topk_ids_enabled",
 ]
