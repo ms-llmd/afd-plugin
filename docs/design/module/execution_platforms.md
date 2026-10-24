@@ -195,6 +195,17 @@ They are controlled by `AFD_GPU_ATTENTION_PROFILER_*` and
 profiler on execution and stops it during shutdown. `VLLM_TORCH_PROFILER_DIR`
 is a fallback trace directory.
 
+### CUDA step statistics
+
+`AFD_STEP_STATS=1` makes every GPU rank log one INFO line per window of
+`AFD_STEP_STATS_EVERY` steps (default 1000). Attention ranks count each forward
+as `full_dbo`, `full_single`, `eager_dbo` or `eager_single`, from the replayed
+descriptor or the eager forward context, and report p50/p90 host launch time,
+GPU span and the GPU gap since the previous step from CUDA events that are read
+lazily, never synchronized. FFN ranks count graph run modes and graph keys and
+report p50/p90 receive, execute and synchronize waits of the server loop. With
+the variable unset the runners keep `None` and their unchanged paths.
+
 ## NPU mechanisms
 
 ### NPU worker and runtime setup
