@@ -188,7 +188,9 @@ class GPUFFNModelRunner:
             graph_exists=cuda_graph_info is not None,
         )
         if self.afd_step_stats is not None:
-            self.afd_step_stats.record_run(run_mode, graph_key)
+            self.afd_step_stats.record_run(
+                run_mode, graph_key, replay_requested=is_graph_replaying
+            )
         if run_mode is AFDGraphRunMode.REPLAY:
             self._cuda_graphs[graph_key]["graph"].replay()
             return None

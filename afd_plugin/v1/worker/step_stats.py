@@ -63,6 +63,8 @@ RECV_WAIT = "recv_wait"
 EXECUTE = "execute"
 SYNC_WAIT = "sync_wait"
 FFN_TIMINGS = (RECV_WAIT, EXECUTE, SYNC_WAIT)
+# FFN step that ran eager although Attention replayed: a graph-key miss.
+REPLAY_MISS = "replay_miss"
 
 FFNGraphKey = tuple[tuple[int, tuple], ...]
 
@@ -318,9 +320,22 @@ class FFNStepStats:
         self.every = every
         self.window = StepStatsWindow(FFN_TIMINGS)
 
-    def record_run(self, mode: AFDGraphRunMode, graph_key: FFNGraphKey) -> None:
-        self.window.modes[mode.value] += 1
-        self.window.graph_keys[(mode.value, graph_key)] += 1
+    def record_run(
+        self,
+        mode: AFDGraphRunMode,
+        graph_key: FFNGraphKey,
+        *,
+        replay_requested: bool = False,
+    ) -> None:
+        # An eager step Attention asked to replay is a graph-key miss; eager
+        # steps Attention also ran eager (profile, warmup, prefill) are not.
+        label = (
+            REPLAY_MISS
+            if mode is AFDGraphRunMode.EAGER and replay_requested
+            else mode.value
+        )
+        self.window.modes[label] += 1
+        self.window.graph_keys[(label, graph_key)] += 1
 
     def finish_step(
         self,
@@ -339,7 +354,9 @@ class FFNStepStats:
                 "AFD step stats %s steps=%d modes=%s graph_keys=%s %s",
                 self.rank_label,
                 window.steps,
-                window.format_modes([mode.value for mode in AFDGraphRunMode]),
+                window.format_modes(
+                    [mode.value for mode in AFDGraphRunMode] + [REPLAY_MISS]
+                ),
                 window.format_graph_keys(),
                 window.format_timings(),
             )

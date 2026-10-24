@@ -758,13 +758,24 @@ def test_ffn_runner_reports_run_mode_and_graph_key_to_step_stats():
     runner._cuda_graphs = {graph_key: {"graph": _FakeGraph()}}
     runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
 
+    missing_metadata = {0: _FakeDPMetadata([2])}
+    missing_key = make_ffn_graph_key(missing_metadata)
+    # Only the two eager steps consume an Attention payload; replay does not.
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
     runner.execute_model(dp_metadata_list=dp_metadata, is_graph_replaying=True)
     runner.execute_model(dp_metadata_list=dp_metadata)
+    runner.execute_model(dp_metadata_list=missing_metadata, is_graph_replaying=True)
 
-    assert runner.afd_step_stats.window.modes == {"replay": 1, "eager": 1}
+    assert runner.afd_step_stats.window.modes == {
+        "replay": 1,
+        "eager": 1,
+        "replay_miss": 1,
+    }
     assert runner.afd_step_stats.window.graph_keys == {
         ("replay", graph_key): 1,
         ("eager", graph_key): 1,
+        ("replay_miss", missing_key): 1,
     }
 
 
