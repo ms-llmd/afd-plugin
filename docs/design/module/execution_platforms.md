@@ -18,6 +18,7 @@ primary_code_paths:
   - "setup.py"
   - "MANIFEST.in"
 related_code_paths:
+  - "afd_plugin/compat/patches/gpu_mrv2_ubatching.py"
   - "afd_plugin/v1/worker/{attention_metadata,attention_model_runner_v2,ffn_model_runner}.py"
   - "afd_plugin/v1/worker/npu/{attention_model_runner_v2,ffn_model_runner,async_ffn_model_runner}.py"
   - "afd_plugin/connectors/{gpu,npu}/**"
@@ -27,9 +28,11 @@ validation_paths:
   - "tests/unit/compat/test_profiler.py"
   - "tests/unit/compat/test_ascend_ops.py"
   - "tests/unit/compat/npu/test_profiler.py"
+  - "tests/unit/compat/patches/test_gpu_mrv2_ubatching.py"
   - "tests/unit/package/test_ascend_build_files.py"
   - "tests/unit/v1/worker/test_cuda_graph.py"
   - "tests/unit/v1/worker/test_dbo.py"
+  - "tests/unit/v1/worker/test_dbo_guard_fallback.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_mla_graph.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
@@ -179,6 +182,23 @@ and publishes the complete stage layout before native execution. Padded token
 sizes drive graph coordination while unpadded lengths retain transfer semantics.
 Scoped factory and dispatch adapters enable the native path at Attention DP1
 as well as DP > 1. AFD accepts exactly two native ubatches.
+
+When every Attention DP rank microbatches, vLLM matches the FULL two-stage
+graph for the largest rank's token count, but runs the step eager, still
+microbatched, when the smallest rank would leave its second stage empty
+(`2 * min < padded`). With power-of-two capture sizes, a one-request imbalance
+(3 to 5 tokens, padded to 8) trips this guard on almost every decode step. The
+scoped dispatch runs such a step without microbatches instead, through vLLM's
+non-microbatched path: every rank pads to the largest count and replays the
+single-batch FULL graph, or runs eager when a rank asks for eager, as for a
+step below the DBO threshold. The decision reads only all-reduced counts and
+the descriptor every rank pads to, so all ranks agree. FFN receives one stage
+and replays the single-stage graph it captured with Attention's single-batch
+graph; step statistics count these steps as `full_single`. A step with no FULL
+two-stage graph (above the largest capture size, or a rank in prefill) keeps
+vLLM's eager microbatching. DP1 applies the same rule.
+`AFD_DBO_GUARD_FALLBACK=0`, set alike on every Attention rank, restores vLLM's
+eager microbatched step.
 
 Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal DBO validation
 applies. Qwen3 MoE DBO remains supported. Earlier Qwen GDN Graph + DBO and
