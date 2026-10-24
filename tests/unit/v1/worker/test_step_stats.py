@@ -305,26 +305,29 @@ def test_attention_end_without_open_launch_records_nothing():
 def test_ffn_stats_count_modes_and_graph_keys_per_window(monkeypatch):
     recording_logger = _RecordingLogger()
     monkeypatch.setattr(step_stats_module, "logger", recording_logger)
-    stats = FFNStepStats("role=ffn dp_rank=0 role_rank=0", every=4)
+    stats = FFNStepStats("role=ffn dp_rank=0 role_rank=0", every=5)
     dbo_key = ((0, (128,)), (1, (128,)))
-    miss_key = ((0, (72,)), (1, (72,)))
+    prefill_key = ((0, (72,)), (1, (72,)))
+    miss_key = ((0, (64,)), (1, (64,)))
 
-    for mode, graph_key in (
-        (AFDGraphRunMode.REPLAY, dbo_key),
-        (AFDGraphRunMode.REPLAY, dbo_key),
-        (AFDGraphRunMode.REPLAY, dbo_key),
-        (AFDGraphRunMode.EAGER, miss_key),
+    for mode, graph_key, replay_requested in (
+        (AFDGraphRunMode.REPLAY, dbo_key, True),
+        (AFDGraphRunMode.REPLAY, dbo_key, True),
+        (AFDGraphRunMode.REPLAY, dbo_key, True),
+        (AFDGraphRunMode.EAGER, prefill_key, False),
+        (AFDGraphRunMode.EAGER, miss_key, True),
     ):
-        stats.record_run(mode, graph_key)
+        stats.record_run(mode, graph_key, replay_requested=replay_requested)
         stats.finish_step(recv_wait_s=0.002, execute_s=0.0005, sync_wait_s=0.001)
 
     assert recording_logger.lines == [
-        "AFD step stats role=ffn dp_rank=0 role_rank=0 steps=4 "
-        "modes=eager:1,warmup:0,capture:0,replay:3 "
-        "graph_keys=replay[0:128|1:128]:3,eager[0:72|1:72]:1 "
-        "recv_wait_ms p50=2.000 p90=2.000 n=4 "
-        "execute_ms p50=0.500 p90=0.500 n=4 "
-        "sync_wait_ms p50=1.000 p90=1.000 n=4"
+        "AFD step stats role=ffn dp_rank=0 role_rank=0 steps=5 "
+        "modes=eager:1,warmup:0,capture:0,replay:3,replay_miss:1 "
+        "graph_keys=replay[0:128|1:128]:3,eager[0:72|1:72]:1,"
+        "replay_miss[0:64|1:64]:1 "
+        "recv_wait_ms p50=2.000 p90=2.000 n=5 "
+        "execute_ms p50=0.500 p90=0.500 n=5 "
+        "sync_wait_ms p50=1.000 p90=1.000 n=5"
     ]
     assert stats.window.steps == 0
     assert not stats.window.graph_keys
