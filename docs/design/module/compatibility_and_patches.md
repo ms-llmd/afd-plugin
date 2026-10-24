@@ -80,6 +80,7 @@ compatibility evidence rather than a released package or container tag.
 | NPU adapters | [`compat/npu/`](../../../afd_plugin/compat/npu) | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py), [`test_ascend_ops.py`](../../../tests/unit/compat/test_ascend_ops.py) |
 | NPU patch paths | [`compat/patches/npu/`](../../../afd_plugin/compat/patches/npu) | [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py) |
 | CUDA native V2 DBO preparation and guard fallback | [`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py) | [`test_gpu_mrv2_ubatching.py`](../../../tests/unit/compat/patches/test_gpu_mrv2_ubatching.py), [`test_dbo_guard_fallback.py`](../../../tests/unit/v1/worker/test_dbo_guard_fallback.py) |
+| CUDA native V2 final-token prefill graph dispatch | [`attention_model_runner_v2.py`](../../../afd_plugin/v1/worker/attention_model_runner_v2.py) | [`test_final_prefill_graph.py`](../../../tests/unit/v1/worker/test_final_prefill_graph.py), [`test_final_prefill_graph_vllm.py`](../../../tests/unit/v1/worker/test_final_prefill_graph_vllm.py) |
 
 ## Patch application lifecycle
 
