@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-from torch import nn  # noqa: E402
+from torch import Tensor, nn  # noqa: E402
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
@@ -59,6 +59,41 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
 
     monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata
+
+
+def test_shared_experts_run_after_dispatch_before_inplace_collect(monkeypatch):
+    events: list[tuple] = []
+    metadata = _install_fake_forward_context(monkeypatch, events)
+
+    shared_outputs: list[Tensor] = []
+
+    def collect(*, ref_tensor, ubatch_idx, dependency):
+        events.append(("recv", ref_tensor, ubatch_idx, dependency))
+        assert dependency is shared_outputs[0]
+        return ref_tensor.mul_(0.25)
+
+    metadata.connector.recv_ffn_output = collect
+
+    class SharedExperts(nn.Module):
+        def forward(self, hidden_states):
+            events.append(("shared",))
+            output = hidden_states * 2
+            shared_outputs.append(output)
+            return output
+
+    proxy = adapter.AFDAttentionFusedMoE(layer_idx=1, external_routing=True)
+    hidden_states = torch.full((2, 4), 8.0)
+    original = hidden_states.clone()
+    output = proxy(
+        hidden_states,
+        router_logits=torch.zeros((2, 8)),
+        shared_experts=SharedExperts(),
+    )
+
+    assert [event[0] for event in events] == ["send", "yield", "shared", "recv"]
+    torch.testing.assert_close(output, original * 2.25)
+    torch.testing.assert_close(events[-1][3], original * 2)
+    assert set(events[0][3]) == {"router_logits"}
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["dense", "moe"])

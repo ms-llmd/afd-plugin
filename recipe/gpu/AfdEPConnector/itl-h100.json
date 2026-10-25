@@ -1,0 +1,4090 @@
+{
+  "experiment": "H100 vLLM serving: graph ablations and dependency correction",
+  "generated_at_utc": "2026-10-18T18:56:24.703350+00:00",
+  "status": "complete",
+  "planned_cases": {
+    "short": {
+      "title": "32 input tokens \u00b7 concurrency 1",
+      "input_tokens": [
+        32
+      ],
+      "concurrency": 1,
+      "requests": 32,
+      "output_tokens": 64
+    },
+    "prefill2048": {
+      "title": "2,048 input tokens \u00b7 concurrency 1",
+      "input_tokens": [
+        2048
+      ],
+      "concurrency": 1,
+      "requests": 32,
+      "output_tokens": 64
+    },
+    "mixed": {
+      "title": "Mixed input lengths \u00b7 concurrency 32",
+      "input_tokens": [
+        32,
+        128,
+        512,
+        1024,
+        1536,
+        2048
+      ],
+      "concurrency": 32,
+      "requests": 128,
+      "output_tokens": 64
+    },
+    "prefillthroughput": {
+      "title": "2,048 input \u00b7 concurrency 32 \u00b7 1 output",
+      "input_tokens": [
+        2048
+      ],
+      "concurrency": 32,
+      "requests": 128,
+      "output_tokens": 1
+    }
+  },
+  "repeats": 3,
+  "comparison_groups": {
+    "frozen_graph_ablations": {
+      "modes": [
+        "p2p-itl-gdr",
+        "afdep-overlap-poll-itl-gdr",
+        "afdep-overlap-poll-itl-ffn-eager",
+        "afdep-overlap-poll-itl-prefill-eager"
+      ],
+      "description": "Original graph-policy ablations use the same frozen implementation."
+    },
+    "dependency_correction": {
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "plugin_commit": "f12edbd473f9b881a4bc21ed794c56458488c8cf",
+      "cases": [
+        "short",
+        "mixed"
+      ],
+      "description": "Separate implementation correction: opaque-op dependency enforces GPU shared-MLP execution before waiting for the reply."
+    }
+  },
+  "not_planned": [
+    {
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "case": "short"
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "case": "prefill2048"
+    },
+    {
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "case": "prefill2048"
+    },
+    {
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "case": "prefillthroughput"
+    }
+  ],
+  "provenance": {
+    "sha256": "e39e5c56764c7eeeee0450ab4f7dac8a72d6e701d610ee7db2de24be3e1b142c",
+    "data": {
+      "date": "2026-10-18",
+      "hardware": "8 H100 80GB HBM3 GPUs, 4 Attention + 4 FFN across two four-GPU NVLink domains",
+      "model": "deepseek-ai/DeepSeek-V2-Lite",
+      "model_revision": "604d5664dddd88a0433dbae533b7fe9472482de0",
+      "precision": "BF16",
+      "expert_partition": "64 routed experts, 16 per FFN rank",
+      "vllm": "0.30.0",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "nccl": "2.30.7",
+      "afdep_network_backend": "GIN_IB_GDAKI type 3, hybrid NVLink forwarding",
+      "network": "Matched GPUDirect and NIC binding; one shared 200Gb/s RDMA port",
+      "afdep_native_source_commit": "9ad705fa3bc08018ff7e0c3128aec86be84f64f8",
+      "plugin_base_commit": "fbf143d8fa8ed43e4a58e32d61d922a5b5e767f4",
+      "plugin_runtime_state": "Base plus FFN graph-replay ablation and lexical shared-expert placement; exact runtime source hashes below. Nsight shows compiler deferred shared GEMMs until after collect in this matrix. Explicit dependency correction evaluated separately.",
+      "runtime_source_sha256": {
+        "afd_plugin/envs.py": "364135d7ef69f4a3dfab23638579fc785f2476edbe193838ebd7b5b9bc63bbd5",
+        "afd_plugin/config.py": "cb6bc17dd402284cc2ea5a1a1fffb24fbc3b4327b7f09a8ee46b3d96cd03ac96",
+        "afd_plugin/__init__.py": "3f236a3ee5fcf178470dea6003518394037c7a5deb1fe6a02266a5a2b6da881c",
+        "afd_plugin/config_utils.py": "91ec5c8e09baa477502b1a1210c0934d3e9915acd5a2d73b68e85c44d7c9b184",
+        "afd_plugin/validation.py": "50b85abf03148994f5669f39f0814df4d11555a95ac64fa6fa8e32793625911f",
+        "afd_plugin/v1/__init__.py": "14d391b776a2b7f904801336c51ed966f5f6686e54ab4734e5c1c9cda4cdfcd9",
+        "afd_plugin/connectors/metadata.py": "161316e4ed8f8a316ba89489a26ebf5c2d3d4f252ee606f2b1a66bd868568f73",
+        "afd_plugin/connectors/__init__.py": "e86d3028438b16d9a83fd52d9ced16db17e2653755b7b4baabece020f1208bb9",
+        "afd_plugin/connectors/factory.py": "efed9dabac9eeb2313858d103ff558a55a5f5d0ac0700614b549d5e79e1a667e",
+        "afd_plugin/connectors/base.py": "dd620457290cb9d7f3570318e68c9d2b391e6d8f7befccb691205fd7643ac16f",
+        "afd_plugin/compat/vllm.py": "45d73bfbb34c293c95155cc2a72e9680a0f256edaf5c0c718712a423540f9f93",
+        "afd_plugin/compat/__init__.py": "bbf9e106d0fc577a8b5fd8a21a7a1462e7921a3d438d0b8ffba6ed58d3ac5308",
+        "afd_plugin/compat/profiler.py": "de16927c06f93946aa9802a52c3bf49c0cdd3666a746fd6edea7b259b7c9ee43",
+        "afd_plugin/distributed/afd_process_group.py": "7de97ba9ca50b4bd1370b21fd05607c753570e9302573590ac7dc5a6959a53a3",
+        "afd_plugin/distributed/__init__.py": "06f32f38b685b264941f4cdf5dc69aeae2b2306af010b0b6743a3a4f702c9443",
+        "afd_plugin/distributed/topology.py": "7985d71f5ef5cec896094d6a86acaf6e58d0efb98bc6624f8d085d3f864ea304",
+        "afd_plugin/model_executor/__init__.py": "eb88ce8ccbcc1f446b2bc70642d26f7f7ad4b7a21319b7955aa93fc30c5b473d",
+        "afd_plugin/model_executor/routing_simulator.py": "3172ca27fe1a86e9e3181112c3374df1bce1d26b35801f9c1d931b018509ad02",
+        "afd_plugin/v1/worker/cuda_graph.py": "f2aa03900c7353bf2eab20a67778d19e259813115504ba31942ecde895baa57c",
+        "afd_plugin/v1/worker/ffn_worker.py": "aeb5d714c7cf1f56d7791b12be19dfb3a8ee59eca069fecbb7f09eefdb21bf82",
+        "afd_plugin/v1/worker/attention_model_runner_v2.py": "5b0e391fe29d873135fbbcf9be156ff98e9346c7b40efee9aaf4e67aa3d989dd",
+        "afd_plugin/v1/worker/ffn_model_runner.py": "7f22b1ed8ac1275bf7a5d2c55f2a3b54c44e646d103cd0d61f4dc6445b67b54e",
+        "afd_plugin/v1/worker/__init__.py": "35485630150b566c8e829e79e1ea1a394e153c2708a232e39d8bdefbc42a0d56",
+        "afd_plugin/v1/worker/ffn_metadata.py": "9a8a726512823161ae2ba68a8941c500904d442f0d5ca8c8fa2ebd1b8e70e2c3",
+        "afd_plugin/v1/worker/attention_worker.py": "769a7ea717b470c8924f8db2587c5de6730065791180798a055a1171ef8848e8",
+        "afd_plugin/v1/worker/attention_metadata.py": "d9798743c5b0a3442002f3850c5b1bfcc0dd33318f8e157dfbadbba1f4ea5fe8",
+        "afd_plugin/v1/worker/ubatch_wrapper.py": "72612fc48659d27ee70c821dbdd313c752965395a626217be4ce249e1b1f4457",
+        "afd_plugin/v1/worker/dbo.py": "1e0b7df50cbd048677a1840a5dcfcefa5157f040c78ae0b0da0e832a15501035",
+        "afd_plugin/v1/worker/npu/attention_model_runner_v2.py": "7b0eccde27aade1bbb0c27d20d0a2a55f2f5f035ecee58ad15df4a1da8f4044d",
+        "afd_plugin/v1/worker/npu/ffn_model_runner.py": "7ecf9df190fad3c3d8accaafc590937ccf22931074af4e57768346a19686e1bc",
+        "afd_plugin/v1/worker/npu/mla_graph.py": "96ad187cd1275f44e5d115277cb4d9c63b518eb96d46471ecfba97cf0f683f49",
+        "afd_plugin/v1/worker/npu/ubatch_runner.py": "b44eb2b6202fca9bb5efa42a2a1544f50fb4dbd623519e7ad998be8fbd1d5a7a",
+        "afd_plugin/v1/worker/npu/attention_worker.py": "90d3adc97ad5f3fe8c3fab0d893843725c8dcaae7284bfe6c6e3541df793b0c8",
+        "afd_plugin/v1/worker/npu/forward_context.py": "25446aa817223e9fa4e62732113138318e1c1579b1d62a0536e8bb52196cdc12",
+        "afd_plugin/v1/worker/npu/attention_model_runner.py": "22b100febb9010de0b48060740f3625c46b5bee6b4ffbdd99f5a46f364a43da6",
+        "afd_plugin/v1/worker/npu/ubatch_utils.py": "bbaa6de9dd6b39919b77a9531b6e781fba185d5baf6406896b15c534eecf384b",
+        "afd_plugin/v1/worker/npu/ubatching.py": "9dc72aa8ad2a2001093b4cf1b27f00734a1d726e73db7bf1b7b794850b78b135",
+        "afd_plugin/v1/worker/npu/npu_ubatch_wrapper.py": "2992c3e56f1464c2c8ff3d274aa03875d8e8f68fdbed3439ae32cf427ba172a5",
+        "afd_plugin/v1/worker/npu/ffn_worker.py": "b1e04aa0dae1f4851d724860dd959043724ac856259a00a3a5eae727b9e9179e",
+        "afd_plugin/v1/worker/npu/__init__.py": "c0c353129bb00a80cadce241253e6af2becabdbf00a41520c4e1f210f576c320",
+        "afd_plugin/connectors/gpu/p2p.py": "4106b860afaf8b5b12b8688b1273096cb7e05a04ea926d969cb007bf702a2575",
+        "afd_plugin/connectors/gpu/__init__.py": "20c815a1fc731c5203d20cce29affc371c5f1c7d01dcc672cae2cc6b7d8965c6",
+        "afd_plugin/connectors/npu/camp2p.py": "2539463a3f39036b815b506340891e51d69a30aad6aa3de81381067ab9410c86",
+        "afd_plugin/connectors/npu/async_cam.py": "75f14e29d026df3d6d3ea710b9f9275cab9f6754a1ac95711b8cc5fba0531083",
+        "afd_plugin/connectors/npu/__init__.py": "909eae4becb1db02d65a0980c30736a2652f4a1d919b180ad2d5fde807ae17f1",
+        "afd_plugin/connectors/gpu/afdep/config.py": "d819a7be4931b83e5e6cbd5981fd71acd3bc5af893bab144d55bdaeba266cc78",
+        "afd_plugin/connectors/gpu/afdep/__init__.py": "a857f6f8534c733578ca39fdeceb250d6ecf44bb8446515dc9ecaecac4e3ccdf",
+        "afd_plugin/connectors/gpu/afdep/connector.py": "58f1bf2ae5588b31e89862b849c1ebbde4e2c4c2bafce92c44a24e8ab47dbc73",
+        "afd_plugin/connectors/gpu/afdep/experts.py": "1fcf1fa41307267aa764b0fce9adb7c4fd07bb63414d24651715dc08aa4cbd16",
+        "afd_plugin/compat/patches/config_validation.py": "b1ff62c2316dc4e85bc1ca26e0be2dd32cdc696cbd44bd33a1b299aba1c36018",
+        "afd_plugin/compat/patches/gpu_mrv2_ubatching.py": "f4ca34b26b9e91071f1ce7e5d065e4e1877ba6f0a127873ca7df0543bc06aaba",
+        "afd_plugin/compat/patches/async_dp_forward_context.py": "8408f216c4570af456a59a6d367bcf253eedc0d56d6a3cb838c92c607aba474f",
+        "afd_plugin/compat/patches/__init__.py": "5a8f034a37a21a67f2a1a656d5a4a89a5f7898f56ffe0fa624d7819661c17bc5",
+        "afd_plugin/compat/patches/engine_core.py": "ab0650782ff1d643d80cfce4995e1e7ef26dc16b956be2e2931c97a3379c780f",
+        "afd_plugin/compat/patches/async_dp_engine.py": "209ec033a931215c0cde0a33edfa5e99faf1a8542ba1fbb39d9a57c99a81bdac",
+        "afd_plugin/compat/npu/runtime_config.py": "bd9d509d15199c429e2d003ddb42c87f42bac5e5765580965dadcaf1d3dd8a9d",
+        "afd_plugin/compat/npu/feature_validation.py": "a4f54715340e67af5c0a4b04d87236f8371b5155240864b50c9cf3b9d9da0aad",
+        "afd_plugin/compat/npu/__init__.py": "ce057b751c0b31f62c311f11edd4af4a687ed95c002066ab02abe7d3b2c6bbcd",
+        "afd_plugin/compat/npu/runtime.py": "916e88df118fc0959c73de9b7a1e9b366cfca5d89c427aec8c37be899bc71b50",
+        "afd_plugin/compat/npu/ops.py": "5b82c5eba8a474502e13baf1ce7adf8d8bd390c6ead88da2ec916c1b91c5e168",
+        "afd_plugin/compat/npu/forward_context.py": "0f73c8a3d46d7d4a13bc83336a44a70b45e179d309abdd9d3bb8f11305e9f412",
+        "afd_plugin/compat/npu/profiler.py": "a7eb08023c25616b31f4a1f453d02ea075e9089d6ac17a0aa4f37a21b00748b8",
+        "afd_plugin/compat/patches/npu/ascend_config.py": "536a03a76935b213add2c245736760ef7425ab8a391d3bb624b684fb7560b87e",
+        "afd_plugin/compat/patches/npu/ascend_platform.py": "a948254fe1f826e6f32055d3c98081242d7badf730521f8fb62707d5a1964afe",
+        "afd_plugin/compat/patches/npu/mla_graph.py": "2e8c6ed4db5d11ed6170e9c8d1d8b98148d01c998873f115a75c145ceda452cc",
+        "afd_plugin/compat/patches/npu/mrv2_ubatching.py": "5454cd7007f64f0d049df99f8facc24a6545a416397518a96c8ca5f0222f3dad",
+        "afd_plugin/model_executor/npu/__init__.py": "ce498c3595a48e540aa2aba49561347002c6755034debc998a3eef430f664332",
+        "afd_plugin/model_executor/npu/async_cam_w4a8.py": "63ae002a8e8d8bd6ff7ec05e0f805dfb228eba253c9d3c4f33f6ea5421797014",
+        "afd_plugin/model_executor/models/model_utils.py": "068999f0783eb68c19485655937bb3887276debceca3443063910242241b8245",
+        "afd_plugin/model_executor/models/deepseek_v4.py": "611a1add1c6863a980f0b6cb82329395c2bd6b0c0751ae85ab293c6edaf14dca",
+        "afd_plugin/model_executor/models/__init__.py": "29b15133fe464c9f1d6252ee7a2c512eeb152b0c1043d164809f0645afaa5891",
+        "afd_plugin/model_executor/models/qwen3_moe.py": "2820ceb400d363e8f5a241e90ceb948c7933984364d39fe5189ef88d5a4cf5b3",
+        "afd_plugin/model_executor/models/qwen3_5.py": "dd0ea637d7f59929c0f2e9a5c2498cffde34fb141b1458da1d17f6394b8eb493",
+        "afd_plugin/model_executor/models/forward_context.py": "5e114ebfff445e4b2df827a9598d9e487e996039eab4a5f55b20159ea47c881e",
+        "afd_plugin/model_executor/models/deepseek_v2.py": "49cfefe7fa084ac0bcf246ed917dead02ad904b42d02a577a129469c634b314f",
+        "afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py": "de0efa868bcd89ef3ec86fa79231d6af9a5d03390079354099dc6cb4cb7184f3",
+        "afd_plugin/model_executor/models/npu/deepseek_v4.py": "c91c42cb814cc1cbf369827421083a1abbfd95d8aea75a9ab7110551adfb0222",
+        "afd_plugin/model_executor/models/npu/deepseek_v4_shared_experts.py": "2359151740ac8706858de621233e64bfaaf6ff3727b430b6dc47d3fdca2e9fcc",
+        "afd_plugin/model_executor/models/npu/async_cam_layout.py": "a925b996d4d2ef4523390fe7427b9cca11caf6a9fad8f65a87028170d516b914",
+        "afd_plugin/model_executor/models/npu/__init__.py": "c97956228f73c453fa6eadbe267139dce50565873e4a0fe64417a2f217c3e53c",
+        "afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py": "782a39d0674656441bf85fd8a83e27357bc1f9850ea3d74296926ba486b44a3c",
+        "afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py": "7eb6b95c9aa7ea6fe029e9a171422324038bf9a8c33a4e37659d80137619630a",
+        "afd_plugin/model_executor/models/npu/async_cam_dbo.py": "041d508f67064fa5289e7cfcd88739d541cff2dc7d8e0f842f18a87afdef3cbe",
+        "afd_plugin/model_executor/models/npu/deepseek_attention_metadata.py": "af26344e2dbbcfe6ee820a0a956cabb92caba76e8a072ed1bb8dee39a8bbd168",
+        "afdep/config.py": "9a652906a80ca2701d6b055b1e1a2f163e9ecefa3d6cac6cbf9089c7202aa80d",
+        "afdep/__init__.py": "7c37b7824a0d6f5db13889d74c95c183a9fea2f0f4093ccec9b4c99360cbcc19",
+        "afdep/_build.py": "de162db35f6b3bf1fb9d71589d055710d5f7a25c8eea28fac5e0127c2a828555",
+        "afdep/buffer.py": "0a7dcacdc5cf4a994f7176440a86b5848a8dd289d493df7cfd3573b9ef6a15db",
+        "afdep/__main__.py": "d3c5c9defe9eabe8621bf1f7c18c4f28714b1248806092b9b2900f094eb61705",
+        "afdep/csrc/kernels.cuh": "b7882c8dfbe28c7734005826ffb430bf8df309ccc70f87e5e02a388fe4395af4",
+        "afdep/csrc/ORIGIN.json": "ab39029a692bb91d1094b1d3d26a5d7112ba51ab94757f9d9ee241fa200d9e97",
+        "afdep/csrc/kernels.hpp": "91d690d2cd806459c5c81cd00f265e7247417f5cf119fe88d45169ddc5229638",
+        "afdep/csrc/checks.hpp": "6813b14c2984042a343b3f06775e461dc1948f529e347a4db97fbc5798050629",
+        "afdep/csrc/buffer.hpp": "6a7f51b02ac551e0065e4bfac69dd2e57c8040700c20ea91884366cfcb0b07a8",
+        "afdep/csrc/kernels.cu": "01ea16ae1da12db29bac1ab9f9f1c18430eba1de05e3341ff0c94df55a49dc5e",
+        "afdep/csrc/nccl_runtime.hpp": "5d04ef71b2ccd47187449eadebcc740c3485cd8443c47eb708a3683f2374558c",
+        "afdep/csrc/layout.hpp": "3a644833bff462ae2a2044b1cf1e07a6972c7abd159af9876ee557f9e57bd9a0",
+        "afdep/third_party/deepep/PROVENANCE.json": "b5a01d0c4ca061aba5729893cb090e13a675426709935aeeba433bd51e33e49c"
+      },
+      "runtime_source_fingerprint": "bbfedebb035e7c5bb6ca9797f1024100f8b065ef01ac07071ea5e10a66cab697",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "graph_modes": {
+        "P2P NCCL": "Attention prefill eager; decode graphs1/8/32; FFN prefill eager/decodegraphs",
+        "afdEP graph": "Attention prefill eager, decode graphs1/8/32; FFN one2048capacitygraph for prefill and decode",
+        "afdEP FFN eager": "Same Attention graphs; FFN steady-state replay disabled; startup capture retained for Attention protocol pairing; same pooledbuffers/nativekernels/GEMMs",
+        "afdEP prefill eager": "Same Attention graphs; FFN onlyprefill replay disabled, decode stillcapacitygraph"
+      },
+      "timing": "Capture/JIT/startup excluded, everytimedgraphreplay included. NoNsightduringprimarytiming. Client-visibleITLfromstreamtokenIDs, no logprobs.",
+      "validation": "Targeted GPU-container connector, graphpolicy, modelproxy and FFNvsPyTorch tests passed; broadermodelaccuracyunestablished (prior16naturalprompts15/16fullgreedyoutputs matchedP2P).",
+      "dependency_correction": {
+        "plugin_commit": "f12edbd473f9b881a4bc21ed794c56458488c8cf",
+        "native_source_commit": "9ad705fa3bc08018ff7e0c3128aec86be84f64f8",
+        "runtime_source_fingerprint": "2e5407783ac90641f6ebcee6e76249c6c3ab202f43a324494a62d4132c58ac3a",
+        "changed_runtime_sources": {
+          "afd_plugin/connectors/gpu/afdep/connector.py": {
+            "before": "58f1bf2ae5588b31e89862b849c1ebbde4e2c4c2bafce92c44a24e8ab47dbc73",
+            "after": "79dad1d13f2162aa5e6e12c034d18fd5e01a6106881b5937347aad499d775127"
+          },
+          "afd_plugin/model_executor/models/deepseek_v2.py": {
+            "before": "49cfefe7fa084ac0bcf246ed917dead02ad904b42d02a577a129469c634b314f",
+            "after": "4ad9a90e3512ebe8a185965b9fc42fbbe3dfa4c23a17d44d52f0d5b3708afc66"
+          }
+        },
+        "validation": "Both source snapshots agree; plugin files match committed source, native transport unchanged. GPU-container regression passed. Nsight ordering and six separately timed short/mixed repeats are evaluated separately from the frozen graph ablations.",
+        "nsight_ordering": {
+          "passed": true,
+          "recognized_complete_shared_mlps": 14078,
+          "strict_before_collect_fractions_by_gpu": {
+            "0": 0.9997184684684685,
+            "1": 1.0,
+            "2": 0.9994297120045623,
+            "3": 0.9994300370475919
+          },
+          "before_fix_fraction": 0,
+          "attention_sqlite_sha256": "c56df1c33691b9bc8ffc8220c82d76888e21b6d0debc4dcbde499bf98d8fc071",
+          "ffn_sqlite_sha256": "2f17ee5dc4dd7672106e1de1c9111a615d20377efb65b9f1b602a83098ef97f7",
+          "meaning": "Verified same-GPU shared MLP completion before collect; permits remote overlap, does not prove cross-host concurrency."
+        }
+      }
+    }
+  },
+  "metric_definitions": {
+    "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30": {
+      "ttft": "Request start to receipt of first token ID, including empty text.",
+      "itl": "Client receipt gaps between adjacent one-token SSE events, pooled across requests; gaps touching multi-token events are excluded. Includes server, transport and client scheduling; not GPU step time.",
+      "tpot": "Per request: (last-token receipt - first-token receipt)/(tokens-1). Includes coalesced tokens; excludes usage/HTTP completion tail.",
+      "timestamps": "Raw timestamps use client perf_counter_ns; request_started_utc_ns is an approximate wall-clock anchor. SSE buffering can compress observed gaps; no generation times are inferred within a chunk.",
+      "percentiles": "Linear interpolation; TPOT percentiles weight requests equally.",
+      "instrumentation": "return_token_ids=true adds token IDs and first-chunk prompt IDs; use identically for all variants. No logprobs requested."
+    }
+  },
+  "aggregation": "Per-run metrics validated against raw requests. Bars are the median of run p50/p95 values; whiskers show the observed repeat range, not confidence intervals. ITL samples pool observed singleton-event gaps; TTFT and TPOT percentiles weight requests equally.",
+  "limitations": [
+    "Client-observed ITL includes server, transport and client scheduling.",
+    "SSE/HTTP buffering can compress observed intervals; GPU step time is not inferred.",
+    "Coalesced tokens do not receive invented zero ITLs; coverage is reported.",
+    "Synthetic token prompts and closed-loop load do not establish production workload performance."
+  ],
+  "missing_runs": [],
+  "output_parity": {
+    "definition": "Exact generated token-ID sequences and first-token IDs for paired request indices/seeds.",
+    "interpretation": "Output differences can change downstream expert routing; matched input seeds and token counts do not imply identical routed work. These parity counts are not a model accuracy evaluation.",
+    "comparisons": [
+      {
+        "case": "short",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 76,
+        "same_first_token": 94,
+        "identical_texts": 76
+      },
+      {
+        "case": "short",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 76,
+        "same_first_token": 94,
+        "identical_texts": 76
+      },
+      {
+        "case": "short",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 96,
+        "same_first_token": 96,
+        "identical_texts": 96
+      },
+      {
+        "case": "short",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-dependency-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 74,
+        "same_first_token": 93,
+        "identical_texts": 74
+      },
+      {
+        "case": "short",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-dependency-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 75,
+        "same_first_token": 91,
+        "identical_texts": 75
+      },
+      {
+        "case": "prefill2048",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 85,
+        "same_first_token": 91,
+        "identical_texts": 85
+      },
+      {
+        "case": "prefill2048",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 85,
+        "same_first_token": 91,
+        "identical_texts": 85
+      },
+      {
+        "case": "prefill2048",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 96,
+        "identical_token_sequences": 96,
+        "same_first_token": 96,
+        "identical_texts": 96
+      },
+      {
+        "case": "mixed",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 317,
+        "same_first_token": 377,
+        "identical_texts": 317
+      },
+      {
+        "case": "mixed",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 319,
+        "same_first_token": 379,
+        "identical_texts": 319
+      },
+      {
+        "case": "mixed",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 345,
+        "same_first_token": 382,
+        "identical_texts": 345
+      },
+      {
+        "case": "mixed",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-prefill-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 339,
+        "same_first_token": 384,
+        "identical_texts": 339
+      },
+      {
+        "case": "mixed",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-dependency-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 316,
+        "same_first_token": 375,
+        "identical_texts": 316
+      },
+      {
+        "case": "mixed",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-dependency-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 322,
+        "same_first_token": 378,
+        "identical_texts": 322
+      },
+      {
+        "case": "prefillthroughput",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-gdr",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 378,
+        "same_first_token": 378,
+        "identical_texts": 378
+      },
+      {
+        "case": "prefillthroughput",
+        "left_mode": "p2p-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 378,
+        "same_first_token": 378,
+        "identical_texts": 378
+      },
+      {
+        "case": "prefillthroughput",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-ffn-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 384,
+        "same_first_token": 384,
+        "identical_texts": 384
+      },
+      {
+        "case": "prefillthroughput",
+        "left_mode": "afdep-overlap-poll-itl-gdr",
+        "right_mode": "afdep-overlap-poll-itl-prefill-eager",
+        "paired_repeats": [
+          0,
+          1,
+          2
+        ],
+        "requests": 384,
+        "identical_token_sequences": 384,
+        "same_first_token": 384,
+        "identical_texts": 384
+      }
+    ]
+  },
+  "runs": [
+    {
+      "name": "p2p-itl-gdr-short-r0",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 0,
+      "raw_file": "p2p-itl-gdr-short-r0.json",
+      "raw_sha256": "27fb587fd13e666e0c2bcf9e5f7684b5e3c21e2b30b5f125d34b6397694d7410",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-short-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 6.413375,
+        "itl_p95_ms": 6.62585425,
+        "ttft_median_ms": 81.3972105,
+        "ttft_p95_ms": 89.4182301,
+        "tpot_median_ms": 6.430021698412698,
+        "tpot_p95_ms": 6.462274765079365,
+        "requests_per_second": 2.054296915179676,
+        "latency_median_ms": 486.02846850000003
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-short-r1",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 1,
+      "raw_file": "p2p-itl-gdr-short-r1.json",
+      "raw_sha256": "c6c98e2a6de53b48139cde8f2dd7af0695da1a89c9b3abadea349ff0c84a7d1c",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-short-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 6.3982209999999995,
+        "itl_p95_ms": 6.59412125,
+        "ttft_median_ms": 79.72901,
+        "ttft_p95_ms": 83.1285721,
+        "tpot_median_ms": 6.393830682539683,
+        "tpot_p95_ms": 6.477781186507936,
+        "requests_per_second": 2.0675847895495387,
+        "latency_median_ms": 483.24926000000005
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-short-r2",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 2,
+      "raw_file": "p2p-itl-gdr-short-r2.json",
+      "raw_sha256": "a52333fd822e0e634e2e5f5129fc01a0aa330721f2945ea138b44a64044b426c",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-short-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 6.393934,
+        "itl_p95_ms": 6.5738585,
+        "ttft_median_ms": 76.900604,
+        "ttft_p95_ms": 81.70656715,
+        "tpot_median_ms": 6.398830428571428,
+        "tpot_p95_ms": 6.443714411904762,
+        "requests_per_second": 2.0805488682466926,
+        "latency_median_ms": 480.5801705
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-prefill2048-r0",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 0,
+      "raw_file": "p2p-itl-gdr-prefill2048-r0.json",
+      "raw_sha256": "15de9f48297a73f1ab1e24a4abcd2e5aa64abab9c2faf3840212231ecaf1ccbf",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-prefill2048-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 6.48193,
+        "itl_p95_ms": 6.6638515,
+        "ttft_median_ms": 80.8250385,
+        "ttft_p95_ms": 86.8532804,
+        "tpot_median_ms": 6.453349119047619,
+        "tpot_p95_ms": 6.53704724047619,
+        "requests_per_second": 2.046783535450674,
+        "latency_median_ms": 489.289326
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-prefill2048-r1",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 1,
+      "raw_file": "p2p-itl-gdr-prefill2048-r1.json",
+      "raw_sha256": "6ee1cdb0979e80695d2baa7da19cc8f426c3e921f62549e0d643f5a674074066",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-prefill2048-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 6.490056,
+        "itl_p95_ms": 6.679164,
+        "ttft_median_ms": 80.369298,
+        "ttft_p95_ms": 87.0753513,
+        "tpot_median_ms": 6.459934047619047,
+        "tpot_p95_ms": 6.555138140476191,
+        "requests_per_second": 2.046425490320129,
+        "latency_median_ms": 488.2336335
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-prefill2048-r2",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 2,
+      "raw_file": "p2p-itl-gdr-prefill2048-r2.json",
+      "raw_sha256": "5c9cbe3402166af4d0e704194fb3aca0ee665d8db41041617f9d2aba12be967d",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-prefill2048-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 6.4907474999999994,
+        "itl_p95_ms": 6.7429675,
+        "ttft_median_ms": 84.286389,
+        "ttft_p95_ms": 88.1687366,
+        "tpot_median_ms": 6.4645638015873015,
+        "tpot_p95_ms": 6.588554865873015,
+        "requests_per_second": 2.032215636032358,
+        "latency_median_ms": 492.2731645
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-mixed-r0",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 0,
+      "raw_file": "p2p-itl-gdr-mixed-r0.json",
+      "raw_sha256": "2a0a00444dfb88016e5003403341c4ce77df326cca89f5f070ee66b387a6777f",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-mixed-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76442,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 10.450273500000002,
+        "itl_p95_ms": 71.33561919999997,
+        "ttft_median_ms": 316.426358,
+        "ttft_p95_ms": 536.5742538,
+        "tpot_median_ms": 14.65903326984127,
+        "tpot_p95_ms": 19.050342195238095,
+        "requests_per_second": 25.135346427099673,
+        "latency_median_ms": 1305.195165
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-mixed-r1",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 1,
+      "raw_file": "p2p-itl-gdr-mixed-r1.json",
+      "raw_sha256": "c5e26d5c187736b73f4a7782e28d88466b54aa800eab95b5e5111cbce76f48ac",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-mixed-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76443,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 10.430034,
+        "itl_p95_ms": 63.696681049999945,
+        "ttft_median_ms": 298.36906450000004,
+        "ttft_p95_ms": 477.98645969999995,
+        "tpot_median_ms": 14.658853595238096,
+        "tpot_p95_ms": 17.649650946031745,
+        "requests_per_second": 26.041823224226388,
+        "latency_median_ms": 1241.4566825
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-mixed-r2",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 2,
+      "raw_file": "p2p-itl-gdr-mixed-r2.json",
+      "raw_sha256": "9adf8ef0151a5c0e5fe5335a3fdadfa9720d02c02ce688ff49a2471045fd73cc",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-mixed-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76444,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 10.452353500000001,
+        "itl_p95_ms": 66.6376037,
+        "ttft_median_ms": 307.62334599999997,
+        "ttft_p95_ms": 471.31117444999995,
+        "tpot_median_ms": 14.362364888888887,
+        "tpot_p95_ms": 18.194961295238095,
+        "requests_per_second": 26.55652171099448,
+        "latency_median_ms": 1240.0932625
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-prefillthroughput-r0",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 0,
+      "raw_file": "p2p-itl-gdr-prefillthroughput-r0.json",
+      "raw_sha256": "597b2d92e4ebbb05959558c66671c91fba16b5ce462843bda982187993789d81",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-prefillthroughput-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13442,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 885.1395359999999,
+        "ttft_p95_ms": 987.6158239499999,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 35.288182788171156,
+        "latency_median_ms": 885.8845464999999
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-prefillthroughput-r1",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 1,
+      "raw_file": "p2p-itl-gdr-prefillthroughput-r1.json",
+      "raw_sha256": "e51356c518f7fa2ad306bd8a21c47ca358aca5ac58f2d489a91eca51deb77df1",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-prefillthroughput-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13443,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 945.7441185,
+        "ttft_p95_ms": 970.91538195,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 33.69046238469108,
+        "latency_median_ms": 946.5915825
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "p2p-itl-gdr-prefillthroughput-r2",
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 2,
+      "raw_file": "p2p-itl-gdr-prefillthroughput-r2.json",
+      "raw_sha256": "ff8601be648777073c900b75ac2af84db3eefb6335dbb8d600c1833e7c20dad5",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/p2p-itl-gdr-prefillthroughput-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13444,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 886.9802435,
+        "ttft_p95_ms": 973.29756355,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 34.14444043876133,
+        "latency_median_ms": 887.8715685
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-short-r0",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-gdr-short-r0.json",
+      "raw_sha256": "eb79fbb08b81c0cbf7df88d0dee58421143b642be7a179913c6adcd23e299501",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-short-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 9.876878000000001,
+        "itl_p95_ms": 11.30184725,
+        "ttft_median_ms": 74.9077605,
+        "ttft_p95_ms": 83.24113595,
+        "tpot_median_ms": 9.990554253968254,
+        "tpot_p95_ms": 10.82263105952381,
+        "requests_per_second": 1.4084315833393406,
+        "latency_median_ms": 705.1773315
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-short-r1",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-gdr-short-r1.json",
+      "raw_sha256": "1e9ce52eb34b913310df1bb085fbe918badc1b97f056a667207b56dae355dd97",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-short-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 10.209832,
+        "itl_p95_ms": 11.3239365,
+        "ttft_median_ms": 76.9552685,
+        "ttft_p95_ms": 87.1542414,
+        "tpot_median_ms": 10.26391753968254,
+        "tpot_p95_ms": 10.660546620634921,
+        "requests_per_second": 1.3794957651673445,
+        "latency_median_ms": 725.0566615
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-short-r2",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-gdr-short-r2.json",
+      "raw_sha256": "513ce10240381dbccf1e55c42298d6d3d43cdbcc1815d1bbb808d20698d3b02d",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-short-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 9.9659005,
+        "itl_p95_ms": 11.3538675,
+        "ttft_median_ms": 72.8736625,
+        "ttft_p95_ms": 82.9152107,
+        "tpot_median_ms": 10.115218150793652,
+        "tpot_p95_ms": 10.564555338095238,
+        "requests_per_second": 1.4024599439831171,
+        "latency_median_ms": 709.6426925000001
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-prefill2048-r0",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-gdr-prefill2048-r0.json",
+      "raw_sha256": "2233f717de538add5c54a41a7f9805bc752de4763684150db554b3031d0d9c88",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-prefill2048-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 10.1072775,
+        "itl_p95_ms": 11.206924749999999,
+        "ttft_median_ms": 81.625118,
+        "ttft_p95_ms": 103.06849715,
+        "tpot_median_ms": 10.143016912698412,
+        "tpot_p95_ms": 10.553872728571427,
+        "requests_per_second": 1.380355811319963,
+        "latency_median_ms": 722.6210455
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-prefill2048-r1",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-gdr-prefill2048-r1.json",
+      "raw_sha256": "91ee5f980c262f1f9dbb227925f3a601b926129ec62c0bf9b5d0d0db68cdfdb7",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-prefill2048-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 9.919086,
+        "itl_p95_ms": 11.120656,
+        "ttft_median_ms": 79.75577,
+        "ttft_p95_ms": 90.0299431,
+        "tpot_median_ms": 9.963158738095238,
+        "tpot_p95_ms": 10.424163223809524,
+        "requests_per_second": 1.4007292785887262,
+        "latency_median_ms": 706.9131125
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-prefill2048-r2",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-gdr-prefill2048-r2.json",
+      "raw_sha256": "cf48915465f3ce546686aa1d2e6447d11b97ceda53c46b4d671a5bde2132401c",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-prefill2048-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 10.109906,
+        "itl_p95_ms": 11.59026475,
+        "ttft_median_ms": 80.5115855,
+        "ttft_p95_ms": 88.10741929999999,
+        "tpot_median_ms": 10.082076857142857,
+        "tpot_p95_ms": 11.015146733333333,
+        "requests_per_second": 1.3791752313008145,
+        "latency_median_ms": 718.1110160000001
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-mixed-r0",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-gdr-mixed-r0.json",
+      "raw_sha256": "2282e83f2eb74667c21e3aa64778827e4cc42263a76ce14fe89caf06d646390e",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-mixed-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76442,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.2312455,
+        "itl_p95_ms": 66.56226814999977,
+        "ttft_median_ms": 324.303531,
+        "ttft_p95_ms": 516.85495925,
+        "tpot_median_ms": 17.437042484126984,
+        "tpot_p95_ms": 20.3615500468254,
+        "requests_per_second": 21.9038566707146,
+        "latency_median_ms": 1437.424312
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-mixed-r1",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-gdr-mixed-r1.json",
+      "raw_sha256": "b620acab2796f10c5633ece2f5fdfc78c2ef36065973403f801bbac90a736527",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-mixed-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76443,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.934168,
+        "itl_p95_ms": 64.68937215,
+        "ttft_median_ms": 315.2737265,
+        "ttft_p95_ms": 560.59828715,
+        "tpot_median_ms": 17.90603626984127,
+        "tpot_p95_ms": 20.432760302380952,
+        "requests_per_second": 21.47005296645653,
+        "latency_median_ms": 1483.115161
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-mixed-r2",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-gdr-mixed-r2.json",
+      "raw_sha256": "cba4c744edc9bfd1f7c582db90c5b36e1da39fbc9b9517ef51332b706ae5784f",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-mixed-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76444,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.125444,
+        "itl_p95_ms": 56.864523999999975,
+        "ttft_median_ms": 281.183499,
+        "ttft_p95_ms": 455.9770897,
+        "tpot_median_ms": 16.400412825396828,
+        "tpot_p95_ms": 18.620855826984126,
+        "requests_per_second": 23.906341772089068,
+        "latency_median_ms": 1311.7019485
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-prefillthroughput-r0",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-gdr-prefillthroughput-r0.json",
+      "raw_sha256": "379e5758bcd4fa4d2ab73ceef5cf9d6f8d1aa99098c0f1d5859293852545cabc",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-prefillthroughput-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13442,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 835.171727,
+        "ttft_p95_ms": 1039.5687478999998,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 36.11448925377563,
+        "latency_median_ms": 835.781206
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-prefillthroughput-r1",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-gdr-prefillthroughput-r1.json",
+      "raw_sha256": "ba8b8756f98f9278af4424b1000280598f161962c1692f495d2bb395c22cd40d",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-prefillthroughput-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13443,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 836.7242229999999,
+        "ttft_p95_ms": 942.335422,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 36.15998581905269,
+        "latency_median_ms": 837.4450645
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-gdr-prefillthroughput-r2",
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-gdr-prefillthroughput-r2.json",
+      "raw_sha256": "312a8c10e4ea4c4fd2dc39d96d595598930967a210cf9f41c8da5cb8e6b9544f",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-gdr-prefillthroughput-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13444,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 837.688097,
+        "ttft_p95_ms": 942.3932024999999,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 36.082946945159485,
+        "latency_median_ms": 838.03192
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-short-r0",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-short-r0.json",
+      "raw_sha256": "0d893faa35e6b9ab8ed44e73b06b10350e1e753d5f5397d098c82565c777f49a",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-short-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 11.578897999999999,
+        "itl_p95_ms": 12.545297999999999,
+        "ttft_median_ms": 74.5117625,
+        "ttft_p95_ms": 86.17270334999999,
+        "tpot_median_ms": 11.674630785714285,
+        "tpot_p95_ms": 12.036252255555556,
+        "requests_per_second": 1.232281415472663,
+        "latency_median_ms": 812.195006
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-short-r1",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-short-r1.json",
+      "raw_sha256": "9da5a858a39f8b040c53cd371613cf968a837e50b0594207c472ea84cd74cbda",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-short-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 11.4222805,
+        "itl_p95_ms": 12.666787,
+        "ttft_median_ms": 74.9101795,
+        "ttft_p95_ms": 86.7756566,
+        "tpot_median_ms": 11.45173638888889,
+        "tpot_p95_ms": 12.191919784126984,
+        "requests_per_second": 1.2424606438838364,
+        "latency_median_ms": 796.2592425
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-short-r2",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "short",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-short-r2.json",
+      "raw_sha256": "50b61d3c1106add563f375f08cb58e4af12ec0ab84ed18ec0391fa77585552a1",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-short-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 11.3175775,
+        "itl_p95_ms": 12.46564875,
+        "ttft_median_ms": 73.64152250000001,
+        "ttft_p95_ms": 83.19910145,
+        "tpot_median_ms": 11.37915226984127,
+        "tpot_p95_ms": 11.98738038809524,
+        "requests_per_second": 1.2609462052039935,
+        "latency_median_ms": 791.175866
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-prefill2048-r0",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-prefill2048-r0.json",
+      "raw_sha256": "d64f2da43c780c484e9dd44a40dff5459d0027fb98ced3bd7f952ba564ef850e",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-prefill2048-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 11.5088215,
+        "itl_p95_ms": 12.578668,
+        "ttft_median_ms": 82.313198,
+        "ttft_p95_ms": 88.5981199,
+        "tpot_median_ms": 11.534888293650795,
+        "tpot_p95_ms": 12.116053976190477,
+        "requests_per_second": 1.2307953684129183,
+        "latency_median_ms": 807.5803745000001
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-prefill2048-r1",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-prefill2048-r1.json",
+      "raw_sha256": "7a83d1835118786268e17f58864e7809ea026a38e3a16f1dc1e6e1d2bd93c266",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-prefill2048-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 11.455846000000001,
+        "itl_p95_ms": 12.24470825,
+        "ttft_median_ms": 83.362114,
+        "ttft_p95_ms": 87.66906254999999,
+        "tpot_median_ms": 11.438915785714286,
+        "tpot_p95_ms": 11.81163693095238,
+        "requests_per_second": 1.243499788275535,
+        "latency_median_ms": 800.6462685
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-prefill2048-r2",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefill2048",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-prefill2048-r2.json",
+      "raw_sha256": "4fdd83e5abb2b048e39e8eb4873d3f1c660cc6a977db7cfc51b9cf097896b04d",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-prefill2048-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 11.617846,
+        "itl_p95_ms": 12.3460455,
+        "ttft_median_ms": 84.930308,
+        "ttft_p95_ms": 88.1885705,
+        "tpot_median_ms": 11.651213912698413,
+        "tpot_p95_ms": 11.899267112698412,
+        "requests_per_second": 1.226435063083066,
+        "latency_median_ms": 818.1716255
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-mixed-r0",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-mixed-r0.json",
+      "raw_sha256": "aed3553b3bdff38b28fb8fd010e446cb4ef825873fa5d133ad40bf23617322ef",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-mixed-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76442,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 14.7097505,
+        "itl_p95_ms": 65.14501764999999,
+        "ttft_median_ms": 340.7805125,
+        "ttft_p95_ms": 582.76936055,
+        "tpot_median_ms": 18.387435015873017,
+        "tpot_p95_ms": 24.238514675396825,
+        "requests_per_second": 20.52653656501067,
+        "latency_median_ms": 1486.901149
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-mixed-r1",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-mixed-r1.json",
+      "raw_sha256": "1b499e7969b26957c8ad4a3b72cca95f6822abea302c0f53dd4ef75ecc66b628",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-mixed-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76443,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 14.693956,
+        "itl_p95_ms": 57.5341844,
+        "ttft_median_ms": 264.294092,
+        "ttft_p95_ms": 510.85013415,
+        "tpot_median_ms": 19.15007684920635,
+        "tpot_p95_ms": 20.735762926190475,
+        "requests_per_second": 21.522932917272914,
+        "latency_median_ms": 1473.6019845
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-mixed-r2",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-mixed-r2.json",
+      "raw_sha256": "d1f54d3ac1b68dd89d1e0a359796a00cadb4d1155561b6619d6f0ee0b75c1ee7",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-mixed-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76444,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 15.440652,
+        "itl_p95_ms": 57.49362049999963,
+        "ttft_median_ms": 418.95863099999997,
+        "ttft_p95_ms": 574.0571596,
+        "tpot_median_ms": 20.003456174603173,
+        "tpot_p95_ms": 23.680664872222223,
+        "requests_per_second": 19.612942358303073,
+        "latency_median_ms": 1635.4874399999999
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r0",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r0.json",
+      "raw_sha256": "366cdd3e23f5b47db25dcc6ca841cc02c7f938c526007112d8d72e931cadb45c",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13442,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 931.8464425,
+        "ttft_p95_ms": 1031.5335804000001,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 32.68518238792621,
+        "latency_median_ms": 932.282715
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r1",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r1.json",
+      "raw_sha256": "687777113e6700729651900ecb0cd901634410be61e5127a69d7390922200fe8",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13443,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 909.3395754999999,
+        "ttft_p95_ms": 1082.20746545,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 33.64701710500323,
+        "latency_median_ms": 909.9210545000001
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r2",
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r2.json",
+      "raw_sha256": "e2c16644fd732c0206577a2f8a62a102d2d6052b5ead28622575187cf12dffc4",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-ffn-eager-prefillthroughput-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13444,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 905.7672245,
+        "ttft_p95_ms": 1002.9126780999999,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 34.332895890734775,
+        "latency_median_ms": 906.277658
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-prefill-eager-mixed-r0",
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-prefill-eager-mixed-r0.json",
+      "raw_sha256": "06cbf9b2ec820f88e61492734e2b1e456c2c71b89fee60de44d6b52e7f4e4e46",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-prefill-eager-mixed-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76442,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.8818065,
+        "itl_p95_ms": 61.2586678,
+        "ttft_median_ms": 393.2713695,
+        "ttft_p95_ms": 637.50980845,
+        "tpot_median_ms": 19.051372587301586,
+        "tpot_p95_ms": 22.631830892063494,
+        "requests_per_second": 20.428316946668886,
+        "latency_median_ms": 1543.391424
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-prefill-eager-mixed-r1",
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-prefill-eager-mixed-r1.json",
+      "raw_sha256": "8a19da88cc9af22e640aaba615504d415dfc5bc425d7c8dc4a04a55e30052b4b",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-prefill-eager-mixed-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76443,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.660160999999999,
+        "itl_p95_ms": 61.04591255,
+        "ttft_median_ms": 402.96612400000004,
+        "ttft_p95_ms": 604.29623035,
+        "tpot_median_ms": 18.003603396825397,
+        "tpot_p95_ms": 22.606896587301588,
+        "requests_per_second": 20.399980189782248,
+        "latency_median_ms": 1523.776437
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-prefill-eager-mixed-r2",
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "mixed",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-prefill-eager-mixed-r2.json",
+      "raw_sha256": "2a7ceae2298f5ee6ffad94478b3260448f6f5699b4d8ba593e460652df1ea02c",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-prefill-eager-mixed-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76444,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.5198685,
+        "itl_p95_ms": 58.56302509999997,
+        "ttft_median_ms": 347.01964050000004,
+        "ttft_p95_ms": 527.92053215,
+        "tpot_median_ms": 17.313866158730157,
+        "tpot_p95_ms": 21.24567154047619,
+        "requests_per_second": 21.841782699592308,
+        "latency_median_ms": 1433.640619
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r0",
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 0,
+      "raw_file": "afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r0.json",
+      "raw_sha256": "3c79173b6b0da0a82ca73c3e79741003a2c07e704ea21b133b57d6f02b5695ff",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13442,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 881.491095,
+        "ttft_p95_ms": 944.7780929,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 34.891149211081235,
+        "latency_median_ms": 882.1476415
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r1",
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 1,
+      "raw_file": "afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r1.json",
+      "raw_sha256": "cfe9c6d1139f3c4458f553d9e715aba14e3257b3c04e82021464e6ad5c3c2cf8",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13443,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 884.2672745,
+        "ttft_p95_ms": 1049.9301807499999,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 33.789114673369156,
+        "latency_median_ms": 884.721137
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r2",
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "implementation_group": "frozen_graph_ablations",
+      "case": "prefillthroughput",
+      "repeat": 2,
+      "raw_file": "afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r2.json",
+      "raw_sha256": "eba4933b54b06348e1f6220e0c1aa0bb3ce29da741f4ed981ddacaa37f16d828",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-overlap-poll-itl-prefill-eager-prefillthroughput-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 1,
+        "warmup": 8,
+        "seed": 13444,
+        "input_tokens": [
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": null,
+        "itl_p95_ms": null,
+        "ttft_median_ms": 893.4657815,
+        "ttft_p95_ms": 966.3151787999999,
+        "tpot_median_ms": null,
+        "tpot_p95_ms": null,
+        "requests_per_second": 33.444796242735094,
+        "latency_median_ms": 894.097068
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "token_bearing_sse_events": 128,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-dependency-overlap-poll-itl-gdr-short-r0",
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "implementation_group": "dependency_correction",
+      "case": "short",
+      "repeat": 0,
+      "raw_file": "afdep-dependency-overlap-poll-itl-gdr-short-r0.json",
+      "raw_sha256": "ea185b8f3c8cfbeb709a4327825a82572db8e1348e387d2e859cf1d69e9c05b0",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-dependency-overlap-poll-itl-gdr-short-r0.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73342,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 9.160357,
+        "itl_p95_ms": 9.73978975,
+        "ttft_median_ms": 68.513526,
+        "ttft_p95_ms": 74.4492313,
+        "tpot_median_ms": 9.252638769841269,
+        "tpot_p95_ms": 9.482784342857142,
+        "requests_per_second": 1.5368756490422317,
+        "latency_median_ms": 651.971645
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-dependency-overlap-poll-itl-gdr-short-r1",
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "implementation_group": "dependency_correction",
+      "case": "short",
+      "repeat": 1,
+      "raw_file": "afdep-dependency-overlap-poll-itl-gdr-short-r1.json",
+      "raw_sha256": "fbb462d0ac70c894cfd4402e0cb2a9b4e64b848f3da25c9b9631042698f963dd",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-dependency-overlap-poll-itl-gdr-short-r1.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73343,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 8.990443500000001,
+        "itl_p95_ms": 9.810223,
+        "ttft_median_ms": 68.370256,
+        "ttft_p95_ms": 75.9246094,
+        "tpot_median_ms": 9.099739111111113,
+        "tpot_p95_ms": 9.456959364285714,
+        "requests_per_second": 1.547135561060595,
+        "latency_median_ms": 642.387835
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-dependency-overlap-poll-itl-gdr-short-r2",
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "implementation_group": "dependency_correction",
+      "case": "short",
+      "repeat": 2,
+      "raw_file": "afdep-dependency-overlap-poll-itl-gdr-short-r2.json",
+      "raw_sha256": "2fc8d10442bde7e2e2938a0f06af77fda9760f7b7963be178b7fc0b37cdfdb48",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-dependency-overlap-poll-itl-gdr-short-r2.json",
+        "requests": 32,
+        "concurrency": 1,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 73344,
+        "input_tokens": [
+          32
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 9.031941,
+        "itl_p95_ms": 9.7525075,
+        "ttft_median_ms": 67.886391,
+        "ttft_p95_ms": 71.56854165,
+        "tpot_median_ms": 9.169371031746032,
+        "tpot_p95_ms": 9.309148446031745,
+        "requests_per_second": 1.555719756871029,
+        "latency_median_ms": 645.542689
+      },
+      "coverage": {
+        "observed_itl_intervals": 2016,
+        "possible_token_intervals": 2016,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 2048,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-dependency-overlap-poll-itl-gdr-mixed-r0",
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "implementation_group": "dependency_correction",
+      "case": "mixed",
+      "repeat": 0,
+      "raw_file": "afdep-dependency-overlap-poll-itl-gdr-mixed-r0.json",
+      "raw_sha256": "b30e88642d83bfaa8bac6e9a1c3ef6353003822a2305d0f774621c0251e48acf",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-dependency-overlap-poll-itl-gdr-mixed-r0.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76442,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 12.787780999999999,
+        "itl_p95_ms": 66.06734619999963,
+        "ttft_median_ms": 319.912777,
+        "ttft_p95_ms": 499.04701099999994,
+        "tpot_median_ms": 17.440722,
+        "tpot_p95_ms": 20.178824611111107,
+        "requests_per_second": 22.965158958115918,
+        "latency_median_ms": 1373.3798415
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-dependency-overlap-poll-itl-gdr-mixed-r1",
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "implementation_group": "dependency_correction",
+      "case": "mixed",
+      "repeat": 1,
+      "raw_file": "afdep-dependency-overlap-poll-itl-gdr-mixed-r1.json",
+      "raw_sha256": "e291cdf0b9a5259c15aec88ba54ca2c979a0122e30dfc4bff0a2efc2e3eef1fc",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-dependency-overlap-poll-itl-gdr-mixed-r1.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76443,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.0735965,
+        "itl_p95_ms": 62.249501549999984,
+        "ttft_median_ms": 266.42511850000005,
+        "ttft_p95_ms": 445.16011295,
+        "tpot_median_ms": 17.47599918253968,
+        "tpot_p95_ms": 19.6781251047619,
+        "requests_per_second": 23.660504717736845,
+        "latency_median_ms": 1346.9248094999998
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "name": "afdep-dependency-overlap-poll-itl-gdr-mixed-r2",
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "implementation_group": "dependency_correction",
+      "case": "mixed",
+      "repeat": 2,
+      "raw_file": "afdep-dependency-overlap-poll-itl-gdr-mixed-r2.json",
+      "raw_sha256": "31012dc37b83d9c2237f2871f2949595aece95bed58e2292112082c4f089eff6",
+      "benchmark_sha256": "b36e94e396f97a8fcec66577532170ea5a022fbab32577a722d6eaa011ae79e4",
+      "config": {
+        "url": "http://127.0.0.1:18305",
+        "output": "/work/afdep-dependency-overlap-poll-itl-gdr-mixed-r2.json",
+        "requests": 128,
+        "concurrency": 32,
+        "output_tokens": 64,
+        "warmup": 8,
+        "seed": 76444,
+        "input_tokens": [
+          32,
+          128,
+          512,
+          1024,
+          1536,
+          2048
+        ]
+      },
+      "metric_definition_sha256": "cfa2eebf345df5aff3048ab63ee61f4a1d1ecc7f0888e8845ffe134b9230aa30",
+      "metrics": {
+        "itl_median_ms": 13.000285,
+        "itl_p95_ms": 51.65691124999992,
+        "ttft_median_ms": 268.515103,
+        "ttft_p95_ms": 524.2498148999996,
+        "tpot_median_ms": 16.170820222222222,
+        "tpot_p95_ms": 19.488684702380947,
+        "requests_per_second": 23.990572085125606,
+        "latency_median_ms": 1318.9210444999999
+      },
+      "coverage": {
+        "observed_itl_intervals": 8064,
+        "possible_token_intervals": 8064,
+        "observed_fraction": 1.0,
+        "token_bearing_sse_events": 8192,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    }
+  ],
+  "summaries": [
+    {
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "case": "short",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 6.3982209999999995,
+          "minimum": 6.393934,
+          "maximum": 6.413375,
+          "run_values": [
+            6.413375,
+            6.3982209999999995,
+            6.393934
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 6.59412125,
+          "minimum": 6.5738585,
+          "maximum": 6.62585425,
+          "run_values": [
+            6.62585425,
+            6.59412125,
+            6.5738585
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 79.72901,
+          "minimum": 76.900604,
+          "maximum": 81.3972105,
+          "run_values": [
+            81.3972105,
+            79.72901,
+            76.900604
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 83.1285721,
+          "minimum": 81.70656715,
+          "maximum": 89.4182301,
+          "run_values": [
+            89.4182301,
+            83.1285721,
+            81.70656715
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 6.398830428571428,
+          "minimum": 6.393830682539683,
+          "maximum": 6.430021698412698,
+          "run_values": [
+            6.430021698412698,
+            6.393830682539683,
+            6.398830428571428
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 6.462274765079365,
+          "minimum": 6.443714411904762,
+          "maximum": 6.477781186507936,
+          "run_values": [
+            6.462274765079365,
+            6.477781186507936,
+            6.443714411904762
+          ]
+        },
+        "requests_per_second": {
+          "median": 2.0675847895495387,
+          "minimum": 2.054296915179676,
+          "maximum": 2.0805488682466926,
+          "run_values": [
+            2.054296915179676,
+            2.0675847895495387,
+            2.0805488682466926
+          ]
+        },
+        "latency_median_ms": {
+          "median": 483.24926000000005,
+          "minimum": 480.5801705,
+          "maximum": 486.02846850000003,
+          "run_values": [
+            486.02846850000003,
+            483.24926000000005,
+            480.5801705
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "case": "short",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 9.9659005,
+          "minimum": 9.876878000000001,
+          "maximum": 10.209832,
+          "run_values": [
+            9.876878000000001,
+            10.209832,
+            9.9659005
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 11.3239365,
+          "minimum": 11.30184725,
+          "maximum": 11.3538675,
+          "run_values": [
+            11.30184725,
+            11.3239365,
+            11.3538675
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 74.9077605,
+          "minimum": 72.8736625,
+          "maximum": 76.9552685,
+          "run_values": [
+            74.9077605,
+            76.9552685,
+            72.8736625
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 83.24113595,
+          "minimum": 82.9152107,
+          "maximum": 87.1542414,
+          "run_values": [
+            83.24113595,
+            87.1542414,
+            82.9152107
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 10.115218150793652,
+          "minimum": 9.990554253968254,
+          "maximum": 10.26391753968254,
+          "run_values": [
+            9.990554253968254,
+            10.26391753968254,
+            10.115218150793652
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 10.660546620634921,
+          "minimum": 10.564555338095238,
+          "maximum": 10.82263105952381,
+          "run_values": [
+            10.82263105952381,
+            10.660546620634921,
+            10.564555338095238
+          ]
+        },
+        "requests_per_second": {
+          "median": 1.4024599439831171,
+          "minimum": 1.3794957651673445,
+          "maximum": 1.4084315833393406,
+          "run_values": [
+            1.4084315833393406,
+            1.3794957651673445,
+            1.4024599439831171
+          ]
+        },
+        "latency_median_ms": {
+          "median": 709.6426925000001,
+          "minimum": 705.1773315,
+          "maximum": 725.0566615,
+          "run_values": [
+            705.1773315,
+            725.0566615,
+            709.6426925000001
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "case": "short",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 11.4222805,
+          "minimum": 11.3175775,
+          "maximum": 11.578897999999999,
+          "run_values": [
+            11.578897999999999,
+            11.4222805,
+            11.3175775
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 12.545297999999999,
+          "minimum": 12.46564875,
+          "maximum": 12.666787,
+          "run_values": [
+            12.545297999999999,
+            12.666787,
+            12.46564875
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 74.5117625,
+          "minimum": 73.64152250000001,
+          "maximum": 74.9101795,
+          "run_values": [
+            74.5117625,
+            74.9101795,
+            73.64152250000001
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 86.17270334999999,
+          "minimum": 83.19910145,
+          "maximum": 86.7756566,
+          "run_values": [
+            86.17270334999999,
+            86.7756566,
+            83.19910145
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 11.45173638888889,
+          "minimum": 11.37915226984127,
+          "maximum": 11.674630785714285,
+          "run_values": [
+            11.674630785714285,
+            11.45173638888889,
+            11.37915226984127
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 12.036252255555556,
+          "minimum": 11.98738038809524,
+          "maximum": 12.191919784126984,
+          "run_values": [
+            12.036252255555556,
+            12.191919784126984,
+            11.98738038809524
+          ]
+        },
+        "requests_per_second": {
+          "median": 1.2424606438838364,
+          "minimum": 1.232281415472663,
+          "maximum": 1.2609462052039935,
+          "run_values": [
+            1.232281415472663,
+            1.2424606438838364,
+            1.2609462052039935
+          ]
+        },
+        "latency_median_ms": {
+          "median": 796.2592425,
+          "minimum": 791.175866,
+          "maximum": 812.195006,
+          "run_values": [
+            812.195006,
+            796.2592425,
+            791.175866
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "case": "short",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 9.031941,
+          "minimum": 8.990443500000001,
+          "maximum": 9.160357,
+          "run_values": [
+            9.160357,
+            8.990443500000001,
+            9.031941
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 9.7525075,
+          "minimum": 9.73978975,
+          "maximum": 9.810223,
+          "run_values": [
+            9.73978975,
+            9.810223,
+            9.7525075
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 68.370256,
+          "minimum": 67.886391,
+          "maximum": 68.513526,
+          "run_values": [
+            68.513526,
+            68.370256,
+            67.886391
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 74.4492313,
+          "minimum": 71.56854165,
+          "maximum": 75.9246094,
+          "run_values": [
+            74.4492313,
+            75.9246094,
+            71.56854165
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 9.169371031746032,
+          "minimum": 9.099739111111113,
+          "maximum": 9.252638769841269,
+          "run_values": [
+            9.252638769841269,
+            9.099739111111113,
+            9.169371031746032
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 9.456959364285714,
+          "minimum": 9.309148446031745,
+          "maximum": 9.482784342857142,
+          "run_values": [
+            9.482784342857142,
+            9.456959364285714,
+            9.309148446031745
+          ]
+        },
+        "requests_per_second": {
+          "median": 1.547135561060595,
+          "minimum": 1.5368756490422317,
+          "maximum": 1.555719756871029,
+          "run_values": [
+            1.5368756490422317,
+            1.547135561060595,
+            1.555719756871029
+          ]
+        },
+        "latency_median_ms": {
+          "median": 645.542689,
+          "minimum": 642.387835,
+          "maximum": 651.971645,
+          "run_values": [
+            651.971645,
+            642.387835,
+            645.542689
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "case": "prefill2048",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 6.490056,
+          "minimum": 6.48193,
+          "maximum": 6.4907474999999994,
+          "run_values": [
+            6.48193,
+            6.490056,
+            6.4907474999999994
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 6.679164,
+          "minimum": 6.6638515,
+          "maximum": 6.7429675,
+          "run_values": [
+            6.6638515,
+            6.679164,
+            6.7429675
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 80.8250385,
+          "minimum": 80.369298,
+          "maximum": 84.286389,
+          "run_values": [
+            80.8250385,
+            80.369298,
+            84.286389
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 87.0753513,
+          "minimum": 86.8532804,
+          "maximum": 88.1687366,
+          "run_values": [
+            86.8532804,
+            87.0753513,
+            88.1687366
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 6.459934047619047,
+          "minimum": 6.453349119047619,
+          "maximum": 6.4645638015873015,
+          "run_values": [
+            6.453349119047619,
+            6.459934047619047,
+            6.4645638015873015
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 6.555138140476191,
+          "minimum": 6.53704724047619,
+          "maximum": 6.588554865873015,
+          "run_values": [
+            6.53704724047619,
+            6.555138140476191,
+            6.588554865873015
+          ]
+        },
+        "requests_per_second": {
+          "median": 2.046425490320129,
+          "minimum": 2.032215636032358,
+          "maximum": 2.046783535450674,
+          "run_values": [
+            2.046783535450674,
+            2.046425490320129,
+            2.032215636032358
+          ]
+        },
+        "latency_median_ms": {
+          "median": 489.289326,
+          "minimum": 488.2336335,
+          "maximum": 492.2731645,
+          "run_values": [
+            489.289326,
+            488.2336335,
+            492.2731645
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "case": "prefill2048",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 10.1072775,
+          "minimum": 9.919086,
+          "maximum": 10.109906,
+          "run_values": [
+            10.1072775,
+            9.919086,
+            10.109906
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 11.206924749999999,
+          "minimum": 11.120656,
+          "maximum": 11.59026475,
+          "run_values": [
+            11.206924749999999,
+            11.120656,
+            11.59026475
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 80.5115855,
+          "minimum": 79.75577,
+          "maximum": 81.625118,
+          "run_values": [
+            81.625118,
+            79.75577,
+            80.5115855
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 90.0299431,
+          "minimum": 88.10741929999999,
+          "maximum": 103.06849715,
+          "run_values": [
+            103.06849715,
+            90.0299431,
+            88.10741929999999
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 10.082076857142857,
+          "minimum": 9.963158738095238,
+          "maximum": 10.143016912698412,
+          "run_values": [
+            10.143016912698412,
+            9.963158738095238,
+            10.082076857142857
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 10.553872728571427,
+          "minimum": 10.424163223809524,
+          "maximum": 11.015146733333333,
+          "run_values": [
+            10.553872728571427,
+            10.424163223809524,
+            11.015146733333333
+          ]
+        },
+        "requests_per_second": {
+          "median": 1.380355811319963,
+          "minimum": 1.3791752313008145,
+          "maximum": 1.4007292785887262,
+          "run_values": [
+            1.380355811319963,
+            1.4007292785887262,
+            1.3791752313008145
+          ]
+        },
+        "latency_median_ms": {
+          "median": 718.1110160000001,
+          "minimum": 706.9131125,
+          "maximum": 722.6210455,
+          "run_values": [
+            722.6210455,
+            706.9131125,
+            718.1110160000001
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "case": "prefill2048",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 11.5088215,
+          "minimum": 11.455846000000001,
+          "maximum": 11.617846,
+          "run_values": [
+            11.5088215,
+            11.455846000000001,
+            11.617846
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 12.3460455,
+          "minimum": 12.24470825,
+          "maximum": 12.578668,
+          "run_values": [
+            12.578668,
+            12.24470825,
+            12.3460455
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 83.362114,
+          "minimum": 82.313198,
+          "maximum": 84.930308,
+          "run_values": [
+            82.313198,
+            83.362114,
+            84.930308
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 88.1885705,
+          "minimum": 87.66906254999999,
+          "maximum": 88.5981199,
+          "run_values": [
+            88.5981199,
+            87.66906254999999,
+            88.1885705
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 11.534888293650795,
+          "minimum": 11.438915785714286,
+          "maximum": 11.651213912698413,
+          "run_values": [
+            11.534888293650795,
+            11.438915785714286,
+            11.651213912698413
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 11.899267112698412,
+          "minimum": 11.81163693095238,
+          "maximum": 12.116053976190477,
+          "run_values": [
+            12.116053976190477,
+            11.81163693095238,
+            11.899267112698412
+          ]
+        },
+        "requests_per_second": {
+          "median": 1.2307953684129183,
+          "minimum": 1.226435063083066,
+          "maximum": 1.243499788275535,
+          "run_values": [
+            1.2307953684129183,
+            1.243499788275535,
+            1.226435063083066
+          ]
+        },
+        "latency_median_ms": {
+          "median": 807.5803745000001,
+          "minimum": 800.6462685,
+          "maximum": 818.1716255,
+          "run_values": [
+            807.5803745000001,
+            800.6462685,
+            818.1716255
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 6048,
+        "possible_token_intervals": 6048,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "case": "mixed",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 10.450273500000002,
+          "minimum": 10.430034,
+          "maximum": 10.452353500000001,
+          "run_values": [
+            10.450273500000002,
+            10.430034,
+            10.452353500000001
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 66.6376037,
+          "minimum": 63.696681049999945,
+          "maximum": 71.33561919999997,
+          "run_values": [
+            71.33561919999997,
+            63.696681049999945,
+            66.6376037
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 307.62334599999997,
+          "minimum": 298.36906450000004,
+          "maximum": 316.426358,
+          "run_values": [
+            316.426358,
+            298.36906450000004,
+            307.62334599999997
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 477.98645969999995,
+          "minimum": 471.31117444999995,
+          "maximum": 536.5742538,
+          "run_values": [
+            536.5742538,
+            477.98645969999995,
+            471.31117444999995
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 14.658853595238096,
+          "minimum": 14.362364888888887,
+          "maximum": 14.65903326984127,
+          "run_values": [
+            14.65903326984127,
+            14.658853595238096,
+            14.362364888888887
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 18.194961295238095,
+          "minimum": 17.649650946031745,
+          "maximum": 19.050342195238095,
+          "run_values": [
+            19.050342195238095,
+            17.649650946031745,
+            18.194961295238095
+          ]
+        },
+        "requests_per_second": {
+          "median": 26.041823224226388,
+          "minimum": 25.135346427099673,
+          "maximum": 26.55652171099448,
+          "run_values": [
+            25.135346427099673,
+            26.041823224226388,
+            26.55652171099448
+          ]
+        },
+        "latency_median_ms": {
+          "median": 1241.4566825,
+          "minimum": 1240.0932625,
+          "maximum": 1305.195165,
+          "run_values": [
+            1305.195165,
+            1241.4566825,
+            1240.0932625
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 24192,
+        "possible_token_intervals": 24192,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "case": "mixed",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 13.2312455,
+          "minimum": 13.125444,
+          "maximum": 13.934168,
+          "run_values": [
+            13.2312455,
+            13.934168,
+            13.125444
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 64.68937215,
+          "minimum": 56.864523999999975,
+          "maximum": 66.56226814999977,
+          "run_values": [
+            66.56226814999977,
+            64.68937215,
+            56.864523999999975
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 315.2737265,
+          "minimum": 281.183499,
+          "maximum": 324.303531,
+          "run_values": [
+            324.303531,
+            315.2737265,
+            281.183499
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 516.85495925,
+          "minimum": 455.9770897,
+          "maximum": 560.59828715,
+          "run_values": [
+            516.85495925,
+            560.59828715,
+            455.9770897
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 17.437042484126984,
+          "minimum": 16.400412825396828,
+          "maximum": 17.90603626984127,
+          "run_values": [
+            17.437042484126984,
+            17.90603626984127,
+            16.400412825396828
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 20.3615500468254,
+          "minimum": 18.620855826984126,
+          "maximum": 20.432760302380952,
+          "run_values": [
+            20.3615500468254,
+            20.432760302380952,
+            18.620855826984126
+          ]
+        },
+        "requests_per_second": {
+          "median": 21.9038566707146,
+          "minimum": 21.47005296645653,
+          "maximum": 23.906341772089068,
+          "run_values": [
+            21.9038566707146,
+            21.47005296645653,
+            23.906341772089068
+          ]
+        },
+        "latency_median_ms": {
+          "median": 1437.424312,
+          "minimum": 1311.7019485,
+          "maximum": 1483.115161,
+          "run_values": [
+            1437.424312,
+            1483.115161,
+            1311.7019485
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 24192,
+        "possible_token_intervals": 24192,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "case": "mixed",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 14.7097505,
+          "minimum": 14.693956,
+          "maximum": 15.440652,
+          "run_values": [
+            14.7097505,
+            14.693956,
+            15.440652
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 57.5341844,
+          "minimum": 57.49362049999963,
+          "maximum": 65.14501764999999,
+          "run_values": [
+            65.14501764999999,
+            57.5341844,
+            57.49362049999963
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 340.7805125,
+          "minimum": 264.294092,
+          "maximum": 418.95863099999997,
+          "run_values": [
+            340.7805125,
+            264.294092,
+            418.95863099999997
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 574.0571596,
+          "minimum": 510.85013415,
+          "maximum": 582.76936055,
+          "run_values": [
+            582.76936055,
+            510.85013415,
+            574.0571596
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 19.15007684920635,
+          "minimum": 18.387435015873017,
+          "maximum": 20.003456174603173,
+          "run_values": [
+            18.387435015873017,
+            19.15007684920635,
+            20.003456174603173
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 23.680664872222223,
+          "minimum": 20.735762926190475,
+          "maximum": 24.238514675396825,
+          "run_values": [
+            24.238514675396825,
+            20.735762926190475,
+            23.680664872222223
+          ]
+        },
+        "requests_per_second": {
+          "median": 20.52653656501067,
+          "minimum": 19.612942358303073,
+          "maximum": 21.522932917272914,
+          "run_values": [
+            20.52653656501067,
+            21.522932917272914,
+            19.612942358303073
+          ]
+        },
+        "latency_median_ms": {
+          "median": 1486.901149,
+          "minimum": 1473.6019845,
+          "maximum": 1635.4874399999999,
+          "run_values": [
+            1486.901149,
+            1473.6019845,
+            1635.4874399999999
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 24192,
+        "possible_token_intervals": 24192,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "case": "mixed",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 13.660160999999999,
+          "minimum": 13.5198685,
+          "maximum": 13.8818065,
+          "run_values": [
+            13.8818065,
+            13.660160999999999,
+            13.5198685
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 61.04591255,
+          "minimum": 58.56302509999997,
+          "maximum": 61.2586678,
+          "run_values": [
+            61.2586678,
+            61.04591255,
+            58.56302509999997
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 393.2713695,
+          "minimum": 347.01964050000004,
+          "maximum": 402.96612400000004,
+          "run_values": [
+            393.2713695,
+            402.96612400000004,
+            347.01964050000004
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 604.29623035,
+          "minimum": 527.92053215,
+          "maximum": 637.50980845,
+          "run_values": [
+            637.50980845,
+            604.29623035,
+            527.92053215
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 18.003603396825397,
+          "minimum": 17.313866158730157,
+          "maximum": 19.051372587301586,
+          "run_values": [
+            19.051372587301586,
+            18.003603396825397,
+            17.313866158730157
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 22.606896587301588,
+          "minimum": 21.24567154047619,
+          "maximum": 22.631830892063494,
+          "run_values": [
+            22.631830892063494,
+            22.606896587301588,
+            21.24567154047619
+          ]
+        },
+        "requests_per_second": {
+          "median": 20.428316946668886,
+          "minimum": 20.399980189782248,
+          "maximum": 21.841782699592308,
+          "run_values": [
+            20.428316946668886,
+            20.399980189782248,
+            21.841782699592308
+          ]
+        },
+        "latency_median_ms": {
+          "median": 1523.776437,
+          "minimum": 1433.640619,
+          "maximum": 1543.391424,
+          "run_values": [
+            1543.391424,
+            1523.776437,
+            1433.640619
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 24192,
+        "possible_token_intervals": 24192,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-dependency-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 shared dependency",
+      "case": "mixed",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": 13.000285,
+          "minimum": 12.787780999999999,
+          "maximum": 13.0735965,
+          "run_values": [
+            12.787780999999999,
+            13.0735965,
+            13.000285
+          ]
+        },
+        "itl_p95_ms": {
+          "median": 62.249501549999984,
+          "minimum": 51.65691124999992,
+          "maximum": 66.06734619999963,
+          "run_values": [
+            66.06734619999963,
+            62.249501549999984,
+            51.65691124999992
+          ]
+        },
+        "ttft_median_ms": {
+          "median": 268.515103,
+          "minimum": 266.42511850000005,
+          "maximum": 319.912777,
+          "run_values": [
+            319.912777,
+            266.42511850000005,
+            268.515103
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 499.04701099999994,
+          "minimum": 445.16011295,
+          "maximum": 524.2498148999996,
+          "run_values": [
+            499.04701099999994,
+            445.16011295,
+            524.2498148999996
+          ]
+        },
+        "tpot_median_ms": {
+          "median": 17.440722,
+          "minimum": 16.170820222222222,
+          "maximum": 17.47599918253968,
+          "run_values": [
+            17.440722,
+            17.47599918253968,
+            16.170820222222222
+          ]
+        },
+        "tpot_p95_ms": {
+          "median": 19.6781251047619,
+          "minimum": 19.488684702380947,
+          "maximum": 20.178824611111107,
+          "run_values": [
+            20.178824611111107,
+            19.6781251047619,
+            19.488684702380947
+          ]
+        },
+        "requests_per_second": {
+          "median": 23.660504717736845,
+          "minimum": 22.965158958115918,
+          "maximum": 23.990572085125606,
+          "run_values": [
+            22.965158958115918,
+            23.660504717736845,
+            23.990572085125606
+          ]
+        },
+        "latency_median_ms": {
+          "median": 1346.9248094999998,
+          "minimum": 1318.9210444999999,
+          "maximum": 1373.3798415,
+          "run_values": [
+            1373.3798415,
+            1346.9248094999998,
+            1318.9210444999999
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 24192,
+        "possible_token_intervals": 24192,
+        "observed_fraction": 1.0,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "p2p-itl-gdr",
+      "label": "P2P NCCL",
+      "case": "prefillthroughput",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "itl_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "ttft_median_ms": {
+          "median": 886.9802435,
+          "minimum": 885.1395359999999,
+          "maximum": 945.7441185,
+          "run_values": [
+            885.1395359999999,
+            945.7441185,
+            886.9802435
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 973.29756355,
+          "minimum": 970.91538195,
+          "maximum": 987.6158239499999,
+          "run_values": [
+            987.6158239499999,
+            970.91538195,
+            973.29756355
+          ]
+        },
+        "tpot_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "tpot_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "requests_per_second": {
+          "median": 34.14444043876133,
+          "minimum": 33.69046238469108,
+          "maximum": 35.288182788171156,
+          "run_values": [
+            35.288182788171156,
+            33.69046238469108,
+            34.14444043876133
+          ]
+        },
+        "latency_median_ms": {
+          "median": 887.8715685,
+          "minimum": 885.8845464999999,
+          "maximum": 946.5915825,
+          "run_values": [
+            885.8845464999999,
+            946.5915825,
+            887.8715685
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-gdr",
+      "label": "afdEP \u00b7 graph",
+      "case": "prefillthroughput",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "itl_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "ttft_median_ms": {
+          "median": 836.7242229999999,
+          "minimum": 835.171727,
+          "maximum": 837.688097,
+          "run_values": [
+            835.171727,
+            836.7242229999999,
+            837.688097
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 942.3932024999999,
+          "minimum": 942.335422,
+          "maximum": 1039.5687478999998,
+          "run_values": [
+            1039.5687478999998,
+            942.335422,
+            942.3932024999999
+          ]
+        },
+        "tpot_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "tpot_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "requests_per_second": {
+          "median": 36.11448925377563,
+          "minimum": 36.082946945159485,
+          "maximum": 36.15998581905269,
+          "run_values": [
+            36.11448925377563,
+            36.15998581905269,
+            36.082946945159485
+          ]
+        },
+        "latency_median_ms": {
+          "median": 837.4450645,
+          "minimum": 835.781206,
+          "maximum": 838.03192,
+          "run_values": [
+            835.781206,
+            837.4450645,
+            838.03192
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-ffn-eager",
+      "label": "afdEP \u00b7 FFN eager",
+      "case": "prefillthroughput",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "itl_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "ttft_median_ms": {
+          "median": 909.3395754999999,
+          "minimum": 905.7672245,
+          "maximum": 931.8464425,
+          "run_values": [
+            931.8464425,
+            909.3395754999999,
+            905.7672245
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 1031.5335804000001,
+          "minimum": 1002.9126780999999,
+          "maximum": 1082.20746545,
+          "run_values": [
+            1031.5335804000001,
+            1082.20746545,
+            1002.9126780999999
+          ]
+        },
+        "tpot_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "tpot_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "requests_per_second": {
+          "median": 33.64701710500323,
+          "minimum": 32.68518238792621,
+          "maximum": 34.332895890734775,
+          "run_values": [
+            32.68518238792621,
+            33.64701710500323,
+            34.332895890734775
+          ]
+        },
+        "latency_median_ms": {
+          "median": 909.9210545000001,
+          "minimum": 906.277658,
+          "maximum": 932.282715,
+          "run_values": [
+            932.282715,
+            909.9210545000001,
+            906.277658
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    },
+    {
+      "mode": "afdep-overlap-poll-itl-prefill-eager",
+      "label": "afdEP \u00b7 prefill eager",
+      "case": "prefillthroughput",
+      "completed_repeats": 3,
+      "expected_repeats": 3,
+      "metrics": {
+        "itl_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "itl_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "ttft_median_ms": {
+          "median": 884.2672745,
+          "minimum": 881.491095,
+          "maximum": 893.4657815,
+          "run_values": [
+            881.491095,
+            884.2672745,
+            893.4657815
+          ]
+        },
+        "ttft_p95_ms": {
+          "median": 966.3151787999999,
+          "minimum": 944.7780929,
+          "maximum": 1049.9301807499999,
+          "run_values": [
+            944.7780929,
+            1049.9301807499999,
+            966.3151787999999
+          ]
+        },
+        "tpot_median_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "tpot_p95_ms": {
+          "median": null,
+          "minimum": null,
+          "maximum": null,
+          "run_values": []
+        },
+        "requests_per_second": {
+          "median": 33.789114673369156,
+          "minimum": 33.444796242735094,
+          "maximum": 34.891149211081235,
+          "run_values": [
+            34.891149211081235,
+            33.789114673369156,
+            33.444796242735094
+          ]
+        },
+        "latency_median_ms": {
+          "median": 884.721137,
+          "minimum": 882.1476415,
+          "maximum": 894.097068,
+          "run_values": [
+            882.1476415,
+            884.721137,
+            894.097068
+          ]
+        }
+      },
+      "coverage": {
+        "observed_itl_intervals": 0,
+        "possible_token_intervals": 0,
+        "observed_fraction": null,
+        "coalesced_token_events": 0,
+        "tokens_in_coalesced_events": 0
+      }
+    }
+  ]
+}

@@ -351,3 +351,5 @@ consider citing it:
   howpublished={\url{https://github.com/vllm-project/afd-plugin}},
 }
 ```
+
+Experimental GPU connector: [afdEP, direct expert routing and a fixed-capacity FFN graph](recipe/gpu/AfdEPConnector/README.md).
