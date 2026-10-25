@@ -232,13 +232,18 @@ def _context(layer: int, tokens: int) -> Any:
 
 
 def _inputs(args, attn_rank: int, tokens: int, layer: int):
-    """Hidden states and Qwen3-style top-k routing over every expert."""
+    """Hidden states and Qwen3-style top-k routing.
+
+    ``--routing hot`` routes every token to FFN rank 0's experts only.
+    """
     import torch
 
     gen = torch.Generator(device="cuda")
     gen.manual_seed(1_000_003 * layer + 7919 * attn_rank + tokens)
     x = torch.randn(tokens, args.hidden, generator=gen, device="cuda")
     logits = torch.randn(tokens, args.experts, generator=gen, device="cuda")
+    if args.routing == "hot":
+        logits[:, args.experts // args.ffn :] = float("-inf")
     weights, ids = torch.topk(torch.softmax(logits, dim=-1), args.top_k, dim=-1)
     weights = weights / weights.sum(dim=-1, keepdim=True)
     return x.to(torch.bfloat16), ids, weights.float()
@@ -713,6 +718,7 @@ def main() -> None:
         "--payload", choices=("bf16", "fp8_block128_fp32"), default="bf16"
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=list(DEFAULT_TOKENS))
+    parser.add_argument("--routing", choices=("random", "hot"), default="random")
     parser.add_argument("--layers", type=int, default=16, help="MoE layers per graph")
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument(
