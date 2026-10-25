@@ -542,14 +542,15 @@ def _bench_tokens(connector: Any, args, state: dict[str, Any], tokens: int):
     torch.cuda.synchronize()
     eager_error = _check(connector, args, state)
     eager_rows = state.get("rows")
-    graph = _capture(connector, args, state, tokens, step)
-    clear_outputs()
-    _control_step(connector, args, tokens, graph=True, capture=False)
-    graph.replay()
-    torch.cuda.synchronize()
-    graph_error = _check(connector, args, state)
-    graph_rows = state.get("rows")
-    del graph
+    if not args.eager_only:
+        graph = _capture(connector, args, state, tokens, step)
+        clear_outputs()
+        _control_step(connector, args, tokens, graph=True, capture=False)
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_error = _check(connector, args, state)
+        graph_rows = state.get("rows")
+        del graph
     state["copy"] = False
 
     # Eager steps (host sync on DeepEP M2N, as the runtime's eager mode).
@@ -563,6 +564,12 @@ def _bench_tokens(connector: Any, args, state: dict[str, Any], tokens: int):
         torch.cuda.synchronize()
         if index >= WARMUP_REPLAYS:
             eager.append((time.perf_counter() - start) * 1e6 / args.layers)
+    if args.eager_only:
+        return {
+            "eager_us_per_layer": eager,
+            "eager_rel_err": eager_error,
+            "ffn_rows": {"eager": eager_rows},
+        }
 
     graph = _capture(connector, args, state, tokens, step)
 
@@ -663,14 +670,6 @@ def _summarize(args, ranks: list[dict[str, Any]]) -> dict[str, Any]:
     ffn = [rank for rank in ranks if rank.get("role") == "ffn"]
     summary: dict[str, Any] = {}
     for tokens in map(str, args.tokens):
-        # Each replay waits for its slowest Attention rank.
-        slowest = [
-            max(values)
-            for values in zip(
-                *(rank["tokens"][tokens]["graph_us_per_layer"] for rank in attention),
-                strict=True,
-            )
-        ]
         eager = [
             max(values)
             for values in zip(
@@ -679,20 +678,30 @@ def _summarize(args, ranks: list[dict[str, Any]]) -> dict[str, Any]:
             )
         ]
         errors = [
-            rank["tokens"][tokens][key]
+            rank["tokens"][tokens].get(key)
             for rank in attention
             for key in ("eager_rel_err", "graph_rel_err")
-            if rank["tokens"][tokens][key] is not None
+            if rank["tokens"][tokens].get(key) is not None
         ]
         summary[tokens] = {
-            "graph_us_per_layer": {
-                "p50": statistics.median(slowest),
-                "p90": _percentile(slowest, 0.9),
-                "p99": _percentile(slowest, 0.99),
-            },
             "eager_us_per_layer_p50": statistics.median(eager),
             "max_rel_err": max(errors) if errors else None,
             "ffn_rows": ffn[0]["tokens"][tokens]["ffn_rows"],
+        }
+        if args.eager_only:
+            continue
+        # Each replay waits for its slowest Attention rank.
+        slowest = [
+            max(values)
+            for values in zip(
+                *(rank["tokens"][tokens]["graph_us_per_layer"] for rank in attention),
+                strict=True,
+            )
+        ]
+        summary[tokens]["graph_us_per_layer"] = {
+            "p50": statistics.median(slowest),
+            "p90": _percentile(slowest, 0.9),
+            "p99": _percentile(slowest, 0.99),
         }
         for side, rank in (("attention", attention[0]), ("ffn", ffn[0])):
             for key in ("profiled_us_per_layer", "kernels", "control"):
@@ -719,6 +728,11 @@ def main() -> None:
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=list(DEFAULT_TOKENS))
     parser.add_argument("--routing", choices=("random", "hot"), default="random")
+    parser.add_argument(
+        "--eager-only",
+        action="store_true",
+        help="time eager steps only, as prefill runs (no graph cap on --tokens)",
+    )
     parser.add_argument("--layers", type=int, default=16, help="MoE layers per graph")
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument(
@@ -733,7 +747,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.transport == "p2p" and args.payload != "bf16":
         parser.error("P2P sends model-dtype (BF16) hidden states")
-    if max(args.tokens) > MAX_CAPTURE_SIZE:
+    if max(args.tokens) > MAX_CAPTURE_SIZE and not args.eager_only:
         parser.error(f"token counts above {MAX_CAPTURE_SIZE} have no decode graph")
     world = args.ffn + args.attn
     args.gpus = list(range(world))
