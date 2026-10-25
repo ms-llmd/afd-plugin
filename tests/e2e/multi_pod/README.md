@@ -77,8 +77,9 @@ out explicitly: identity resolution has to stay unit-testable without a GPU
 or a cluster.
 
 The barrier name constants (`ADDRESS_BARRIER`, `LAUNCHED_BARRIER`,
-`SERVING_BARRIER`, `VERDICT_BARRIER`) name the four synchronization points
-every pod passes through, in order — they show up again in `run_pod()`.
+`SERVING_BARRIER`, `VERDICT_BARRIER`, `TEARDOWN_BARRIER`) name the five
+synchronization points every pod passes through, in order — they show up
+again in `run_pod()`.
 `ROLE_LABELS` is just for readable log prefixes (`ATTN`, `FFN`, `BASELINE`).
 
 ### `PodProcess` (lines 79–85)
@@ -175,6 +176,19 @@ line 442). Reading it top to bottom:
 8. On success, prints a `PASSED` line tagged with this pod's index, scenario,
    and layout, and returns `0`.
 
+9. **Release the store, whatever the outcome.** Everything after connecting
+   runs inside a `try`/`finally` that calls `leave_rendezvous()`. Pod 0's
+   process *is* the store server, so it must outlive every peer's last store
+   call: a barrier only proves that every pod *arrived*, and a peer may still
+   be asleep in the barrier's poll interval when pod 0 returns from it. So
+   after its own cleanup each peer calls `Rendezvous.depart()` (its last
+   store write), and pod 0 calls `wait_for_departures()` before exiting,
+   bounded by `departure_timeout(args)` — the scenario's teardown budget
+   plus `DEPARTURE_GRACE_S`. A straggler (a peer that died or never
+   connected) is logged, never turned into a different result; another
+   arrival barrier could not replace this, since the last pod to arrive
+   always leaves while the others still sleep.
+
 ### `run_pod()` (lines 159–259) — phases 6–11, the ordered protocol
 
 This is the heart of the coordination logic, and its own comments number the
@@ -236,6 +250,13 @@ within one poll interval.
   the process's own exit code (and thus the k8s Job / Docker container exit
   code, and thus `test_multi_pod()`'s subprocess result) reflect pass/fail
   for the whole distributed run, not just this pod's local view.
+
+- **Phase 12 — teardown barrier.** A passing pod waits on
+  `TEARDOWN_BARRIER` before returning into cleanup, so no pod stops its
+  roles until every pod has passed its final liveness check. Stopping a
+  local role can take down its AFD peers on other pods, which a pod still
+  checking would misreport as a failed run. This is the only barrier
+  *without* `on_poll`: from here on a child exiting is expected.
 
 ### `launch_slot()` (lines 262–290)
 

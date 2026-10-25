@@ -71,9 +71,13 @@ ADDRESS_BARRIER = "addresses"
 LAUNCHED_BARRIER = "launched"
 SERVING_BARRIER = "serving"
 VERDICT_BARRIER = "verdict"
+TEARDOWN_BARRIER = "teardown"
 
 HEALTH_POLL_INTERVAL_S = 2.0
 HEALTH_REQUEST_TIMEOUT_S = 5
+# On top of a peer's teardown budget: SIGKILL reaping, log thread joins and
+# barrier polling skew before it departs the store.
+DEPARTURE_GRACE_S = 60
 ROLE_LABELS = {ATTENTION_ROLE: "ATTN", FFN_ROLE: "FFN", "baseline": "BASELINE"}
 
 
@@ -116,59 +120,64 @@ def main() -> int:
         pod_index=pod_index,
         num_pods=layout.num_pods,
     )
-    rendezvous.verify_agreement(layout.canonical(), args.scenario)
-    addresses = resolve_addresses(args, rendezvous, layout.num_pods, pod_index)
-    pod_plan = plan(topology, layout, addresses)[pod_index]
-    print_plan(pod_plan, addresses)
+    # Everything after connecting releases the store on the way out, so pod 0
+    # outlives every peer's last store call whatever the outcome.
+    try:
+        rendezvous.verify_agreement(layout.canonical(), args.scenario)
+        addresses = resolve_addresses(args, rendezvous, layout.num_pods, pod_index)
+        pod_plan = plan(topology, layout, addresses)[pod_index]
+        print_plan(pod_plan, addresses)
 
-    stale = find_stale_run_markers(args.run_id)
-    if stale:
-        message = f"pod {pod_index}: stale processes from an earlier run: {stale}"
-        rendezvous.publish_abort(message)
-        raise RuntimeError(message)
+        stale = find_stale_run_markers(args.run_id)
+        if stale:
+            message = f"pod {pod_index}: stale processes from an earlier run: {stale}"
+            rendezvous.publish_abort(message)
+            raise RuntimeError(message)
 
-    processes: list[PodProcess] = []
-    log_threads: list[threading.Thread] = []
+        processes: list[PodProcess] = []
+        log_threads: list[threading.Thread] = []
 
-    def cleanup() -> None:
-        try:
+        def cleanup() -> None:
             try:
-                terminate_processes(
-                    [entry.process for entry in processes],
-                    termination_timeout_s=process_termination_timeout(args),
-                    deferred_sigkill_pgids=deferred_sigkill_pgids(
-                        args,
-                        processes,
-                    ),
-                    force_kill_environment=(
-                        {
-                            E2E_RUN_ID_ENV: pod_e2e_run_id(args.run_id, pod_index),
-                            E2E_PROCESS_ROLE_ENV: FFN_ROLE,
-                        }
-                        if uses_npu_async_process_cleanup(args)
-                        else None
-                    ),
-                )
-            finally:
-                for thread in log_threads:
-                    thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
-        except BaseException as exc:
-            publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", str(exc))
-            raise
-        publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", "ok")
+                try:
+                    terminate_processes(
+                        [entry.process for entry in processes],
+                        termination_timeout_s=process_termination_timeout(args),
+                        deferred_sigkill_pgids=deferred_sigkill_pgids(
+                            args,
+                            processes,
+                        ),
+                        force_kill_environment=(
+                            {
+                                E2E_RUN_ID_ENV: pod_e2e_run_id(args.run_id, pod_index),
+                                E2E_PROCESS_ROLE_ENV: FFN_ROLE,
+                            }
+                            if uses_npu_async_process_cleanup(args)
+                            else None
+                        ),
+                    )
+                finally:
+                    for thread in log_threads:
+                        thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
+            except BaseException as exc:
+                publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", str(exc))
+                raise
+            publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", "ok")
 
-    with cancellable_run(cleanup):
-        try:
-            run_pod(args, rendezvous, pod_plan, processes, log_threads)
-        except BaseException as exc:
-            rendezvous.publish_abort(f"pod {pod_index}: {exc}")
-            raise
+        with cancellable_run(cleanup):
+            try:
+                run_pod(args, rendezvous, pod_plan, processes, log_threads)
+            except BaseException as exc:
+                rendezvous.publish_abort(f"pod {pod_index}: {exc}")
+                raise
 
-    print(
-        f"\n[pod-{pod_index}] E2E SCENARIO {args.scenario} "
-        f"LAYOUT {layout.canonical()} PASSED",
-        flush=True,
-    )
+        print(
+            f"\n[pod-{pod_index}] E2E SCENARIO {args.scenario} "
+            f"LAYOUT {layout.canonical()} PASSED",
+            flush=True,
+        )
+    finally:
+        leave_rendezvous(rendezvous, departure_timeout(args))
     return 0
 
 
@@ -179,7 +188,7 @@ def run_pod(
     processes: list[PodProcess],
     log_threads: list[threading.Thread],
 ) -> None:
-    """Phases 6-11: ordered launch, readiness, evaluation, verdict."""
+    """Phases 6-12: ordered launch, readiness, evaluation, verdict, teardown."""
     pod_index = pod_plan.index
 
     def assert_local_processes_alive() -> None:
@@ -270,6 +279,12 @@ def run_pod(
     print(f"[pod-{pod_index}] verdict: {verdict}", flush=True)
     if verdict != PASS_VERDICT:
         raise RuntimeError(f"pod {pod_index} run failed: {verdict}")
+
+    # Phase 12: no pod tears down until every pod has passed its last liveness
+    # check. Stopping a local role can kill its remote AFD peers, which a pod
+    # still checking would report as a failed run. No on_poll here: from now on
+    # a child exiting is expected.
+    rendezvous.barrier(TEARDOWN_BARRIER, args.verdict_timeout)
 
 
 def launch_slot(
@@ -379,6 +394,31 @@ def resolve_addresses(
             raise RuntimeError(f"pod {index} did not publish an address")
         addresses.append(address)
     return addresses
+
+
+def departure_timeout(args: argparse.Namespace) -> float:
+    """Return how long pod 0 keeps the store up for peers to finish cleanup."""
+    return process_termination_timeout(args) + DEPARTURE_GRACE_S
+
+
+def leave_rendezvous(rendezvous: Rendezvous, timeout_s: float) -> None:
+    """Release the store: a peer departs, pod 0 waits for every peer first.
+
+    Best effort, like publish_quietly: the exit code already carries the result.
+    """
+    try:
+        if rendezvous.pod_index != 0:
+            rendezvous.depart()
+            return
+        stragglers = rendezvous.wait_for_departures(timeout_s)
+        if stragglers:
+            print(
+                f"[pod-0] closing the store before "
+                f"{[f'pod-{index}' for index in stragglers]} departed",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001 - the exit code carries the result
+        print(f"could not leave the rendezvous: {exc}", flush=True)
 
 
 def publish_quietly(rendezvous: Rendezvous, key: str, value: str) -> None:

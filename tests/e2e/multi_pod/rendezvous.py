@@ -139,6 +139,36 @@ class Rendezvous:
             return None
         return "; ".join(messages)
 
+    # -- departure -------------------------------------------------------
+
+    def depart(self) -> None:
+        """Tell the store owner this pod makes no further store calls.
+
+        Arrival keys cannot carry this: a pod that saw every arrival may still
+        have peers asleep inside the same barrier, so pod 0 must not take the
+        store down until each peer has departed. Pod 0 owns the store and
+        leaves last, so it never departs.
+        """
+        if self.pod_index != 0:
+            self.set(self._departed_key(self.pod_index), "1")
+
+    def wait_for_departures(self, timeout_s: float) -> list[int]:
+        """Keep the store up until every peer departed; return the stragglers.
+
+        Never raises on a straggler: the run's result is settled by now, and a
+        peer that died or never connected must not turn it into another one.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            missing = [
+                index
+                for index in range(1, self.num_pods)
+                if not self.store.check([self._departed_key(index)])
+            ]
+            if not missing or time.monotonic() >= deadline:
+                return missing
+            time.sleep(self.poll_interval_s)
+
     # -- barriers --------------------------------------------------------
 
     def barrier(
@@ -210,3 +240,7 @@ class Rendezvous:
     @staticmethod
     def _arrival_key(name: str, pod_index: int) -> str:
         return f"arrived/{name}/{pod_index}"
+
+    @staticmethod
+    def _departed_key(pod_index: int) -> str:
+        return f"departed/{pod_index}"
