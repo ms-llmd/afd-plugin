@@ -524,7 +524,7 @@ def _clock_offsets(state: dict[str, Any], world_rank: int, world: int) -> dict:
             graphs[peer] = graph
             dist.barrier()
         state["clock_graphs"] = graphs
-    offsets, bounds, at = [0.0] * world, [0.0] * world, 0.0
+    offsets, bounds, ats = [0.0] * world, [0.0] * world, [0.0] * world
     for peer, graph in state["clock_graphs"].items():
         best = None
         for _ in range(CLOCK_PINGS):
@@ -540,12 +540,12 @@ def _clock_offsets(state: dict[str, Any], world_rank: int, world: int) -> dict:
                 midpoint = sent + round_trip / 2
                 best = (round_trip, int(gathered[peer][1]) - midpoint, midpoint)
         assert best is not None
-        bounds[peer], offsets[peer] = best[0] / 2, best[1]
-        at = best[2]
+        bounds[peer], offsets[peer], ats[peer] = best[0] / 2, best[1], best[2]
     return {
         "offset_ns": offsets[world_rank],
         "error_bound_ns": max(bounds),
-        "at_ns": at,
+        # Rank 0's clock at this rank's own calibration, for drift interpolation.
+        "at_ns": ats[world_rank],
     }
 
 
@@ -914,7 +914,7 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 
 PHASES = (
-    ("attention_dispatch", "Attention dispatch kernel"),
+    ("attention_dispatch", "Attention dispatch, from the layer start"),
     ("to_ffn", "dispatch in flight and FFN receive"),
     ("experts", "FFN experts"),
     ("ffn_combine", "FFN combine send"),
@@ -964,15 +964,17 @@ def _phase_summary(attention: list, ffn: list, tokens: str, key: str) -> dict:
         for layer in range(1, len(a_steps[0][step])):
             a = [rank[step][layer] for rank in a_steps]
             f = [rank[step][layer] for rank in f_steps]
+            # The layer starts when the last Attention rank finished the previous one.
+            begin = max(marks[0] for marks in a)
             sender = max(a, key=lambda marks: marks[1])
             reply = max(f, key=lambda marks: marks[3])
             last = max(a, key=lambda marks: marks[2])
-            values["attention_dispatch"].append(sender[1] - sender[0])
+            values["attention_dispatch"].append(sender[1] - begin)
             values["to_ffn"].append(reply[1] - sender[1])
             values["experts"].append(reply[2] - reply[1])
             values["ffn_combine"].append(reply[3] - reply[2])
             values["to_attention"].append(last[2] - reply[3])
-            values["round_trip"].append(last[2] - sender[0])
+            values["round_trip"].append(last[2] - begin)
             values["ffn_idle"].append(max(0.0, sender[1] - reply[0]))
     clocks = [
         clock
@@ -984,7 +986,26 @@ def _phase_summary(attention: list, ffn: list, tokens: str, key: str) -> dict:
         for c in (rank["tokens"][tokens][key]["clock"] for rank in attention + ffn)
     ]
     trips = values["round_trip"]
+    overhead = None
+    if key == "graph_phases":
+        # Stamps sit on the critical path: compare whole marked and unmarked steps
+        # (both from replay start to the slowest Attention rank's last combine).
+        spans = [
+            max(rank[step][-1][-1] for rank in a_steps)
+            - min(rank[step][0][0] for rank in a_steps)
+            for step in range(len(a_steps[0]))
+        ]
+        layers = len(a_steps[0][0])
+        plain = [
+            max(values_) * layers
+            for values_ in zip(
+                *(rank["tokens"][tokens]["graph_us_per_layer"] for rank in attention),
+                strict=True,
+            )
+        ]
+        overhead = (statistics.median(spans) - statistics.median(plain)) / layers
     return {
+        "mark_overhead_us_per_layer": overhead,
         "mean_us": {name: statistics.mean(v) for name, v in values.items()},
         "round_trip_us": {
             "p50": statistics.median(trips),
