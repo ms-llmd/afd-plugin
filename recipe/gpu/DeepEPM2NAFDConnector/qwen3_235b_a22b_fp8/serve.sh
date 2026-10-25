@@ -73,7 +73,13 @@ case "$ROLE" in
     echo "ROLE must be ffn or attention" >&2
     exit 1 ;;
 esac
-local_ranks=$((ranks < LOCAL_GPUS ? ranks : LOCAL_GPUS))
+# This pod runs ranks START_RANK.. of the role, at most LOCAL_GPUS of them.
+remaining=$((ranks - START_RANK))
+local_ranks=$((remaining < LOCAL_GPUS ? remaining : LOCAL_GPUS))
+if ((local_ranks < 1)); then
+  echo "START_RANK $START_RANK leaves no $ROLE ranks of $ranks for this pod" >&2
+  exit 1
+fi
 dp=(--data-parallel-size "$ranks" --data-parallel-size-local "$local_ranks"
   --data-parallel-address "$head_ip" --data-parallel-rpc-port "$rpc_port")
 if [[ "$START_RANK" != 0 ]]; then

@@ -97,4 +97,6 @@ DeepGEMM `e1f418c2` and NCCL 2.30.7:
 - Decode stage only, as the connector's support table states.
 - FP8 replies are lossy: GSM8K was unchanged on Qwen3-235B, but next-token KL
   rose about 2.5 times over the BF16 run-to-run noise floor.
-- DBO needs Attention data parallelism of 2 or more.
+- DBO helps at long context and hurts at short context: on H200 it cut TPOT by
+  10–13% at 131K but added 11–17% at 4K. Leave `DBO=0` for short-context
+  serving.
