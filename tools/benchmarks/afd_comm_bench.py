@@ -59,6 +59,8 @@ SMS_PER_GPU = 132
 RANK_TIMEOUT_S = 3600
 GEMM_CALIBRATION = 20
 PHASE_REPLAYS = 50
+# Slack beyond the clock bound before a step's phases count as misaligned.
+STEP_SANITY_US = 50.0
 CLOCK_PINGS = 64
 # Phase stamps per layer: Attention after dispatch and after combine; FFN when
 # rows are ready, experts done and combine done. A layer starts where the
@@ -957,10 +959,18 @@ def _phase_summary(attention: list, ffn: list, tokens: str, key: str) -> dict:
 
     a_steps = [absolute(rank) for rank in attention]
     f_steps = [absolute(rank) for rank in ffn]
+    clocks = [
+        clock
+        for rank in attention + ffn
+        for clock in rank["tokens"][tokens][key]["clock"]
+    ]
+    bound_us = max(c["error_bound_ns"] for c in clocks) / 1e3
     names = [name for name, _ in PHASES]
     values: dict[str, list[float]] = {name: [] for name in names}
     values.update(round_trip=[], ffn_idle=[])
+    dropped = 0
     for step in range(len(a_steps[0])):
+        step_values: dict[str, list[float]] = {name: [] for name in values}
         for layer in range(1, len(a_steps[0][step])):
             a = [rank[step][layer] for rank in a_steps]
             f = [rank[step][layer] for rank in f_steps]
@@ -969,18 +979,21 @@ def _phase_summary(attention: list, ffn: list, tokens: str, key: str) -> dict:
             sender = max(a, key=lambda marks: marks[1])
             reply = max(f, key=lambda marks: marks[3])
             last = max(a, key=lambda marks: marks[2])
-            values["attention_dispatch"].append(sender[1] - begin)
-            values["to_ffn"].append(reply[1] - sender[1])
-            values["experts"].append(reply[2] - reply[1])
-            values["ffn_combine"].append(reply[3] - reply[2])
-            values["to_attention"].append(last[2] - reply[3])
-            values["round_trip"].append(last[2] - begin)
-            values["ffn_idle"].append(max(0.0, sender[1] - reply[0]))
-    clocks = [
-        clock
-        for rank in attention + ffn
-        for clock in rank["tokens"][tokens][key]["clock"]
-    ]
+            step_values["attention_dispatch"].append(sender[1] - begin)
+            step_values["to_ffn"].append(reply[1] - sender[1])
+            step_values["experts"].append(reply[2] - reply[1])
+            step_values["ffn_combine"].append(reply[3] - reply[2])
+            step_values["to_attention"].append(last[2] - reply[3])
+            step_values["round_trip"].append(last[2] - begin)
+            step_values["ffn_idle"].append(max(0.0, sender[1] - reply[0]))
+        # A step whose in-flight phase runs far below zero had a bad anchor
+        # stamp on some rank (seen once in a few eager passes): drop it.
+        worst = min(step_values["to_ffn"] + step_values["to_attention"])
+        if worst < -(bound_us + STEP_SANITY_US):
+            dropped += 1
+            continue
+        for name, items in step_values.items():
+            values[name].extend(items)
     drifts = [
         abs(c[1]["offset_ns"] - c[0]["offset_ns"]) / 1e3
         for c in (rank["tokens"][tokens][key]["clock"] for rank in attention + ffn)
@@ -1013,11 +1026,12 @@ def _phase_summary(attention: list, ffn: list, tokens: str, key: str) -> dict:
             "p99": _percentile(trips, 0.99),
         },
         "samples": len(trips),
+        "dropped_steps": dropped,
         # Negative in-flight phases mean clocks or overlap moved a boundary.
         "most_negative_in_flight_us": min(
             min(values["to_ffn"]), min(values["to_attention"])
         ),
-        "clock_error_bound_us": max(c["error_bound_ns"] for c in clocks) / 1e3,
+        "clock_error_bound_us": bound_us,
         "clock_drift_us": max(drifts),
     }
 
