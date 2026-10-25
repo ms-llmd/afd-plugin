@@ -58,6 +58,12 @@ MAX_CAPTURE_SIZE = 512
 SMS_PER_GPU = 132
 RANK_TIMEOUT_S = 3600
 GEMM_CALIBRATION = 20
+PHASE_REPLAYS = 50
+CLOCK_PINGS = 64
+# Phase stamps per layer: Attention after dispatch and after combine; FFN when
+# rows are ready, experts done and combine done. A layer starts where the
+# previous one ended, so step start is stamped once.
+ATTENTION_MARKS, FFN_MARKS = 2, 3
 INTERFERENCE_WINDOW_US = 100_000
 
 
@@ -97,7 +103,7 @@ def _vllm_config(args: argparse.Namespace, role: str, role_rank: int, port: int)
             "capacity_tokens_per_rank": max(args.tokens),
             "payload_format": args.payload,
             "num_lanes": 1,
-            "network": {"preset": "single-node"},
+            "network": {"preset": args.network},
             "cpu_sync_min_tokens": 0,
         }
         if deepep
@@ -112,7 +118,7 @@ def _vllm_config(args: argparse.Namespace, role: str, role_rank: int, port: int)
                     "DeepEPM2NAFDConnector" if deepep else "P2pNcclAFDConnector"
                 ),
                 "role": role,
-                "host": "127.0.0.1",
+                "host": args.master_addr,
                 "port": port,
                 "num_attention_ranks": args.attn,
                 "num_ffn_ranks": args.ffn,
@@ -299,25 +305,53 @@ class _FFNGroup:
 
 
 def _layer(connector: Any, args, state: dict[str, Any], layer: int, tokens: int):
-    """One MoE layer's exchange on this rank."""
+    """One MoE layer's exchange on this rank.
+
+    With ``state["marks"]`` set (the phase passes), stamps ``%globaltimer``
+    at each phase boundary of this layer on the caller's stream.
+    """
     import torch
+
+    marks = state.get("marks")
+
+    def mark(index: int) -> None:
+        if marks is None or not index:
+            return
+        if isinstance(marks, list):
+            marks[layer][index - 1].record()
+        else:
+            _stamp(marks[layer, index - 1 : index])
 
     if connector.afd_config.role == "attention":
         x, ids, weights = state["inputs"][layer]
         out = state["outs"][layer]
+        mark(0)
         if args.transport in DEEPEP_TRANSPORTS:
             connector.send_attn_output(
                 x, _context(layer, tokens), topk_ids=ids, topk_weights=weights
             )
         else:
             connector.send_attn_output(x, _context(layer, tokens))
+        mark(1)
         connector.recv_ffn_output(out, 0)
+        mark(2)
         return
+    mark(0)
     payload = connector.recv_attn_output(0)
     hidden = payload.hidden_states
     state["rows"] = int(hidden.shape[0])
     if args.transport not in DEEPEP_TRANSPORTS:
         connector.send_ffn_output(state["ffn_group"].exchange(hidden), payload.context)
+        return
+    ready = connector._transfer_state(payload.context).ready_event
+    torch.cuda.current_stream().wait_event(ready)
+    mark(1)
+    if args.experts_mode == "real":
+        out = connector.run_experts(payload, state["weights"])
+        mark(2)
+        connector.send_ffn_output(out, payload.context)
+        connector.synchronize_lanes()
+        mark(3)
         return
     replies = state.setdefault("replies", {})
     shape = tuple(hidden.shape)
@@ -328,16 +362,20 @@ def _layer(connector: Any, args, state: dict[str, Any], layer: int, tokens: int)
     # once the lane has it. Timed passes skip the copy: the receive buffer is
     # padded per expert, so copying it all would cost more than the exchange.
     if state["copy"] and hidden.dtype == torch.bfloat16:
-        ready = connector._transfer_state(payload.context).ready_event
-        torch.cuda.current_stream().wait_event(ready)
         reply.copy_(hidden)
+    mark(2)
     connector.send_ffn_output(reply, payload.context)
     connector.synchronize_lanes()
+    mark(3)
 
 
 def _check(connector: Any, args, state: dict[str, Any]) -> float | None:
     """Relative error of the last BF16 step's outputs against the expected combine."""
-    if connector.afd_config.role != "attention" or args.payload != "bf16":
+    if (
+        connector.afd_config.role != "attention"
+        or args.payload != "bf16"
+        or args.experts_mode == "real"
+    ):
         return None
     scale = args.top_k if args.transport in DEEPEP_TRANSPORTS else args.ffn
     worst = 0.0
@@ -419,6 +457,175 @@ def _kernel_profile(replay: Any, control: Any, layers: int) -> dict[str, Any]:
         ),
         "control": dict(control_names),
     }
+
+
+_STAMP: Any = None
+
+
+def _stamp(slot: Any) -> None:
+    """Write this GPU's ``%globaltimer`` (ns) into the one-element ``slot``."""
+    global _STAMP
+    if _STAMP is None:
+        from vllm.triton_utils import tl, triton
+
+        @triton.jit
+        def stamp_kernel(out_ptr):
+            previous = tl.load(out_ptr)
+            now = tl.inline_asm_elementwise(
+                "mov.u64 $0, %globaltimer;",
+                "=l,l",
+                [previous],
+                dtype=tl.int64,
+                is_pure=False,
+                pack=1,
+            )
+            tl.store(out_ptr, now)
+
+        _STAMP = stamp_kernel
+    _STAMP[(1,)](slot)
+
+
+def _clock_offsets(state: dict[str, Any], world_rank: int, world: int) -> dict:
+    """Every rank's ``%globaltimer`` offset from rank 0's, by NCCL ping-pong.
+
+    Rank 0 stamps, sends one element to a peer and stamps when the reply
+    lands; the peer stamps between its receive and its reply. Both directions
+    take the same path, so the peer's clock reads ``offset`` ahead of the
+    midpoint of rank 0's stamps. Each ping is one CUDA graph (no launch gaps);
+    the ping with the shortest round trip wins and half of it bounds the error.
+    Returns the offset and the rank-0 time it was measured at.
+    """
+    import torch
+    import torch.distributed as dist
+
+    comm, slots = state["clock_comm"], state["clock_slots"]
+    token = torch.zeros(1, device="cuda")
+    if "clock_graphs" not in state:
+
+        def ping(peer: int) -> None:
+            if world_rank == 0:
+                _stamp(slots[0:1])
+                comm.send(token, peer)
+                comm.recv(token, peer)
+                _stamp(slots[2:3])
+            elif world_rank == peer:
+                comm.recv(token, 0)
+                _stamp(slots[1:2])
+                comm.send(token, 0)
+
+        graphs = {}
+        for peer in range(1, world):
+            ping(peer)
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                ping(peer)
+            graphs[peer] = graph
+            dist.barrier()
+        state["clock_graphs"] = graphs
+    offsets, bounds, at = [0.0] * world, [0.0] * world, 0.0
+    for peer, graph in state["clock_graphs"].items():
+        best = None
+        for _ in range(CLOCK_PINGS):
+            dist.barrier()
+            if world_rank in (0, peer):
+                graph.replay()
+            torch.cuda.synchronize()
+            gathered = [torch.zeros(3, dtype=torch.int64) for _ in range(world)]
+            dist.all_gather(gathered, slots.cpu())
+            sent, landed = int(gathered[0][0]), int(gathered[0][2])
+            round_trip = landed - sent
+            if best is None or round_trip < best[0]:
+                midpoint = sent + round_trip / 2
+                best = (round_trip, int(gathered[peer][1]) - midpoint, midpoint)
+        assert best is not None
+        bounds[peer], offsets[peer] = best[0] / 2, best[1]
+        at = best[2]
+    return {
+        "offset_ns": offsets[world_rank],
+        "error_bound_ns": max(bounds),
+        "at_ns": at,
+    }
+
+
+def _expert_weights(args, connector: Any) -> Any:
+    """Random weights for this FFN rank's experts, in the payload's format."""
+    import torch
+
+    from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import quantize_fp8_block128
+    from afd_plugin.connectors.routed_experts import LocalExpertWeights
+
+    count = len(connector.layout.expert_range(connector.role_rank))
+    shapes = (
+        (count, 2 * args.intermediate, args.hidden),
+        (count, args.hidden, args.intermediate),
+    )
+    w13, w2 = (
+        (torch.randn(shape, device="cuda") * shape[2] ** -0.5).to(torch.bfloat16)
+        for shape in shapes
+    )
+    if args.payload == "bf16":
+        return LocalExpertWeights(w13=w13, w2=w2)
+    w13_q, w13_s = quantize_fp8_block128(w13)
+    w2_q, w2_s = quantize_fp8_block128(w2)
+    return LocalExpertWeights(w13=w13_q, w2=w2_q, w13_scale=w13_s, w2_scale=w2_s)
+
+
+def _phase_pass(connector, args, state, step, control, replay_fn, count, eager):
+    """``count`` steps with a mark per phase boundary, in ``%globaltimer`` ns.
+
+    Graph steps stamp ``%globaltimer`` (about 0.7 µs per stamp; a CUDA event
+    node costs twice that). Eager steps record CUDA events instead, since a
+    stamp's kernel launch costs host time there, and convert them to ns from
+    one stamp per step. ``_clock_offsets`` aligns the GPUs' clocks.
+    """
+    import torch
+    import torch.distributed as dist
+
+    per_layer = (
+        ATTENTION_MARKS if connector.afd_config.role == "attention" else FFN_MARKS
+    )
+    begin = torch.zeros(1, dtype=torch.int64, device="cuda")
+    reference = torch.cuda.Event(enable_timing=True)
+    if eager:
+        state["marks"] = [
+            [torch.cuda.Event(enable_timing=True) for _ in range(per_layer)]
+            for _ in range(args.layers)
+        ]
+    else:
+        state["marks"] = torch.zeros(
+            args.layers, per_layer, dtype=torch.int64, device="cuda"
+        )
+
+    def stamped_step() -> None:
+        _stamp(begin)
+        reference.record()
+        step()
+
+    run = replay_fn(stamped_step)
+    begins, steps = [], []
+    for index in range(WARMUP_REPLAYS + count):
+        control()
+        torch.cuda.synchronize()
+        dist.barrier()
+        run()
+        torch.cuda.synchronize()
+        if index < WARMUP_REPLAYS:
+            continue
+        start = int(begin.item())
+        begins.append(start)
+        if eager:
+            steps.append(
+                [
+                    [start + reference.elapsed_time(event) * 1e6 for event in layer]
+                    for layer in state["marks"]
+                ]
+            )
+        else:
+            steps.append(state["marks"].cpu().tolist())
+    state.pop("marks")
+    return {"begin_ns": begins, "marks_ns": steps}
 
 
 def _capture(connector: Any, args, state: dict[str, Any], tokens: int, step: Any):
@@ -564,12 +771,23 @@ def _bench_tokens(connector: Any, args, state: dict[str, Any], tokens: int):
         torch.cuda.synchronize()
         if index >= WARMUP_REPLAYS:
             eager.append((time.perf_counter() - start) * 1e6 / args.layers)
+    result: dict[str, Any] = {
+        "eager_us_per_layer": eager,
+        "eager_rel_err": eager_error,
+        "ffn_rows": {"eager": eager_rows},
+    }
+    world = args.ffn + args.attn
+    if args.phases:
+        before = _clock_offsets(state, args.world_rank, world)
+        result["eager_phases"] = _phase_pass(
+            connector, args, state, step, control, lambda fn: fn, EAGER_STEPS, True
+        )
+        result["eager_phases"]["clock"] = [
+            before,
+            _clock_offsets(state, args.world_rank, world),
+        ]
     if args.eager_only:
-        return {
-            "eager_us_per_layer": eager,
-            "eager_rel_err": eager_error,
-            "ffn_rows": {"eager": eager_rows},
-        }
+        return result
 
     graph = _capture(connector, args, state, tokens, step)
 
@@ -597,14 +815,32 @@ def _bench_tokens(connector: Any, args, state: dict[str, Any], tokens: int):
         end_event.synchronize()
         if index >= WARMUP_REPLAYS:
             replays.append(start_event.elapsed_time(end_event) * 1e3 / args.layers)
-    result = {
-        "graph_us_per_layer": replays,
-        "eager_us_per_layer": eager,
-        "eager_rel_err": eager_error,
-        "graph_rel_err": graph_error,
-        "ffn_rows": {"eager": eager_rows, "graph": graph_rows},
+    result.update(
+        graph_us_per_layer=replays,
+        graph_rel_err=graph_error,
+        ffn_rows={"eager": eager_rows, "graph": graph_rows},
         **_kernel_profile(replay, graph_control, args.layers),
-    }
+    )
+    if args.phases:
+
+        def capture_marked(stamped_step: Any) -> Any:
+            return _capture(connector, args, state, tokens, stamped_step).replay
+
+        before = _clock_offsets(state, args.world_rank, world)
+        result["graph_phases"] = _phase_pass(
+            connector,
+            args,
+            state,
+            step,
+            graph_control,
+            capture_marked,
+            PHASE_REPLAYS,
+            False,
+        )
+        result["graph_phases"]["clock"] = [
+            before,
+            _clock_offsets(state, args.world_rank, world),
+        ]
     if tokens in args.interference:
         dist.barrier()
         result["interference"] = _interference(
@@ -621,11 +857,12 @@ def _rank_main(args, world_rank: int, ports: list[int], out_dir: str) -> None:
         import torch
         import torch.distributed as dist
 
+        args.world_rank = world_rank
         local_rank = args.gpus[world_rank]
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
             "gloo",
-            init_method=f"tcp://127.0.0.1:{ports[0]}",
+            init_method=f"tcp://{args.master_addr}:{ports[0]}",
             world_size=args.ffn + args.attn,
             rank=world_rank,
         )
@@ -643,6 +880,17 @@ def _rank_main(args, world_rank: int, ports: list[int], out_dir: str) -> None:
             state["ffn_group"] = _FFNGroup(args, ffn_pg, local_rank)
         torch.cuda.synchronize()
         result["connector_device_bytes"] = free_before - torch.cuda.mem_get_info()[0]
+        if args.experts_mode == "real" and role == "ffn":
+            state["weights"] = _expert_weights(args, connector)
+        if args.phases:
+            from vllm.distributed.device_communicators.pynccl import (
+                PyNcclCommunicator,
+            )
+
+            state["clock_comm"] = PyNcclCommunicator(
+                group=dist.group.WORLD, device=local_rank
+            )
+            state["clock_slots"] = torch.zeros(3, dtype=torch.int64, device="cuda")
         result["tokens"] = {
             str(tokens): _bench_tokens(connector, args, state, tokens)
             for tokens in args.tokens
@@ -665,6 +913,94 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1))))]
 
 
+PHASES = (
+    ("attention_dispatch", "Attention dispatch kernel"),
+    ("to_ffn", "dispatch in flight and FFN receive"),
+    ("experts", "FFN experts"),
+    ("ffn_combine", "FFN combine send"),
+    ("to_attention", "combine in flight and Attention receive"),
+)
+
+
+def _phase_summary(attention: list, ffn: list, tokens: str, key: str) -> dict:
+    """Split each layer's round trip into its critical-path phases.
+
+    Stamps convert to rank 0's clock. Per layer, the chain runs from the
+    Attention rank whose dispatch finishes last, through the FFN rank whose
+    combine finishes last, to the Attention rank whose combine finishes last;
+    its phases sum to that layer's round trip. The first layer of each step
+    is skipped (step start).
+    """
+
+    def absolute(rank: dict) -> list:
+        entry = rank["tokens"][tokens][key]
+        before, after = entry["clock"]
+        # Clocks drift: interpolate the offset between the two calibrations.
+        span = after["at_ns"] - before["at_ns"]
+        drift = (after["offset_ns"] - before["offset_ns"]) / span if span else 0.0
+
+        def to_rank0(stamp: int) -> float:
+            offset = before["offset_ns"]
+            offset += drift * (stamp - offset - before["at_ns"])
+            return (stamp - offset) / 1e3
+
+        steps = []
+        for begin, layers in zip(entry["begin_ns"], entry["marks_ns"], strict=True):
+            # Each layer: [start, *its stamps]; a layer starts at the last one's end.
+            start, rows = to_rank0(begin), []
+            for stamps in layers:
+                row = [start] + [to_rank0(stamp) for stamp in stamps]
+                rows.append(row)
+                start = row[-1]
+            steps.append(rows)
+        return steps
+
+    a_steps = [absolute(rank) for rank in attention]
+    f_steps = [absolute(rank) for rank in ffn]
+    names = [name for name, _ in PHASES]
+    values: dict[str, list[float]] = {name: [] for name in names}
+    values.update(round_trip=[], ffn_idle=[])
+    for step in range(len(a_steps[0])):
+        for layer in range(1, len(a_steps[0][step])):
+            a = [rank[step][layer] for rank in a_steps]
+            f = [rank[step][layer] for rank in f_steps]
+            sender = max(a, key=lambda marks: marks[1])
+            reply = max(f, key=lambda marks: marks[3])
+            last = max(a, key=lambda marks: marks[2])
+            values["attention_dispatch"].append(sender[1] - sender[0])
+            values["to_ffn"].append(reply[1] - sender[1])
+            values["experts"].append(reply[2] - reply[1])
+            values["ffn_combine"].append(reply[3] - reply[2])
+            values["to_attention"].append(last[2] - reply[3])
+            values["round_trip"].append(last[2] - sender[0])
+            values["ffn_idle"].append(max(0.0, sender[1] - reply[0]))
+    clocks = [
+        clock
+        for rank in attention + ffn
+        for clock in rank["tokens"][tokens][key]["clock"]
+    ]
+    drifts = [
+        abs(c[1]["offset_ns"] - c[0]["offset_ns"]) / 1e3
+        for c in (rank["tokens"][tokens][key]["clock"] for rank in attention + ffn)
+    ]
+    trips = values["round_trip"]
+    return {
+        "mean_us": {name: statistics.mean(v) for name, v in values.items()},
+        "round_trip_us": {
+            "p50": statistics.median(trips),
+            "p95": _percentile(trips, 0.95),
+            "p99": _percentile(trips, 0.99),
+        },
+        "samples": len(trips),
+        # Negative in-flight phases mean clocks or overlap moved a boundary.
+        "most_negative_in_flight_us": min(
+            min(values["to_ffn"]), min(values["to_attention"])
+        ),
+        "clock_error_bound_us": max(c["error_bound_ns"] for c in clocks) / 1e3,
+        "clock_drift_us": max(drifts),
+    }
+
+
 def _summarize(args, ranks: list[dict[str, Any]]) -> dict[str, Any]:
     attention = [rank for rank in ranks if rank.get("role") == "attention"]
     ffn = [rank for rank in ranks if rank.get("role") == "ffn"]
@@ -685,11 +1021,20 @@ def _summarize(args, ranks: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         summary[tokens] = {
             "eager_us_per_layer_p50": statistics.median(eager),
+            "eager_us_per_layer_p95": _percentile(eager, 0.95),
             "max_rel_err": max(errors) if errors else None,
             "ffn_rows": ffn[0]["tokens"][tokens]["ffn_rows"],
         }
+        if args.phases:
+            summary[tokens]["eager_phases"] = _phase_summary(
+                attention, ffn, tokens, "eager_phases"
+            )
         if args.eager_only:
             continue
+        if args.phases:
+            summary[tokens]["graph_phases"] = _phase_summary(
+                attention, ffn, tokens, "graph_phases"
+            )
         # Each replay waits for its slowest Attention rank.
         slowest = [
             max(values)
@@ -701,6 +1046,7 @@ def _summarize(args, ranks: list[dict[str, Any]]) -> dict[str, Any]:
         summary[tokens]["graph_us_per_layer"] = {
             "p50": statistics.median(slowest),
             "p90": _percentile(slowest, 0.9),
+            "p95": _percentile(slowest, 0.95),
             "p99": _percentile(slowest, 0.99),
         }
         for side, rank in (("attention", attention[0]), ("ffn", ffn[0])):
@@ -743,30 +1089,73 @@ def main() -> None:
         metavar="TOKENS",
         help="token counts to also replay against a GEMM stream on every rank",
     )
+    parser.add_argument(
+        "--experts-mode",
+        choices=("identity", "real"),
+        default="identity",
+        help="identity: FFN returns what it received (comm only, checked); "
+        "real: the connector's expert GEMMs on random weights",
+    )
+    parser.add_argument(
+        "--phases",
+        action="store_true",
+        help="also time each phase of every layer on every rank (DeepEP M2N)",
+    )
+    parser.add_argument(
+        "--network",
+        default="single-node",
+        help="connector network preset (single-node, ib, roce-routed, auto, ...)",
+    )
+    parser.add_argument("--nodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--master-addr", default="127.0.0.1")
+    parser.add_argument(
+        "--ports", type=int, nargs=2, help="rendezvous ports (required with --nodes)"
+    )
+    parser.add_argument(
+        "--summarize-only",
+        action="store_true",
+        help="write the report from rank files already in the output directory",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.phases and args.transport not in DEEPEP_TRANSPORTS:
+        parser.error("--phases times the DeepEP M2N connector's phases")
+    if args.nodes > 1 and args.ports is None:
+        parser.error("--nodes > 1 needs --ports")
     if args.transport == "p2p" and args.payload != "bf16":
         parser.error("P2P sends model-dtype (BF16) hidden states")
     if max(args.tokens) > MAX_CAPTURE_SIZE and not args.eager_only:
         parser.error(f"token counts above {MAX_CAPTURE_SIZE} have no decode graph")
     world = args.ffn + args.attn
-    args.gpus = list(range(world))
+    if world % args.nodes:
+        parser.error("ranks must split evenly over --nodes")
+    # Ranks fill nodes in order: FFN ranks first, so 2 nodes put FFN and
+    # Attention on separate nodes.
+    per_node = world // args.nodes
+    args.gpus = [rank % per_node for rank in range(world)]
     out_dir = args.output.with_suffix("")
     out_dir.mkdir(parents=True, exist_ok=True)
-    ports = _free_ports(2)
-    ctx = mp.get_context("spawn")
-    procs = [
-        ctx.Process(target=_rank_main, args=(args, rank, ports, str(out_dir)))
-        for rank in range(world)
-    ]
-    for proc in procs:
-        proc.start()
-    deadline = time.monotonic() + RANK_TIMEOUT_S
-    for proc in procs:
-        proc.join(timeout=max(1.0, deadline - time.monotonic()))
-    for proc in procs:
-        if proc.is_alive():
-            proc.kill()
+    if not args.summarize_only:
+        ports = args.ports or _free_ports(2)
+        ctx = mp.get_context("spawn")
+        local = range(args.node_rank * per_node, (args.node_rank + 1) * per_node)
+        procs = [
+            ctx.Process(target=_rank_main, args=(args, rank, ports, str(out_dir)))
+            for rank in local
+        ]
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + RANK_TIMEOUT_S
+        for proc in procs:
+            proc.join(timeout=max(1.0, deadline - time.monotonic()))
+        for proc in procs:
+            if proc.is_alive():
+                proc.kill()
+        if args.nodes > 1:
+            # Other nodes' rank files are copied here, then --summarize-only.
+            print(json.dumps({"transport": args.transport, "node": args.node_rank}))
+            return
     ranks = []
     for rank in range(world):
         path = out_dir / f"rank{rank}.json"
