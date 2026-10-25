@@ -25,8 +25,6 @@ depends_on:
 validation_paths:
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
-  - "tests/unit/v1/worker/test_final_prefill_graph.py"
-  - "tests/unit/v1/worker/test_final_prefill_graph_vllm.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/model_executor/test_async_cam_dbo.py"

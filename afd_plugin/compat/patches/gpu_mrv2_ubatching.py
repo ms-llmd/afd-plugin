@@ -136,7 +136,10 @@ def _make_forward_contexts(
 # threshold does. The guard reads all-reduced counts and the FULL descriptor
 # every rank already pads to, so every rank reaches the same decision. A step
 # for which no FULL microbatched graph matches keeps native eager
-# microbatching; its single-batch path has no graph to replay either.
+# microbatching; its single-batch path has no graph to replay either. Each
+# rank's AFD_DBO_GUARD_FALLBACK rides the same all-reduce as the counts, and
+# the fallback applies only when every rank has it on, so ranks launched with
+# different settings still take one path (the native one) instead of hanging.
 # AFD_DBO_GUARD_FALLBACK=0 restores the native eager microbatched step.
 # Signature: matches sync_cudagraph_and_dp_padding exactly at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/dp_utils.py, sync_cudagraph_and_dp_padding;
@@ -167,13 +170,18 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+    # ### PATCH START: all-reduce each rank's guard fallback setting.
+    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
+    # ### PATCH END: all-reduce each rank's guard fallback setting.
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
+    # ### PATCH START: all-reduce each rank's guard fallback setting.
+    tensor[6][dp_rank] = int(dbo_guard_fallback_enabled())
+    # ### PATCH END: all-reduce each rank's guard fallback setting.
     if should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
@@ -185,6 +193,15 @@ def sync_cudagraph_and_dp_padding(
     max_query_lens_across_dp = tensor[3]
     allow_ubatching_across_dp = tensor[4]
     num_reqs_across_dp = tensor[5]
+    # ### PATCH START: all-reduce each rank's guard fallback setting.
+    guard_fallback_across_dp = tensor[6]
+    guard_fallback = bool(torch.all(guard_fallback_across_dp == 1))
+    if not guard_fallback and bool(torch.any(guard_fallback_across_dp == 1)):
+        logger.warning_once(
+            "AFD_DBO_GUARD_FALLBACK differs across DP ranks; every rank runs "
+            "the native eager microbatched step when the guard trips"
+        )
+    # ### PATCH END: all-reduce each rank's guard fallback setting.
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -237,8 +254,7 @@ def sync_cudagraph_and_dp_padding(
                     # CUDA graphs.
                     # ### PATCH START: note a FULL graph the empty-stage guard rejects.
                     run_single_batch = (
-                        ubatch_desc.cg_mode == CUDAGraphMode.FULL
-                        and dbo_guard_fallback_enabled()
+                        ubatch_desc.cg_mode == CUDAGraphMode.FULL and guard_fallback
                     )
                     # ### PATCH END: note a FULL graph the empty-stage guard rejects.
                     ubatch_desc = None

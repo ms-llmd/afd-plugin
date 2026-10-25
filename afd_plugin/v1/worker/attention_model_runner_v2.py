@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
@@ -646,6 +647,35 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         )
         # ### PATCH END: classify final decode-sized prompt chunks as decodes.
 
+    @functools.cached_property
+    def _afd_runner_serves_final_prefills(self) -> bool:
+        """The runner checks of _afd_prefills_run_as_decodes, made once.
+
+        None of them changes after initialization: the first real batch comes
+        after load_model and initialize_kv_cache have set the model state and
+        the KV connector.
+        """
+        if not final_prefill_graph_enabled():
+            return False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        return not (
+            self.speculative_config is not None
+            or self.is_pooling_model
+            or self.fast_prefill is not None
+            or self.uses_inputs_embeds
+            or self.model_config.uses_mrope
+            or type(self.model_state) is not DefaultModelState
+            or (
+                isinstance(self.kv_connector, ActiveKVConnector)
+                and (
+                    kv_transfer_config is None
+                    or kv_transfer_config.kv_connector_module_path is not None
+                    or kv_transfer_config.kv_connector
+                    not in FORWARD_INDEPENDENT_KV_CONNECTORS
+                )
+            )
+        )
+
     def _afd_prefills_run_as_decodes(self, batch_state: BatchReqState) -> bool:
         """Whether a FULL decode graph computes every prefilling request exactly.
 
@@ -663,26 +693,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         replay skips. A prefilling request that asks for prompt logprobs keeps
         the eager step. PP and CP are rejected at construction.
         """
-        if not final_prefill_graph_enabled():
-            return False
-        kv_transfer_config = self.vllm_config.kv_transfer_config
-        if (
-            self.speculative_config is not None
-            or self.is_pooling_model
-            or self.fast_prefill is not None
-            or self.uses_inputs_embeds
-            or self.model_config.uses_mrope
-            or type(self.model_state) is not DefaultModelState
-            or (
-                isinstance(self.kv_connector, ActiveKVConnector)
-                and (
-                    kv_transfer_config is None
-                    or kv_transfer_config.kv_connector_module_path is not None
-                    or kv_transfer_config.kv_connector
-                    not in FORWARD_INDEPENDENT_KV_CONNECTORS
-                )
-            )
-        ):
+        if not self._afd_runner_serves_final_prefills:
             return False
         is_prefilling = batch_state.is_prefilling_np
         num_scheduled = batch_state.num_scheduled_tokens[is_prefilling]

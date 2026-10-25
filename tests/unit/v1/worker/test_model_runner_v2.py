@@ -5,28 +5,51 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
+from typing import Any
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+import numpy as np  # noqa: E402
 from torch import device as torch_device  # noqa: E402
 from vllm.config import CUDAGraphMode  # noqa: E402
+from vllm.distributed.kv_transfer.kv_connector.factory import (  # noqa: E402
+    KVConnectorFactory,
+)
 from vllm.forward_context import (  # noqa: E402
     BatchDescriptor,
     ForwardContext,
     override_forward_context,
 )
+from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
-from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor  # noqa: E402
+from vllm.v1.worker.gpu.kv_connector import (  # noqa: E402
+    NO_OP_KV_CONNECTOR,
+    ActiveKVConnector,
+)
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState  # noqa: E402
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import (  # noqa: E402
+    MambaHybridModelState,
+)
+from vllm.v1.worker.gpu.sample.prompt_logprob import (  # noqa: E402
+    PromptLogprobsWorker,
+)
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
+from afd_plugin.compat.patches import gpu_mrv2_ubatching  # noqa: E402
+from afd_plugin.envs import AFD_FINAL_PREFILL_GRAPH  # noqa: E402
 from afd_plugin.model_executor.models import (  # noqa: E402
     forward_context as afd_forward_context,
 )
@@ -41,12 +64,18 @@ from afd_plugin.v1.worker import (  # noqa: E402
     ffn_worker,
 )
 from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
+    FORWARD_INDEPENDENT_KV_CONNECTORS,
     AFDAttentionModelRunnerV2,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
+)
+from tests.unit.fakes.dp_dispatch import (  # noqa: E402
+    CaptureGraphManager,
+    ThreadAllReduce,
+    sync_fields,
 )
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
@@ -2260,3 +2289,351 @@ def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
 
     assert _NativeRunnerSentinel.instances == 1
     assert native_module.GPUModelRunner is _NativeRunnerSentinel
+
+
+# Final-token prefill graph dispatch (AFD_FINAL_PREFILL_GRAPH): the AFD override
+# of gather_batch_req_state against vLLM's own, on the same runner state.
+
+_MAX_NUM_REQS = 16
+_PROMPT_LEN = 4096
+_DECODE_QUERY_LEN = 1
+# (prefill_len, num_computed, num_scheduled, prompt_logprobs) per request.
+_DECODE_REQ = (_PROMPT_LEN, _PROMPT_LEN + 3, 1, False)
+# Admitted with its prompt KV supplied: only the last prompt token remains.
+_FINAL_TOKEN_REQ = (_PROMPT_LEN, _PROMPT_LEN - 1, 1, False)
+
+
+@pytest.fixture(autouse=True)
+def _default_final_prefill_graph(monkeypatch):
+    # Tests start from the default; one that turns the switch off says so.
+    monkeypatch.delenv(AFD_FINAL_PREFILL_GRAPH, raising=False)
+
+
+def _final_prefill_runner(
+    requests: dict[str, tuple[int, int, int, bool]], **overrides: Any
+) -> tuple[AFDAttentionModelRunnerV2, SimpleNamespace]:
+    req_id_to_index = {req_id: index for index, req_id in enumerate(requests)}
+    prefill_len = np.zeros(_MAX_NUM_REQS, dtype=np.int32)
+    num_computed_prefill_tokens = np.zeros(_MAX_NUM_REQS, dtype=np.int32)
+    prompt_logprobs_worker = PromptLogprobsWorker(_MAX_NUM_REQS)
+    for req_id, (length, computed, _, prompt_logprobs) in requests.items():
+        index = req_id_to_index[req_id]
+        prefill_len[index] = length
+        num_computed_prefill_tokens[index] = min(computed, length)
+        prompt_logprobs_worker.add_request(
+            req_id,
+            index,
+            SamplingParams(prompt_logprobs=1 if prompt_logprobs else None),
+        )
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    attributes: dict[str, Any] = {
+        "decode_query_len": _DECODE_QUERY_LEN,
+        "req_states": SimpleNamespace(
+            req_id_to_index=req_id_to_index,
+            prefill_len=SimpleNamespace(np=prefill_len),
+            num_computed_prefill_tokens=num_computed_prefill_tokens,
+        ),
+        "adaptive_verification": None,
+        "vllm_config": SimpleNamespace(kv_transfer_config=None),
+        "speculative_config": None,
+        "is_pooling_model": False,
+        "fast_prefill": None,
+        "uses_inputs_embeds": False,
+        "model_config": SimpleNamespace(uses_mrope=False),
+        "model_state": object.__new__(DefaultModelState),
+        "kv_connector": NO_OP_KV_CONNECTOR,
+        "prompt_logprobs_worker": prompt_logprobs_worker,
+        **overrides,
+    }
+    for name, value in attributes.items():
+        setattr(runner, name, value)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={
+            req_id: scheduled for req_id, (_, _, scheduled, _) in requests.items()
+        },
+        total_num_scheduled_tokens=sum(
+            scheduled for _, _, scheduled, _ in requests.values()
+        ),
+        scheduled_spec_decode_tokens={},
+    )
+    return runner, scheduler_output
+
+
+def _final_prefill_gathers(requests, *, dummy_run=False, **overrides):
+    """(patched, native) gather_batch_req_state results on one runner state."""
+    runner, scheduler_output = _final_prefill_runner(requests, **overrides)
+    patched = AFDAttentionModelRunnerV2.gather_batch_req_state(
+        runner, scheduler_output, dummy_run
+    )
+    native = native_v2.GPUModelRunner.gather_batch_req_state(
+        runner, scheduler_output, dummy_run
+    )
+    return patched, native
+
+
+def _same_batch_state(left, right) -> bool:
+    return all(
+        np.array_equal(a, b) if isinstance(a, np.ndarray) else a == b
+        for a, b in zip(left, right, strict=True)
+    )
+
+
+def _kv_transfer(name: str, module_path: str | None = None) -> dict[str, Any]:
+    return {
+        "kv_connector": object.__new__(ActiveKVConnector),
+        "vllm_config": SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector=name, kv_connector_module_path=module_path
+            )
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "requests, patched_uniform",
+    [
+        ({"new": _FINAL_TOKEN_REQ}, _DECODE_QUERY_LEN),
+        (
+            {"a": _DECODE_REQ, "new-0": _FINAL_TOKEN_REQ, "b": _DECODE_REQ},
+            _DECODE_QUERY_LEN,
+        ),
+        ({"a": _DECODE_REQ, "b": _DECODE_REQ}, _DECODE_QUERY_LEN),
+        ({"a": _DECODE_REQ, "new": (_PROMPT_LEN, _PROMPT_LEN - 5, 5, False)}, None),
+        ({"a": _DECODE_REQ, "new": (_PROMPT_LEN, _PROMPT_LEN - 5, 1, False)}, None),
+        ({"new": _FINAL_TOKEN_REQ, "chunk": (_PROMPT_LEN, 0, 8, False)}, None),
+        ({"a": _DECODE_REQ, "new": (_PROMPT_LEN, _PROMPT_LEN - 1, 1, True)}, None),
+        (
+            {"a": (_PROMPT_LEN, _PROMPT_LEN + 3, 1, True), "new": _FINAL_TOKEN_REQ},
+            _DECODE_QUERY_LEN,
+        ),
+    ],
+    ids=[
+        "final-token-only",
+        "mixed",
+        "decode-only",
+        "multi-token-final-chunk",
+        "non-final-one-token-chunk",
+        "next-to-a-prompt-chunk",
+        "prompt-logprobs",
+        "decode-with-prompt-logprobs",
+    ],
+)
+def test_final_prefill_gather_differs_from_native_only_in_the_uniform_count(
+    requests, patched_uniform
+):
+    """Only a batch whose prefills are all final decode-sized prompt chunks
+    without prompt logprobs reports the decode count; the batch state, and
+    every other batch, match vLLM.
+
+    Why: the count selects the FULL decode graph, while has_prefill must stay
+    True so prepare_inputs still writes the prompt token before replay.
+    """
+    (patched_state, patched_count), (native_state, native_count) = (
+        _final_prefill_gathers(requests)
+    )
+
+    assert _same_batch_state(patched_state, native_state)
+    assert patched_count == patched_uniform
+    assert native_count == (None if patched_state.has_prefill else _DECODE_QUERY_LEN)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        None,
+        {"speculative_config": object()},
+        {"is_pooling_model": True},
+        {"fast_prefill": object()},
+        {"uses_inputs_embeds": True},
+        {"model_config": SimpleNamespace(uses_mrope=True)},
+        {"model_state": object.__new__(MambaHybridModelState)},
+        {"model_state": object()},
+        _kv_transfer("LMCacheConnectorV1"),
+        _kv_transfer("DecodeBenchConnector", module_path="custom.connector"),
+        {
+            "kv_connector": object.__new__(ActiveKVConnector),
+            "vllm_config": SimpleNamespace(kv_transfer_config=None),
+        },
+    ],
+    ids=[
+        "switch-off",
+        "speculative",
+        "pooling",
+        "fast-prefill",
+        "inputs-embeds",
+        "mrope",
+        "mamba-hybrid-state",
+        "model-defined-state",
+        "lmcache",
+        "custom-module-path",
+        "active-without-config",
+    ],
+)
+def test_final_prefill_runner_without_a_covering_graph_matches_native(
+    monkeypatch, overrides
+):
+    """With the switch off, or a runner setting a FULL decode graph does not
+    cover, the override returns exactly what vLLM returns.
+
+    Why: those runners must keep vLLM's eager step for a final-token prefill.
+    """
+    if overrides is None:
+        monkeypatch.setenv(AFD_FINAL_PREFILL_GRAPH, "0")
+        overrides = {}
+    for requests in ({"a": _DECODE_REQ, "new": _FINAL_TOKEN_REQ}, {"a": _DECODE_REQ}):
+        patched, native = _final_prefill_gathers(requests, **overrides)
+        assert _same_batch_state(patched[0], native[0])
+        assert patched[1] == native[1]
+
+
+def _body_is_noop(function: Any) -> bool:
+    node = ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+    assert isinstance(node, ast.FunctionDef)
+    return all(
+        isinstance(statement, ast.Pass)
+        or (isinstance(statement, ast.Return) and statement.value is None)
+        or (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        )
+        for statement in node.body
+    )
+
+
+def _reads_forward_context(function: Any) -> bool:
+    node = ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+    assert isinstance(node, ast.FunctionDef)
+    return any(
+        isinstance(child, ast.Name) and child.id == "forward_context"
+        for statement in node.body
+        for child in ast.walk(statement)
+    )
+
+
+@pytest.mark.parametrize("name", sorted(FORWARD_INDEPENDENT_KV_CONNECTORS))
+def test_final_prefill_forward_independent_kv_connectors_take_the_decode_graph(name):
+    """Each connector the override trusts does no work inside the forward in
+    the pinned vLLM, and with it configured a final-token prefill takes the
+    decode graph.
+
+    Why: FULL replay skips the forward's connector hooks, so the override may
+    only trust connectors whose hooks there are no-ops.
+    """
+    connector_cls = KVConnectorFactory.get_connector_class_by_name(name)
+    assert connector_cls.requires_piecewise_for_cudagraph({}) is False
+    assert _body_is_noop(connector_cls.wait_for_layer_load)
+    assert _body_is_noop(connector_cls.save_kv_layer)
+    assert not _reads_forward_context(connector_cls.start_load_kv)
+
+    requests = {"a": _DECODE_REQ, "new": _FINAL_TOKEN_REQ}
+    patched, _ = _final_prefill_gathers(requests, **_kv_transfer(name))
+    assert patched[1] == _DECODE_QUERY_LEN
+
+
+def test_final_prefill_dummy_batch_matches_native():
+    """A dummy batch returns vLLM's uniform count and no batch state.
+
+    Why: profile and capture runs must not change with the override.
+    """
+    patched, native = _final_prefill_gathers({"dummy": _DECODE_REQ}, dummy_run=True)
+    assert patched == native == (None, _DECODE_QUERY_LEN)
+
+
+def _final_prefill_dp_step(monkeypatch, dispatch, rank_batches, *, use_ubatching):
+    dp_size = len(rank_batches)
+    rank_inputs = []
+    for requests in rank_batches:
+        runner, scheduler_output = _final_prefill_runner(requests)
+        batch_state, uniform = AFDAttentionModelRunnerV2.gather_batch_req_state(
+            runner, scheduler_output, False
+        )
+        rank_inputs.append((len(requests), batch_state.num_tokens, uniform))
+    reducer = ThreadAllReduce(dp_size)
+    for module in (dp_utils, gpu_mrv2_ubatching):
+        monkeypatch.setattr(module, "dist", SimpleNamespace(all_reduce=reducer))
+        monkeypatch.setattr(
+            module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+        )
+    parallel = SimpleNamespace(
+        data_parallel_size=dp_size,
+        use_ubatching=use_ubatching,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=12,
+    )
+
+    def rank_step(dp_rank):
+        num_reqs, num_tokens, uniform = rank_inputs[dp_rank]
+        manager = CaptureGraphManager(
+            BatchExecutionDescriptor, CUDAGraphMode, decode_threshold=2
+        )
+        return dispatch(
+            manager,
+            num_reqs,
+            num_tokens,
+            uniform,
+            dp_size,
+            dp_rank,
+            max_query_len=_DECODE_QUERY_LEN,
+            parallel_config=parallel,
+            allow_ubatching=use_ubatching,
+            uniform_decode=uniform == _DECODE_QUERY_LEN,
+        )
+
+    with ThreadPoolExecutor(max_workers=dp_size) as pool:
+        results = list(pool.map(rank_step, range(dp_size)))
+    assert reducer.calls == dp_size
+    return [(desc, sync_fields(sync)) for desc, sync in results]
+
+
+def _decode_batch(count, prefix):
+    return {f"{prefix}-{index}": _DECODE_REQ for index in range(count)}
+
+
+_FINAL_PREFILL_RANK_BATCHES = [
+    {**_decode_batch(3, "r0"), "r0-new": _FINAL_TOKEN_REQ},
+    _decode_batch(4, "r1"),
+    _decode_batch(3, "r2"),
+]
+
+
+@pytest.mark.parametrize("use_ubatching", [True, False])
+@pytest.mark.parametrize(
+    "dispatch",
+    [dp_utils.dispatch_cg_and_sync_dp, gpu_mrv2_ubatching.dispatch_cg_and_sync_dp],
+    ids=["native", "afd"],
+)
+def test_final_prefill_dp_ranks_agree_on_the_decode_graph(
+    monkeypatch, dispatch, use_ubatching
+):
+    """A rank with a final-token prefill dispatches as its decode-only ranks do:
+    every rank replays the same FULL decode graph, with or without DBO, through
+    vLLM's coordinator and AFD's copy; with the switch off every rank runs eager.
+
+    Why: one rank classified differently would send every DP rank, and the FFN
+    ranks with them, down the eager step.
+    """
+    results = _final_prefill_dp_step(
+        monkeypatch, dispatch, _FINAL_PREFILL_RANK_BATCHES, use_ubatching=use_ubatching
+    )
+    num_ubatches = 2 if use_ubatching else 1
+    for desc, sync in results:
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert (desc.num_tokens, desc.num_ubatches) == (4, num_ubatches)
+        assert sync == ([4, 4, 4], _DECODE_QUERY_LEN, False, 4)
+    decode_only = [
+        _decode_batch(len(requests), f"r{rank}")
+        for rank, requests in enumerate(_FINAL_PREFILL_RANK_BATCHES)
+    ]
+    assert results == _final_prefill_dp_step(
+        monkeypatch, dispatch, decode_only, use_ubatching=use_ubatching
+    )
+
+    monkeypatch.setenv(AFD_FINAL_PREFILL_GRAPH, "0")
+    for desc, sync in _final_prefill_dp_step(
+        monkeypatch, dispatch, _FINAL_PREFILL_RANK_BATCHES, use_ubatching=use_ubatching
+    ):
+        assert desc.cg_mode == CUDAGraphMode.NONE
+        assert sync[1] is None
+        assert sync[2] is True

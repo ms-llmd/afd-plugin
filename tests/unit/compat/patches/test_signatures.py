@@ -8,10 +8,23 @@ import inspect
 import pytest
 
 
-@pytest.mark.parametrize("hook", ["capture-inputs", "camp2p-dispatch"])
+@pytest.mark.parametrize(
+    "hook", ["capture-inputs", "camp2p-dispatch", "gpu-dp-coordinator"]
+)
 def test_scoped_patch_preserves_upstream_signature(hook):
     pytest.importorskip("torch")
     pytest.importorskip("vllm")
+    if hook == "gpu-dp-coordinator":
+        # A copy the AFD DBO dispatch calls, not a symbol it installs.
+        from vllm.v1.worker.gpu import dp_utils as target
+
+        from afd_plugin.compat.patches import gpu_mrv2_ubatching as adapter
+
+        symbol = "sync_cudagraph_and_dp_padding"
+        assert inspect.signature(
+            getattr(adapter, symbol), eval_str=True
+        ) == inspect.signature(getattr(target, symbol), eval_str=True)
+        return
     if hook == "capture-inputs":
         from vllm.v1.worker.gpu import cudagraph_utils as target
         from vllm.v1.worker.gpu.pcp_manager import PCPManager  # noqa: F401

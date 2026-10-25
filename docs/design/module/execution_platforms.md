@@ -32,9 +32,6 @@ validation_paths:
   - "tests/unit/package/test_ascend_build_files.py"
   - "tests/unit/v1/worker/test_cuda_graph.py"
   - "tests/unit/v1/worker/test_dbo.py"
-  - "tests/unit/v1/worker/test_dbo_guard_fallback.py"
-  - "tests/unit/v1/worker/test_final_prefill_graph.py"
-  - "tests/unit/v1/worker/test_final_prefill_graph_vllm.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_mla_graph.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
@@ -215,14 +212,16 @@ microbatched, when the smallest rank would leave its second stage empty
 scoped dispatch runs such a step without microbatches instead, through vLLM's
 non-microbatched path: every rank pads to the largest count and replays the
 single-batch FULL graph, or runs eager when a rank asks for eager, as for a
-step below the DBO threshold. The decision reads only all-reduced counts and
-the descriptor every rank pads to, so all ranks agree. FFN receives one stage
-and replays the single-stage graph it captured with Attention's single-batch
-graph; step statistics count these steps as `full_single`. A step with no FULL
-two-stage graph (above the largest capture size, or a rank in prefill) keeps
-vLLM's eager microbatching. DP1 applies the same rule.
-`AFD_DBO_GUARD_FALLBACK=0`, set alike on every Attention rank, restores vLLM's
-eager microbatched step.
+step below the DBO threshold. The decision reads only all-reduced values (the
+counts, and each rank's `AFD_DBO_GUARD_FALLBACK`, which rides the same
+all-reduce) and the descriptor every rank pads to, so all ranks agree. FFN
+receives one stage and replays the single-stage graph it captured with
+Attention's single-batch graph. A step with no FULL two-stage graph (above the
+largest capture size, or a rank in prefill) keeps vLLM's eager microbatching.
+DP1 applies the same rule. `AFD_DBO_GUARD_FALLBACK=0` restores vLLM's eager
+microbatched step; the fallback applies only when every Attention rank has it
+on, so ranks launched with different settings all take vLLM's step, with a
+warning.
 
 Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal DBO validation
 applies. Qwen3 MoE DBO remains supported. Earlier Qwen GDN Graph + DBO and

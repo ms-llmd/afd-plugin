@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""DP doubles for the GPU DBO dispatch tests: graphs, collective and ranks.
+"""DP dispatch doubles: CUDA graph manager, all-reduce and simulated ranks.
 
 Each simulated DP rank runs the dispatch under test on its own thread, and the
 all-reduce double sums every rank's tensor in place as ``dist.all_reduce``
