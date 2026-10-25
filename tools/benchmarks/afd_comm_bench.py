@@ -1168,8 +1168,18 @@ def main() -> None:
         for proc in procs:
             proc.start()
         deadline = time.monotonic() + RANK_TIMEOUT_S
-        for proc in procs:
-            proc.join(timeout=max(1.0, deadline - time.monotonic()))
+        # A rank that fails leaves its peers waiting on it: stop them all.
+        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+            if any(proc.exitcode not in (None, 0) for proc in procs) or any(
+                not proc.is_alive()
+                and not json.loads(
+                    Path(out_dir, f"rank{rank}.json").read_text() or "{}"
+                ).get("ok", False)
+                for rank, proc in zip(local, procs, strict=True)
+                if Path(out_dir, f"rank{rank}.json").exists()
+            ):
+                break
+            time.sleep(1.0)
         for proc in procs:
             if proc.is_alive():
                 proc.kill()
