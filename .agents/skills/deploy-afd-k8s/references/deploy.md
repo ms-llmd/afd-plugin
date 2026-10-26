@@ -137,8 +137,12 @@ Must be inside the namespace's allowed range or the pod is rejected at
 admission. Look it up once, reuse for every pod:
 
 ```bash
+# Note the jsonpath escaping: dots in the annotation key are escaped with a
+# backslash, but the slashes are NOT -- escaping them too silently yields an
+# empty string and falls back to 1000, which an OpenShift SCC then rejects
+# at admission (`1000 is not an allowed group`).
 FS_GROUP="$(kubectl -n "$NAMESPACE" get ns "$NAMESPACE" \
-  -o jsonpath='{.metadata.annotations.openshift\.io\.sa\.scc\.supplemental-groups}' 2>/dev/null \
+  -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}' 2>/dev/null \
   | cut -d/ -f1)"
 FS_GROUP="${FS_GROUP:-1000}"
 ```
@@ -258,15 +262,17 @@ ordinal first, waiting for Ready -- which is why the template pins
 
 ## 4f. Wait for readiness
 
-One call per StatefulSet; the readinessProbe only passes once the pod's own
-engine is up, so this replaces log-marker polling (budget 60 minutes --
-model download and graph capture dominate):
+One wait per pod (not `kubectl rollout status` -- that only works with
+`RollingUpdate`, and the template pins `updateStrategy: OnDelete`); the
+readinessProbe only passes once the pod's own engine is up, so this replaces
+log-marker polling (budget 60 minutes -- model download and graph capture
+dominate):
 
 ```bash
-for sts_name in <every deployed sts_name>; do
-  kubectl -n "$NAMESPACE" rollout status "sts/$sts_name" --timeout=60m \
-    || { kubectl -n "$NAMESPACE" describe "sts/$sts_name" | tail -40; \
-         kubectl -n "$NAMESPACE" logs "pod/${sts_name}-0" --tail=100; exit 1; }
+for pod in <every pod of the plan, e.g. vllm-pod-ffn-0 vllm-pod-attention-0 vllm-pod-attention-1>; do
+  kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/$pod" --timeout=60m \
+    || { kubectl -n "$NAMESPACE" describe "pod/$pod" | tail -40; \
+         kubectl -n "$NAMESPACE" logs "pod/$pod" --tail=100; exit 1; }
 done
 ```
 
