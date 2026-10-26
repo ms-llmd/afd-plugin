@@ -118,6 +118,33 @@ class _ConnectorDrivenFakeConnector(_FakeConnector):
         self.control_plane = None
 
 
+class _FakeEplbController:
+    """Records the EPLB calls the FFN runner makes per connector step."""
+
+    def __init__(self):
+        self.prepare_loads = 0
+        self.registrations = []
+        self.async_loop_starts = []
+        self.steps = []
+        self.prepared_forwards = []
+
+    def prepare_load(self):
+        self.prepare_loads += 1
+
+    def maybe_register_model(self, model, model_config, load_dummy_weights):
+        self.registrations.append((model, model_config, load_dummy_weights))
+        return True
+
+    def maybe_start_async_loop(self, eplb_models_added):
+        self.async_loop_starts.append(eplb_models_added)
+
+    def step(self, is_dummy=False, is_profile=False):
+        self.steps.append((is_dummy, is_profile))
+
+    def prepare_forward(self, model_config, num_unpadded_tokens, ubatch_slices=None):
+        self.prepared_forwards.append((model_config, num_unpadded_tokens))
+
+
 class _FakeModel:
     def get_experts_layer_indices(self):
         return ()
@@ -156,6 +183,7 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
+            enable_eplb=False,
             is_moe_model=True,
             use_sequence_parallel_moe=False,
         ),
@@ -166,12 +194,17 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     )
     runner.connector = _FakeConnector()
     runner.model = model
+    runner.model_config = SimpleNamespace()
     runner.afd_config = SimpleNamespace(compute_gate_on_attention=False)
     runner.afd_cudagraph_policy = SimpleNamespace(enabled=False)
     runner.num_layers = num_layers
     runner.use_cuda_graph = False
     runner._cuda_graphs = {}
+    runner._graph_memory_pool = None
+    runner.load_config = SimpleNamespace()
+    runner.device = torch.device("cpu")
     runner.prof = None
+    runner.eplb = _FakeEplbController()
     return runner
 
 
@@ -182,6 +215,7 @@ def test_ffn_runner_owns_connector_execution_without_native_runner_inheritance()
 def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(monkeypatch):
     config = SimpleNamespace(
         use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(enable_eplb=False),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             hf_text_config=SimpleNamespace(num_hidden_layers=2),
@@ -725,6 +759,117 @@ def test_ffn_runner_steps_gpu_profiler():
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
     assert runner.prof.steps == 1
+
+
+def test_ffn_runner_loads_model_and_registers_eplb(monkeypatch):
+    runner = _runner_with_connector_and_model(_FakeModel())
+    model = runner.model
+    runner.model = None
+    loader = SimpleNamespace(
+        load_model=lambda **_kwargs: model,
+        load_weights=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_model_loader", lambda _config: loader
+    )
+
+    runner.load_model()
+
+    assert runner.model is model
+    assert runner.eplb.prepare_loads == 1
+    assert runner.eplb.registrations == [(model, runner.model_config, False)]
+    assert runner.eplb.async_loop_starts == [True]
+
+
+def test_ffn_runner_steps_eplb_once_per_real_step():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert runner.eplb.steps == [(False, False)]
+
+
+def test_ffn_runner_marks_warmup_and_capturing_steps_dummy():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.extend(
+        _payload("hidden", _metadata()) for _ in range(2)
+    )
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])}, is_warmup=True)
+    runner.execute_model(
+        dp_metadata_list={0: _FakeDPMetadata([1])}, is_graph_capturing=True
+    )
+
+    assert runner.eplb.steps == [(True, False), (True, False)]
+
+
+def test_ffn_runner_replay_steps_eplb_as_real_step():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.use_cuda_graph = True
+    graph = _FakeGraph()
+    dp_metadata = {0: _FakeDPMetadata([1])}
+    runner._cuda_graphs = {
+        make_ffn_graph_key(dp_metadata): {"graph": graph},
+    }
+
+    runner.execute_model(dp_metadata_list=dp_metadata, is_graph_replaying=True)
+
+    assert graph.replay_count == 1
+    assert runner.eplb.steps == [(False, False)]
+
+
+def test_ffn_runner_prepares_eplb_unpadded_tokens_from_dp_metadata():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.vllm_config.parallel_config.enable_eplb = True
+    runner.connector.attn_size = 4
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([4, 6])})
+
+    # Two DP counts of 4 and 6 tokens, each replicated across two Attention
+    # TP peers, give 20 real tokens for the router's record kernel.
+    assert runner.eplb.prepared_forwards == [(runner.model_config, 20)]
+
+
+def test_ffn_runner_skips_eplb_prepare_when_eplb_is_disabled():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([4, 6])})
+
+    assert runner.eplb.prepared_forwards == []
+
+
+def test_ffn_runner_rejects_multistage_eplb_payload():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.vllm_config.parallel_config.enable_eplb = True
+    two_stage = {0: _FakeDPMetadata([1]), 1: _FakeDPMetadata([1])}
+
+    with pytest.raises(RuntimeError, match="exactly one stage"):
+        runner.execute_model(dp_metadata_list=two_stage)
+
+
+def test_ffn_runner_capture_prepared_and_steps_eplb_as_dummy(monkeypatch):
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.use_cuda_graph = True
+    runner.vllm_config.parallel_config.enable_eplb = True
+    monkeypatch.setattr(runner, "_dummy_run", lambda **_kwargs: None)
+    free_gpu_memory = [100, 90]
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (free_gpu_memory.pop(0), 0))
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: object())
+    monkeypatch.setattr(
+        ffn_model_runner_module, "graph_capture", lambda **_kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module, "set_cudagraph_capturing_enabled", lambda _v: None
+    )
+
+    cuda_graph_size = runner.capture_model(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert cuda_graph_size == 10
+    assert runner.eplb.steps == [(True, False)]
+    assert runner.eplb.prepared_forwards == [(runner.model_config, 2)]
 
 
 def test_ffn_runner_releases_owned_runtime_state_on_shutdown(monkeypatch):
