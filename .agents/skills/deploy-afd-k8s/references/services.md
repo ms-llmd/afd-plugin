@@ -17,13 +17,13 @@ Headless identity Service every StatefulSet's `serviceName` points at.
 `publishNotReadyAddresses: true`, selector `app=afd-recipe,
 afd-deployment=<DEPLOY_NAME>`, no ports. It exists for two reasons:
 StatefulSets require a `serviceName`, and it gives every pod a stable DNS
-name (`<pod>.<governing>.<namespace>.svc.cluster.local`) that resolves
+name (`<pod>.<governing>.<namespace>.svc.<cluster-domain>`) that resolves
 even before the pod is ready -- which the ExternalName endpoints below
 point at.
 
 ```bash
 TEMPLATE_DEPLOY_NAME="$DEPLOY_NAME" envsubst '${TEMPLATE_DEPLOY_NAME}' \
-  < templates/service-governing.yaml | kubectl apply -f -
+  < templates/service-governing.yaml | kubectl apply -n "$NAMESPACE" -f -
 ```
 
 ## ExternalName endpoints -- one per entry point
@@ -40,10 +40,16 @@ recreation and tracks its current IP automatically.
 | `${DEPLOY_NAME}-service` | always | attention head (or the sole pod of a plain recipe) |
 | `${DEPLOY_NAME}-ffn-p2p-service` | plan has >1 pod | FFN head (owns the rendezvous TCPStore) |
 | `${DEPLOY_NAME}-attn-dp-service` | attention split across >1 pod | attention head |
-| `${DEPLOY_NAME}-ffn-dp-service` | FFN split across >1 pod | FFN head |
+
+There is deliberately **no** `${DEPLOY_NAME}-ffn-dp-service`: nothing
+consumes an FFN_DP_ADDRESS today (no env in the StatefulSet template, no
+recipe flag) -- add one back, gated on the FFN role being split, if a
+recipe ever needs it.
 
 Which of the optional ones applies comes from the plan parsed in
-[resolve-recipe.md](resolve-recipe.md), never asked. The StatefulSet template provides the deployment's service names as fixed
+[resolve-recipe.md](resolve-recipe.md) (`TOTAL_PODS`, `ATTN_SPLIT`), never
+asked -- and deploy.md gates each `endpoint` call in code accordingly.
+The StatefulSet template provides the deployment's service names as fixed
 pod env (`AFD_CONNECTOR_HOST`, `ATTENTION_DP_ADDRESS`); recipes that need
 them require them and fail fast when missing, and carry no baked-in
 defaults that could only ever be right for one `DEPLOY_NAME`.

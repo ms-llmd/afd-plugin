@@ -1,11 +1,12 @@
 ---
 name: deploy-afd-k8s
-description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. Placement across pods is never asked for or assumed -- it is read directly off the recipe's own top-of-file comment block (however that block describes it, strict or prose): a recipe whose comment describes a per-pod placement deploys exactly that many pods with exactly that per-pod setup; a recipe without one deploys as a single pod. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e).
+description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serving StatefulSet(s), and Service(s), and waiting until the endpoint answers. Placement across pods is never asked for or assumed -- it is read directly off the recipe's own top-of-file comment block (however that block describes it, strict or prose): a recipe whose comment describes a per-pod placement deploys exactly that many pods with exactly that per-pod setup; a recipe without one deploys as a single pod. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e).
 ---
 
 # Deploy an AFD GPU recipe on Kubernetes
 
-Stand up a serve pod (or pods) running a local AFD recipe script on a
+Stand up serving StatefulSet(s) -- one per role, whose pods run a local AFD
+recipe script -- on a
 Kubernetes/OpenShift cluster and leave a reachable OpenAI-compatible
 endpoint behind.
 
@@ -17,7 +18,7 @@ On success this skill guarantees, in the target namespace:
 |---|---|
 | Endpoint | `http://${DEPLOY_NAME}-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `DEPLOY_NAME` defaults to `vllm`, `CLIENT_PORT` to `18305`) |
 | Serving | the model named by `MODEL_ID` |
-| StatefulSet(s) / Service | one StatefulSet per role (`${DEPLOY_NAME}-pod-<role>`, `replicas` = that role's pod count, pods `<name>-<ordinal>`); plain recipes use one both-roles StatefulSet `${DEPLOY_NAME}-pod`; client Service `${DEPLOY_NAME}-service` (an ExternalName at the attention head pod), labels `app=afd-recipe,afd-deployment=<DEPLOY_NAME>,role=serve` |
+| StatefulSet(s) / Service | one StatefulSet per role (`${DEPLOY_NAME}-pod-<role>`, `replicas` = that role's pod count, pods `<name>-<ordinal>`); plain recipes use one both-roles StatefulSet `${DEPLOY_NAME}-pod`; client Service `${DEPLOY_NAME}-service` (an ExternalName at the attention head pod). Every object the deployment creates (StatefulSets, pods, Services, ConfigMap) is labeled `afd-deployment=<DEPLOY_NAME>` so the whole deployment selects/reports/tears down with `-l afd-deployment=<DEPLOY_NAME>`; pods and StatefulSets also carry `app=afd-recipe,role=serve`, other objects `app=afd-recipe`. The model PVC is deliberately not labeled (shared, user-named state). |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs |
 
@@ -27,14 +28,19 @@ own pod) recovers from a peer-pod crash with no operator action. A
 **split-role** deployment (one role across multiple pods, e.g. a headless
 attention shard) does **not** recover automatically from the loss of its
 head pod: an idle surviving shard never detects the peer loss and never
-rejoins the restarted peer's rendezvous. Remediation is restarting that
-role's pods together (delete the role's pods; the StatefulSet recreates
-them). Root cause is connector-level peer-loss detection, not this skill.
+rejoins the restarted peer's rendezvous. Remediation is restarting the
+deployment's pods together (`kubectl delete pod -l afd-deployment=<name>`;
+the StatefulSets recreate them) -- never one role or one shard on its own,
+for the same collective-startup reason that the StatefulSets pin
+`updateStrategy: OnDelete`. Root cause is connector-level peer-loss
+detection, not this skill.
 
-Whenever a recipe's header spans more than one pod, two more internal-only
-Services may also exist (`${DEPLOY_NAME}-ffn-p2p-service` always;
-`${DEPLOY_NAME}-attn-dp-service` and/or `${DEPLOY_NAME}-ffn-dp-service` only
-if that role is itself split across more than one pod). All but the
+Whenever a recipe's header spans more than one pod, up to two more
+internal-only Services may also exist:
+`${DEPLOY_NAME}-ffn-p2p-service` (rendezvous -- always, when the plan has
+more than one pod) and `${DEPLOY_NAME}-attn-dp-service` (only when the
+attention role is itself split across more than one pod; there is
+deliberately no FFN counterpart -- see [services.md](services.md)). All but the
 governing Service are ExternalName pointers at head pods -- callers never talk to these directly. See
 [services.md](references/services.md).
 
@@ -59,8 +65,8 @@ governing Service are ExternalName pointers at head pods -- callers never talk t
 
 ## Requirements
 
-- A live, authenticated `kubectl`/`oc` session able to create/delete Pods,
-  Services, ConfigMaps, and PVCs in the target namespace.
+- A live, authenticated `kubectl`/`oc` session able to create/delete
+  StatefulSets, Pods, Services, ConfigMaps, and PVCs in the target namespace.
 - `envsubst` (from `gettext`) locally.
 - An image, pushed where the cluster can pull it. Ask the user whether to
   use an image they already have, or to build one from `docker/Dockerfile.ci`

@@ -64,6 +64,11 @@ Whatever the phrasing, extract the only two facts the deployment needs:
 - whether either role is split across more than one pod (that alone
   decides the optional DP-coordination Services)
 
+and expose the plan to later steps as shell variables (deploy.md step 4d
+gates the optional Services on them): `PLAN_IS_PLAIN=1` for a single-pod
+recipe; otherwise `TOTAL_PODS` (sum of the per-role pod counts) and
+`ATTN_SPLIT=1` iff the attention role itself spans more than one pod.
+
 For each entry, derive (used by [deploy.md](deploy.md) and
 [services.md](services.md)):
 
@@ -71,9 +76,11 @@ For each entry, derive (used by [deploy.md](deploy.md) and
 default `DEPLOY_NAME=vllm`, the attention StatefulSet is
 `vllm-pod-attention`), with `replicas` = that role's pod count.
 `DEPLOY_NAME` (default `vllm`) prefixes every resource the deployment
-creates -- StatefulSets, Services, ConfigMap -- and labels pods with
-`afd-deployment: <DEPLOY_NAME>`, so two deployments with different names
-coexist in one namespace without colliding. Kubernetes appends the pod
+creates -- StatefulSets, Services, ConfigMap -- and labels every object
+it creates with `afd-deployment: <DEPLOY_NAME>`, so two deployments with
+different names coexist in one namespace without colliding (and the whole
+deployment can be selected, reported, and torn down as a unit with `-l
+afd-deployment=<DEPLOY_NAME>`). Kubernetes appends the pod
 ordinal itself, so pods are `<statefulset-name>-<ordinal>` (e.g.
 `vllm-pod-attention-0`, `vllm-pod-attention-1`) -- the ordinal suffix is
 a StatefulSet invariant and cannot be removed.

@@ -35,12 +35,15 @@ GPU_COUNT=$(( $(grep -o ',' <<<"$devices" | wc -l) + 1 ))
 State and confirm: target cluster/namespace, `AFD_PLUGIN_IMAGE`, `MODEL_ID`,
 `PVC_NAME`, `CLIENT_PORT`, `RECIPE_SCRIPT_PATH`, `DEPLOY_NAME` (default
 `vllm`; change it to run a second deployment alongside an existing one --
-it prefixes every resource name and labels pods `afd-deployment:
-<DEPLOY_NAME>`), and the plan as a table of `role | replicas | GPU_COUNT`
+it prefixes every resource name and labels every object it creates
+`afd-deployment: <DEPLOY_NAME>`, so report/teardown/cleanup can select the
+whole deployment with `-l afd-deployment=<DEPLOY_NAME>`), and the plan as a
+table of `role | replicas | GPU_COUNT`
 (read straight from the recipe's header -- no shape to negotiate, just
-restate what was parsed). Flag that step 4 **deletes any existing
-StatefulSet(s)** (and their pods) with the same name(s) about to be
-deployed.
+restate what was parsed). Flag that step 4 **deletes every existing
+StatefulSet** (and its pods) carrying this deployment's label -- including
+ones from a previous plan with different names (e.g. a leftover
+single-pod `${DEPLOY_NAME}-pod` after switching to a split-role plan).
 
 ```bash
 AFD_PLUGIN_IMAGE=<image>
@@ -49,25 +52,38 @@ PVC_NAME=<pvc-name>
 CLIENT_PORT=<n>   # from the script's --port; default 18305
 RECIPE_SCRIPT_PATH=<local-recipe-script-path>
 DEPLOY_NAME=${DEPLOY_NAME:-vllm}
+# An unset context namespace resolves to empty here, which would silently
+# corrupt head DNS (<pod>.<svc>..svc.cluster.local) and the fsGroup lookup
+# below -- default it, and pass -n "$NAMESPACE" on every kubectl call in
+# this skill rather than relying on the context.
 NAMESPACE="$(kubectl config view --minify -o jsonpath='{..namespace}')"
+NAMESPACE="${NAMESPACE:-default}"
+# The cluster DNS domain is not always cluster.local -- read it off the
+# CoreDNS config, falling back to the default. Override manually
+# (CLUSTER_DOMAIN=...) if the cluster runs a different DNS stack.
+CLUSTER_DOMAIN="$(kubectl -n kube-system get configmap coredns \
+  -o jsonpath='{.data.Corefile}' 2>/dev/null \
+  | awk '/^\s*kubernetes\s/ {print $2; exit}')"
+CLUSTER_DOMAIN="${CLUSTER_DOMAIN:-cluster.local}"
 ```
 
 **Node placement is left to the scheduler by default.** Only add
 `podAntiAffinity` forcing Pods onto separate nodes if the caller explicitly
 asks to exercise cross-node placement -- add this to every StatefulSet's
-pod-template `metadata.labels` and `spec` in `templates/statefulset.yaml`
-before applying:
+pod-template `spec` in `templates/statefulset.yaml` before applying. No
+extra label is needed: pods already carry `afd-deployment:
+${TEMPLATE_DEPLOY_NAME}` (envsubst fills it in), so keying the rule on it
+repels only this deployment's pods -- a second deployment in the namespace
+stays free to share the node:
 
 ```yaml
-  labels:
-    afd-multinode-group: afd-multinode
   spec:
     affinity:
       podAntiAffinity:
         requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
               matchExpressions:
-                - {key: afd-multinode-group, operator: In, values: ["afd-multinode"]}
+                - {key: afd-deployment, operator: In, values: ["${TEMPLATE_DEPLOY_NAME}"]}
             topologyKey: kubernetes.io/hostname
 ```
 
@@ -84,13 +100,14 @@ MODEL_PVC_SIZE=${MODEL_PVC_SIZE:-100Gi}
 STORAGE_CLASS=${STORAGE_CLASS:-}
 PVC_ACCESS_MODE=ReadWriteOnce   # ReadWriteMany if the plan has >1 pod
 
-if kubectl get pvc "${PVC_NAME}" >/dev/null 2>&1; then
+if kubectl -n "$NAMESPACE" get pvc "${PVC_NAME}" >/dev/null 2>&1; then
   echo "PVC ${PVC_NAME} exists; reusing its warm HF_HOME cache for ${MODEL_ID}"
   echo "NOTE: verify its size fits ${MODEL_ID}, and its accessModes include"
   echo "      ReadWriteMany if this plan has >1 pod -- an RWO reuse deadlocks the 2nd pod"
 else
   envsubst '${PVC_NAME} ${MODEL_PVC_SIZE} ${STORAGE_CLASS} ${PVC_ACCESS_MODE}' \
-    < templates/pvc.yaml | grep -v 'storageClassName: *$' | kubectl apply -f -
+    < templates/pvc.yaml | grep -v 'storageClassName: *$' \
+    | kubectl apply -n "$NAMESPACE" -f -
 fi
 ```
 
@@ -105,9 +122,13 @@ Lets the pod run any local recipe -- edited, uncommitted, or new -- without
 rebuilding the image. Run from wherever `RECIPE_SCRIPT_PATH` resolves:
 
 ```bash
-kubectl create configmap "${DEPLOY_NAME}-recipe-script" \
+kubectl -n "$NAMESPACE" create configmap "${DEPLOY_NAME}-recipe-script" \
   --from-file=recipe.sh="${RECIPE_SCRIPT_PATH}" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --dry-run=client -o yaml | kubectl apply -n "$NAMESPACE" -f -
+# Label it like every other object of the deployment (create configmap has
+# no --labels flag), so teardown/cleanup can select it by label.
+kubectl -n "$NAMESPACE" label configmap "${DEPLOY_NAME}-recipe-script" \
+  "afd-deployment=$DEPLOY_NAME" --overwrite
 ```
 
 ## 4c. fsGroup
@@ -116,7 +137,7 @@ Must be inside the namespace's allowed range or the pod is rejected at
 admission. Look it up once, reuse for every pod:
 
 ```bash
-FS_GROUP="$(kubectl get ns "$(kubectl config view --minify -o jsonpath='{..namespace}')" \
+FS_GROUP="$(kubectl -n "$NAMESPACE" get ns "$NAMESPACE" \
   -o jsonpath='{.metadata.annotations.openshift\.io\.sa\.scc\.supplemental-groups}' 2>/dev/null \
   | cut -d/ -f1)"
 FS_GROUP="${FS_GROUP:-1000}"
@@ -127,21 +148,23 @@ FS_GROUP="${FS_GROUP:-1000}"
 Create every Service that applies -- see [services.md](services.md) for
 which, and why this must happen **before** deploying any StatefulSet in 4e
 below. The governing Service is always created; the rest are ExternalName
-pointers built from one shared template:
+pointers built from one shared template. Gate each optional endpoint in
+code on the plan (never create them unconditionally -- a single-pod deploy
+would get ExternalName Services pointing at pods that do not exist):
 
 ```bash
 governing_svc="${DEPLOY_NAME}-recipe-sts"
-head_dns() { echo "$1.${governing_svc}.${NAMESPACE}.svc.cluster.local"; }
+head_dns() { echo "$1.${governing_svc}.${NAMESPACE}.svc.${CLUSTER_DOMAIN}"; }
 endpoint() { # $1=service name, $2=head pod name
   TEMPLATE_DEPLOY_NAME="$DEPLOY_NAME" TEMPLATE_SVC_NAME="$1" \
   TEMPLATE_ENDPOINT="$(head_dns "$2")" \
   envsubst '${TEMPLATE_DEPLOY_NAME} ${TEMPLATE_SVC_NAME} ${TEMPLATE_ENDPOINT}' \
-    < templates/service-endpoint.yaml | kubectl apply -f -
+    < templates/service-endpoint.yaml | kubectl apply -n "$NAMESPACE" -f -
 }
 
 # Governing (identity) Service -- always.
 TEMPLATE_DEPLOY_NAME="$DEPLOY_NAME" envsubst '${TEMPLATE_DEPLOY_NAME}' \
-  < templates/service-governing.yaml | kubectl apply -f -
+  < templates/service-governing.yaml | kubectl apply -n "$NAMESPACE" -f -
 
 # Client-facing endpoint -- always; targets the attention head pod
 # (or the sole pod of a plain recipe).
@@ -151,17 +174,21 @@ else
   endpoint "${DEPLOY_NAME}-service" "${DEPLOY_NAME}-pod-attention-0"
 fi
 
-# Rendezvous endpoint -- iff the plan has more than one pod; targets the
-# FFN head pod, which owns the TCPStore.
-endpoint "${DEPLOY_NAME}-ffn-p2p-service" "${DEPLOY_NAME}-pod-ffn-0"
+# Rendezvous endpoint -- only when the plan spans more than one pod;
+# targets the FFN head pod, which owns the TCPStore.
+[ "${TOTAL_PODS:-1}" -gt 1 ] \
+  && endpoint "${DEPLOY_NAME}-ffn-p2p-service" "${DEPLOY_NAME}-pod-ffn-0"
 
-# DP-coordination endpoints -- iff that role is split across >1 pod;
-# targets that role's head pod.
-endpoint "${DEPLOY_NAME}-attn-dp-service" "${DEPLOY_NAME}-pod-attention-0"
-endpoint "${DEPLOY_NAME}-ffn-dp-service" "${DEPLOY_NAME}-pod-ffn-0"
+# DP-coordination endpoint -- only when the attention role itself is
+# split across >1 pod; targets the attention head pod. (No FFN counterpart:
+# nothing consumes an FFN_DP_ADDRESS today -- no env, no recipe. Add one
+# back, gated the same way, if a recipe ever needs it.)
+[ "${ATTN_SPLIT:-0}" = "1" ] \
+  && endpoint "${DEPLOY_NAME}-attn-dp-service" "${DEPLOY_NAME}-pod-attention-0"
 ```
 
-Which of the optional endpoints applies comes from the plan parsed in
+`TOTAL_PODS` (>1 when the recipe spans pods) and `ATTN_SPLIT` (1 when the
+attention role spans >1 pod) come from the plan parsed in
 [resolve-recipe.md](resolve-recipe.md), never asked.
 
 ## 4e. Deploy StatefulSet(s)
@@ -178,15 +205,22 @@ deploy_role_sts() {
   local sts_name="${DEPLOY_NAME}-pod"
   [ "$role" != "both" ] && sts_name="${DEPLOY_NAME}-pod-${role}"
 
-  kubectl delete sts "$sts_name" --ignore-not-found
-
   TEMPLATE_IMAGE="$AFD_PLUGIN_IMAGE" TEMPLATE_MODEL="$MODEL_ID" TEMPLATE_POD="$sts_name" \
   TEMPLATE_GPU="$gpu" TEMPLATE_PVC="$PVC_NAME" TEMPLATE_FSGROUP="$FS_GROUP" \
   TEMPLATE_CLIENT_PORT="$CLIENT_PORT" TEMPLATE_REPLICAS="$replicas" TEMPLATE_ROLE="$role" \
   TEMPLATE_DEPLOY_NAME="$DEPLOY_NAME" \
   envsubst '${TEMPLATE_IMAGE} ${TEMPLATE_MODEL} ${TEMPLATE_POD} ${TEMPLATE_GPU} ${TEMPLATE_PVC} ${TEMPLATE_FSGROUP} ${TEMPLATE_CLIENT_PORT} ${TEMPLATE_REPLICAS} ${TEMPLATE_ROLE} ${TEMPLATE_DEPLOY_NAME}' \
-    < templates/statefulset.yaml | kubectl apply -f -
+    < templates/statefulset.yaml | kubectl apply -n "$NAMESPACE" -f -
 }
+
+# Pre-deploy cleanup, by label and once for the whole deployment -- not per
+# StatefulSet name inside deploy_role_sts: a previous deploy of this
+# DEPLOY_NAME with a different plan leaves differently-named StatefulSets
+# behind (e.g. single-pod `${DEPLOY_NAME}-pod` after switching to a
+# split-role plan), still holding GPUs. The label selects exactly this
+# deployment's objects, never a second deployment's.
+kubectl -n "$NAMESPACE" delete sts -l "afd-deployment=$DEPLOY_NAME" \
+  --ignore-not-found
 ```
 
 Plain recipe, one both-roles StatefulSet:
@@ -203,9 +237,24 @@ deploy_role_sts ffn 1 2
 deploy_role_sts attention 2 2
 ```
 
-A re-applied ConfigMap (step 4b) does **not** restart running pods -- after
-changing the recipe, either re-run the `kubectl delete sts` + apply above or
-`kubectl rollout restart sts/<name>`.
+A re-applied ConfigMap (step 4b) or StatefulSet template does **not**
+restart running pods (`updateStrategy: OnDelete` in the template). AFD
+startup is a collective across every pod of the deployment, so pods must
+restart together -- after changing the recipe or the template, either
+re-run the `kubectl delete sts` + apply above, or restart every pod at
+once:
+
+```bash
+kubectl delete pod -l afd-deployment="$DEPLOY_NAME"
+```
+
+Never restart one role or one shard on its own: a restarted shard cannot
+rejoin the surviving pods' DP world and the deployment deadlocks (the
+split-role gap documented in SKILL.md), and a restarted role alone leaves
+the other role running the old recipe/config. A StatefulSet's default
+`RollingUpdate` has exactly this problem -- one pod at a time, highest
+ordinal first, waiting for Ready -- which is why the template pins
+`OnDelete`.
 
 ## 4f. Wait for readiness
 
@@ -215,9 +264,9 @@ model download and graph capture dominate):
 
 ```bash
 for sts_name in <every deployed sts_name>; do
-  kubectl rollout status "sts/$sts_name" --timeout=60m \
-    || { kubectl describe "sts/$sts_name" | tail -40; \
-         kubectl logs "pod/${sts_name}-0" --tail=100; exit 1; }
+  kubectl -n "$NAMESPACE" rollout status "sts/$sts_name" --timeout=60m \
+    || { kubectl -n "$NAMESPACE" describe "sts/$sts_name" | tail -40; \
+         kubectl -n "$NAMESPACE" logs "pod/${sts_name}-0" --tail=100; exit 1; }
 done
 ```
 
