@@ -1,17 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Dependency-free policy checks for the scoped GPU DP1 DBO seams."""
+"""Dependency-free policy checks for the scoped GPU DBO dispatch seams."""
 
 from __future__ import annotations
 
 import ast
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from typing import Any
 
 import pytest
+
+from afd_plugin.envs import AFD_DBO_GUARD_FALLBACK, dbo_guard_fallback_enabled
+from afd_plugin.v1.worker.cuda_graph import make_ffn_graph_key
+from tests.unit.fakes.dp_dispatch import (
+    CaptureGraphManager,
+    ThreadAllReduce,
+    run_dp_ranks,
+    sync_fields,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PATCH_PATH = REPO_ROOT / "afd_plugin/compat/patches/gpu_mrv2_ubatching.py"
@@ -19,8 +30,10 @@ RUNNER_PATH = REPO_ROOT / "afd_plugin/v1/worker/attention_model_runner_v2.py"
 
 
 class _CUDAGraphMode(Enum):
+    # vLLM's values; DP coordination takes the minimum across ranks.
     NONE = 0
-    FULL = 1
+    PIECEWISE = 1
+    FULL = 2
 
 
 @dataclass(frozen=True)
@@ -32,6 +45,14 @@ class _BatchDescriptor:
     max_query_len: int | None = None
     num_active_loras: int = 0
     num_ubatches: int = 1
+
+
+@dataclass(frozen=True)
+class _DPSyncState:
+    num_tokens_across_dp: Any
+    uniform_token_count: int | None
+    eager: bool
+    num_reqs: int
 
 
 class _GraphManager:
@@ -66,22 +87,59 @@ class _GraphManager:
         )
 
 
-def _parallel(*, dp_size=1, use_ubatching=True):
+def _parallel(*, dp_size=1, use_ubatching=True, decode_threshold=2):
     return SimpleNamespace(
         data_parallel_size=dp_size,
         data_parallel_rank=0,
         tensor_parallel_size=2,
         use_ubatching=use_ubatching,
         num_ubatches=2,
-        dbo_decode_token_threshold=2,
+        dbo_decode_token_threshold=decode_threshold,
         dbo_prefill_token_threshold=12,
+    )
+
+
+@pytest.fixture(autouse=True)
+def default_guard_fallback(monkeypatch):
+    # Every test starts from the default; a test that turns it off says so.
+    monkeypatch.delenv(AFD_DBO_GUARD_FALLBACK, raising=False)
+
+
+def _list_torch():
+    return SimpleNamespace(
+        int32="int32",
+        full=lambda shape, value, **kwargs: [value] * shape[0],
+        full_like=lambda values, value: [value] * len(values),
+    )
+
+
+def _numpy_torch():
+    # The DP coordinator's tensor operations, on numpy arrays.
+    np = pytest.importorskip("numpy")
+    return SimpleNamespace(
+        int32=np.int32,
+        zeros=lambda *shape, dtype, device: np.zeros(shape, dtype=dtype),
+        all=np.all,
+        any=np.any,
+        full=lambda shape, value, dtype, device: np.full(shape, value, dtype=dtype),
+        full_like=np.full_like,
     )
 
 
 @pytest.fixture
 def patches():
+    return _load_patches(_list_torch())
+
+
+@pytest.fixture
+def dp_patches():
+    return _load_patches(_numpy_torch())
+
+
+def _load_patches(torch_double):
     # Execute the patch's functions with small native API doubles. This keeps
     # the real eligibility/control policy under test without importing CUDA.
+    warnings: list[str] = []
     tree = ast.parse(PATCH_PATH.read_text())
     functions: list[ast.stmt] = [
         node for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -140,12 +198,15 @@ def patches():
         "UBatchRunner": NativeUBatchRunner,
         "DPMetadata": NativeDPMetadata,
         "model_runner": native_module,
-        "logger": SimpleNamespace(info_once=lambda *args: None),
-        "torch": SimpleNamespace(
-            int32="int32",
-            full=lambda shape, value, **kwargs: [value] * shape[0],
-            full_like=lambda values, value: [value] * len(values),
+        "logger": SimpleNamespace(
+            info_once=lambda *args: None, warning_once=warnings.append
         ),
+        "torch": torch_double,
+        "dist": SimpleNamespace(all_reduce=_unexpected_collective),
+        "get_dp_group": lambda: SimpleNamespace(cpu_group=None),
+        "should_skip_dp_coordination": lambda: False,
+        "DPSyncState": _DPSyncState,
+        "dbo_guard_fallback_enabled": dbo_guard_fallback_enabled,
         "create_forward_context": lambda attn, config, **kwargs: SimpleNamespace(
             attn_metadata=attn, vllm_config=config, **kwargs
         ),
@@ -157,7 +218,11 @@ def patches():
     future = ast.parse("from __future__ import annotations").body
     module = ast.Module(body=future + functions, type_ignores=[])
     exec(compile(module, str(PATCH_PATH), "exec"), namespace)
-    return SimpleNamespace(**namespace, namespace=namespace)
+    return SimpleNamespace(**namespace, namespace=namespace, warnings=warnings)
+
+
+def _unexpected_collective(*args, **kwargs):
+    raise AssertionError("DP collective outside a simulated DP step")
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
@@ -237,16 +302,22 @@ def test_dp1_thresholds_select_eager_microbatches_without_handshake(
 
 
 @pytest.mark.parametrize(
-    "num_tokens, capture_tokens, expected_mode, expected_tokens",
+    "num_tokens, capture_tokens, fallback, expected",
     [
-        (8, 16, _CUDAGraphMode.FULL, 16),
-        (3, 16, _CUDAGraphMode.NONE, 3),
-        (8, None, _CUDAGraphMode.NONE, 8),
+        (8, 16, "1", (_CUDAGraphMode.FULL, 16, 2)),
+        (8, 16, "0", (_CUDAGraphMode.FULL, 16, 2)),
+        # The guard rejects the 16-token microbatched graph: the default
+        # replays the single-batch graph, the switch keeps eager microbatches.
+        (3, 16, "1", (_CUDAGraphMode.FULL, 16, 1)),
+        (3, 16, "0", (_CUDAGraphMode.NONE, 3, 2)),
+        (8, None, "1", (_CUDAGraphMode.NONE, 8, 2)),
+        (8, None, "0", (_CUDAGraphMode.NONE, 8, 2)),
     ],
 )
 def test_dp1_uses_microbatch_graph_bucket_or_native_eager_padding_fallback(
-    patches, num_tokens, capture_tokens, expected_mode, expected_tokens
+    patches, monkeypatch, num_tokens, capture_tokens, fallback, expected
 ):
+    monkeypatch.setenv(AFD_DBO_GUARD_FALLBACK, fallback)
     manager = _GraphManager(capture_tokens)
     desc, sync = patches.dispatch_cg_and_sync_dp(
         manager,
@@ -260,9 +331,7 @@ def test_dp1_uses_microbatch_graph_bucket_or_native_eager_padding_fallback(
         uniform_decode=True,
     )
     assert sync is None
-    assert desc.cg_mode is expected_mode
-    assert desc.num_tokens == expected_tokens
-    assert desc.num_ubatches == 2
+    assert (desc.cg_mode, desc.num_tokens, desc.num_ubatches) == expected
     assert manager.calls == [1, 2]
 
 
@@ -285,7 +354,7 @@ def test_profile_dispatch_does_not_select_a_graph(patches):
     assert manager.calls == []
 
 
-def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
+def test_dp2_coordinates_through_afd_copy_with_all_dispatch_arguments(patches):
     calls = []
     expected = (object(), object())
 
@@ -293,6 +362,7 @@ def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
         calls.append((args, kwargs))
         return expected
 
+    # Replace the AFD coordinator copy the dispatch resolves at call time.
     patches.namespace["sync_cudagraph_and_dp_padding"] = sync
     manager = _GraphManager()
     parallel = _parallel(dp_size=2)
@@ -322,6 +392,209 @@ def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
         "uniform_decode": False,
     }
     assert manager.calls == [1]
+
+
+def _dp_step(
+    dp_patches,
+    counts,
+    *,
+    decode_threshold=2,
+    uniform_token_counts=None,
+    allow_ubatching=True,
+    dispatch=None,
+):
+    """Run one DP step of the patched dispatch on every rank; one collective each."""
+
+    reducer = ThreadAllReduce(len(counts))
+    dp_patches.namespace["dist"] = SimpleNamespace(all_reduce=reducer)
+    managers = [
+        CaptureGraphManager(
+            _BatchDescriptor, _CUDAGraphMode, decode_threshold=decode_threshold
+        )
+        for _ in counts
+    ]
+    results = run_dp_ranks(
+        dispatch or dp_patches.dispatch_cg_and_sync_dp,
+        managers,
+        counts,
+        _parallel(dp_size=len(counts), decode_threshold=decode_threshold),
+        uniform_token_counts=uniform_token_counts,
+        allow_ubatching=allow_ubatching,
+    )
+    assert reducer.calls == len(counts)
+    return results, managers[0]
+
+
+def _ffn_graph_key(num_tokens_across_dp):
+    return make_ffn_graph_key(
+        {0: SimpleNamespace(num_tokens_across_dp_cpu=list(num_tokens_across_dp))}
+    )
+
+
+# (per-rank decode tokens, DBO decode threshold, capture size every rank pads to)
+GUARD_REJECTS_FULL_GRAPH = [
+    ([4, 4, 5, 3], 2, 8),
+    ([5, 3], 2, 8),
+    ([8, 8, 8, 1], 1, 8),
+    ([16, 9, 8, 7], 2, 16),
+]
+
+
+@pytest.mark.parametrize("counts, decode_threshold, padded", GUARD_REJECTS_FULL_GRAPH)
+def test_dp_guard_rejected_full_graph_replays_single_batch_graph_on_every_rank(
+    dp_patches, counts, decode_threshold, padded
+):
+    results, manager = _dp_step(dp_patches, counts, decode_threshold=decode_threshold)
+
+    dp_size = len(counts)
+    single_batch_graph = _BatchDescriptor(
+        _CUDAGraphMode.FULL, padded, padded, uniform_token_count=1
+    )
+    assert single_batch_graph in manager.captured
+    for desc, sync in results:
+        assert desc == single_batch_graph
+        assert sync_fields(sync) == ([padded] * dp_size, 1, False, padded)
+    # Exactly what the same ranks run when the step does not microbatch.
+    native_single_batch, _ = _dp_step(
+        dp_patches, counts, decode_threshold=decode_threshold, allow_ubatching=False
+    )
+    assert [(desc, sync_fields(sync)) for desc, sync in results] == [
+        (desc, sync_fields(sync)) for desc, sync in native_single_batch
+    ]
+    # FULL replay sends one stage padded alike on every rank: the FFN graph key
+    # captured with this single-batch graph, not the two-stage key.
+    _, sync = results[0]
+    assert _ffn_graph_key(sync.num_tokens_across_dp.tolist()) == (
+        (0, (padded,) * dp_size),
+    )
+
+
+@pytest.mark.parametrize(
+    "counts, decode_threshold",
+    [(counts, threshold) for counts, threshold, _ in GUARD_REJECTS_FULL_GRAPH],
+)
+def test_dp_switch_off_keeps_native_eager_microbatched_step(
+    dp_patches, monkeypatch, counts, decode_threshold
+):
+    monkeypatch.setenv(AFD_DBO_GUARD_FALLBACK, "0")
+    results, _ = _dp_step(dp_patches, counts, decode_threshold=decode_threshold)
+
+    max_tokens = max(counts)
+    for dp_rank, (desc, sync) in enumerate(results):
+        assert desc == _BatchDescriptor(
+            _CUDAGraphMode.NONE, max_tokens, counts[dp_rank], num_ubatches=2
+        )
+        assert sync_fields(sync) == ([max_tokens] * len(counts), 1, True, max_tokens)
+
+
+def test_dp_ranks_that_disagree_on_the_fallback_all_take_the_native_step(dp_patches):
+    """Rank 0 has the fallback on and the others off: every rank runs the native
+    eager microbatched step, as with the switch off everywhere, and it warns.
+
+    Why: a per-rank decision would send rank 0 to the single-batch graph and the
+    others to eager microbatches, and the step would hang.
+    """
+    counts = [4, 4, 5, 3]
+    rank_setting = threading.local()
+    dp_patches.namespace["dbo_guard_fallback_enabled"] = lambda: rank_setting.enabled
+    dispatch = dp_patches.dispatch_cg_and_sync_dp
+
+    def rank_dispatch(manager, num_reqs, num_tokens, uniform, dp_size, dp_rank, **kw):
+        rank_setting.enabled = dp_rank == 0
+        return dispatch(manager, num_reqs, num_tokens, uniform, dp_size, dp_rank, **kw)
+
+    results, _ = _dp_step(dp_patches, counts, dispatch=rank_dispatch)
+
+    max_tokens = max(counts)
+    for dp_rank, (desc, sync) in enumerate(results):
+        assert desc == _BatchDescriptor(
+            _CUDAGraphMode.NONE, max_tokens, counts[dp_rank], num_ubatches=2
+        )
+        assert sync_fields(sync) == ([max_tokens] * len(counts), 1, True, max_tokens)
+    assert dp_patches.warnings
+
+
+# (per-rank tokens, per-rank uniform decode length, guard rejects a FULL graph)
+NATIVE_COMPARISON_STEPS = [
+    ([4, 4, 5, 3], None, True),
+    ([5, 3], None, True),
+    ([16, 9, 8, 7], None, True),
+    ([4, 4, 4, 4], None, False),
+    ([8, 6, 7, 5], None, False),
+    ([2, 3], None, False),
+    ([1, 8], None, False),
+    ([20, 3], None, False),
+    ([12, 30], [None, 1], False),
+    ([11, 20], [None, 1], False),
+]
+
+
+@pytest.mark.vllm_runtime
+@pytest.mark.parametrize(
+    "counts, uniform, guard_rejects_full_graph", NATIVE_COMPARISON_STEPS
+)
+def test_patched_dispatch_matches_native_except_a_rejected_full_graph(
+    monkeypatch, counts, uniform, guard_rejects_full_graph
+):
+    """Against the pinned vLLM coordinator on real descriptors: the patched
+    dispatch equals native on every step except one whose FULL microbatched
+    graph the guard rejects, where it equals native without microbatching; with
+    the switch off it equals native everywhere.
+
+    Why: the patch copies vLLM's coordinator; this pins that the copy changes
+    only the guard-rejected case.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("vllm")
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu import dp_utils
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from afd_plugin.compat.patches import gpu_mrv2_ubatching
+
+    def dp_step(dispatch, *, allow_ubatching=True):
+        reducer = ThreadAllReduce(len(counts))
+        for module in (dp_utils, gpu_mrv2_ubatching):
+            monkeypatch.setattr(module, "dist", SimpleNamespace(all_reduce=reducer))
+            monkeypatch.setattr(
+                module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+            )
+        managers = [
+            CaptureGraphManager(
+                BatchExecutionDescriptor, CUDAGraphMode, decode_threshold=2
+            )
+            for _ in counts
+        ]
+        results = run_dp_ranks(
+            dispatch,
+            managers,
+            counts,
+            _parallel(dp_size=len(counts)),
+            uniform_token_counts=uniform,
+            allow_ubatching=allow_ubatching,
+        )
+        assert reducer.calls == len(counts)
+        return [(desc, sync_fields(sync)) for desc, sync in results]
+
+    native = dp_step(dp_utils.dispatch_cg_and_sync_dp)
+    patched = dp_step(gpu_mrv2_ubatching.dispatch_cg_and_sync_dp)
+    if guard_rejects_full_graph:
+        assert all(
+            desc.cg_mode == CUDAGraphMode.NONE and desc.num_ubatches == 2
+            for desc, _ in native
+        )
+        assert patched == dp_step(
+            dp_utils.dispatch_cg_and_sync_dp, allow_ubatching=False
+        )
+        assert all(
+            desc.cg_mode == CUDAGraphMode.FULL and desc.num_ubatches == 1
+            for desc, _ in patched
+        )
+    else:
+        assert patched == native
+
+    monkeypatch.setenv(AFD_DBO_GUARD_FALLBACK, "0")
+    assert dp_step(gpu_mrv2_ubatching.dispatch_cg_and_sync_dp) == native
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ primary_code_paths:
   - "setup.py"
   - "MANIFEST.in"
 related_code_paths:
+  - "afd_plugin/compat/patches/gpu_mrv2_ubatching.py"
   - "afd_plugin/v1/worker/{attention_metadata,attention_model_runner_v2,ffn_model_runner}.py"
   - "afd_plugin/v1/worker/npu/{attention_model_runner_v2,ffn_model_runner,async_ffn_model_runner}.py"
   - "afd_plugin/connectors/{gpu,npu}/**"
@@ -27,6 +28,7 @@ validation_paths:
   - "tests/unit/compat/test_profiler.py"
   - "tests/unit/compat/test_ascend_ops.py"
   - "tests/unit/compat/npu/test_profiler.py"
+  - "tests/unit/compat/patches/test_gpu_mrv2_ubatching.py"
   - "tests/unit/package/test_ascend_build_files.py"
   - "tests/unit/v1/worker/test_cuda_graph.py"
   - "tests/unit/v1/worker/test_dbo.py"
@@ -164,6 +166,28 @@ Single-stage full replay bypasses context creation, so an instance-scoped
 `run_fullgraph` hook publishes its padded shape; two-stage replay reuses the
 already-published layout. Temporary symbols and state are restored in `finally`.
 
+vLLM 0.30.0 reports a uniform decode count only for a batch without prefill.
+A step that admits a request whose prompt KV a KV connector supplied
+(DecodeBenchConnector, or NIXL on a decode instance: one prompt token left)
+therefore matches no FULL decode graph, and that one rank makes every Attention
+DP rank and every FFN rank run the step eager. The Attention runner's
+`gather_batch_req_state` override reports the decode count when every
+prefilling request is scheduled for exactly its remaining prompt tokens, that
+count is the decode query length, and none asks for prompt logprobs. The step
+then replays the FULL decode graph or its DBO twin. `has_prefill` stays true,
+so `prepare_prefill_inputs` still writes the prompt token into the input buffer
+before replay; positions, sequence lengths, slot mapping, block tables and
+attention metadata come from the same code as for a decode step. Such a rank
+reports the count decode-only ranks report, so the DP all-reduce agrees and
+FFN receives the payload and graph key of a decode step of that size. vLLM's
+classification is kept with speculative decoding, pooling, KV-sharing fast
+prefill, embedding or M-RoPE inputs, a model state other than
+`DefaultModelState` (Mamba, KDA, encoder-decoder or model-defined), and a KV
+connector outside `FORWARD_INDEPENDENT_KV_CONNECTORS` (DecodeBench and NIXL):
+FULL replay runs no connector hook inside the forward, and it starts a
+synchronous load with no attention metadata in the forward context.
+`AFD_FINAL_PREFILL_GRAPH=0` restores vLLM's eager step.
+
 FFN uses the Attention payload's warmup/capture flags. It creates a shared
 CUDA graph memory pool, uses `connector.control_plane` to update the owning
 connector state before `torch.cuda.graph(...)`, captures only
@@ -179,6 +203,25 @@ and publishes the complete stage layout before native execution. Padded token
 sizes drive graph coordination while unpadded lengths retain transfer semantics.
 Scoped factory and dispatch adapters enable the native path at Attention DP1
 as well as DP > 1. AFD accepts exactly two native ubatches.
+
+When every Attention DP rank microbatches, vLLM matches the FULL two-stage
+graph for the largest rank's token count, but runs the step eager, still
+microbatched, when the smallest rank would leave its second stage empty
+(`2 * min < padded`). With power-of-two capture sizes, a one-request imbalance
+(3 to 5 tokens, padded to 8) trips this guard on almost every decode step. The
+scoped dispatch runs such a step without microbatches instead, through vLLM's
+non-microbatched path: every rank pads to the largest count and replays the
+single-batch FULL graph, or runs eager when a rank asks for eager, as for a
+step below the DBO threshold. The decision reads only all-reduced values (the
+counts, and each rank's `AFD_DBO_GUARD_FALLBACK`, which rides the same
+all-reduce) and the descriptor every rank pads to, so all ranks agree. FFN
+receives one stage and replays the single-stage graph it captured with
+Attention's single-batch graph. A step with no FULL two-stage graph (above the
+largest capture size, or a rank in prefill) keeps vLLM's eager microbatching.
+DP1 applies the same rule. `AFD_DBO_GUARD_FALLBACK=0` restores vLLM's eager
+microbatched step; the fallback applies only when every Attention rank has it
+on, so ranks launched with different settings all take vLLM's step, with a
+warning.
 
 Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal DBO validation
 applies. Qwen3 MoE DBO remains supported. Earlier Qwen GDN Graph + DBO and
