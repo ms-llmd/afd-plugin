@@ -314,6 +314,22 @@ def test_unsupported_modes_fail_closed(
         adapter._validate_supported_config(vllm_config, afd_config)
 
 
+def test_ffn_role_eplb_passes_supported_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FFN-role EPLB passes the gate that Attention-role EPLB fails."""
+
+    vllm_config = _model_config()
+    vllm_config.parallel_config.enable_eplb = True
+    monkeypatch.setattr(
+        adapter,
+        "current_platform",
+        _platform(is_cuda=True),
+    )
+
+    adapter._validate_supported_config(vllm_config, AFDConfig(role="ffn"))
+
+
 def test_rocm_platform_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         adapter,

@@ -260,6 +260,83 @@ def test_qwen_rejects_unsupported_parallel_feature_before_construction(
         adapter.AFDQwen3_5MoeForConditionalGeneration(vllm_config=vllm_config)
 
 
+def test_qwen_conditional_model_accepts_ffn_role_eplb(monkeypatch):
+    """FFN-role EPLB passes the feature gates that Attention EPLB fails."""
+
+    class FakeCausalLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.make_empty_intermediate_tensors = object()
+
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            vision_config=SimpleNamespace(out_hidden_size=8),
+        ),
+        multimodal_config=SimpleNamespace(
+            language_model_only=True,
+            mm_encoder_tp_mode="weights",
+            is_multimodal_pruning_enabled=lambda: False,
+            video_pruning_rate=0.2,
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        lora_config=None,
+        model_config=model_config,
+        quant_config=None,
+        parallel_config=SimpleNamespace(
+            enable_eplb=True,
+            eplb_config=SimpleNamespace(num_redundant_experts=32),
+            pipeline_parallel_size=1,
+            use_sequence_parallel_moe=False,
+        ),
+        speculative_config=None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "parse_optional_afd_config",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            role="ffn",
+            compute_gate_on_attention=False,
+        ),
+    )
+    monkeypatch.setattr(
+        adapter.AFDQwen3_5MoeForConditionalGeneration,
+        "_mark_tower_model",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        adapter.AFDQwen3_5MoeForConditionalGeneration,
+        "_mark_language_model",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "Qwen3_VisionTransformer",
+        lambda *_args, **_kwargs: nn.Identity(),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "cached_tokenizer_from_config",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "AFDQwen3_5MoeForCausalLM",
+        lambda **_kwargs: FakeCausalLM(),
+    )
+    monkeypatch.setattr(
+        adapter.AFDQwen3_5MoeForConditionalGeneration,
+        "set_moe_parameters",
+        lambda _self: None,
+    )
+
+    model = adapter.AFDQwen3_5MoeForConditionalGeneration(
+        vllm_config=vllm_config,
+    )
+
+    assert model.afd_role == "ffn"
+
+
 def test_qwen_conditional_model_rejects_pipeline_parallelism_before_construction(
     monkeypatch,
 ):
