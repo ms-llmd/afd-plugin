@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """DeepEP M2N AFD connector: expert-routed Attention <-> FFN transport.
 
-Port of FastAFD's DeepEP M2N path (``3c71619``) to the plugin connector
-contract. Routing runs on the Attention side: each Attention rank sends only
+Based on DeepEP and DeepGEMM and inspired by FastAFD adaptations. Routing
+runs on the Attention side: each Attention rank sends only
 the routed copies of its tokens, straight to the FFN ranks that own the chosen
 experts; FFN ranks run their local experts on what they receive and send the
 weighted results back, where combine sums each token's top-k contributions.
@@ -49,7 +49,8 @@ Transport:
 
 Scope: BF16 or FP8 (block-128, fp32 scales) payload; eager, ``torch.compile``
 (dispatch/combine are custom ops) and CUDA graphs; up to two lanes (DBO);
-single node (multi-node needs RDMA pods).
+one or several nodes (ranks in different NVLink domains use NCCL GIN over
+RDMA; see ``network.py``).
 """
 
 from __future__ import annotations

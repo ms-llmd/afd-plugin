@@ -8,6 +8,7 @@ owners:
 primary_code_paths:
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
+  - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
@@ -83,9 +84,13 @@ Attention.
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
+| CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
-GPU and NPU FFN runners are independent, connector-driven owners. Ascend
+GPU and NPU FFN runners are independent, connector-driven owners. The CUDA
+FFN worker selects `GPUFFNRoutedExpertsModelRunner` when the connector class
+is an `AFDRoutedExpertsConnector`, and pins vLLM's MoE backend (`auto` becomes
+`triton`; other backends are rejected) before the model is built. Ascend
 selects the synchronous or Async runner in the FFN worker from the connector, with no MRV1
 inheritance or fallback. Native model loading owns weight materialization and
 quantization postprocessing. The runner explicitly initializes Ascend MC2
@@ -144,8 +149,9 @@ connector owns transport/process-group resources.
 CUDA and Ascend require ModelRunnerV2 on both roles. FFN remains connector-driven and
 does not adopt native V2 request state or scheduler-driven execution:
 
-- CUDA temporarily substitutes `GPUFFNModelRunner` at the native V2
-  construction seam inside `Worker.init_device()`; the existing AFD runner is
+- CUDA temporarily substitutes `GPUFFNModelRunner`, or
+  `GPUFFNRoutedExpertsModelRunner` for a routed-experts connector, at the
+  native V2 construction seam inside `Worker.init_device()`; the AFD runner is
   still the runtime object.
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
@@ -158,6 +164,9 @@ static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
 Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
 Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
+CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
+the same DBO setting on both roles; see the
+[DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md).
 Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
 with Attention-side gating. CAMP2P supports eager and graph DBO with
 Attention DP > 1 and matching two-stage FFN control metadata. Async CAM
@@ -300,6 +309,20 @@ Ascend translates AFD-level token counts to the DP-level token-count vector
 expected by the upstream forward context. When TP expands Attention rank
 counts beyond DP metadata width, token counts are replicated per TP rank and
 then aggregated for each FFN rank.
+
+### Routed-experts forward
+
+`GPUFFNRoutedExpertsModelRunner` serves connectors that deliver routed
+(token, local expert) rows (DeepEP M2N). Routing runs on Attention, so the
+runner skips the forward-context and DP metadata setup above. After the native
+loader runs, it reads each MoE layer's local experts from vLLM's
+`RoutedExperts` (`FFNLocalExperts`, `FusedMoE` layout) and passes them, with the
+MoE layer indices, to the connector's collective `init_afd_connector()`. For
+each MoE layer and stage, in Attention's order, it receives the routed rows,
+runs `connector.run_experts()`, and sends the weighted rows back; at the end
+of the step it calls `connector.synchronize_lanes()`. vLLM's MoE forward never
+runs on this runner. Dense (non-MoE) layers and shared experts have no owner
+on this path, so the model adapters reject them.
 
 ## Role-aware model loading
 

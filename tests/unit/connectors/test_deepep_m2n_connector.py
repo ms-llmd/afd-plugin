@@ -723,7 +723,7 @@ def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
 def test_handshake_rejects_mismatched_network_config():
     """One rank with a different ``network`` config fails the handshake.
 
-    Why: every rank must derive the same NIC and GIN plan.
+    Why: every rank must derive the same network plan (GIN and hybrid mode).
     """
     layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
     infos = _handshake(layout)
