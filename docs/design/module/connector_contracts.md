@@ -22,6 +22,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/unit/distributed/**"
+  - "tests/gpu/**"
 upstream_refs:
   - "vLLM vllm.forward_context.DPMetadata"
   - "vLLM vllm.distributed.parallel_state"
