@@ -49,7 +49,8 @@ Transport:
 
 Scope: BF16 or FP8 (block-128, fp32 scales) payload; eager, ``torch.compile``
 (dispatch/combine are custom ops) and CUDA graphs; up to two lanes (DBO);
-single node (multi-node needs RDMA pods).
+one or several nodes (ranks in different NVLink domains use NCCL GIN over
+RDMA; see ``network.py``).
 """
 
 from __future__ import annotations
