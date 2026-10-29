@@ -46,7 +46,9 @@ class AFDDPMetadata:
             )
 
     @contextmanager
-    def sp_local_sizes(self, sequence_parallel_size: int) -> Generator[list[int]]:
+    def sp_local_sizes(
+        self, sequence_parallel_size: int
+    ) -> Generator[list[int], None, None]:
         local_sizes: list[int] = (
             (
                 (self.num_tokens_across_dp_cpu + sequence_parallel_size - 1)
@@ -78,7 +80,7 @@ class AFDDPMetadata:
         sequence_parallel_size: int,
         max_chunk_size_per_rank: int,
         chunk_idx: int,
-    ) -> Generator[list[int]]:
+    ) -> Generator[list[int], None, None]:
         sp_tokens = (
             (
                 (self.num_tokens_across_dp_cpu + sequence_parallel_size - 1)
@@ -132,6 +134,10 @@ class AFDControlPayload:
         is_profile: Whether the payload belongs to an initial memory-profile
             forward. NPU FFN workers use this to preserve Ascend's balanced
             dummy MoE routing in the split-process AFD execution model.
+        num_real_tokens: The publishing Attention rank's real (unpadded) token
+            count for the first stage. Graph capture and replay payloads carry
+            padded DP counts, so connectors that need real counts (DeepEP M2N
+            EPLB load recording) read this instead. ``0`` when unknown.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
@@ -139,6 +145,7 @@ class AFDControlPayload:
     is_warmup: bool
     is_graph_replaying: bool = False
     is_profile: bool = False
+    num_real_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -393,6 +400,7 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "is_warmup": bool(payload.is_warmup),
         "is_graph_replaying": bool(payload.is_graph_replaying),
         "is_profile": bool(payload.is_profile),
+        "num_real_tokens": int(payload.num_real_tokens),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -423,6 +431,7 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         is_warmup=bool(payload.get("is_warmup", False)),
         is_graph_replaying=bool(payload.get("is_graph_replaying", False)),
         is_profile=bool(payload.get("is_profile", False)),
+        num_real_tokens=int(payload.get("num_real_tokens", 0)),
     )
 
 

@@ -22,6 +22,7 @@ from afd_plugin.connectors.metadata import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.eplb.eplb_state import EplbState
 
 
 @dataclass(frozen=True)
@@ -281,6 +282,7 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
         *,
         moe_layer_indices: Sequence[int] | None = None,
         local_experts: Mapping[int, FFNLocalExperts] | None = None,
+        eplb_state: EplbState | None = None,
     ) -> None:
         """Collective: check what every rank loaded, then create resources.
 
@@ -289,6 +291,9 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
                 ``None`` skips the post-load checks for this rank.
             local_experts: FFN only: this rank's experts per MoE layer, as
                 vLLM loaded them.
+            eplb_state: FFN only, EPLB deployments: the runner's registered
+                vLLM ``EplbState``, whose expert maps and rearrangement
+                schedule the connector shares with the Attention ranks.
         """
         raise NotImplementedError
 
@@ -310,6 +315,28 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
         capture ends.
         """
         raise NotImplementedError
+
+    def apply_eplb_routing(
+        self,
+        topk_ids: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Rewrite Attention-side logical top-k ids for expert placement.
+
+        Connectors that place experts dynamically (EPLB) override this to map
+        logical ids to physical ids and record expert load; the default is the
+        identity, for connectors whose FFN routes or places experts linearly.
+        """
+        return topk_ids
+
+    def step_ffn_eplb(self) -> None:
+        """Advance FFN-side EPLB state after one connector step.
+
+        The FFN runner calls this once per step, real or dummy. Connectors
+        that balance experts dynamically implement it; the default (static
+        expert placement) does nothing.
+        """
+        return None
 
 
 class AFDControlPlane(ABC):

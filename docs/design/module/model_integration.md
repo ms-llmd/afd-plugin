@@ -178,8 +178,11 @@ by vLLM. Checkpoint weights are filtered once by layer-stage path before the
 native loader consumes them.
 
 This path is CUDA-only and requires `compute_gate_on_attention=false`. It fails
-during construction for sequence-parallel MoE, EPLB, pipeline parallelism,
-speculative decoding, LoRA, or NPU.
+during construction for sequence-parallel MoE, EPLB on the Attention role,
+pipeline parallelism, speculative decoding, LoRA, or NPU; the FFN role
+supports FFN-side EPLB (see
+[FFN runtime](ffn_runtime.md#ffn-side-eplb)) through the native
+`Qwen3MoeSparseMoeBlock` construction.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
 
@@ -190,8 +193,11 @@ gate, routed experts, shared expert, and shared-expert gate.
 
 This path is CUDA-only, text-only, and requires `--language-model-only`,
 `compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
-multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
-LoRA before language-model construction; NPU model-config resolution fails
+multimodal execution, sequence-parallel MoE, EPLB on the Attention role,
+speculative decoding, and LoRA before language-model construction; the FFN
+role supports FFN-side EPLB (see
+[FFN runtime](ffn_runtime.md#ffn-side-eplb)) through the native
+`Qwen3NextSparseMoeBlock` construction. NPU model-config resolution fails
 before model loading. GDN DBO is unsupported under native hybrid/multimodal
 DBO validation; ordinary eager and graph execution remain supported. Earlier
 H20 Graph + DBO and recurrent-state/CUDA Graph parity checks describe the

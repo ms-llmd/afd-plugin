@@ -37,6 +37,7 @@ from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
 )
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
+from tests.unit.fakes.eplb import FakeEPLBController  # noqa: E402
 from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
@@ -156,7 +157,9 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
+            enable_eplb=False,
             is_moe_model=True,
+            tensor_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
         compilation_config=SimpleNamespace(
@@ -166,12 +169,17 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     )
     runner.connector = _FakeConnector()
     runner.model = model
+    runner.model_config = SimpleNamespace()
     runner.afd_config = SimpleNamespace(compute_gate_on_attention=False)
     runner.afd_cudagraph_policy = SimpleNamespace(enabled=False)
     runner.num_layers = num_layers
     runner.use_cuda_graph = False
     runner._cuda_graphs = {}
+    runner._graph_memory_pool = None
+    runner.load_config = SimpleNamespace()
+    runner.device = torch.device("cpu")
     runner.prof = None
+    runner.eplb = FakeEPLBController()
     return runner
 
 
@@ -182,6 +190,7 @@ def test_ffn_runner_owns_connector_execution_without_native_runner_inheritance()
 def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(monkeypatch):
     config = SimpleNamespace(
         use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(enable_eplb=False),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             hf_text_config=SimpleNamespace(num_hidden_layers=2),
@@ -725,6 +734,235 @@ def test_ffn_runner_steps_gpu_profiler():
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
     assert runner.prof.steps == 1
+
+
+def test_ffn_runner_loads_model_and_registers_eplb(monkeypatch):
+    runner = _runner_with_connector_and_model(_FakeModel())
+    model = runner.model
+    runner.model = None
+    loader = SimpleNamespace(
+        load_model=lambda **_kwargs: model,
+        load_weights=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_model_loader", lambda _config: loader
+    )
+
+    runner.load_model()
+
+    assert runner.model is model
+    assert runner.eplb.prepare_loads == 1
+    assert runner.eplb.registrations == [(model, runner.model_config, False)]
+    assert runner.eplb.async_loop_starts == [True]
+
+
+def test_ffn_runner_steps_eplb_once_per_real_step():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert runner.eplb.steps == [(False, False)]
+
+
+def test_ffn_runner_marks_warmup_and_capturing_steps_dummy():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.extend(
+        _payload("hidden", _metadata()) for _ in range(2)
+    )
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])}, is_warmup=True)
+    runner.execute_model(
+        dp_metadata_list={0: _FakeDPMetadata([1])}, is_graph_capturing=True
+    )
+
+    assert runner.eplb.steps == [(True, False), (True, False)]
+
+
+def test_ffn_runner_replay_steps_eplb_as_real_step():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.use_cuda_graph = True
+    graph = _FakeGraph()
+    dp_metadata = {0: _FakeDPMetadata([1])}
+    runner._cuda_graphs = {
+        make_ffn_graph_key(dp_metadata): {"graph": graph},
+    }
+
+    runner.execute_model(dp_metadata_list=dp_metadata, is_graph_replaying=True)
+
+    assert graph.replay_count == 1
+    assert runner.eplb.steps == [(False, False)]
+
+
+def test_ffn_runner_prepares_eplb_unpadded_tokens_from_dp_metadata():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.vllm_config.parallel_config.enable_eplb = True
+    runner.connector.attn_size = 4
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([4, 6])})
+
+    # Two DP counts of 4 and 6 tokens, each replicated across two Attention
+    # TP peers, give 20 real tokens for the router's record kernel.
+    assert runner.eplb.prepared_forwards == [(runner.model_config, 20)]
+
+
+def test_ffn_runner_skips_eplb_prepare_when_eplb_is_disabled():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([4, 6])})
+
+    assert runner.eplb.prepared_forwards == []
+
+
+def test_ffn_runner_rejects_multistage_eplb_payload():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.vllm_config.parallel_config.enable_eplb = True
+    two_stage = {0: _FakeDPMetadata([1]), 1: _FakeDPMetadata([1])}
+
+    with pytest.raises(RuntimeError, match="exactly one stage"):
+        runner.execute_model(dp_metadata_list=two_stage)
+
+
+def test_ffn_runner_capture_prepared_and_steps_eplb_as_dummy(monkeypatch):
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.use_cuda_graph = True
+    runner.vllm_config.parallel_config.enable_eplb = True
+    monkeypatch.setattr(runner, "_dummy_run", lambda **_kwargs: None)
+    free_gpu_memory = [100, 90]
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (free_gpu_memory.pop(0), 0))
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: object())
+    monkeypatch.setattr(
+        ffn_model_runner_module, "graph_capture", lambda **_kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        ffn_model_runner_module, "set_cudagraph_capturing_enabled", lambda _v: None
+    )
+
+    cuda_graph_size = runner.capture_model(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert cuda_graph_size == 10
+    assert runner.eplb.steps == [(True, False)]
+    assert runner.eplb.prepared_forwards == [(runner.model_config, 2)]
+
+
+class _FakeEplbModelState:
+    """The EplbModelState fields the placement log reads."""
+
+    def __init__(self, placement: list[list[int]]):
+        self.physical_to_logical_map = torch.tensor(placement)
+        self.expert_load_window = torch.zeros(
+            (2, len(placement), len(placement[0])), dtype=torch.int32
+        )
+        self.model_name = "test-model"
+        self.rebalanced = False
+
+
+class _FakeEplbState:
+    """Steps the counter and commits a new placement at the boundary."""
+
+    def __init__(self, placements: list[list[list[int]]]):
+        self.model_states = {"model-hash": _FakeEplbModelState(placements[0])}
+        self.expert_rearrangement_step_interval = 2
+        self.expert_rearrangement_step = 0
+        self._placements = placements
+        self._rearrangements = 0
+
+    def step(self, is_dummy=False, is_profile=False):
+        self.expert_rearrangement_step += 1
+        if self.expert_rearrangement_step < self.expert_rearrangement_step_interval:
+            return
+        self.expert_rearrangement_step = 0
+        self._rearrangements += 1
+        self.model_states["model-hash"].physical_to_logical_map = torch.tensor(
+            self._placements[min(self._rearrangements, len(self._placements) - 1)]
+        )
+
+
+def _runner_for_placement_logging(state, *, log_placement: bool):
+    runner = _runner_with_connector_and_model(_FakeModel())
+    # The runner's EPLB seam needs only the state and its step; two FFN EP
+    # ranks split the four-slot placement.
+    runner.eplb = SimpleNamespace(state=state, step=state.step)
+    runner.vllm_config.parallel_config.data_parallel_size = 2
+    runner.vllm_config.parallel_config.eplb_config = SimpleNamespace(
+        log_balancedness=log_placement,
+    )
+    return runner
+
+
+def test_ffn_runner_logs_placement_when_a_rearrangement_commits(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """With log_balancedness the FFN logs the committed expert placement
+    when EplbState.step rearranges, and only then.
+
+    Why: vLLM's own log lists load stats, not which expert went where.
+    """
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 0)
+    )
+    state = _FakeEplbState(
+        [
+            [[0, 1, 2, 3], [0, 1, 2, 3]],
+            [[0, 2, 1, 3], [0, 2, 1, 3]],
+        ]
+    )
+    runner = _runner_for_placement_logging(state, log_placement=True)
+
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+        # Not due yet: this step only advanced the counter.
+        assert caplog.messages == []
+        runner.eplb_step()
+
+    message = caplog.messages[0]
+    assert "AFD FFN EPLB chose experts for model test-model" in message
+    assert "rank 0=[0, 2] | rank 1=[1, 3]" in message
+    # A step without a further rearrangement stays silent.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+    assert caplog.messages == []
+
+
+def test_ffn_runner_placement_logging_needs_balancedness_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Without log_balancedness no placement is logged, even at a
+    rearrangement boundary."""
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 0)
+    )
+    state = _FakeEplbState([[[0, 1, 2, 3], [0, 1, 2, 3]]])
+    runner = _runner_for_placement_logging(state, log_placement=False)
+
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+        runner.eplb_step()
+
+    assert caplog.messages == []
+
+
+def test_ffn_runner_placement_logging_only_on_ep_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Every FFN EP rank holds the same map; only EP rank 0 logs it."""
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 1)
+    )
+    state = _FakeEplbState([[[0, 1, 2, 3], [0, 1, 2, 3]]])
+    runner = _runner_for_placement_logging(state, log_placement=True)
+
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+        runner.eplb_step()
+
+    assert caplog.messages == []
 
 
 def test_ffn_runner_releases_owned_runtime_state_on_shutdown(monkeypatch):

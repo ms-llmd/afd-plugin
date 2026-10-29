@@ -13,7 +13,7 @@ supported layouts.
 .
 ├── qwen3_30b_a3b/
 │   ├── README.md
-│   └── prefill_decode_colocation/   # 2A2F: eager, graph, graph + DBO, Attention TP2
+│   └── prefill_decode_colocation/   # 2A2F: eager, graph, graph + EPLB, graph + DBO, Attention TP2
 └── qwen3_235b_a22b_fp8/
     ├── README.md
     └── prefill_decode_colocation/   # 4A2F FP8 payload: graph, graph + DBO
