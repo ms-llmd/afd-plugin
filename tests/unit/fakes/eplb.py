@@ -9,6 +9,7 @@ class FakeEPLBController:
     """Records the EPLB calls the FFN runner makes per connector step."""
 
     def __init__(self):
+        self.state = None
         self.prepare_loads = 0
         self.registrations = []
         self.async_loop_starts = []
