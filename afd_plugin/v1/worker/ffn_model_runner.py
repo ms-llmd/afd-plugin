@@ -191,10 +191,14 @@ class GPUFFNModelRunner:
             self.eplb_step(is_dummy=is_warmup or is_graph_capturing)
             return None
 
+        # An eager fallback for a step Attention replays keeps the replay flag,
+        # so the connector plans the step the way Attention does (graph mode,
+        # no host sync).
         self._ffn_forward(
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            is_graph_replaying=is_graph_replaying,
         )
         self.eplb_step(is_dummy=is_warmup or is_graph_capturing)
         return None
@@ -251,17 +255,15 @@ class GPUFFNModelRunner:
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        is_graph_replaying: bool = False,
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            cast(
-                AFDControlPlane, self.connector.control_plane
-            ).update_state_from_dp_metadata(
-                _make_dp_metadata_payload(
-                    dp_metadata_list,
-                    is_graph_capturing=is_graph_capturing,
-                    is_warmup=is_warmup,
-                ),
+            self._update_connector_state(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
             )
 
         model = self.get_model()
@@ -329,6 +331,25 @@ class GPUFFNModelRunner:
                         )
                     self.connector.send_ffn_output(rank_ffn_output, context)
         return rank_ffn_output
+
+    def _update_connector_state(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+        *,
+        is_graph_capturing: bool,
+        is_warmup: bool,
+        is_graph_replaying: bool,
+    ) -> None:
+        cast(
+            AFDControlPlane, self.connector.control_plane
+        ).update_state_from_dp_metadata(
+            _make_dp_metadata_payload(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
+            ),
+        )
 
     def _execute_eager_mode(
         self,
@@ -536,11 +557,13 @@ def _make_dp_metadata_payload(
     *,
     is_graph_capturing: bool = False,
     is_warmup: bool = False,
+    is_graph_replaying: bool = False,
 ) -> AFDControlPayload:
     return AFDControlPayload(
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=is_graph_capturing,
         is_warmup=is_warmup,
+        is_graph_replaying=is_graph_replaying,
     )
 
 

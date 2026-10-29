@@ -37,6 +37,7 @@ from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
 )
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
+from tests.unit.fakes.eplb import FakeEPLBController  # noqa: E402
 from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
@@ -118,33 +119,6 @@ class _ConnectorDrivenFakeConnector(_FakeConnector):
         self.control_plane = None
 
 
-class _FakeEplbController:
-    """Records the EPLB calls the FFN runner makes per connector step."""
-
-    def __init__(self):
-        self.prepare_loads = 0
-        self.registrations = []
-        self.async_loop_starts = []
-        self.steps = []
-        self.prepared_forwards = []
-
-    def prepare_load(self):
-        self.prepare_loads += 1
-
-    def maybe_register_model(self, model, model_config, load_dummy_weights):
-        self.registrations.append((model, model_config, load_dummy_weights))
-        return True
-
-    def maybe_start_async_loop(self, eplb_models_added):
-        self.async_loop_starts.append(eplb_models_added)
-
-    def step(self, is_dummy=False, is_profile=False):
-        self.steps.append((is_dummy, is_profile))
-
-    def prepare_forward(self, model_config, num_unpadded_tokens, ubatch_slices=None):
-        self.prepared_forwards.append((model_config, num_unpadded_tokens))
-
-
 class _FakeModel:
     def get_experts_layer_indices(self):
         return ()
@@ -204,7 +178,7 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     runner.load_config = SimpleNamespace()
     runner.device = torch.device("cpu")
     runner.prof = None
-    runner.eplb = _FakeEplbController()
+    runner.eplb = FakeEPLBController()
     return runner
 
 
