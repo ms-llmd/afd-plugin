@@ -21,10 +21,11 @@ Launch scripts for Qwen3-30B-A3B (BF16) on `DeepEPM2NAFDConnector` with vLLM
 
 ```text
 prefill_decode_colocation/
-├── 2a2f_eager_dp2tp1.sh       # Attention DP2 x TP1, eager
-├── 2a2f_graph_dp2tp1.sh       # Attention DP2 x TP1, FULL_DECODE_ONLY graph
-├── 2a2f_graph_dbo_dp2tp1.sh   # Attention DP2 x TP1, graph + DBO
-└── 2a2f_graph_dp1tp2.sh       # Attention DP1 x TP2, FULL_DECODE_ONLY graph
+├── 2a2f_eager_dp2tp1.sh            # Attention DP2 x TP1, eager
+├── 2a2f_graph_dp2tp1.sh            # Attention DP2 x TP1, FULL_DECODE_ONLY graph
+├── 2a2f_graph_eplb_dp2tp1.sh       # Attention DP2 x TP1, graph + FFN EPLB
+├── 2a2f_graph_dbo_dp2tp1.sh        # Attention DP2 x TP1, graph + DBO
+└── 2a2f_graph_dp1tp2.sh            # Attention DP1 x TP2, FULL_DECODE_ONLY graph
 ```
 
 ## Configuration notes
@@ -41,6 +42,13 @@ prefill_decode_colocation/
 - The dispatch capacity is derived from `--max-num-batched-tokens` and the
   largest capture size, so lowering `--max-num-batched-tokens` shrinks the
   transport buffers.
+- The EPLB script enables `--enable-eplb` on the FFN server only, with 32
+  redundant experts (160 physical experts, 80 per FFN rank). Attention needs
+  no EPLB flags: it records expert load while routing and adopts the FFN's
+  expert placement. Async EPLB (`use_async`) and DBO are not supported with
+  EPLB on this connector; the first rearrangement happens after
+  `step_interval - step_interval // 4` steps (vLLM's `--eplb-config`
+  defaults: 2250 steps).
 
 ## Checking a deployment
 

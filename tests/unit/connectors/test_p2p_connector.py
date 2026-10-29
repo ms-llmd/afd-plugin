@@ -467,12 +467,14 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
             is_warmup=False,
             is_graph_replaying=True,
             is_profile=True,
+            num_real_tokens=42,
         ),
     )
     decoded_payload = module.decode_control_payload(payload)
     decoded = decoded_payload.dp_metadata_list
 
     assert payload.startswith(b"{")
+    assert decoded_payload.num_real_tokens == 42
     assert isinstance(decoded[7], AFDDPMetadata)
     assert _tolist(decoded[7].num_tokens_across_dp_cpu) == [3, 5]
     assert int(decoded[7].max_tokens_across_dp_cpu) == 5

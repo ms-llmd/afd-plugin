@@ -2095,6 +2095,7 @@ def test_v2_load_model_reports_moe_layers_to_routed_connector(monkeypatch):
     assert connector.init_kwargs == {
         "moe_layer_indices": (1, 3),
         "local_experts": None,
+        "eplb_state": None,
     }
 
 
