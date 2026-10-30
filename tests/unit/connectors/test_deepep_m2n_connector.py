@@ -939,15 +939,14 @@ def test_close_without_init_is_safe():
     assert connector.is_initialized is False
 
 
-@pytest.mark.parametrize("control_backend", ["nccl", "gloo"])
-def test_close_cancels_the_control_receive_but_not_the_lanes_group(
-    monkeypatch, control_backend
-):
+def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
     """``close()`` aborts the control group once, never the bootstrap group
     the lanes use, and later receives raise the cancellation error.
 
     Why: the FFN worker joins its metadata-receive thread before the native
-    worker shutdown; a receive nobody can cancel blocks that shutdown.
+    worker shutdown; a receive nobody can cancel blocks that shutdown. The
+    GPU test ``test_close_cancels_a_blocked_control_receive`` checks the real
+    groups for both control backends.
     """
     aborted = []
 
@@ -957,12 +956,7 @@ def test_close_cancels_the_control_receive_but_not_the_lanes_group(
         aborted.append(group)
 
     monkeypatch.setattr(connector_module, "_abort_process_group", abort)
-    connector = _connector(
-        "ffn",
-        0,
-        M2NTopology(ffn_size=1, attn_size=1),
-        {"control_backend": control_backend},
-    )
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=1, attn_size=1))
     control, bootstrap = SimpleNamespace(), SimpleNamespace()
     connector.group, connector.bootstrap_group = control, bootstrap
 

@@ -213,8 +213,8 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
             )
             self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             if _routes_on_attention(afd_config):
-                # Same gate as native Qwen3MoeSparseMoeBlock (GateLinear and its
-                # router-GEMM kernels), same weight path.
+                # Same gate as native Qwen3MoeSparseMoeBlock (GateLinear, same
+                # arguments), same weight path.
                 self.mlp.gate = native.GateLinear(
                     config.hidden_size,
                     config.num_experts,

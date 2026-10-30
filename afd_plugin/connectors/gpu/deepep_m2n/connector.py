@@ -999,7 +999,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
-        self.control_plane = DeepEPM2NAFDControlPlane(self)
+        self.control_plane: DeepEPM2NAFDControlPlane = DeepEPM2NAFDControlPlane(self)
 
     # ==============================
     # Lifecycle
