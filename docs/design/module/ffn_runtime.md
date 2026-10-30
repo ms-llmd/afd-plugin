@@ -39,7 +39,8 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner construction seam"
   - "vLLM vllm.v1.engine.core.EngineCore"
@@ -149,10 +150,9 @@ connector owns transport/process-group resources.
 CUDA and Ascend require ModelRunnerV2 on both roles. FFN remains connector-driven and
 does not adopt native V2 request state or scheduler-driven execution:
 
-- CUDA temporarily substitutes `GPUFFNModelRunner`, or
-  `GPUFFNRoutedExpertsModelRunner` for a routed-experts connector, at the
-  native V2 construction seam inside `Worker.init_device()`; the AFD runner is
-  still the runtime object.
+- CUDA overrides `Worker._make_model_runner()` to construct
+  `GPUFFNRoutedExpertsModelRunner` for routed-experts connectors, otherwise
+  `GPUFFNModelRunner`.
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
@@ -162,8 +162,9 @@ does not adopt native V2 request state or scheduler-driven execution:
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
-Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
-Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
+Attention DP1 or DP > 1. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
 the same DBO setting on both roles; see the
 [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md).
@@ -362,19 +363,23 @@ The daemon catches failures, stores the original exception, logs it, and makes
 the error visible through `raise_ffn_loop_error_if_any()`. Re-entering startup
 or completing shutdown therefore surfaces an earlier background failure.
 
-Shutdown ordering is:
+CUDA shutdown ordering is:
 
 ```text
-signal daemon event
-  -> runner stops profiler and closes connector
+signal daemon event and close the control plane
   -> join daemon thread with a bounded timeout
   -> surface stored loop error
-  -> delegate remaining worker/runner shutdown upstream
+  -> after the thread has exited, delegate worker/runner shutdown upstream
+  -> runner stops profiler, releases its GPU state and closes the connector
 ```
 
-Connector receive calls may be blocking; the connector's `close()` behavior
-is responsible for releasing its communication resources so shutdown can
-complete.
+Connector receive calls may be blocking. The GPU control plane aborts its
+owned metadata process group to unblock the receiver before joining it. If the
+thread does not exit, native resources are not released underneath it. The
+connector then releases its remaining communication resources during runner
+shutdown. An earlier daemon failure is still surfaced after the join. Ascend
+uses its own connector close or asynchronous drain path before joining the
+daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
 
 ## Candidate invariants
 

@@ -26,6 +26,8 @@ validation_paths:
   - "tests/unit/distributed/**"
   - "tests/gpu/**"
 upstream_refs:
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.forward_context.DPMetadata"
   - "vLLM vllm.distributed.parallel_state"
   - "PyTorch torch.distributed process-group APIs used by the pinned runtime"
