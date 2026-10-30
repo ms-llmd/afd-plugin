@@ -135,6 +135,17 @@ def _iter_role_weights(
             yield name, loaded_weight
 
 
+def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Route the padding rows of this TP rank's ``sequence_parallel_chunk``
+    slice of ``num_tokens`` tokens to ``UNROUTED_EXPERT_ID``."""
+    local_tokens = topk_ids.shape[0]
+    token_index = native.get_tensor_model_parallel_rank() * local_tokens
+    token_index = token_index + torch.arange(local_tokens, device=topk_ids.device)
+    return topk_ids.masked_fill(
+        (token_index >= num_tokens).unsqueeze(1), UNROUTED_EXPERT_ID
+    )
+
+
 class RemoteFFNProxy(nn.Module):
     """FFN stage executed through the AFD connector.
 
@@ -178,14 +189,7 @@ class RemoteFFNProxy(nn.Module):
             renormalize=self.renormalize,
         )
         if self.tp_size > 1:
-            local_tokens = hidden_states.shape[0]
-            token_index = native.get_tensor_model_parallel_rank() * local_tokens
-            token_index = token_index + torch.arange(
-                local_tokens, device=topk_ids.device
-            )
-            topk_ids = topk_ids.masked_fill(
-                (token_index >= num_tokens).unsqueeze(1), UNROUTED_EXPERT_ID
-            )
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
         output = self._send_and_receive(
             hidden_states,
             topk_ids=topk_ids,
@@ -471,6 +475,13 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
     therefore owns the gate, the native router and the shared experts; the
     FFN runs only the routed experts. The shared experts run between dispatch
     and combine, overlapping the transfer and the FFN, as Async CAM does.
+
+    With Attention TP > 1 every TP rank holds the same tokens, so each routes
+    and dispatches only its ``sequence_parallel_chunk`` slice, as
+    ``RemoteFFNProxy`` does. The shared MLP then runs on that slice too, so it
+    is built with ``is_sequence_parallel`` (replicated weights, no all-reduce)
+    as native ``DeepseekV2MoE`` does; the TP group all-gathers routed plus
+    shared output.
     """
 
     # Patch reason: native DeepseekV2MoE runs the router and the shared experts
@@ -488,14 +499,6 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         layer_idx: int,
         prefix: str,
     ) -> None:
-        # The proxy dispatches every token it gets; vLLM's sequence-parallel
-        # split, which would give each TP rank its own slice, is rejected by
-        # AFD DeepSeek, so a TP peer would dispatch the same tokens again.
-        if vllm_config.parallel_config.tensor_parallel_size != 1:
-            raise RuntimeError(
-                "AFD DeepSeek with DeepEP M2N requires Attention "
-                "tensor_parallel_size=1",
-            )
         super().__init__(
             config=config,
             parallel_config=vllm_config.parallel_config,
@@ -520,6 +523,7 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         self.routed_scaling_factor = float(
             getattr(config, "routed_scaling_factor", 1.0),
         )
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.shared_experts = (
             native.DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -527,6 +531,7 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
                 * config.n_shared_experts,
                 hidden_act=config.hidden_act,
                 quant_config=vllm_config.quant_config,
+                is_sequence_parallel=self.tp_size > 1,
                 prefix=f"{prefix}.shared_experts",
             )
             if config.n_shared_experts
@@ -539,6 +544,9 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         assert self.gate is not None
+        num_tokens = hidden_states.shape[0]
+        if self.tp_size > 1:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
         router_logits, _ = self.gate(hidden_states)
         topk_weights, topk_ids = self.router.select_experts(
             hidden_states,
@@ -546,6 +554,8 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         )
         if self.routed_scaling_factor != 1.0:
             topk_weights = topk_weights * self.routed_scaling_factor
+        if self.tp_size > 1:
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
         stage_idx = self.experts._send(
             hidden_states,
             topk_ids=topk_ids,
@@ -557,10 +567,13 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
             None if self.shared_experts is None else self.shared_experts(hidden_states)
         )
         hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
-        routed_output = self.experts._receive(hidden_states, stage_idx)
-        if shared_output is None:
-            return routed_output
-        return routed_output + shared_output
+        output = self.experts._receive(hidden_states, stage_idx)
+        if shared_output is not None:
+            output = output + shared_output
+        if self.tp_size > 1:
+            output = native.tensor_model_parallel_all_gather(output, 0)
+            output = output[:num_tokens]
+        return output
 
 
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):

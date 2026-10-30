@@ -18,7 +18,6 @@ from tests.conftest import (
     run_runner,
 )
 from tests.e2e.runner import (
-    DEEPEP_M2N_ATTENTION_TP_SCENARIOS,
     DEEPEP_M2N_SCENARIOS,
     DEFAULT_GSM8K_SAMPLE_LIMIT,
     GSM8K_LIMIT_ENV,
@@ -55,14 +54,6 @@ SCENARIOS = (
     "afd-eager-2a1f",
     "afd-graph-2a1f",
     "afd-graph-dbo-2a1f",
-)
-# DeepEP M2N (routing on Attention) runs 2A2F. AFD DeepSeek rejects Attention
-# TP > 1 with it, so the Attention-TP cases stay Qwen3-only. They need DeepEP
-# and 4 GPUs; CI selects test ids explicitly and does not run them.
-DEEPEP_M2N_DEEPSEEK_SCENARIOS = tuple(
-    scenario
-    for scenario in DEEPEP_M2N_SCENARIOS
-    if scenario not in DEEPEP_M2N_ATTENTION_TP_SCENARIOS
 )
 
 
@@ -197,11 +188,10 @@ def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize(
-    "scenario",
-    DEEPEP_M2N_DEEPSEEK_SCENARIOS,
-    ids=DEEPEP_M2N_DEEPSEEK_SCENARIOS,
-)
+# DeepEP M2N (routing on Attention) runs 2A2F, including Attention TP2. The
+# cases need DeepEP and 4 GPUs; CI selects test ids explicitly and does not
+# run them.
+@pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
 def test_deepseek_v2_lite_deepep_m2n(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     run_runner(command, env=_runner_env(scenario))

@@ -520,25 +520,43 @@ def test_deepep_m2n_attention_owns_gate_and_shared_experts(
     }
 
 
-def test_deepep_m2n_attention_rejects_tensor_parallel(
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_deepep_m2n_shared_experts_replicated_under_attention_tp(
     monkeypatch,
     construction_env,
+    tp_size,
 ):
-    """Why: the DeepSeek M2N MoE dispatches every token it gets, so each
-    Attention TP peer would send the same tokens again."""
-    _use_cuda_remote_experts(monkeypatch)
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.tensor_parallel_size = 2
+    """With Attention TP > 1 the shared MLP is built sequence-parallel
+    (replicated weights, no all-reduce); with TP 1 it is the plain native MLP.
 
-    with pytest.raises(RuntimeError, match="tensor_parallel_size=1"):
-        _make_layer(
-            monkeypatch,
-            role="attention",
-            layer_idx=1,
-            attention_gate=True,
-            vllm_config=vllm_config,
-            connector=DEEPEP_M2N_CONNECTOR,
-        )
+    Why: each TP rank runs the shared MLP on its own token slice; a TP-sharded
+    MLP would all-reduce partial sums of different tokens.
+    """
+    _use_cuda_remote_experts(monkeypatch)
+    shared_kwargs = []
+
+    class _RecordingMLP(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            shared_kwargs.append(kwargs)
+
+    monkeypatch.setattr(adapter.native, "DeepseekV2MLP", _RecordingMLP)
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=1,
+        attention_gate=True,
+        vllm_config=vllm_config,
+        connector=DEEPEP_M2N_CONNECTOR,
+    )
+
+    assert layer.mlp.tp_size == tp_size
+    (kwargs,) = shared_kwargs
+    assert kwargs["prefix"] == "model.layers.1.mlp.shared_experts"
+    assert kwargs["is_sequence_parallel"] is (tp_size > 1)
 
 
 def test_ffn_constructs_no_real_attention(

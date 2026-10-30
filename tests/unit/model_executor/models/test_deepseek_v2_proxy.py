@@ -225,6 +225,10 @@ class _InPlaceCombineConnector(_FakeConnector):
     """Combine writes the routed output into the Attention buffer, as DeepEP
     M2N does."""
 
+    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
+        # Record what was sent; combine overwrites the buffer afterwards.
+        super().send_attn_output(hidden_states.clone(), context, **kwargs)
+
     def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
         self.events.append(("recv", ref_tensor, ubatch_idx))
         return ref_tensor.fill_(COMBINED_VALUE)
@@ -244,7 +248,7 @@ class _Scale(nn.Module):
         return hidden_states * self.factor
 
 
-def _routed_experts_moe(*, shared_experts, routed_scaling_factor):
+def _routed_experts_moe(*, shared_experts, routed_scaling_factor, tp_size=1):
     moe = object.__new__(adapter.AFDDeepseekV2RoutedExpertsMoE)
     nn.Module.__init__(moe)
     moe.gate = _LogitsGate()
@@ -255,6 +259,7 @@ def _routed_experts_moe(*, shared_experts, routed_scaling_factor):
         ),
     )
     moe.routed_scaling_factor = routed_scaling_factor
+    moe.tp_size = tp_size
     moe.experts = adapter.AFDAttentionFusedMoE(layer_idx=3, external_routing=True)
     moe.shared_experts = shared_experts
     return moe
@@ -736,3 +741,58 @@ def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
         if event[0] == "send"
     ]
     assert unrouted == [False, True, True, True]
+
+
+@pytest.mark.parametrize(
+    ("tp_rank", "sent_tokens", "padding_rows"),
+    [(0, [0, 1], []), (1, [2, 0], [1])],
+)
+def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
+    monkeypatch, tp_rank, sent_tokens, padding_rows
+):
+    """With TP 2 and 3 tokens the DeepSeek M2N MoE routes and dispatches only
+    its slice, unroutes the padding row, adds the shared output of the slice
+    before combine overwrites it, and all-gathers routed plus shared.
+
+    Why: TP peers hold the same tokens; each must dispatch a disjoint slice,
+    and the replicated shared MLP must see the same rows as combine.
+    """
+    tp_size = 2
+    shared_factor = 3.0
+    events: list[tuple] = []
+    afd_metadata = _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    afd_metadata.connector = _InPlaceCombineConnector(events)
+    monkeypatch.setattr(
+        adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
+    )
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    gathered_inputs = []
+
+    def all_gather(local_output, dim):
+        gathered_inputs.append(local_output.clone())
+        return torch.cat([local_output, local_output + PEER_OFFSET], dim=dim)
+
+    monkeypatch.setattr(adapter.native, "tensor_model_parallel_all_gather", all_gather)
+    moe = _routed_experts_moe(
+        shared_experts=_Scale(shared_factor),
+        routed_scaling_factor=1.0,
+        tp_size=tp_size,
+    )
+
+    output = moe(_tokens(3))
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    sent_states, sent_kwargs = events[0][1], events[0][3]
+    assert sent_states[:, 0].tolist() == sent_tokens
+    unrouted = (sent_kwargs["topk_ids"] == adapter.UNROUTED_EXPERT_ID).all(dim=1)
+    assert unrouted.nonzero().flatten().tolist() == padding_rows
+    (local_output,) = gathered_inputs
+    expected_local = COMBINED_VALUE + shared_factor * torch.tensor(
+        sent_tokens, dtype=torch.float32
+    )[:, None].expand(-1, ROUTING_HIDDEN_SIZE)
+    assert torch.equal(local_output, expected_local)
+    assert torch.equal(
+        output, torch.cat([local_output, local_output + PEER_OFFSET])[:3]
+    )

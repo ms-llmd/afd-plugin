@@ -173,9 +173,7 @@ devices and FFN DP2 on the other two.
 
 `test_deepseek_v2_lite_deepep_m2n` in
 `tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` runs
-DeepSeek-V2-Lite through the three DP2 x TP1 scenarios; the Attention-TP
-scenarios stay Qwen3-only because the DeepSeek M2N path requires Attention
-TP 1.
+DeepSeek-V2-Lite through the same five scenarios.
 
 They need four SM90 or newer GPUs, afdEP-comm and DeepGEMM; see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)

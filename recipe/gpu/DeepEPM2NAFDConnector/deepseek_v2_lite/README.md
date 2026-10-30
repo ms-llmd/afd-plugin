@@ -17,22 +17,26 @@ E2E cases (`test_deepseek_v2_lite_deepep_m2n` in
 
 ## Layout
 
-`2A2F`: Attention DP2 on GPUs 0,1 and FFN DP2 on GPUs 2,3. FFN rank 0 owns
-routed experts 0-31 and FFN rank 1 owns routed experts 32-63.
+`2A2F`: Attention on GPUs 0,1 (DP2, or DP1 x TP2) and FFN DP2 on GPUs 2,3.
+FFN rank 0 owns routed experts 0-31 and FFN rank 1 owns routed experts 32-63.
 
 ```text
 prefill_decode_colocation/
 ├── 2a2f_eager_dp2tp1.sh       # Attention DP2 x TP1, eager
 ├── 2a2f_graph_dp2tp1.sh       # Attention DP2 x TP1, FULL_DECODE_ONLY graph
-└── 2a2f_graph_dbo_dp2tp1.sh   # Attention DP2 x TP1, graph + DBO
+├── 2a2f_graph_dbo_dp2tp1.sh   # Attention DP2 x TP1, graph + DBO
+└── 2a2f_graph_dp1tp2.sh       # Attention DP1 x TP2, FULL_DECODE_ONLY graph
 ```
 
 ## Configuration notes
 
 - Both roles set `compute_gate_on_attention: true`, use the same rank counts,
-  and run with `--enable-expert-parallel`. Both run TP 1.
+  and run with `--enable-expert-parallel`. The FFN runs TP 1.
 - Attention runs the gate, the router, the dense first layer and the two
   shared experts; the FFN runs only the routed experts.
+- With Attention TP 2 each TP rank routes and dispatches its slice of the
+  tokens and runs the shared experts on that slice with replicated weights;
+  the TP group all-gathers the result.
 - `connector_extra_config` is left empty, so the payload is BF16 and the FFN
   runs DeepGEMM experts.
 - The graph and DBO settings match the
@@ -40,7 +44,5 @@ prefill_decode_colocation/
 
 ## Limitations
 
-- Attention TP must be 1: the DeepSeek M2N path does not split tokens across
-  Attention TP ranks.
 - DeepSeek-V2 (`DeepseekV2ForCausalLM`) only; DeepSeek-V3 and GLM-DSA are
   rejected with this connector.
