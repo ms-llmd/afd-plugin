@@ -185,7 +185,11 @@ def test_config_defaults_and_round_trip():
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
         ({"bucket_granularity": 0}, "bucket_granularity"),
         ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
-        ({"control_backend": "mpi"}, "control_backend"),
+        # Removed (gloo could not cancel a blocked receive): rejected, not ignored.
+        (
+            {"control_backend": "nccl"},
+            "unknown DeepEPM2NAFDConnector options.*control_backend",
+        ),
         ({"network": {"gin": "maybe"}}, "network.gin"),
         # The connector no longer plans NICs: NCCL picks them.
         ({"network": {"nic_policy": "shared"}}, "unknown network options"),
@@ -674,11 +678,14 @@ def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, messa
         ({(1, "expert_alignment"): 64}, "expert_alignment"),
         ({(0, "role"): "attention"}, "expected 'ffn'"),
         ({(2, "sm"): [8, 0]}, "SM90 or newer"),
+        # Protocol 1 ranks may still build a gloo control group.
+        ({(1, "protocol"): "deepep_m2n/1"}, "disagree on protocol"),
     ],
 )
 def test_handshake_rejects_mismatches(overrides, message):
     """One rank's record differs (hidden size, payload format, expert
-    alignment, role order, or a pre-Hopper GPU): the handshake raises.
+    alignment, role order, a pre-Hopper GPU, or the handshake protocol): the
+    handshake raises.
 
     Why: disagreeing ranks would corrupt data or hang; fail before buffers.
     """
@@ -732,36 +739,6 @@ def test_handshake_rejects_mismatched_network_config():
 
     with pytest.raises(RuntimeError, match="disagree on network"):
         validate_handshake(infos, layout, NetworkConfig())
-
-
-def test_handshake_rejects_mixed_control_backends():
-    """FFN on ``nccl`` and Attention on ``gloo``: the handshake raises.
-
-    Why: NCCL ranks would create a communicator that the gloo ranks never
-    join, so startup would hang until the timeout instead of failing.
-    """
-    layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
-    nccl = _handshake(layout)
-    gloo = _handshake(layout, config=DeepEPM2NConfig(control_backend="gloo"))
-
-    validate_handshake(gloo, layout, NetworkConfig())
-    with pytest.raises(RuntimeError, match="disagree on control_backend"):
-        validate_handshake([nccl[0], gloo[1]], layout, NetworkConfig())
-
-
-def test_gloo_control_backend_stages_payloads_on_cpu():
-    """With ``control_backend: gloo`` control payloads are staged on CPU.
-
-    Why: gloo cannot send CUDA tensors.
-    """
-    connector = _connector(
-        "attention",
-        0,
-        M2NTopology(ffn_size=1, attn_size=1),
-        {"control_backend": "gloo"},
-    )
-
-    assert connector.control_device == torch.device("cpu")
 
 
 def test_config_parses_network_section_and_tunables():
@@ -946,7 +923,7 @@ def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
     Why: the FFN worker joins its metadata-receive thread before the native
     worker shutdown; a receive nobody can cancel blocks that shutdown. The
     GPU test ``test_close_cancels_a_blocked_control_receive`` checks the real
-    groups for both control backends.
+    groups.
     """
     aborted = []
 
@@ -984,7 +961,7 @@ def test_receive_failure_is_a_cancellation_only_after_a_local_close(
     raises the cancellation error; any other failure propagates unchanged.
 
     Why: the FFN worker stops quietly only on a cancellation it requested;
-    the abort surfaces as a backend-specific error (gloo: ValueError).
+    the abort surfaces as an error that depends on where the receive was.
     """
     monkeypatch.setattr(connector_module, "_abort_process_group", lambda group: None)
     connector = _connector("ffn", 0, M2NTopology(ffn_size=1, attn_size=1))

@@ -406,7 +406,6 @@ def test_peer_exit_fails_within_timeout(tmp_path):
         {"tokens": 64, "exit_world_rank": 1},
         {
             "capacity_tokens_per_rank": CAPACITY,
-            "control_backend": "gloo",
             "cpu_timeout_s": PEER_EXIT_TIMEOUT_S,
             "gpu_timeout_s": PEER_EXIT_TIMEOUT_S,
         },
@@ -425,16 +424,15 @@ def test_peer_exit_fails_within_timeout(tmp_path):
     assert elapsed < PEER_EXIT_BUDGET_S
 
 
-@pytest.mark.parametrize("control_backend", ["nccl", "gloo"])
-def test_close_cancels_a_blocked_control_receive(control_backend, tmp_path):
+def test_close_cancels_a_blocked_control_receive(tmp_path):
     """Closing the control plane stops an FFN receive waiting on the idle
     control group with the cancellation error, and leaves the bootstrap group
     the DeepEP lanes hold usable.
 
     Why: vLLM 0.32's FFN worker closes the control plane, then joins its
     receive thread for 5 s and skips the native shutdown if the thread is
-    still alive. With gloo the control group must not be the bootstrap group,
-    or the abort breaks every lane.
+    still alive. The abort must reach only the control group, never the
+    bootstrap group every lane holds.
     """
     topology = M2NTopology(1, 1)
     _skip_without_gpus(topology)
@@ -442,7 +440,7 @@ def test_close_cancels_a_blocked_control_receive(control_backend, tmp_path):
         topology,
         close_cancels_receive_scenario,
         {"tokens": 8, "block_s": CLOSE_BLOCK_S, "join_s": CLOSE_JOIN_S},
-        {"capacity_tokens_per_rank": CAPACITY, "control_backend": control_backend},
+        {"capacity_tokens_per_rank": CAPACITY},
         tmp_path,
     )
 

@@ -66,7 +66,7 @@ sync, graph mode), so there is no per-layer control traffic.
 
 Before allocating transport buffers, all ranks exchange a handshake and fail
 together if they disagree. The handshake checks the payload format, model
-shapes, lane count (DBO), `control_backend`, `network`, bucket settings, GPU
+shapes, lane count (DBO), `network`, bucket settings, GPU
 architecture (SM90 or newer), and the FFN deployment (expert parallel, EP
 size, FFN TP=1, linear expert placement, no EPLB, all2all backend and expert
 weight format). The FFN adopts the Attention TP size, dispatch capacity and
@@ -177,7 +177,6 @@ Unknown keys are rejected. All keys are optional.
 | `expert_num_sms` | `int` | `0` | SMs used by the FFN's DeepGEMM expert kernels; must be even. `0` uses all SMs. With DBO, a value that leaves SMs for the other lane's transport kernels avoids delaying overlapping GEMMs. |
 | `cpu_timeout_s` | `int` | `120` | Transport host-wait timeout. |
 | `gpu_timeout_s` | `int` | `120` | Transport kernel-spin timeout. |
-| `control_backend` | `str` | `"nccl"` | Backend of the connector's own control group, which carries the per-step control payload: `"nccl"` or `"gloo"`. The handshake and transport bootstrap always use a separate gloo group. `gloo` keeps the control payload off the GPUs and RDMA NICs. |
 | `network` | `object` | see below | Fabric settings. |
 
 `network` keys:

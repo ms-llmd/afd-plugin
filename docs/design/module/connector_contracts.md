@@ -100,7 +100,7 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | Connector | Accepted connector-specific fields |
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
-| `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, `control_backend`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
+| `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
 | `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
 | `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and FFN two-stream options. Attention microbatching uses native DBO configuration. |
 
@@ -122,7 +122,7 @@ synchronous NPU runtime requires both common and connector-local values to be
 | Connector | Platform | World ordering | Control plane | FFN step selection |
 | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | FFN ranks, then Attention ranks | `P2pNcclAFDControlPlane`; stage DP metadata over a separate NCCL group | `connector.control_plane is not None` |
-| `DeepEPM2NAFDConnector` | CUDA | FFN ranks, then Attention ranks | `DeepEPM2NAFDControlPlane`; Attention rank 0 sends each step's payload to every FFN rank over the connector's own NCCL or Gloo group | `connector.control_plane is not None`; the FFN worker selects `GPUFFNRoutedExpertsModelRunner` |
+| `DeepEPM2NAFDConnector` | CUDA | FFN ranks, then Attention ranks | `DeepEPM2NAFDControlPlane`; Attention rank 0 sends each step's payload to every FFN rank over the connector's own NCCL group | `connector.control_plane is not None`; the FFN worker selects `GPUFFNRoutedExpertsModelRunner` |
 | `CAMP2pAFDConnector` | Ascend | FFN ranks, then Attention ranks | `CAMP2pAFDControlPlane`; stage DP metadata over Gloo plus HCCL data groups | `connector.control_plane is not None` |
 | `CAMAsyncAFDConnector` | Ascend | Attention ranks, then FFN ranks | `None`; routing/token metadata travels with CAM dispatch payloads | `connector.control_plane is None` |
 
@@ -311,7 +311,7 @@ metadata is present.
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
 | CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
-| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, the connector's NCCL or Gloo control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Across nodes every NVLink domain must hold an equal, contiguous block of world ranks. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
+| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Across nodes every NVLink domain must hold an equal, contiguous block of world ranks. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
 
