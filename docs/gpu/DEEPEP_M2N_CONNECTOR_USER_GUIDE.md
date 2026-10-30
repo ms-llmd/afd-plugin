@@ -177,7 +177,7 @@ Unknown keys are rejected. All keys are optional.
 | `expert_num_sms` | `int` | `0` | SMs used by the FFN's DeepGEMM expert kernels; must be even. `0` uses all SMs. With DBO, a value that leaves SMs for the other lane's transport kernels avoids delaying overlapping GEMMs. |
 | `cpu_timeout_s` | `int` | `120` | Transport host-wait timeout. |
 | `gpu_timeout_s` | `int` | `120` | Transport kernel-spin timeout. |
-| `control_backend` | `str` | `"nccl"` | Backend of the connector's own process group (handshake, transport bootstrap, per-step control payload): `"nccl"` or `"gloo"`. `gloo` keeps this traffic off the GPUs and RDMA NICs. |
+| `control_backend` | `str` | `"nccl"` | Backend of the connector's own control group, which carries the per-step control payload: `"nccl"` or `"gloo"`. The handshake and transport bootstrap always use a separate gloo group. `gloo` keeps the control payload off the GPUs and RDMA NICs. |
 | `network` | `object` | see below | Fabric settings. |
 
 `network` keys:

@@ -28,6 +28,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
     connector as connector_module,
 )
@@ -936,6 +937,79 @@ def test_close_without_init_is_safe():
     connector.close()
 
     assert connector.is_initialized is False
+
+
+@pytest.mark.parametrize("control_backend", ["nccl", "gloo"])
+def test_close_cancels_the_control_receive_but_not_the_lanes_group(
+    monkeypatch, control_backend
+):
+    """``close()`` aborts the control group once, never the bootstrap group
+    the lanes use, and later receives raise the cancellation error.
+
+    Why: the FFN worker joins its metadata-receive thread before the native
+    worker shutdown; a receive nobody can cancel blocks that shutdown.
+    """
+    aborted = []
+
+    def abort(group):
+        if group in aborted:
+            raise ValueError("group already unregistered")
+        aborted.append(group)
+
+    monkeypatch.setattr(connector_module, "_abort_process_group", abort)
+    connector = _connector(
+        "ffn",
+        0,
+        M2NTopology(ffn_size=1, attn_size=1),
+        {"control_backend": control_backend},
+    )
+    control, bootstrap = SimpleNamespace(), SimpleNamespace()
+    connector.group, connector.bootstrap_group = control, bootstrap
+
+    connector.control_plane.close()
+    connector.close()
+    connector.close()
+
+    assert aborted == [control]
+    with pytest.raises(AFDControlPlaneClosedError):
+        connector.control_plane.recv_dp_metadata_list()
+
+
+@pytest.mark.parametrize(
+    ("closes_first", "error", "expected"),
+    [
+        (True, ValueError("group is not initialized"), AFDControlPlaneClosedError),
+        (True, RuntimeError("NCCL communicator aborted"), AFDControlPlaneClosedError),
+        (False, RuntimeError("NCCL transport failure"), RuntimeError),
+    ],
+)
+def test_receive_failure_is_a_cancellation_only_after_a_local_close(
+    monkeypatch, closes_first, error, expected
+):
+    """A receive that fails because this rank closed its control plane
+    raises the cancellation error; any other failure propagates unchanged.
+
+    Why: the FFN worker stops quietly only on a cancellation it requested;
+    the abort surfaces as a backend-specific error (gloo: ValueError).
+    """
+    monkeypatch.setattr(connector_module, "_abort_process_group", lambda group: None)
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=1, attn_size=1))
+    connector.group = SimpleNamespace()
+
+    def failing_receive(**kwargs):
+        if closes_first:
+            connector.control_plane.close()
+        raise error
+
+    monkeypatch.setattr(connector_module, "recv_control_payload", failing_receive)
+
+    with pytest.raises(expected) as caught:
+        connector.control_plane.recv_dp_metadata_list()
+
+    if closes_first:
+        assert caught.value.__cause__ is error
+    else:
+        assert caught.value is error
 
 
 def test_data_path_requires_initialization():
