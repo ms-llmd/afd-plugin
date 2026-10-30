@@ -217,6 +217,90 @@ def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
     assert torch.equal(output, hidden_states * 0.25)
 
 
+COMBINED_VALUE = 1.0
+ROUTE_WEIGHT = 0.5
+
+
+class _InPlaceCombineConnector(_FakeConnector):
+    """Combine writes the routed output into the Attention buffer, as DeepEP
+    M2N does."""
+
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+        self.events.append(("recv", ref_tensor, ubatch_idx))
+        return ref_tensor.fill_(COMBINED_VALUE)
+
+
+class _LogitsGate(nn.Module):
+    def forward(self, hidden_states):
+        return torch.zeros(hidden_states.shape[0], ROUTING_NUM_EXPERTS), None
+
+
+class _Scale(nn.Module):
+    def __init__(self, factor: float) -> None:
+        super().__init__()
+        self.factor = factor
+
+    def forward(self, hidden_states):
+        return hidden_states * self.factor
+
+
+def _routed_experts_moe(*, shared_experts, routed_scaling_factor):
+    moe = object.__new__(adapter.AFDDeepseekV2RoutedExpertsMoE)
+    nn.Module.__init__(moe)
+    moe.gate = _LogitsGate()
+    moe.router = SimpleNamespace(
+        select_experts=lambda hidden_states, router_logits: (
+            torch.full((hidden_states.shape[0], ROUTING_TOP_K), ROUTE_WEIGHT),
+            torch.zeros((hidden_states.shape[0], ROUTING_TOP_K), dtype=torch.int32),
+        ),
+    )
+    moe.routed_scaling_factor = routed_scaling_factor
+    moe.experts = adapter.AFDAttentionFusedMoE(layer_idx=3, external_routing=True)
+    moe.shared_experts = shared_experts
+    return moe
+
+
+@pytest.mark.parametrize(
+    ("shared_factor", "routed_scaling_factor"),
+    [(None, 1.0), (3.0, 1.0), (3.0, 2.0)],
+    ids=["routed-only", "shared", "shared-scaled"],
+)
+def test_m2n_moe_sends_topk_and_adds_shared_output_of_dispatched_input(
+    monkeypatch, shared_factor, routed_scaling_factor
+):
+    """The DeepSeek M2N MoE sends top-k routes scaled by routed_scaling_factor
+    and returns combine plus the shared experts of the input it dispatched.
+
+    Why: combine overwrites the Attention buffer and sums weight * expert, so
+    the shared MLP must read the input before combine, and the routed scale
+    must ride in the weights.
+    """
+    events: list[tuple] = []
+    afd_metadata = _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    afd_metadata.connector = _InPlaceCombineConnector(events)
+    moe = _routed_experts_moe(
+        shared_experts=None if shared_factor is None else _Scale(shared_factor),
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    hidden_value = 2.0
+    hidden_states = torch.full((2, ROUTING_HIDDEN_SIZE), hidden_value)
+
+    output = moe(hidden_states)
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    send_kwargs = events[0][3]
+    assert set(send_kwargs) == {"topk_ids", "topk_weights"}
+    assert torch.equal(
+        send_kwargs["topk_weights"],
+        torch.full((2, ROUTING_TOP_K), ROUTE_WEIGHT * routed_scaling_factor),
+    )
+    shared_value = 0.0 if shared_factor is None else hidden_value * shared_factor
+    assert torch.equal(
+        output,
+        torch.full((2, ROUTING_HIDDEN_SIZE), COMBINED_VALUE + shared_value),
+    )
+
+
 def test_remote_proxy_requires_forward_metadata(monkeypatch):
     monkeypatch.setattr(
         adapter,

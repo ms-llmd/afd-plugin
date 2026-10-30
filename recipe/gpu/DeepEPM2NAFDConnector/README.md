@@ -11,6 +11,9 @@ supported layouts.
 
 ```text
 .
+├── deepseek_v2_lite/
+│   ├── README.md
+│   └── prefill_decode_colocation/   # 2A2F: eager, graph, graph + DBO
 ├── qwen3_30b_a3b/
 │   ├── README.md
 │   └── prefill_decode_colocation/   # 2A2F: eager, graph, graph + DBO, Attention TP2
@@ -24,8 +27,8 @@ running anything in it.
 
 ## Prerequisites
 
-- SM90 or newer GPUs on one node: 4 for the Qwen3-30B-A3B recipes, 6 for the
-  Qwen3-235B-A22B-FP8 recipes.
+- SM90 or newer GPUs on one node: 4 for the DeepSeek-V2-Lite and
+  Qwen3-30B-A3B recipes, 6 for the Qwen3-235B-A22B-FP8 recipes.
 - vLLM `v0.30.0`, the plugin, afdEP-comm (the `afdep` extra) and DeepGEMM
   installed in one environment, with the elfutils headers available to
   DeepGEMM's JIT. See
