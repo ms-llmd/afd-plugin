@@ -490,8 +490,8 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
     # Patch functionality: build the native router and shared MLP next to the
     # remote-experts shell; route, dispatch, run the shared MLP, combine.
     # Signature: AFD-owned; takes vllm_config and layer_idx.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
         *,
