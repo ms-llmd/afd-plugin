@@ -29,7 +29,7 @@ running anything in it.
 
 - SM90 or newer GPUs on one node: 4 for the DeepSeek-V2-Lite and
   Qwen3-30B-A3B recipes, 6 for the Qwen3-235B-A22B-FP8 recipes.
-- vLLM `v0.30.0`, the plugin, afdEP-comm (the `afdep` extra) and DeepGEMM
+- vLLM `v0.32.0`, the plugin, afdEP-comm (the `afdep` extra) and DeepGEMM
   installed in one environment, with the elfutils headers available to
   DeepGEMM's JIT. See
   [Installation](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation).

@@ -1,7 +1,7 @@
 # DeepSeek-V2-Lite with DeepEPM2NAFDConnector
 
 Launch scripts for DeepSeek-V2-Lite (BF16) on `DeepEPM2NAFDConnector` with
-vLLM `v0.30.0`. They use the same layouts as the DeepSeek-V2-Lite DeepEP M2N
+vLLM `v0.32.0`. They use the same layouts as the DeepSeek-V2-Lite DeepEP M2N
 E2E cases (`test_deepseek_v2_lite_deepep_m2n` in
 [`tests/e2e`](../../../../tests/e2e/README.md#deepep-m2n-scenarios)).
 
