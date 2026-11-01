@@ -44,5 +44,5 @@ prefill_decode_colocation/
 
 ## Limitations
 
-- DeepSeek-V2 (`DeepseekV2ForCausalLM`) only; DeepSeek-V3 and GLM-DSA are
-  rejected with this connector.
+- DeepSeek-V2 (`DeepseekV2ForCausalLM`); DeepSeek-V3 is rejected with this
+  connector. For GLM-5.3 see [`glm_5_3_fp8`](../glm_5_3_fp8/README.md).

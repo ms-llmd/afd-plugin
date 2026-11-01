@@ -27,8 +27,13 @@ Supported models:
   Attention runs the dense layers and the shared experts; the shared experts
   overlap the dispatch and the FFN. With Attention TP > 1 each TP rank runs
   them, with replicated weights, on the token slice it dispatches.
+- GLM-5.3 (`GlmMoeDsaForCausalLM`, block-128 FP8, validated with the FP8
+  payload on three 8xH100 nodes). It runs through the DeepSeek wrapper:
+  Attention also runs the sparse-attention indexer and the sigmoid router with
+  its correction bias, and folds `routed_scaling_factor` into the top-k
+  weights.
 
-DeepSeek-V3, GLM-DSA and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
+DeepSeek-V3 and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
 
 ## How it works
 
