@@ -12,6 +12,9 @@
 
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/GLM-5.3}
 export VLLM_USE_V2_MODEL_RUNNER=1
+# Loading 750 GB of weights and capturing graphs through the connector can take
+# longer than vLLM's default 600 s engine start-up wait.
+export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-3600}
 
 # The DeepEP M2N rendezvous runs on FFN world rank 0 (pod 1).
 AFD_CONNECTOR_HOST=${AFD_CONNECTOR_HOST:-vllm-ffn-p2p-service}
@@ -71,6 +74,7 @@ fi
 if [[ "$POD" == ATTENTION_* ]]; then
   vllm serve "$MODEL_PATH" \
       --data-parallel-size 8 \
+      --api-server-count 1 \
       "${COMMON_ARGS[@]}" \
       --additional-config "$(AFD_CONFIG attention)" \
       --host 127.0.0.1 \

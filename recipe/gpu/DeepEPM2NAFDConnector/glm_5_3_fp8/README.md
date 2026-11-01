@@ -41,8 +41,9 @@ hosts the AFD rendezvous (`AFD_CONNECTOR_HOST`), and the FFN DP head
   checkpoint's experts are block-128 FP8.
 - The MTP layer is not loaded; speculative decoding is not supported with this
   connector.
-- `afd_process_group_timeout_s` and `--cpu-distributed-timeout-seconds` are
-  raised to 3600 s because loading 750 GB of weights can take several
+- `afd_process_group_timeout_s`, `--cpu-distributed-timeout-seconds` and
+  `VLLM_ENGINE_READY_TIMEOUT_S` are raised to 3600 s because loading 750 GB of
+  weights and capturing graphs through the connector can take more than ten
   minutes.
 
 ### RoCE with unrouted rails
