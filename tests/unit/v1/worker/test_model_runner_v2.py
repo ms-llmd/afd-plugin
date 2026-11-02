@@ -156,6 +156,7 @@ def _v2_config(
         enable_expert_parallel=True,
         enable_elastic_ep=False,
         enable_eplb=False,
+        eplb_config=SimpleNamespace(use_async=False),
         use_sequence_parallel_moe=False,
         is_moe_model=True,
         enable_dbo=False,
@@ -507,6 +508,16 @@ _GPU_GRAPH = {
             },
             None,
             id="accept-ffn-eplb",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.eplb_config.use_async": True,
+            },
+            _err("async EPLB"),
+            id="reject-ffn-eplb-async",
         ),
         pytest.param(
             {

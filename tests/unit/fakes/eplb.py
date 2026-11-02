@@ -19,12 +19,12 @@ class FakeEPLBController:
     def prepare_load(self):
         self.prepare_loads += 1
 
-    def maybe_register_model(self, model, model_config, load_dummy_weights):
-        self.registrations.append((model, model_config, load_dummy_weights))
+    def maybe_register_model(self, model, model_config):
+        self.registrations.append((model, model_config))
         return True
 
-    def maybe_start_async_loop(self, eplb_models_added):
-        self.async_loop_starts.append(eplb_models_added)
+    def maybe_start_async_loop(self, eplb_models_added, load_dummy_weights=False):
+        self.async_loop_starts.append((eplb_models_added, load_dummy_weights))
 
     def step(self, is_dummy=False, is_profile=False):
         self.steps.append((is_dummy, is_profile))
