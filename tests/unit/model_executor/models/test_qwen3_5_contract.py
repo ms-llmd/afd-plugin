@@ -295,6 +295,7 @@ def test_qwen_conditional_model_accepts_ffn_role_eplb(monkeypatch):
             video_pruning_rate=0.2,
         ),
     )
+    model_config.get_multimodal_config = lambda: model_config.multimodal_config
     vllm_config = SimpleNamespace(
         lora_config=None,
         model_config=model_config,
