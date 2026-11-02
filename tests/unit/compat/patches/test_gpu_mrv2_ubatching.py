@@ -140,19 +140,38 @@ def _bounds(slices):
     ]
 
 
+class _HostBounds(list):
+    """Host sequence bounds: indexable, assignable and cloneable like a tensor."""
+
+    def clone(self):
+        return _HostBounds(self)
+
+
 @dataclass(frozen=True)
 class _DecodeBatch:
-    """The InputBatch fields prepare reads for a one-token-per-request batch."""
+    """The InputBatch fields the captured-split scope reads."""
 
     num_reqs: int
     num_tokens: int
     num_reqs_after_padding: int
     num_tokens_after_padding: int
+    seq_lens_cpu_upper_bound: _HostBounds
     max_query_len: int | None = None
 
 
+def _decode_batch(num_reqs, num_tokens=None, graph_tokens=32):
+    # Real requests carry a nonzero host bound; padding rows stay at zero.
+    return _DecodeBatch(
+        num_reqs,
+        num_reqs if num_tokens is None else num_tokens,
+        graph_tokens,
+        graph_tokens,
+        _HostBounds([7] * num_reqs + [0] * (graph_tokens - num_reqs)),
+    )
+
+
 def _native_slices(input_batch, num_ubatches):
-    # Native vLLM 0.30 slicing clamps a trailing microbatch without real
+    # Native vLLM 0.32 slicing clamps a trailing microbatch without real
     # requests onto the last real request; only that outcome matters here.
     split = input_batch.num_tokens_after_padding // num_ubatches
     last_start = min(split, input_batch.num_reqs - 1)
@@ -163,30 +182,6 @@ def _native_slices(input_batch, num_ubatches):
             slice(split, input_batch.num_tokens_after_padding),
         ),
     ]
-
-
-def _slice_decode_batch(input_batch, ubatch_slice, *args, **kwargs):
-    start, stop = ubatch_slice.request_slice.start, ubatch_slice.request_slice.stop
-    return SimpleNamespace(
-        num_reqs=max(0, min(stop, input_batch.num_reqs) - start),
-        max_query_len=input_batch.max_query_len,
-        seq_lens_cpu_upper_bound=[0] * (stop - start),
-        is_padding=ubatch_slice.token_slice,
-    )
-
-
-class _ModelState:
-    def prepare_attn(self, ubatch, cg_mode, block_tables, slot_mappings, *args, **kw):
-        return {
-            "max_query_len": ubatch.max_query_len,
-            "max_seq_len": max(ubatch.seq_lens_cpu_upper_bound),
-            "block_tables": block_tables,
-        }
-
-
-class _SlotMappings:
-    def __getitem__(self, key):
-        return key[1]
 
 
 @pytest.fixture
@@ -239,6 +234,9 @@ def patches():
     def native_dispatch(*args, **kwargs):
         raise AssertionError("dispatch was not scoped")
 
+    def native_sync(*args, **kwargs):
+        raise AssertionError("native DP coordination was not stubbed")
+
     def check_thresholds(config, num_tokens, uniform_decode):
         threshold = (
             config.dbo_decode_token_threshold
@@ -260,6 +258,8 @@ def patches():
         "UBatchRunner": NativeUBatchRunner,
         "DPMetadata": NativeDPMetadata,
         "model_runner": native_module,
+        "gpu_ubatch_utils": SimpleNamespace(create_ubatch_slices=_native_slices),
+        "sync_cudagraph_and_dp_padding": native_sync,
         "logger": SimpleNamespace(info_once=lambda *args: None),
         "torch": SimpleNamespace(
             int32="int32",
@@ -275,12 +275,6 @@ def patches():
         ),
         "pairwise": pairwise,
         "UBatchSlice": _UBatchSlice,
-        "UBatchState": SimpleNamespace,
-        "create_ubatch_slices": _native_slices,
-        "_slice_input_batch": _slice_decode_batch,
-        "build_slot_mappings_by_layer": lambda slot_mappings, kv_cache_config: (
-            slot_mappings
-        ),
     }
     future = ast.parse("from __future__ import annotations").body
     module = ast.Module(body=future + functions, type_ignores=[])
@@ -301,18 +295,6 @@ def test_factory_keeps_native_runner_and_changes_only_dp1_instance(patches, dp_s
     assert runner.inputs == inputs
     assert patches.UBatchRunner._make_forward_contexts is native_context_factory
     assert ("_make_forward_contexts" in vars(runner)) is (dp_size == 1)
-
-
-@pytest.mark.parametrize("unsupported", [None, *UNSUPPORTED_SPLIT_CONFIGS])
-def test_factory_binds_captured_split_prepare_only_where_supported(
-    patches, unsupported
-):
-    overrides = UNSUPPORTED_SPLIT_CONFIGS.get(unsupported, {})
-    config = _vllm_config(parallel=_parallel(dp_size=2), **overrides)
-
-    runner = patches.maybe_build_ubatch_runner(config, None, None, [], None, 32)
-
-    assert ("prepare" in vars(runner)) is (unsupported is None)
 
 
 def test_disabled_dbo_does_not_construct_runner(patches):
@@ -381,12 +363,14 @@ def test_dp1_thresholds_select_eager_microbatches_without_handshake(
     [
         # (cg_mode, padded tokens, microbatches)
         (9, 16, False, (_CUDAGraphMode.FULL, 16, 2)),
-        # At most half of the graph: the captured split replays it ...
+        # Exactly half of the graph: native admits the microbatched graph.
+        (8, 16, False, (_CUDAGraphMode.FULL, 16, 2)),
+        # Less than half: the captured split replays the microbatched graph ...
         (3, 16, True, (_CUDAGraphMode.FULL, 16, 2)),
-        (8, 16, True, (_CUDAGraphMode.FULL, 16, 2)),
+        (7, 16, True, (_CUDAGraphMode.FULL, 16, 2)),
         # ... and without it the regular graph does, never eager.
         (3, 16, False, (_CUDAGraphMode.FULL, 16, 1)),
-        (8, 16, False, (_CUDAGraphMode.FULL, 16, 1)),
+        (7, 16, False, (_CUDAGraphMode.FULL, 16, 1)),
         (8, None, True, (_CUDAGraphMode.NONE, 8, 2)),
     ],
 )
@@ -421,87 +405,76 @@ def test_dp1_replays_a_graph_for_an_underfilled_microbatched_step(
 def test_captured_split_halves_requests_and_tokens_alike(
     patches, graph_tokens, expected
 ):
-    batch = _DecodeBatch(3, 3, graph_tokens, graph_tokens)
+    batch = _decode_batch(3, graph_tokens=graph_tokens)
     assert _bounds(patches.captured_ubatch_slices(batch, 2)) == expected
 
 
 @pytest.mark.parametrize(
-    "unsupported, min_tokens, max_tokens, capture_tokens, falls_back",
-    [
-        (None, 15, 17, 32, False),
-        ("mla", 15, 17, 32, True),
-        ("mla", 16, 17, 32, True),
-        ("mla", 17, 17, 32, False),
-        ("speculative", 2, 3, 8, True),
-        ("mla", 15, 17, None, False),
-    ],
+    "num_reqs, padding_only_starts",
+    [(1, [16]), (15, [16]), (16, [16]), (17, []), (32, [])],
 )
-def test_regular_graph_fallback_only_without_the_captured_split(
-    patches, unsupported, min_tokens, max_tokens, capture_tokens, falls_back
+def test_full_decode_prepares_at_the_captured_split(
+    patches, num_reqs, padding_only_starts
 ):
-    config = _vllm_config(**UNSUPPORTED_SPLIT_CONFIGS.get(unsupported, {}))
-    manager = _GraphManager(capture_tokens, config)
-    assert (
-        patches.needs_regular_graph_fallback(
-            manager, max_tokens, min_tokens, max_tokens, 1, 0, 2
-        )
-        is falls_back
-    )
+    # Native slicing would start the trailing microbatch at the last real
+    # request whenever it would otherwise hold padding only.
+    batch = _decode_batch(num_reqs)
+    runner = SimpleNamespace(vllm_config=_vllm_config(), num_ubatches=2)
 
+    with patches.use_captured_ubatch_split(
+        runner, batch, _CUDAGraphMode.FULL, False
+    ) as split_batch:
+        slices = patches.gpu_ubatch_utils.create_ubatch_slices(split_batch, 2)
 
-def _prepare(patches, input_batch, cg_mode):
-    runner = SimpleNamespace(
-        num_ubatches=2,
-        ubatch_query_start_loc=[None, None],
-        ubatch_seq_lens=[None, None],
-        ubatch_dcp_local_seq_lens=[None, None],
-        dcp_size=1,
-        dcp_rank=0,
-        cp_interleave=1,
-        model_state=_ModelState(),
-        attn_groups=[],
-        kv_cache_config=None,
-        _make_forward_contexts=lambda slices, attn, slot_mappings, padding: attn,
-    )
-    block_tables = (list(range(input_batch.num_reqs_after_padding)),)
-    return patches.prepare(runner, input_batch, block_tables, _SlotMappings(), cg_mode)
-
-
-def test_underfilled_full_decode_replays_the_captured_split(patches):
-    # 15 real requests padded into a 32 graph: native slicing would start the
-    # trailing microbatch at request 14 instead of the captured 16.
-    state = _prepare(patches, _DecodeBatch(15, 15, 32, 32), _CUDAGraphMode.FULL)
-
-    assert _bounds(state.slices) == [(0, 16, 0, 16), (16, 32, 16, 32)]
-    trailing = state.forward_contexts[1]
-    assert trailing["block_tables"] == (list(range(16, 32)),)
-    assert trailing["max_query_len"] == 1
-    assert trailing["max_seq_len"] == 1
-
-
-@pytest.mark.parametrize("num_reqs", [17, 24, 32])
-def test_filled_full_decode_split_matches_native_slicing(patches, num_reqs):
-    input_batch = _DecodeBatch(num_reqs, num_reqs, 32, 32)
-    state = _prepare(patches, input_batch, _CUDAGraphMode.FULL)
-    assert state.slices == _native_slices(input_batch, 2)
+    assert _bounds(slices) == [(0, 16, 0, 16), (16, 32, 16, 32)]
+    assert split_batch.max_query_len == 1
+    raised = [
+        row
+        for row, bound in enumerate(split_batch.seq_lens_cpu_upper_bound)
+        if bound != batch.seq_lens_cpu_upper_bound[row]
+    ]
+    assert raised == padding_only_starts
+    assert all(split_batch.seq_lens_cpu_upper_bound[row] == 1 for row in raised)
+    assert patches.gpu_ubatch_utils.create_ubatch_slices is _native_slices
 
 
 @pytest.mark.parametrize(
-    "input_batch, cg_mode",
+    "unsupported, batch, cg_mode, for_capture",
     [
-        (_DecodeBatch(15, 15, 32, 32), _CUDAGraphMode.NONE),
-        (_DecodeBatch(15, 20, 32, 32), _CUDAGraphMode.FULL),
+        (None, _decode_batch(15), _CUDAGraphMode.NONE, False),
+        (None, _decode_batch(15), _CUDAGraphMode.FULL, True),
+        (None, _decode_batch(15, num_tokens=20), _CUDAGraphMode.FULL, False),
+        *[
+            (name, _decode_batch(15), _CUDAGraphMode.FULL, False)
+            for name in UNSUPPORTED_SPLIT_CONFIGS
+        ],
     ],
-    ids=["eager", "multi-token-request"],
+    ids=["eager", "capture", "multi-token-request", *UNSUPPORTED_SPLIT_CONFIGS],
 )
-def test_other_microbatched_steps_keep_native_slicing(patches, input_batch, cg_mode):
-    state = _prepare(patches, input_batch, cg_mode)
+def test_other_microbatched_steps_keep_native_preparation(
+    patches, unsupported, batch, cg_mode, for_capture
+):
+    config = _vllm_config(**UNSUPPORTED_SPLIT_CONFIGS.get(unsupported, {}))
+    runner = SimpleNamespace(vllm_config=config, num_ubatches=2)
 
-    assert state.slices == _native_slices(input_batch, 2)
-    assert [context["max_query_len"] for context in state.forward_contexts] == [
-        None,
-        None,
-    ]
+    with patches.use_captured_ubatch_split(
+        runner, batch, cg_mode, for_capture
+    ) as split_batch:
+        slices = patches.gpu_ubatch_utils.create_ubatch_slices(split_batch, 2)
+
+    assert split_batch is batch
+    assert slices == _native_slices(batch, 2)
+
+
+def test_captured_split_scope_restores_native_slicing_after_failure(patches):
+    runner = SimpleNamespace(vllm_config=_vllm_config(), num_ubatches=2)
+    scope = patches.use_captured_ubatch_split(
+        runner, _decode_batch(15), _CUDAGraphMode.FULL, False
+    )
+    with pytest.raises(RuntimeError, match="native failure"), scope:
+        assert patches.gpu_ubatch_utils.create_ubatch_slices is not _native_slices
+        raise RuntimeError("native failure")
+    assert patches.gpu_ubatch_utils.create_ubatch_slices is _native_slices
 
 
 def test_profile_dispatch_does_not_select_a_graph(patches):
@@ -525,7 +498,10 @@ def test_profile_dispatch_does_not_select_a_graph(patches):
 
 def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
     calls = []
-    expected = (object(), object())
+    expected = (
+        _BatchDescriptor(_CUDAGraphMode.FULL, 16, 16, num_ubatches=2),
+        _DPSyncState([16, 16], None, False, 16),
+    )
 
     def sync(*args, **kwargs):
         calls.append((args, kwargs))
@@ -547,7 +523,7 @@ def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
         allow_ubatching=True,
         uniform_decode=False,
     )
-    assert actual is expected
+    assert actual == expected
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args[0] is manager
@@ -560,6 +536,79 @@ def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
         "uniform_decode": False,
     }
     assert manager.calls == [1]
+
+
+@pytest.mark.parametrize(
+    "unsupported, expected_ubatches",
+    [(None, 2), ("mla", 1), ("speculative", 1), ("inner-state", 1)],
+)
+def test_dp2_underfilled_rank_replays_a_graph_instead_of_native_eager(
+    patches, unsupported, expected_ubatches
+):
+    # Native matched the 32-token microbatched graph for the largest rank (17)
+    # and ran eager because the smallest rank (15) fills less than half of it.
+    config = _vllm_config(**UNSUPPORTED_SPLIT_CONFIGS.get(unsupported, {}))
+    native_eager = (
+        _BatchDescriptor(_CUDAGraphMode.NONE, 17, 15, num_ubatches=2),
+        _DPSyncState([17, 17], 1, True, 17),
+    )
+    patches.namespace["sync_cudagraph_and_dp_padding"] = lambda *a, **k: native_eager
+
+    desc, sync = patches.dispatch_cg_and_sync_dp(
+        _GraphManager(32, config),
+        15,
+        15,
+        1,
+        2,
+        0,
+        max_query_len=1,
+        parallel_config=_parallel(dp_size=2),
+        allow_ubatching=True,
+        uniform_decode=True,
+    )
+
+    assert (desc.cg_mode, desc.num_tokens, desc.num_ubatches) == (
+        _CUDAGraphMode.FULL,
+        32,
+        expected_ubatches,
+    )
+    assert sync == _DPSyncState([32, 32], 1, False, 32)
+
+
+@pytest.mark.parametrize(
+    "native_mode, native_ubatches, eager, capture_tokens, need_eager",
+    [
+        (_CUDAGraphMode.NONE, 2, True, None, False),
+        (_CUDAGraphMode.NONE, 1, True, 32, False),
+        (_CUDAGraphMode.FULL, 2, False, 32, False),
+        (_CUDAGraphMode.NONE, 2, True, None, True),
+    ],
+    ids=["no-microbatched-graph", "eager-without-microbatches", "graph", "profile"],
+)
+def test_dp2_keeps_other_native_results(
+    patches, native_mode, native_ubatches, eager, capture_tokens, need_eager
+):
+    native = (
+        _BatchDescriptor(native_mode, 17, 15, num_ubatches=native_ubatches),
+        _DPSyncState([17, 17], 1, eager, 17),
+    )
+    patches.namespace["sync_cudagraph_and_dp_padding"] = lambda *a, **k: native
+    manager = None if need_eager else _GraphManager(capture_tokens)
+
+    result = patches.dispatch_cg_and_sync_dp(
+        manager,
+        15,
+        15,
+        1,
+        2,
+        0,
+        need_eager=need_eager,
+        parallel_config=_parallel(dp_size=2),
+        allow_ubatching=True,
+        uniform_decode=True,
+    )
+
+    assert result == native
 
 
 @pytest.mark.parametrize(
@@ -709,6 +758,91 @@ def test_captured_split_is_native_slicing_once_real_requests_reach_it(
         assert (native == captured) is (2 * num_reqs > graph_tokens), num_reqs
 
 
+@pytest.mark.vllm_runtime
+def test_native_prepare_builds_a_padding_only_microbatch_at_the_captured_split(
+    native_patch, monkeypatch
+):  # long-test: pads a real dummy batch the way prepare_inputs does.
+    # Pins the native slicing internals the captured split relies on: native
+    # prepare takes its split from create_ubatch_slices, sub-batches keep the
+    # parent's max_query_len and host bounds, and FULL attention preparation
+    # sizes metadata by padded counts.
+    import numpy as np
+    import torch
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.model_states import default
+    from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
+
+    graph_tokens, num_reqs, real_seq_len = 32, 15, 7
+    buffers = InputBuffers(graph_tokens, graph_tokens, torch.device("cpu"))
+    real = InputBatch.make_dummy(num_reqs, num_reqs, buffers)
+    query_start_loc_np = np.full(graph_tokens + 1, num_reqs, dtype=np.int32)
+    query_start_loc_np[: num_reqs + 1] = real.query_start_loc_np
+    seq_lens_cpu_upper_bound = torch.zeros(graph_tokens, dtype=torch.int32)
+    seq_lens_cpu_upper_bound[:num_reqs] = real_seq_len
+    # The FULL-padded batch prepare_inputs builds for 15 decodes in a 32 graph.
+    batch = replace(
+        real,
+        num_reqs_after_padding=graph_tokens,
+        num_tokens_after_padding=graph_tokens,
+        query_start_loc=buffers.query_start_loc[: graph_tokens + 1],
+        query_start_loc_np=query_start_loc_np,
+        seq_lens=buffers.seq_lens[:graph_tokens],
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        input_ids=buffers.input_ids[:graph_tokens],
+        positions=buffers.positions[:graph_tokens],
+        is_padding=buffers.is_padding[:graph_tokens],
+    )
+    recorded: list[dict] = []
+
+    def record_attn_metadata(**kwargs):
+        recorded.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(default, "build_attn_metadata", record_attn_metadata)
+    model_state = SimpleNamespace(supports_mm_inputs=False, encoder_cache=None)
+    model_state.prepare_attn = MethodType(
+        default.DefaultModelState.prepare_attn, model_state
+    )
+    runner = UBatchRunner.__new__(UBatchRunner)
+    vars(runner).update(
+        vllm_config=_vllm_config(),
+        num_ubatches=2,
+        ubatch_query_start_loc=[
+            torch.zeros(graph_tokens + 1, dtype=torch.int32) for _ in range(2)
+        ],
+        ubatch_seq_lens=[
+            torch.zeros(graph_tokens, dtype=torch.int32) for _ in range(2)
+        ],
+        ubatch_dcp_local_seq_lens=[None, None],
+        dcp_size=1,
+        dcp_rank=0,
+        cp_interleave=1,
+        model_state=model_state,
+        attn_groups=[],
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        _make_forward_contexts=lambda slices, attn, slot_mappings, padding: attn,
+    )
+    block_table = torch.arange(graph_tokens).unsqueeze(1)
+
+    with native_patch.use_captured_ubatch_split(
+        runner, batch, CUDAGraphMode.FULL, False
+    ) as split_batch:
+        state = runner.prepare(
+            split_batch,
+            (block_table,),
+            torch.zeros(1, graph_tokens, dtype=torch.int64),
+            CUDAGraphMode.FULL,
+        )
+
+    assert _bounds(state.slices) == [(0, 16, 0, 16), (16, 32, 16, 32)]
+    assert [
+        (call["num_reqs"], call["max_query_len"], call["max_seq_len"])
+        for call in recorded
+    ] == [(16, 1, real_seq_len), (16, 1, 1)]
+    assert torch.equal(recorded[1]["block_tables"][0], block_table[16:])
+
+
 class _NativeGraphManager:
     CAPTURE_SIZES = (8, 16, 32, 64)
 
@@ -728,7 +862,14 @@ class _NativeGraphManager:
         from vllm.config import CUDAGraphMode
         from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-        size = next(size for size in self.CAPTURE_SIZES if size >= num_tokens)
+        size = next((size for size in self.CAPTURE_SIZES if size >= num_tokens), None)
+        if size is None:
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_ubatches=num_ubatches,
+            )
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.FULL,
             num_tokens=size,
@@ -742,20 +883,21 @@ class _NativeGraphManager:
 @pytest.mark.parametrize(
     "tokens_across_dp, split_supported, expected",
     [
-        # (padded tokens, microbatches); every case replays a FULL graph.
-        ((15, 17), True, (32, 2)),
-        ((15, 17), False, (32, 1)),
-        ((16, 32), True, (32, 2)),
-        ((16, 32), False, (32, 1)),
-        ((16, 16), False, (16, 2)),
+        # (cg_mode, padded tokens, microbatches) on every rank.
+        ((15, 17), True, ("FULL", 32, 2)),
+        ((15, 17), False, ("FULL", 32, 1)),
+        # Exactly half of the graph: native admits the microbatched graph.
+        ((16, 32), False, ("FULL", 32, 2)),
+        ((16, 16), False, ("FULL", 16, 2)),
+        # No microbatched graph for the largest rank: native eager remains.
+        ((15, 70), True, ("NONE", 70, 2)),
     ],
 )
 def test_dp2_underfilled_rank_replays_a_graph_on_every_rank(
     native_patch, monkeypatch, tokens_across_dp, split_supported, expected
 ):
     import torch
-    from vllm.config import CUDAGraphMode
-    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu import dp_utils
 
     def all_reduce(tensor, group=None):
         # Peers vote like the calling rank except for their own batch size.
@@ -765,31 +907,35 @@ def test_dp2_underfilled_rank_replays_a_graph_on_every_rank(
             tensor[0, rank] = tokens
             tensor[5, rank] = tokens
 
-    monkeypatch.setattr(native_patch.dist, "all_reduce", all_reduce)
+    # Native coordination, and with it the native `2 * min < N` guard, runs
+    # unchanged; only the collective is local.
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
     monkeypatch.setattr(
-        native_patch, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
     )
     vllm_config = _vllm_config() if split_supported else _vllm_config(mla=True)
     manager = _NativeGraphManager(vllm_config)
+    parallel = _parallel(dp_size=len(tokens_across_dp))
 
     results = []
     for rank, tokens in enumerate(tokens_across_dp):
-        desc, sync = native_patch.sync_cudagraph_and_dp_padding(
+        desc, sync = native_patch.dispatch_cg_and_sync_dp(
             manager,
-            BatchExecutionDescriptor(CUDAGraphMode.FULL, tokens, tokens, 1),
             tokens,
             tokens,
             1,
             len(tokens_across_dp),
             rank,
-            parallel_config=_parallel(dp_size=len(tokens_across_dp)),
+            max_query_len=1,
+            parallel_config=parallel,
             allow_ubatching=True,
             uniform_decode=True,
         )
-        assert desc.cg_mode == CUDAGraphMode.FULL
-        assert sync is not None and not sync.eager
+        assert sync is not None
+        assert sync.eager is (desc.cg_mode.name == "NONE")
         assert torch.equal(
-            sync.num_tokens_across_dp, torch.full((2,), expected[0], dtype=torch.int32)
+            sync.num_tokens_across_dp,
+            torch.full((2,), desc.num_tokens, dtype=torch.int32),
         )
-        results.append((desc.num_tokens, desc.num_ubatches))
+        results.append((desc.cg_mode.name, desc.num_tokens, desc.num_ubatches))
     assert results == [expected] * len(tokens_across_dp)

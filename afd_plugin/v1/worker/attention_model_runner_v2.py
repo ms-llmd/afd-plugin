@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState
 
 from afd_plugin.compat.patches.gpu_mrv2_ubatching import (
+    use_captured_ubatch_split,
     use_gpu_mrv2_dbo_dispatch,
     use_gpu_mrv2_ubatch_factory,
 )
@@ -136,13 +137,16 @@ def _use_afd_ubatch_preparation(
         # factory alias, bypassing the ordinary AFD context provider. Its graph
         # branch also bypasses prepare_inputs_to_capture.
         # Patch functionality: decorate native stage state and publish one complete
-        # A/F payload before threads start (or before FULL replay).
+        # A/F payload before threads start (or before FULL replay). A FULL
+        # one-token decode is prepared at its captured split (see
+        # use_captured_ubatch_split) so an underfilled DP rank can replay it.
         # Signature: matches UBatchRunner.prepare in
         # vllm/v1/worker/gpu/ubatch_utils.py at vLLM
         # 5df63a7203cdb9328d824a27b682e77c7b9928be.
         # Delegation exception: keep native slicing/attention preparation in the
         # bound method. Remove this seam when upstream offers a prepared-state
-        # callback; no runner class or module-global function is replaced here.
+        # callback; no runner class is replaced, and the captured-split scope
+        # swaps the native split function only for that one native call.
         def prepare(
             self,
             input_batch: InputBatch,
@@ -152,9 +156,12 @@ def _use_afd_ubatch_preparation(
             for_capture: bool = False,
         ) -> UBatchState:
             # ### PATCH START: bind AFD to native stage state outside graph execution.
-            prepared = original_prepare(
-                input_batch, block_tables, slot_mappings, cg_mode, for_capture
-            )
+            with use_captured_ubatch_split(
+                self, input_batch, cg_mode, for_capture
+            ) as split_input_batch:
+                prepared = original_prepare(
+                    split_input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                )
             if event_tracker is not None:
                 desc, is_warmup = event_tracker.consume(
                     input_batch.num_reqs,

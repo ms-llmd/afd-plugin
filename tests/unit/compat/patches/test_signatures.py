@@ -198,6 +198,14 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="dbo-dispatch",
         ),
         pytest.param(
+            GPU_UBATCH,
+            None,
+            "create_ubatch_slices",
+            "gpu_mrv2_ubatching:captured_ubatch_slices",
+            None,
+            id="dbo-captured-split",
+        ),
+        pytest.param(
             "vllm.v1.worker.gpu.cudagraph_utils",
             None,
             "prepare_inputs_to_capture",

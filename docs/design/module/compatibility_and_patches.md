@@ -132,11 +132,84 @@ not the package dependency policy.
 | [`async_dp_forward_context.py`](../../../afd_plugin/compat/patches/async_dp_forward_context.py): `vllm.forward_context.set_forward_context` plus already-imported worker aliases | Skips native `DPMetadata` construction/coordination only for AFD async-DP; otherwise uses the copied upstream flow. | Imported by `register_afd`; same target/dev/unknown guard. Rebinds known already-imported aliases so callers do not retain the old function. | [`test_async_dp_forward_context.py`](../../../tests/unit/compat/patches/test_async_dp_forward_context.py) covers async skip and non-async coordination. | Remove when vLLM supports a per-engine-role opt-out from native MoE DP metadata coordination. |
 | [`config_validation.py`](../../../afd_plugin/compat/patches/config_validation.py): `EngineArgs.create_engine_config`, `VllmConfig.__post_init__` | For AFD-owned ubatching with a non-DeepEP backend, temporarily presents `deepep_low_latency` during upstream validation and restores the configured backend. After upstream platform normalization, maps an initial `worker_cls="auto"` to the role-specific CUDA or standard Ascend AFD worker. Native hybrid/multimodal DBO rejection remains intact, including Qwen3.5/3.6 GDN models. | Imported by `register_afd`; accepts the target version, development versions, or missing version metadata. Saves originals on upstream modules under AFD-specific attributes before installing wrappers. Explicit worker paths and non-AFD configs are not remapped. | [`test_config_validation.py`](../../../tests/unit/compat/patches/test_config_validation.py) covers backend relaxation, four role/platform mappings, explicit and non-AFD preservation, repeated validation, unsupported platforms, and dev versions. | Remove the backend branch when upstream validation distinguishes plugin-owned ubatching; remove worker mapping when vLLM offers plugin-owned role-aware worker selection. |
 | [`engine_core.py`](../../../afd_plugin/compat/patches/engine_core.py): `EngineCore.__init__`, `_initialize_kv_caches`, `shutdown`; `EngineCoreProc.run_busy_loop`; `DPEngineCoreProc.run_busy_loop` | AFD FFN becomes a connector daemon: construct executor, skip scheduler/KV setup, return an empty KV-shaped result on late paths, start/monitor/stop the FFN worker loop, and use FFN-safe shutdown. Non-FFN branches copy pinned upstream behavior. | Imported by `register_afd`; Installs under the target/dev compatibility check (also permitting missing version metadata); no saved-original sentinel. Direct class assignment remains tied to the pinned upstream implementation. | [`test_engine_core.py`](../../../tests/unit/compat/patches/test_engine_core.py) covers FFN initialization, non-FFN behavior, and daemon start/stop; role runtime tests cover error propagation. | Remove when vLLM offers a headless connector-daemon engine lifecycle or an executor mode that does not require scheduler/KV ownership. |
-| [`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py): `vllm.v1.worker.gpu.model_runner.maybe_build_ubatch_runner` and `dispatch_cg_and_sync_dp` aliases, `UBatchRunner.prepare` and `_make_forward_contexts` (instance-bound), `sync_cudagraph_and_dp_padding` (copied) | Builds the native `UBatchRunner` at DP1 with DP1 child DP metadata. FULL one-token decode microbatches keep the captured request/token split, so a DP rank holding at most half of the graph's requests replays the microbatched graph instead of running eager; a trailing microbatch without real requests keeps its padded shape. Configs without that split (speculative decoding, inner-state models, MLA, PCP/DCP) replay the regular graph instead. Other steps use native slicing and coordination. | Scoped to AFD Attention KV initialization and each `execute_model`; aliases are restored on exit. The prepare binding is per runner instance, chosen once from the config. | [`test_gpu_mrv2_ubatching.py`](../../../tests/unit/compat/patches/test_gpu_mrv2_ubatching.py) covers the DP1 factory and metadata, captured-split slicing against native vLLM slicing, padding-only microbatches, and DP1 and DP2 graph selection for underfilled ranks. | Remove the split and dispatch patches when native FULL microbatching keeps the captured split; the factory when native GPU DBO supports DP1. |
+| [`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py): `vllm.v1.worker.gpu.model_runner.maybe_build_ubatch_runner` and `dispatch_cg_and_sync_dp` aliases, `UBatchRunner._make_forward_contexts` (instance-bound), `vllm.v1.worker.gpu.ubatch_utils.create_ubatch_slices` (one `prepare` call) | Builds the native `UBatchRunner` at DP1 with DP1 child DP metadata. Where native dispatch would run an underfilled DP rank's microbatched FULL decode eager, the step replays the microbatched graph at the split it was captured with; configs without that split (speculative decoding, inner-state models, MLA, PCP/DCP) replay the regular graph instead. Native DP coordination and preparation run unchanged; see [GPU MRV2 captured microbatch split](#gpu-mrv2-captured-microbatch-split). | Scoped to AFD Attention KV initialization and each `execute_model`; aliases are restored on exit. The split function is swapped only around one native `prepare` call from the AFD preparation seam in `attention_model_runner_v2.py`. | [`test_gpu_mrv2_ubatching.py`](../../../tests/unit/compat/patches/test_gpu_mrv2_ubatching.py) covers the DP1 factory and metadata, the captured split against native slicing, a padding-only microbatch through native `prepare`, and DP1 and DP2 graph selection for underfilled ranks through native coordination. | Remove the split and dispatch patches when native FULL microbatching keeps the captured split; the factory when native GPU DBO supports DP1. |
 | [`npu/ascend_platform.py`](../../../afd_plugin/compat/patches/npu/ascend_platform.py): `NPUPlatform.check_and_update_config` | Snapshots AFD DBO state, runs upstream normalization, and restores configured `enable_dbo`, `ubatch_size`, and `all2all_backend` in `finally`; non-AFD behavior is unchanged. | Installed through the config facade during AFD NPU normalization and verified again by the worker runtime facade; no version guard. Saves the original on the class and uses a class sentinel. The runtime facade caches success only after the wrapper is installed, so an early missing vLLM-Ascend import remains retryable. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) and [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py). | Remove when vLLM-Ascend recognizes plugin-owned DBO workers or no longer clears these fields. |
 | [`npu/ascend_config.py`](../../../afd_plugin/compat/patches/npu/ascend_config.py): `vllm_ascend.ascend_config.init_ascend_config`, loaded factory aliases, and the AFD DP child entry point | Excludes the AFD namespace from native constructor arguments; preserves config identity, validation, singleton publication, and cache refresh. DP children install the factory before native Ascend initialization. | Installed by the NPU config facade; rebinds already-loaded aliases. The DP entry point is selected only for AFD synchronous Attention or FFN. | [`test_ascend_config_lifecycle.py`](../../../tests/unit/compat/npu/test_ascend_config_lifecycle.py), [`test_ascend_engine_core_binding.py`](../../../tests/unit/compat/npu/test_ascend_engine_core_binding.py). | Remove when Ascend accepts plugin namespaces and loads general plugins before config validation in every DP child. |
 | [`npu/mla_graph.py`](../../../afd_plugin/compat/patches/npu/mla_graph.py): `vllm_ascend.attention.mla_v1.get_graph_params` | Resolves an AFD ubatch-owned `GraphParams` registry from the active forward context and otherwise delegates to the saved upstream process-global resolver. | Called through `apply_afd_ascend_patches_if_needed` during NPU worker startup; no version guard. Saves the original on the upstream module and uses a module sentinel. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) covers AFD-context resolution, upstream fallback, and idempotence; [`test_npu_mla_graph.py`](../../../tests/unit/v1/worker/test_npu_mla_graph.py) covers the owning graph lifecycle. | Remove when vLLM-Ascend accepts a forward-context-local MLA graph registry or exposes an equivalent resolver hook. |
 | [`npu/mrv2_ubatching.py`](../../../afd_plugin/compat/patches/npu/mrv2_ubatching.py): native ubatch factory, dispatch, child DP metadata, input slicing, context and stream aliases | Builds `NPUUBatchRunner`, enables Async CAM DBO at DP1, omits Async child DP coordination, applies native truncation to Ascend CPU sequence lengths, preserves model-specific PP slices/nested auxiliary outputs, and provides NPU stream/failure handling during eager and capture. Native MRV2 owns execution and graph lifecycle. | Scoped to AFD initialization, preparation or execution; every replaced alias is restored in `finally`. The scope temporarily changes module symbols, so it is not an independent concurrent-runner API. | [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py), [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_mrv2_dbo.py`](../../../tests/npu/test_mrv2_dbo.py). | Remove when native vLLM/Ascend supports NPU child builders and streams, optional child DP metadata, DP1 DBO and peer cancellation. |
+
+## GPU MRV2 captured microbatch split
+
+A FULL microbatched decode graph replays the request and token offsets fixed
+at capture. Native vLLM 0.32.0 re-derives the split from the real requests on
+every step, so it runs a microbatched step eager whenever the smallest DP rank
+fills at most half of the graph (`2 * min < N` in
+`sync_cudagraph_and_dp_padding`).
+[`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py)
+keeps such steps on a graph with two seams and no copied native coordination
+or preparation:
+
+- `dispatch_cg_and_sync_dp` runs native DP coordination unchanged. When it
+  returns an eager microbatched descriptor while a FULL microbatched graph
+  matches the agreed token count, only that guard refused the graph; AFD then
+  selects the microbatched graph, or the regular graph for configs without the
+  captured split. The decision reads only DP-agreed values, so every rank picks
+  the same graph without another collective. DP1 applies the same rule locally.
+- `use_captured_ubatch_split` wraps one native `UBatchRunner.prepare` call of a
+  FULL one-token decode. It installs `captured_ubatch_slices` as the module's
+  `create_ubatch_slices` and passes a copy of the batch that bounds queries at
+  one token and gives the first row of each microbatch without real requests a
+  one-token host sequence bound.
+
+### Correctness risk
+
+- The trailing microbatch may hold padding requests only. Attention metadata
+  builders and every kernel in the graph must accept it on replay. This is
+  validated only for configs `replays_captured_ubatch_split` admits, by the GPU
+  E2E gate; other attention backends and models rely on the same preparation
+  path but have no padding-only replay evidence.
+- The dispatch and preparation seams must agree. A microbatched graph chosen
+  for an underfilled rank replays correctly only when the same step is prepared
+  at the captured split. `_use_afd_execution_context` enters both; entering
+  `use_gpu_mrv2_dbo_dispatch` without the AFD preparation seam replays shifted
+  attention metadata without an error.
+- A padding-only microbatch has a host sequence bound of one on its first row
+  and zero device sequence lengths. Kernels captured with `max_model_len`
+  ignore the host bound; a backend that plans replay work from it plans one
+  token for that row.
+- At exactly half of the graph (`2 * min == N`), native vLLM admits the
+  microbatched graph with its own split. Configs without the captured split
+  keep that behavior: the shifted request has no query tokens in the trailing
+  microbatch, so it computes no real output.
+
+### Assumptions on vLLM slicing internals
+
+The seams rely on these vLLM 0.32.0 (`5df63a72`) internals. The
+`vllm_runtime` tests in
+[`test_gpu_mrv2_ubatching.py`](../../../tests/unit/compat/patches/test_gpu_mrv2_ubatching.py)
+pin each one against the installed vLLM, and
+[`test_signatures.py`](../../../tests/unit/compat/patches/test_signatures.py)
+pins the replaced signatures:
+
+1. `UBatchRunner.prepare` takes its split only from the module-level
+   `create_ubatch_slices`, looked up at call time; nothing else calls it.
+2. Capture prepares `InputBatch.make_dummy(N, N)` through the same `prepare`,
+   so microbatch `i` of a FULL one-token graph covers requests and tokens
+   `[i * (N // n), (i + 1) * (N // n))`, the last one taking the remainder.
+3. `_slice_input_batch` keeps the parent's `max_query_len` and copies each
+   microbatch's host sequence bounds from the parent's request rows.
+4. FULL `DefaultModelState.prepare_attn` sizes metadata by padded counts and
+   derives `max_query_len` from the microbatch's own query lengths unless the
+   batch carries one, and `max_seq_len` from the host sequence bounds.
+5. `sync_cudagraph_and_dp_padding` reports the guard only as an eager
+   descriptor with more than one microbatch, and
+   `CudaGraphManager.dispatch(..., num_ubatches=n)` returns either a FULL
+   microbatched graph or an eager descriptor.
+
+vLLM after 0.32.0 already changes `UBatchRunner.prepare` to take the batch
+descriptor and DP sync state, adds a `uniform_token_count` parameter to
+`create_ubatch_slices`, and adds `DPSyncState` fields. Re-check every
+assumption when the pin moves.
 
 ## Temporary CUDA DeepSeek-V4 DBO fixes
 
