@@ -767,7 +767,7 @@ def test_ffn_runner_requires_dp_metadata_list():
 
 
 def test_ffn_runner_profiles_zero_cudagraph_memory():
-    """vLLM 0.30.0 Worker.determine_available_memory calls this on CUDA when
+    """vLLM Worker.determine_available_memory calls this on CUDA when
     CUDA graphs are enabled; FFN graphs are captured lazily from the connector
     loop into their own pool, so the engine estimate must stay zero."""
 

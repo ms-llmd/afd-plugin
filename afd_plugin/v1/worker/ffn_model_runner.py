@@ -214,7 +214,7 @@ class GPUFFNModelRunner:
         self.eplb_step(is_dummy=is_warmup or is_graph_capturing)
         return None
 
-    # Patch reason: vLLM 0.30.0 steps EPLB from GPUModelRunner methods
+    # Patch reason: vLLM steps EPLB from GPUModelRunner methods
     # (sample_tokens/pool/dummy_run via step_eplb_after); the FFN runner is
     # connector-driven and has no native runner methods to decorate, so the
     # connector step paths call this seam directly after each forward.
@@ -223,8 +223,8 @@ class GPUFFNModelRunner:
     # rearrangement counters of all FFN ranks in lockstep without recording
     # their (garbage) expert load.
     # Signature: mirrors GPUModelRunner.eplb_step; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu/eplb_utils.py,
-    # step_eplb_after; commit ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # Upstream: vllm/v1/worker/gpu/eplb_utils.py,
+    # step_eplb_after.
     def eplb_step(self, is_dummy: bool = False) -> None:
         """Step the FFN-side EPLB state after one connector-driven step."""
 
@@ -250,7 +250,7 @@ class GPUFFNModelRunner:
         if not self.vllm_config.parallel_config.eplb_config.log_balancedness:
             return None
         # Every FFN EP rank holds the same global map; only rank 0 logs.
-        # ``rank_in_group`` is an attribute in vLLM 0.30's GroupCoordinator,
+        # ``rank_in_group`` is an attribute in vLLM's GroupCoordinator,
         # the rank inside the EP group.
         if get_ep_group().rank_in_group != 0:
             return None

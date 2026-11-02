@@ -1200,7 +1200,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
 
 
 def test_v2_capture_profile_only_truncates_tracker_and_forwards_flag(monkeypatch):
-    """Mirror the 0.30.0 memory-profiling capture: the manager truncates the
+    """Mirror the memory-profiling capture: the manager truncates the
     FULL descriptor list to ``_max_full_descs_to_capture`` and the AFD wrapper
     must forward ``profile_only`` while pairing exactly the captured subset."""
     events: list[str] = []

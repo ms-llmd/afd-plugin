@@ -477,8 +477,7 @@ def _ffn_num_physical_experts(vllm_config: VllmConfig) -> int:
     """Physical expert slots the FFN loads: logical experts plus EPLB
     redundant copies. DeepEP routes rows to slots, so every rank must agree
     on this count."""
-    text_config = vllm_config.model_config.hf_text_config
-    num_experts = int(text_config.num_experts)
+    num_experts = vllm_config.model_config.get_num_experts()
     if not vllm_config.parallel_config.enable_eplb:
         return num_experts
     return num_experts + int(
@@ -987,7 +986,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             num_experts=(
                 _ffn_num_physical_experts(vllm_config)
                 if afd_config.role == "ffn"
-                else int(text_config.num_experts)
+                else vllm_config.model_config.get_num_experts()
             ),
         )
         # EPLB coordination (see deepep_m2n/eplb.py): an Attention-side load

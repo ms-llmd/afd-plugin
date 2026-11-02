@@ -342,7 +342,7 @@ CUDA graphs capture.
 
 ## FFN-side EPLB
 
-The FFN role can enable vLLM 0.30's expert-parallel load balancing
+The FFN role can enable vLLM's expert-parallel load balancing
 (`--enable-eplb` plus `--eplb-config`). `GPUFFNModelRunner` owns the native
 `EPLBController` and follows the upstream `GPUModelRunner` wiring:
 
