@@ -12,10 +12,17 @@ no longer exists:
 
 Reports live on a reports PVC, independently of any pod, so every past run
 is still retrievable as long as that PVC exists. Mount it from a short-lived
-busybox helper, pinned to the serving node -- the PVC is `ReadWriteOnce`, so
-a second pod can only attach it from the node where it is already mounted,
-otherwise `Multi-Attach error for volume ...` leaves the helper `Pending`
-indefinitely.
+busybox helper, pinned to the node where that PVC is attached -- it is
+`ReadWriteOnce`, so a second pod can only attach it from the node that
+already holds it, otherwise `Multi-Attach error for volume ...` leaves the
+helper `Pending` indefinitely. Pick the node from whatever already has it,
+never from a serving pod's name (`vllm-pod` does not exist any more; a
+multi-pod plan's pods are `${DEPLOY_NAME}-pod-<role>-<ordinal>`):
+
+```bash
+kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}' \
+  | grep -i bench || true   # last bench pod, if it still exists
+```
 
 Set `RUN_ID` to the run you want and `LOCAL_DIR` to where it should land:
 
@@ -26,7 +33,11 @@ LOCAL_DIR="./reports/${RUN_ID}"
 
 ```bash
 HELPER=vllm-bench-reports-copy
-VLLM_NODE="$(kubectl get pod vllm-pod -o jsonpath='{.spec.nodeName}')"
+# Pin only while another pod still holds vllm-bench-reports -- normally the
+# last vllm-bench pod, or an earlier copy helper. An empty value means
+# nothing holds it, so any node can attach it: drop the `nodeName:` line
+# below in that case rather than emitting it empty.
+VLLM_NODE="<node from the lookup above>"
 
 kubectl delete pod "${HELPER}" --ignore-not-found
 envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
@@ -77,8 +88,9 @@ kubectl delete pod "${HELPER}" --ignore-not-found
 before choosing a `RUN_ID`.
 
 The helper mounts the PVC `readOnly`, so it cannot disturb a run in
-progress. It is still safe to skip the node pin only if no other pod has the
-PVC attached -- pinning is harmless either way, so keep it.
+progress. Pinning is harmful only when the node is wrong, so leave
+`nodeName:` out entirely when nothing holds the claim (see the note above
+the manifest).
 
 If the PVC itself is gone, the reports are gone: nothing here recovers them.
 Copy reports out promptly rather than relying on the PVC as archival storage.
