@@ -8,7 +8,7 @@ RPC. Its daemon does not service HTTP RPC. CUDA V4 also records a bounded set
 of successful live transactions, pairing native A input IDs with the actual
 first local Hash-layer F input IDs. Capture retains references without D2H.
 CUDA target: 5df63a7203cdb9328d824a27b682e77c7b9928be (0.32.0).
-Ascend retains the existing 0.30 call without CUDA's randomize_inputs argument.
+Ascend retains the existing native call without CUDA's randomize_inputs argument.
 Remove these wrappers when upstream exposes equivalent live Attention/FFN
 replay and microbatch counters.
 """
@@ -396,7 +396,7 @@ def _install_probes() -> type:
     # Patch functionality: count completed live replay and nonempty microbatches.
     # Signature/source: GPUModelRunner.execute_model, CUDA vLLM 5df63a7,
     # vllm/v1/worker/gpu/model_runner.py. Delegation is observation-only.
-    # Ascend retains its 0.30 native call; randomize_inputs is CUDA-only.
+    # Ascend retains its native call; randomize_inputs is CUDA-only.
     def execute(
         self,
         scheduler_output: SchedulerOutput,

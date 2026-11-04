@@ -160,10 +160,35 @@ def validate_gpu_model_runner_v2_config(
     if (
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
-        or parallel.enable_eplb
         or parallel.use_sequence_parallel_moe
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
+    if parallel.enable_eplb:
+        # EPLB runs on the FFN role only: Attention holds no experts and no
+        # MoE routing, and its CUDA remote-expert shells reject EPLB.
+        if expected_role != "ffn":
+            raise RuntimeError(
+                "AFD ModelRunnerV2 supports EPLB only on the FFN role",
+            )
+        # The FFN-side record kernel selects its per-ubatch unpadded token
+        # tensor through vLLM's DBO thread context, which the FFN daemon loop
+        # never installs, so DBO steps would read the wrong token count.
+        if parallel.enable_dbo or parallel.use_ubatching:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 FFN EPLB does not support DBO or ubatching",
+            )
+        # vLLM 0.32 async EPLB commits new expert maps from a background
+        # worker outside the connector step boundary: AFD steps EPLB from
+        # the connector loop, and the M2N exchange adopts the committed maps
+        # only at that boundary. Migration batching is async-only, so this
+        # gate covers it too.
+        if parallel.eplb_config.use_async:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 FFN EPLB does not support async EPLB: "
+                "rearrangement commits expert maps from a background worker "
+                "outside the connector step boundary. Pass use_async=false "
+                "in --eplb-config.",
+            )
     if (
         parallel.enable_dbo or parallel.use_ubatching
     ) and parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:

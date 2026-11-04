@@ -156,6 +156,7 @@ def _v2_config(
         enable_expert_parallel=True,
         enable_elastic_ep=False,
         enable_eplb=False,
+        eplb_config=SimpleNamespace(use_async=False),
         use_sequence_parallel_moe=False,
         is_moe_model=True,
         enable_dbo=False,
@@ -495,7 +496,48 @@ _GPU_GRAPH = {
             {"par.enable_elastic_ep": True}, _err("static expert"), id="reject-elastic"
         ),
         pytest.param(
-            {"par.enable_eplb": True}, _err("static expert"), id="reject-eplb"
+            {"par.enable_eplb": True},
+            _err("EPLB only on the FFN role"),
+            id="reject-attention-eplb",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+            },
+            None,
+            id="accept-ffn-eplb",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.eplb_config.use_async": True,
+            },
+            _err("async EPLB"),
+            id="reject-ffn-eplb-async",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.enable_dbo": True,
+            },
+            _err("DBO or ubatching"),
+            id="reject-ffn-eplb-dbo",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.use_ubatching": True,
+            },
+            _err("DBO or ubatching"),
+            id="reject-ffn-eplb-ubatching",
         ),
         pytest.param(
             {"par.use_sequence_parallel_moe": True},
@@ -1169,7 +1211,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
 
 
 def test_v2_capture_profile_only_truncates_tracker_and_forwards_flag(monkeypatch):
-    """Mirror the 0.30.0 memory-profiling capture: the manager truncates the
+    """Mirror the memory-profiling capture: the manager truncates the
     FULL descriptor list to ``_max_full_descs_to_capture`` and the AFD wrapper
     must forward ``profile_only`` while pairing exactly the captured subset."""
     events: list[str] = []
@@ -2050,6 +2092,7 @@ def test_v2_load_model_reports_moe_layers_to_routed_connector(monkeypatch):
     assert connector.init_kwargs == {
         "moe_layer_indices": (1, 3),
         "local_experts": None,
+        "eplb_state": None,
     }
 
 

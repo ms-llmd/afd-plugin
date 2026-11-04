@@ -137,7 +137,7 @@ class PreparedUBatchRunner:
 
 
 class LegacyNPUAttentionMetadataState:
-    """Expose the vLLM 0.30 attention-preparation signature on CPU."""
+    """Expose the legacy vLLM attention-preparation signature on CPU."""
 
     def __init__(self):
         self.prepare_error = None
