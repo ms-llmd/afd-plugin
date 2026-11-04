@@ -58,6 +58,11 @@ Carry `DEPLOY_NAME`, `NAMESPACE`, and `CLIENT_PORT` into every later step:
 the endpoint name and port belong to the deployment, so a hard-coded
 `vllm-service:18305` only works while both defaults happen to match.
 
+The bench pod runs the same image the deployment does -- `AFD_PLUGIN_IMAGE`,
+the value you passed to `deploy-afd-k8s`. That skill only uses it as a prefix
+assignment on its own `envsubst`, so it sets nothing you can read back later;
+the manifest's `TEMPLATE_IMAGE` is initialised from it in step 4.
+
 ```bash
 export DEPLOY_NAME=${DEPLOY_NAME:-vllm}
 export NAMESPACE="<namespace reported by deploy-afd-k8s>"
@@ -172,8 +177,10 @@ name it interpolates, including step 1's `RUN_ID` and the values carried
 over from step 2:
 
 ```bash
-# Re-export: envsubst skips unexported names silently, and an empty RUN_ID,
-# MODEL_ID or PVC_NAME gives a pod that honours none of the run's identity.
+# deploy-afd-k8s passes its image as a prefix assignment to its own envsubst,
+# so TEMPLATE_IMAGE is never left set in this shell -- initialise it from the
+# deployment's image. envsubst skips unexported names silently, and an empty
+# RUN_ID, MODEL_ID or PVC_NAME gives a pod that honours none of the run.
 export TEMPLATE_IMAGE="${TEMPLATE_IMAGE:-$AFD_PLUGIN_IMAGE}"
 [ -n "$TEMPLATE_IMAGE" ] || { echo "set AFD_PLUGIN_IMAGE to the image deploy-afd-k8s used"; exit 1; }
 export MODEL_ID PVC_NAME RUN_ID DEPLOY_NAME CLIENT_PORT
@@ -378,7 +385,7 @@ cat > "${LOCAL_DIR}/run.json" <<EOF
   "harness": "vllm-bench-serve",
   "recipe": "${RECIPE_SCRIPT_PATH}",
   "model_id": "${MODEL_ID}",
-  "image": "${AFD_PLUGIN_IMAGE}",
+  "image": "${TEMPLATE_IMAGE}",
   "gpu_count": "${GPU_COUNT}",
   "max_num_batched_tokens": <the attention role's, from deploy step 2>,
   "workload": "<balanced|max-throughput|prefix-heavy|long-context|smoke|custom>",
