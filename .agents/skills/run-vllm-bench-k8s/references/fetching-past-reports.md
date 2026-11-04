@@ -32,13 +32,19 @@ LOCAL_DIR="./reports/${RUN_ID}"
 ```
 
 ```bash
-HELPER=vllm-bench-reports-copy
+export HELPER=vllm-bench-reports-copy
 # Pin only while another pod still holds vllm-bench-reports -- normally the
 # last vllm-bench pod, or an earlier copy helper. An empty value means
 # nothing holds it, so any node can attach it: drop the `nodeName:` line
 # below in that case rather than emitting it empty.
-VLLM_NODE="<node from the lookup above>"
+export VLLM_NODE="<node from the lookup above>"
+```
 
+Both are exported because `envsubst` only reads **exported** variables: an
+unexported name substitutes as empty with no error, which would render an
+empty `metadata.name` and make `kubectl apply` reject the helper pod.
+
+```bash
 kubectl delete pod "${HELPER}" --ignore-not-found
 envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
 apiVersion: v1

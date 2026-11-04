@@ -167,12 +167,18 @@ The pod runs the AFD image, so the wrapper is already on disk at
 
 Export the workload chosen in step 3 -- these are the `balanced` defaults.
 `envsubst` only sees **exported** variables -- an unexported name
-substitutes as empty with no error, so `export` every name in the list
-below, including `TEMPLATE_IMAGE`/`MODEL_ID`/`RUN_ID`/`PVC_NAME`/
-`DEPLOY_NAME`/`CLIENT_PORT` carried over from step 2, and `VLLM_NODE` too if
-you will pin the pod (see below):
+substitutes as empty with no error -- so the block below re-exports every
+name it interpolates, including step 1's `RUN_ID` and the values carried
+over from step 2:
 
 ```bash
+# Re-export: envsubst skips unexported names silently, and an empty RUN_ID,
+# MODEL_ID or PVC_NAME gives a pod that honours none of the run's identity.
+export TEMPLATE_IMAGE="${TEMPLATE_IMAGE:-$AFD_PLUGIN_IMAGE}"
+[ -n "$TEMPLATE_IMAGE" ] || { echo "set AFD_PLUGIN_IMAGE to the image deploy-afd-k8s used"; exit 1; }
+export MODEL_ID PVC_NAME RUN_ID DEPLOY_NAME CLIENT_PORT
+export VLLM_NODE          # empty is fine when you are not pinning
+
 export DATASET_NAME=random
 export INPUT_LEN=1024
 export OUTPUT_LEN=256
@@ -318,7 +324,12 @@ The pod holds after the sweep, so completion is the sentinel file, not a
 `Succeeded` phase -- which also preserves the exit code:
 
 ```bash
-kubectl logs -f pod/vllm-bench 2>/dev/null || true
+# Never foreground-follow the log: the container holds with `sleep infinity`
+# until activeDeadlineSeconds (4h), so `kubectl logs -f` never returns and
+# the sentinel polling below would never run. Read progress without -f, or
+# follow it in the background.
+kubectl logs pod/vllm-bench --tail=200 2>/dev/null || true
+# kubectl logs -f pod/vllm-bench > "/tmp/${RUN_ID}.log" 2>&1 &
 
 deadline=$(( $(date +%s) + 7200 ))
 RC=""
@@ -328,7 +339,9 @@ while true; do
     "")      echo "vllm-bench pod is gone"; exit 1 ;;
     Failed)  echo "vllm-bench Failed (OOM, or activeDeadlineSeconds hit)"
              kubectl describe pod vllm-bench | tail -20
-             kubectl logs vllm-bench --tail=100; exit 1 ;;
+             kubectl logs vllm-bench --tail=100
+             echo "finished points are still on vllm-bench-reports -- see references/fetching-past-reports.md"
+             exit 1 ;;
   esac
   RC="$(kubectl exec vllm-bench -- cat "/reports/${RUN_ID}/.exit_code" 2>/dev/null || true)"
   [ -n "$RC" ] && break
