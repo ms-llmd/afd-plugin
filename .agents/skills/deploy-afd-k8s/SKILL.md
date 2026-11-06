@@ -29,7 +29,9 @@ than one pod) -- callers never talk to these directly. See
 
 ## Scope
 
-- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` (GPU only, not NPU),
+- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` or
+  `recipe/gpu/DeepEPM2NAFDConnector/**` (GPU only, not NPU; the M2N image
+  must contain afdEP-comm and DeepGEMM),
   **`prefill_decode_colocation` only** (attention + FFN workers, no prefill
   split).
   `prefill_decode_disaggregation` recipes are **out of scope**: they need a
@@ -44,7 +46,12 @@ than one pod) -- callers never talk to these directly. See
   `# For pod N: POD=...` line per pod, but the comment isn't guaranteed to
   use that exact grammar going forward. See
   [resolve-recipe.md](references/resolve-recipe.md).
-- Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
+- `DeepEPM2NAFDConnector` recipes take their placement from `LAYOUT` (one
+  pod per `<a>A<f>F` entry) and run-specific settings as env (`VLLM_ARGS`,
+  `DECODE_BENCH`, ...); see [resolve-recipe.md](references/resolve-recipe.md).
+  This skill only serves; the decode-only benchmark's client
+  (`tools/benchmarks/decode_bench_client.py`) is run separately against the
+  endpoint.
 
 ## Requirements
 

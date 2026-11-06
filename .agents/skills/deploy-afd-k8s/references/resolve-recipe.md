@@ -1,7 +1,8 @@
 # 1. Resolve the recipe, its model, and its placement
 
 Take the recipe path from the user, or ask. It must be a colocation recipe
-under `recipe/gpu/P2pNcclAFDConnector/**/prefill_decode_colocation/` (GPU
+under `recipe/gpu/P2pNcclAFDConnector/**/prefill_decode_colocation/` or
+`recipe/gpu/DeepEPM2NAFDConnector/**/prefill_decode_colocation/` (GPU
 only; prefill/decode disaggregation recipes are out of scope -- see
 `SKILL.md` Scope).
 
@@ -88,3 +89,37 @@ For each entry, derive (used by [deploy.md](deploy.md) and
   which case `worker` if that line's `ATTENTION_HEADLESS` override is `1`,
   else `head`.
 - **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
+
+### `LAYOUT` recipes: `POD=AFD_<index>`
+
+The `DeepEPM2NAFDConnector` recipes (`graph.sh`, `eager.sh`, `dbo.sh` under
+`recipe/gpu/DeepEPM2NAFDConnector/<model>/prefill_decode_colocation/`) state
+their placement through `LAYOUT`: one pod per comma-separated `<a>A<f>F`
+entry, in order, pod `k` running `POD=AFD_<k>`, every pod with the same
+`LAYOUT`. Take `LAYOUT` from the caller's settings, else from the script's
+`LAYOUT=${LAYOUT:-...}` default; never ask. Each pod derives its own DP flags
+(headless, start rank), devices and roles from `LAYOUT` and `POD`, so for
+entry `k` with `a` Attention and `f` FFN ranks:
+
+- **k8s Pod name**: `vllm-pod-afd-<k>`. A one-entry `LAYOUT` (the default
+  `2A2F`) is a plain single pod: `vllm-pod`, no `POD` needed.
+- **GPU count**: `a + f`. The recipe computes `CUDA_VISIBLE_DEVICES` (FFN on
+  the pod's first `f` GPUs), so there is no literal to read.
+- **`afd-attn-node-role`**: `none` when `a` is 0, `head` on the first entry
+  with `a > 0`, `worker` on later ones. **`afd-ffn-node-role`**: the same
+  with `f`. For example `2A0F,0A2F` is `head none` and `none head`, and
+  `1A1F,1A1F` is `head head` and `worker worker`.
+- **Container env**: `POD=AFD_<k>` and `LAYOUT=<layout>`, plus every setting
+  the caller gives (`MODEL_PATH`, `ATTN_TP`, `VLLM_ARGS`, `ATTN_ARGS`,
+  `FFN_ARGS`, `DECODE_BENCH`, `M2N_EXTRA_CONFIG`, NCCL variables), the same on
+  every pod. Leave `HEAD_HOST`, `ATTN_HEAD_HOST` and `FFN_HEAD_HOST` unset:
+  the defaults name the Services from [services.md](services.md). With
+  `DECODE_BENCH`, also set `AFD_REPO=/opt/afd-plugin` (the repository in
+  `docker/Dockerfile.ci` images), since the connector lives in
+  `tools/benchmarks` and the recipe runs from `/work`.
+- **Ports** are literals: `--port 18000` on the Attention `vllm serve`
+  (`CLIENT_PORT`), the AFD rendezvous `"port": 6239` in the `afd` JSON, and
+  the DP RPC ports as the third argument of the two `role_dp` calls (`13355`
+  FFN, `13345` Attention).
+- Whether the connector accepts the placement is checked at startup, not
+  here; see the connector guide's supported layouts.
