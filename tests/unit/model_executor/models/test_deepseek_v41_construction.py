@@ -71,7 +71,11 @@ def _afd_config(role: str, **overrides) -> SimpleNamespace:
         ({}, {"parallel_config.use_ubatching": True}, "DBO"),
         ({}, {"parallel_config.tensor_parallel_size": 2}, "TP=1"),
         ({}, {"kernel_config.moe_backend": MEGA_MOE_BACKEND}, "MegaMoE"),
-        ({}, {"speculative_config": object()}, "speculative decoding"),
+        (
+            {},
+            {"speculative_config": SimpleNamespace(method="eagle3")},
+            "only with the native DSpark drafter",
+        ),
     ],
     ids=[
         "ffn-role",
@@ -100,8 +104,16 @@ def test_attention_model_rejects_unsupported_deployments(
         )
 
 
-def test_attention_model_accepts_the_supported_deployment():
-    deepseek_v41._validate_attention_config(_vllm_config(), _afd_config("attention"))
+@pytest.mark.parametrize(
+    "speculative_config",
+    [None, SimpleNamespace(method="dspark")],
+    ids=["no-spec", "dspark"],
+)
+def test_attention_model_accepts_the_supported_deployment(speculative_config):
+    """Plain decoding and DSpark (drafter local on Attention) are supported."""
+    deepseek_v41._validate_attention_config(
+        _vllm_config(speculative_config=speculative_config), _afd_config("attention")
+    )
 
 
 @pytest.mark.parametrize(

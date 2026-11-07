@@ -259,6 +259,7 @@ class AFDDeepseekV41RoutedExperts(nn.Module):
 
 
 ROUTED_EXPERTS_PATH = ".ffn.experts."
+DSPARK_METHOD = "dspark"
 
 
 def _validate_attention_config(vllm_config: VllmConfig, afd_config: AFDConfig) -> None:
@@ -295,8 +296,15 @@ def _validate_attention_config(vllm_config: VllmConfig, afd_config: AFDConfig) -
         raise RuntimeError("AFD DeepSeek-V4.1 does not support EPLB")
     if vllm_config.lora_config is not None:
         raise RuntimeError("AFD DeepSeek-V4.1 does not support LoRA")
-    if vllm_config.speculative_config is not None:
-        raise RuntimeError("AFD DeepSeek-V4.1 does not support speculative decoding")
+    # DSpark M1: the native drafter runs on each Attention rank with its own
+    # local experts; only the target's MoE layers cross the AFD boundary.
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is not None and speculative_config.method != DSPARK_METHOD:
+        raise RuntimeError(
+            "AFD DeepSeek-V4.1 supports speculative decoding only with the "
+            f"native DSpark drafter (method {DSPARK_METHOD!r}), got "
+            f"{speculative_config.method!r}"
+        )
     # Replay changes per-layer token counts within a step; every MoE layer of
     # an AFD step must carry the same token plan.
     if vllm_config.cache_config.swa_bounded_replay:
