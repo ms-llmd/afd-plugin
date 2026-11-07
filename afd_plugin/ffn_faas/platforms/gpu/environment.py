@@ -103,9 +103,10 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         re-asserts the ``external_launcher`` executor, swaps in the
         FFN-only routed-experts architecture that ``AFDFFNWorker.init_device``
         selects for this connector, and pins vLLM's MoE backend (Triton, or
-        Marlin for MXFP4 experts) as ``AFDFFNWorker._make_model_runner`` does. The pin must happen before
-        any FusedMoE is constructed: FusedMoE picks its weight layout at
-        construction, and a reordered layout would be read silently wrong.
+        Marlin for MXFP4 experts) as ``AFDFFNWorker._make_model_runner``
+        does. The pin must happen before any FusedMoE is constructed:
+        FusedMoE picks its weight layout at construction, and a reordered
+        layout would be read silently wrong.
         """
         from vllm.engine.arg_utils import EngineArgs
 
