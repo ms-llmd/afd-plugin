@@ -4,11 +4,11 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR
+from afd_plugin.ffn_faas.platforms.launch import validate_common_ffn_launch
 
 
 @dataclass(frozen=True)
@@ -25,60 +25,44 @@ class FFNConfig:
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
     full_graph: bool = False
-    ffn_two_stream: bool = False
-    ffn_compute_aic_num: int | None = None
-    ffn_compute_aiv_num: int | None = None
-    ffn_combine_aiv_num: int | None = None
     hccl_buffer_size: int | None = None
     shutdown_timeout: float = 5.0
 
     def __post_init__(self) -> None:
         positive = (
-            self.attention_ranks,
             self.attention_tp,
-            self.ffn_ranks,
             self.max_num_batched_tokens,
             self.max_num_seqs,
         )
         if any(value <= 0 for value in positive):
-            raise ValueError(
-                "rank counts, TP and scheduler capacities must be positive"
-            )
+            raise ValueError("Attention TP and scheduler capacities must be positive")
         if self.attention_ranks % self.attention_tp:
             raise ValueError("Attention ranks must be divisible by Attention TP")
         if self.max_num_batched_tokens % self.attention_tp:
             raise ValueError(
                 "the CAM dispatch envelope must be divisible by Attention TP"
             )
-        if not 0 <= self.rank < self.ffn_ranks or min(self.local_rank, self.device) < 0:
-            raise ValueError("invalid F rank or local device")
-        if not self.host or not 0 < self.port < 65536:
-            raise ValueError("CAM rendezvous requires a host and a valid port")
-        if not math.isfinite(self.shutdown_timeout) or self.shutdown_timeout <= 0:
-            raise ValueError("shutdown timeout must be finite and positive")
-        optional_positive = (
-            self.ffn_compute_aic_num,
-            self.ffn_compute_aiv_num,
-            self.ffn_combine_aiv_num,
-            self.hccl_buffer_size,
+        validate_common_ffn_launch(
+            attention_ranks=self.attention_ranks,
+            ffn_ranks=self.ffn_ranks,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            host=self.host,
+            port=self.port,
+            shutdown_timeout=self.shutdown_timeout,
         )
-        if any(value is not None and value <= 0 for value in optional_positive):
-            raise ValueError("explicit CAM core and HCCL budgets must be positive")
+        if self.device < 0:
+            raise ValueError("invalid local NPU device")
+        if self.hccl_buffer_size is not None and self.hccl_buffer_size <= 0:
+            raise ValueError("explicit CAM HCCL buffer size must be positive")
 
     def additional_config(self) -> dict:
         extra = {
             "dynamicQuant": 1,
             "attn_ranks_per_dp": self.attention_tp,
-            "ffn_two_stream": self.ffn_two_stream,
         }
-        for name, value in (
-            ("ffn_compute_aic_num", self.ffn_compute_aic_num),
-            ("ffn_compute_aiv_num", self.ffn_compute_aiv_num),
-            ("ffn_combine_aiv_num", self.ffn_combine_aiv_num),
-            ("hccl_buffer_size", self.hccl_buffer_size),
-        ):
-            if value is not None:
-                extra[name] = value
+        if self.hccl_buffer_size is not None:
+            extra["hccl_buffer_size"] = self.hccl_buffer_size
         return {
             "afd": {
                 "connector": AFD_ASYNC_CONNECTOR,

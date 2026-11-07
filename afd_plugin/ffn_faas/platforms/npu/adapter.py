@@ -10,6 +10,10 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
+from afd_plugin.ffn_faas.platforms.launch import (
+    read_ffn_launcher_environment,
+    require_v2_model_runner,
+)
 from afd_plugin.ffn_faas.platforms.npu import get_model
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
 
@@ -40,37 +44,23 @@ class AscendCAMAdapter:
         parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
         parser.add_argument("--max-num-seqs", type=int, default=256)
         parser.add_argument("--full-graph", action="store_true")
-        parser.add_argument("--ffn-two-stream", action="store_true")
-        parser.add_argument("--ffn-compute-aic-num", type=int)
-        parser.add_argument("--ffn-compute-aiv-num", type=int)
-        parser.add_argument("--ffn-combine-aiv-num", type=int)
         parser.add_argument("--hccl-buffer-size", type=int)
 
     def configure(self, args: Namespace) -> FFNLaunch:
-        rank, local_rank, world = (
-            int(os.environ.get(key, default))
-            for key, default in (
-                ("RANK", "0"),
-                ("LOCAL_RANK", "0"),
-                ("WORLD_SIZE", "1"),
-            )
-        )
-        if world != args.ffn_ranks:
-            raise ValueError("F-only launcher WORLD_SIZE must equal --ffn-ranks")
-        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
+        launcher = read_ffn_launcher_environment(args.ffn_ranks)
+        require_v2_model_runner()
+        local_world = launcher.local_world_size
         devices = (
             tuple(map(int, args.devices.split(",")))
             if args.devices
             else tuple(range(local_world))
         )
         if (
-            not 0 <= local_rank < len(devices)
+            not 0 <= launcher.local_rank < len(devices)
             or len(set(devices)) != len(devices)
             or min(devices) < 0
         ):
             raise ValueError("--devices must supply distinct local NPU IDs")
-        if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
-            raise ValueError("set VLLM_USE_V2_MODEL_RUNNER=1 on both A and F")
         if os.environ.get("AFD_ASYNC_CAM_LAYERED_GMM") != "1":
             raise ValueError("standalone V4 requires AFD_ASYNC_CAM_LAYERED_GMM=1")
         settings = FFNConfig(
@@ -78,25 +68,21 @@ class AscendCAMAdapter:
             attention_ranks=args.attention_ranks,
             attention_tp=args.attention_tp,
             ffn_ranks=args.ffn_ranks,
-            rank=rank,
-            local_rank=local_rank,
-            device=devices[local_rank],
+            rank=launcher.rank,
+            local_rank=launcher.local_rank,
+            device=devices[launcher.local_rank],
             host=args.host,
             port=args.port,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
             full_graph=args.full_graph,
-            ffn_two_stream=args.ffn_two_stream,
-            ffn_compute_aic_num=args.ffn_compute_aic_num,
-            ffn_compute_aiv_num=args.ffn_compute_aiv_num,
-            ffn_combine_aiv_num=args.ffn_combine_aiv_num,
             hccl_buffer_size=args.hccl_buffer_size,
             shutdown_timeout=args.shutdown_timeout,
         )
         model = get_model(args.model, settings.ffn_ranks, settings.rank)
         return FFNLaunch(
-            rank=rank,
-            local_rank=local_rank,
+            rank=launcher.rank,
+            local_rank=launcher.local_rank,
             model_path=str(model.root),
             backend_name="CAMAsyncAFDConnector",
             shutdown_timeout=settings.shutdown_timeout,
