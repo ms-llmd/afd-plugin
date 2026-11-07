@@ -128,7 +128,8 @@ The connector needs three components in addition to the plugin and vLLM:
      `cusparse.h` and other CUDA headers shipped by the `nvidia-*` wheels.
      Add that wheel `include` directory to `CPLUS_INCLUDE_PATH` for the build.
    - The `fused_experts` expert backend (vLLM's Triton kernels) runs without
-     DeepGEMM; it is a reference backend.
+     DeepGEMM; it is a reference backend. The `marlin` backend (MXFP4
+     experts) also runs without DeepGEMM.
 
 3. A GPU with compute capability 9.0 or newer on every rank.
 
@@ -174,7 +175,7 @@ Unknown keys are rejected. All keys are optional.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `payload_format` | `str` | `"bf16"` | Dispatch wire format: `"bf16"` or `"fp8_block128_fp32"` (FP8 e4m3 rows with one fp32 scale per 128 channels). The FFN must load matching expert weights: BF16 weights for `bf16`, block-128 FP8 weights (for example an FP8 checkpoint with `weight_block_size=[128, 128]`) for `fp8_block128_fp32`. |
-| `expert_backend` | `str` | `"deepgemm"` | `"deepgemm"` (DeepGEMM grouped GEMMs) or `"fused_experts"` (vLLM `fused_experts`, a reference path). |
+| `expert_backend` | `str` | `"deepgemm"` | `"deepgemm"` (DeepGEMM grouped GEMMs), `"fused_experts"` (vLLM `fused_experts`, a reference path) or `"marlin"` (MXFP4 experts after vLLM's Marlin repack, W4A16 with the checkpoint's SwiGLU clamp; required for MXFP4 checkpoints such as DeepSeek-V4.1 and rejected for others; BF16 payload only). |
 | `capacity_tokens_per_rank` | `int \| null` | `null` | Largest dispatch one Attention rank issues per call (with Attention TP, its slice); sizes the transport buffers. `null` uses the larger of `max_num_batched_tokens` and the largest CUDA-graph capture size, divided by the Attention TP size. |
 | `num_lanes` | `int \| null` | `null` | In-flight micro-batches, one transport buffer each, `1` or `2`. `null` uses vLLM's micro-batch count: 2 with DBO, otherwise 1. |
 | `bucket_granularity` | `int` | `1` | Dispatch buckets are rounded up to this multiple, then to the next rung of the bucket ladder derived from the CUDA-graph capture sizes. Every step uses one of a few kernel sets compiled at startup. |

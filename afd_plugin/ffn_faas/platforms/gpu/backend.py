@@ -15,7 +15,10 @@ import threading
 
 from vllm.config import set_current_vllm_config
 
-from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
+from afd_plugin.connectors.gpu.deepep_m2n.connector import (
+    DeepEPM2NAFDConnector,
+    ffn_expert_weight_format,
+)
 from afd_plugin.ffn_faas.model_utils import parameter_storage_bytes
 from afd_plugin.ffn_faas.platforms.gpu.environment import GPUFFNEnvironment
 from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
@@ -63,7 +66,8 @@ class DeepEPM2NFFNBackend:
            buffers and the dispatch-kernel precompile.
 
         Phases: ``loading`` through step 5 (with ``loaded_experts`` and
-        ``total_experts`` after the load), ``connecting`` from step 5 on; the
+        ``total_experts`` after the load), ``connecting`` from step 5 on (with
+        ``model_architecture`` and ``expert_weight_format``); the
         host marks ``ready`` afterwards. CUDA graphs are not captured here: they
         are captured lazily, driven by Attention's warmup and capture
         payloads, exactly as on the Worker path. Every owner is assigned
@@ -91,16 +95,20 @@ class DeepEPM2NFFNBackend:
                 for layer_idx in self.runner.moe_layer_indices
             )
             service.loading_progress(total_experts, total_experts)
-            parameter_bytes = parameter_storage_bytes(model)
+            parameter_bytes = parameter_storage_bytes(self.runner.get_model())
             local_expert_ids = self.runner.local_experts[
                 self.runner.moe_layer_indices[0]
             ].expert_ids
+            # Read without model knowledge: the FFN-only shell the registry
+            # chose, and the expert format the connector will run.
             service.phase(
                 ServicePhase.CONNECTING,
                 model_loaded=True,
                 parameter_bytes=parameter_bytes,
                 local_expert_first=local_expert_ids[0],
                 local_expert_last=local_expert_ids[-1],
+                model_architecture=config.model_config.hf_config.architectures[0],
+                expert_weight_format=ffn_expert_weight_format(config),
             )
             self.runner.initialize_afd_connector()
             assert connector.attn_tp_size is not None

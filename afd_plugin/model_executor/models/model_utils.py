@@ -14,8 +14,11 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
 
+# Checkpoint architecture -> FFN-only shell used on CUDA with a routed-experts
+# connector (DeepEP M2N), by the standalone FFN service and the Worker FFN.
 _ROUTED_EXPERTS_MODEL_ARCHITECTURES: Final[dict[str, str]] = {
     "Qwen3MoeForCausalLM": "AFDQwen3MoeRoutedExperts",
+    "DeepseekV41ForCausalLM": "AFDDeepseekV41RoutedExperts",
 }
 
 
@@ -34,9 +37,21 @@ def get_afd_model_config(
     device_type: Literal["cuda", "npu"],
     routed_experts_connector: bool = False,
 ) -> ModelConfig:
-    """Return a model config that resolves to an AFD model implementation."""
+    """Return a model config that resolves to an AFD model implementation.
+
+    On CUDA with a routed-experts connector, an architecture with an FFN-only
+    shell resolves to that shell, even when no full AFD model is registered
+    for it (DeepSeek-V4.1 has only the FFN shell so far).
+    """
 
     for model_arch in model_config.hf_config.architectures:
+        if routed_experts_connector and device_type == "cuda":
+            routed_architecture = _ROUTED_EXPERTS_MODEL_ARCHITECTURES.get(model_arch)
+            if routed_architecture is not None:
+                # deepcopy keeps the hf_text_config is hf_config identity.
+                afd_model_config = deepcopy(model_config)
+                afd_model_config.hf_config.architectures = [routed_architecture]
+                return afd_model_config
         if model_arch in _MODEL_REGISTRATIONS:
             if model_arch == "DSparkDraftModel" and device_type != "npu":
                 raise ValueError("AFD DSpark currently supports only the NPU backend")
@@ -50,14 +65,7 @@ def get_afd_model_config(
             # automatically. vLLM Ascend uses that identity to distinguish
             # text models from multimodal models.
             afd_model_config = deepcopy(model_config)
-            routed_architecture = (
-                _ROUTED_EXPERTS_MODEL_ARCHITECTURES.get(model_arch)
-                if routed_experts_connector and device_type == "cuda"
-                else None
-            )
-            afd_model_config.hf_config.architectures = [
-                routed_architecture or f"AFD{model_arch}"
-            ]
+            afd_model_config.hf_config.architectures = [f"AFD{model_arch}"]
             return afd_model_config
     return model_config
 

@@ -11,7 +11,7 @@ keeps its existing `vllm serve` launch, model, connector and DBO path.
 
 | Supported | Rejected at startup |
 | --- | --- |
-| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts |
+| A registered CUDA routed-experts model: `Qwen3MoeForCausalLM` (BF16, every layer MoE, no shared experts); `DeepseekV41ForCausalLM` (MXFP4 experts, FFN side only; needs `"expert_backend":"marlin"`, no `--dbo`) | Unregistered models, other `quantization_config`s, dense or partial-MoE Qwen3, Qwen3 shared experts, V4.1 FP8 experts |
 | `DeepEPM2NAFDConnector` with `payload_format: bf16` | P2P, afdEP-direct, flexible placement, FP8 payload |
 | F TP=1, EP over all F ranks, linear expert placement | EPLB, elastic EP, redundant experts, PP/CP, LoRA, speculative decoding |
 | Eager, FULL_DECODE_ONLY CUDA graphs, DBO with two lanes (eager and graph) | Other graph modes, more than two micro-batches |

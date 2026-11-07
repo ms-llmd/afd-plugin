@@ -84,17 +84,18 @@ def test_model_config_rewrites_architecture_in_private_copy(
 
 
 @pytest.mark.parametrize(
-    "routed_experts_connector,expected_architecture",
+    "architecture,routed_experts_connector,expected_architecture",
     [
-        (False, "AFDQwen3MoeForCausalLM"),
-        (True, "AFDQwen3MoeRoutedExperts"),
+        ("Qwen3MoeForCausalLM", False, "AFDQwen3MoeForCausalLM"),
+        ("Qwen3MoeForCausalLM", True, "AFDQwen3MoeRoutedExperts"),
+        ("DeepseekV41ForCausalLM", True, "AFDDeepseekV41RoutedExperts"),
     ],
-    ids=["full-model", "routed-experts-shell"],
+    ids=["qwen3-full-model", "qwen3-routed-shell", "dsv41-routed-shell"],
 )
-def test_qwen3_routed_connector_selects_the_ffn_only_shell(
-    model_utils, routed_experts_connector, expected_architecture
+def test_routed_connector_selects_the_ffn_only_shell(
+    model_utils, architecture, routed_experts_connector, expected_architecture
 ):
-    hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+    hf_config = SimpleNamespace(architectures=[architecture])
     original = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
 
     mapped = model_utils.get_afd_model_config(
@@ -104,7 +105,35 @@ def test_qwen3_routed_connector_selects_the_ffn_only_shell(
     )
 
     assert mapped.hf_config.architectures == [expected_architecture]
-    assert hf_config.architectures == ["Qwen3MoeForCausalLM"]
+    assert mapped.hf_text_config is mapped.hf_config
+    assert hf_config.architectures == [architecture]
+
+
+@pytest.mark.parametrize(
+    "device_type,routed_experts_connector",
+    [("cuda", False), ("npu", True)],
+    ids=["cuda-without-routed-connector", "npu"],
+)
+def test_deepseek_v41_has_only_the_cuda_routed_experts_shell(
+    model_utils, device_type, routed_experts_connector
+):
+    """DeepSeek-V4.1 keeps its native architecture outside the CUDA routed
+    path, so the runner's M2N allowlist (or native vLLM) decides.
+
+    Why: no full AFD V4.1 model exists yet; a rewrite to an unregistered
+    ``AFDDeepseekV41ForCausalLM`` would fail later with a less clear error.
+    """
+    original = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+    )
+
+    mapped = model_utils.get_afd_model_config(
+        original,
+        device_type=device_type,
+        routed_experts_connector=routed_experts_connector,
+    )
+
+    assert mapped is original
 
 
 def test_model_config_preserves_distinct_nested_text_config(model_utils):
