@@ -140,8 +140,12 @@ class GPUFFNConfig:
         and bucket ladder from Attention in the M2N handshake. vLLM's
         ``all2all_backend`` and ``moe_backend`` are not set, so the handshake
         sees the idle default backend and ``select_routed_moe_backend`` can
-        pin ``auto`` to Triton. The EP weight filter skips non-local expert
-        tensors before they are read, as the Worker-path recipes do.
+        pin ``auto`` to the backend whose layout the connector reads. The EP
+        weight filter skips non-local expert tensors before they are read, as
+        the Worker-path recipes do. F never runs an encoder and holds no KV
+        cache, so every model gets ``language_model_only`` (no multimodal
+        config) and no SWA bounded replay; both are no-ops for models without
+        those features.
         """
         return ffn_engine_kwargs(
             model=self.model,
@@ -156,6 +160,8 @@ class GPUFFNConfig:
                     {"cudagraph_mode": FFN_GRAPH_MODE} if self.graph else {}
                 ),
                 "enable_dbo": self.dbo,
+                "language_model_only": True,
+                "swa_bounded_replay": False,
             },
         )
 

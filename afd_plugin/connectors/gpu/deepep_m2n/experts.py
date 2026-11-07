@@ -26,6 +26,9 @@ Backends:
 - ``fused_experts``: vLLM's Triton ``fused_experts`` with ``top_k=1`` on the
   valid rows (FP8 inputs and weights are dequantized to BF16 first). Reads the
   prefix sum on the host: a correctness reference, not a fast path.
+- ``marlin``: BF16 rows with MXFP4 weights after vLLM's Marlin repack
+  (``mxfp4_experts.py``), with the checkpoint's SwiGLU clamp. Requires
+  ``expert_alignment`` 1; no host reads.
 """
 
 from __future__ import annotations
@@ -42,10 +45,17 @@ from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
     dequantize_fp8_rows,
     silu_mul_fp8_quant,
 )
+from afd_plugin.connectors.gpu.deepep_m2n.mxfp4_experts import (
+    MARLIN_EXPERT_BACKEND,
+    Mxfp4MarlinExpertWeights,
+    marlin_workspace,
+    run_marlin_experts,
+    sentinel_expert_map,
+)
 from afd_plugin.connectors.metadata import FP8_DTYPE, LocalExpertWeights
 
-ExpertBackend = Literal["deepgemm", "fused_experts"]
-EXPERT_BACKENDS: tuple[ExpertBackend, ...] = ("deepgemm", "fused_experts")
+ExpertBackend = Literal["deepgemm", "fused_experts", "marlin"]
+EXPERT_BACKENDS: tuple[ExpertBackend, ...] = ("deepgemm", "fused_experts", "marlin")
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -75,6 +85,16 @@ class DeepEPM2NExperts:
             raise ValueError(f"expert backend must be one of {EXPERT_BACKENDS}")
         self.backend = backend
         self.expert_alignment = expert_alignment
+        self._marlin_workspace: torch.Tensor | None = None
+        # Sentinel expert maps by local expert count (one per deployment).
+        self._marlin_expert_maps: dict[int, torch.Tensor] = {}
+        if backend == MARLIN_EXPERT_BACKEND:
+            if expert_alignment != 1:
+                raise ValueError("the marlin expert backend needs expert_alignment 1")
+            # Allocated here, eagerly, so no CUDA-graph capture allocates it.
+            self._marlin_workspace = marlin_workspace(
+                torch.device("cuda", torch.cuda.current_device())
+            )
         if backend == "deepgemm":
             deepgemm.set_contiguous_m_alignment(expert_alignment)
             if num_sms:
@@ -117,6 +137,13 @@ class DeepEPM2NExperts:
                 f"payload dtype {recv_x.dtype} does not match the expert weights "
                 f"({weights.w13.dtype}) or the presence of scales"
             )
+        is_mxfp4_marlin = isinstance(weights, Mxfp4MarlinExpertWeights)
+        if is_mxfp4_marlin != (self.backend == MARLIN_EXPERT_BACKEND):
+            raise ValueError(
+                f"expert backend {self.backend!r} cannot run "
+                f"{type(weights).__name__}; MXFP4 Marlin weights need the "
+                f"{MARLIN_EXPERT_BACKEND!r} backend and only it"
+            )
         if out is None:
             out = torch.empty(recv_x.shape, dtype=torch.bfloat16, device=recv_x.device)
         elif out.shape != recv_x.shape or out.dtype != torch.bfloat16:
@@ -126,6 +153,10 @@ class DeepEPM2NExperts:
             )
         if recv_x.shape[0] == 0:
             return out
+        if isinstance(weights, Mxfp4MarlinExpertWeights):
+            return self._run_marlin(
+                recv_x, recv_topk_weights, recv_count_psum, weights, out
+            )
         if self.backend == "fused_experts":
             return self._run_fused_experts(
                 recv_x, recv_scale, recv_topk_weights, recv_count_psum, weights, out
@@ -136,6 +167,30 @@ class DeepEPM2NExperts:
             )
         return self._run_deepgemm_bf16(
             recv_x, recv_topk_weights, recv_count_psum, weights, out
+        )
+
+    def _run_marlin(
+        self,
+        recv_x: torch.Tensor,
+        recv_topk_weights: torch.Tensor,
+        recv_count_psum: torch.Tensor,
+        weights: Mxfp4MarlinExpertWeights,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self._marlin_workspace is not None
+        num_experts = weights.num_experts
+        expert_map = self._marlin_expert_maps.get(num_experts)
+        if expert_map is None:
+            expert_map = sentinel_expert_map(num_experts, recv_x.device)
+            self._marlin_expert_maps[num_experts] = expert_map
+        return run_marlin_experts(
+            recv_x,
+            recv_topk_weights,
+            recv_count_psum,
+            weights,
+            out,
+            workspace=self._marlin_workspace,
+            expert_map=expert_map,
         )
 
     def _run_deepgemm_bf16(

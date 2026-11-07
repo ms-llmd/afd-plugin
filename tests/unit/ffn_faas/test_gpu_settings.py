@@ -67,6 +67,10 @@ def test_engine_args_describe_an_f_only_ep_rank(graph, dbo, eager, compilation_c
     assert kwargs["enable_dbo"] is dbo
     # vLLM's idle default all2all backend is what the M2N handshake requires.
     assert "all2all_backend" not in kwargs
+    # F runs no encoder and holds no KV cache, for every model (no-ops for
+    # text models without SWA replay; required by DeepSeek-V4.1).
+    assert kwargs["language_model_only"] is True
+    assert kwargs["swa_bounded_replay"] is False
 
 
 @pytest.mark.parametrize(

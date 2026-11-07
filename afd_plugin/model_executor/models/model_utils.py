@@ -14,9 +14,16 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
 
+# Checkpoint architecture -> FFN-only shell used on CUDA with a routed-experts
+# connector (DeepEP M2N), by the standalone FFN service and the Worker FFN.
 _ROUTED_EXPERTS_MODEL_ARCHITECTURES: Final[dict[str, str]] = {
     "Qwen3MoeForCausalLM": "AFDQwen3MoeRoutedExperts",
+    "DeepseekV41ForCausalLM": "AFDDeepseekV41RoutedExperts",
 }
+# Registered architectures with only a CUDA AFD implementation.
+_CUDA_ONLY_MODEL_ARCHITECTURES: Final[frozenset[str]] = frozenset(
+    {"DeepseekV41ForCausalLM"}
+)
 
 
 def has_afd_model_registration(model_config: ModelConfig) -> bool:
@@ -34,9 +41,21 @@ def get_afd_model_config(
     device_type: Literal["cuda", "npu"],
     routed_experts_connector: bool = False,
 ) -> ModelConfig:
-    """Return a model config that resolves to an AFD model implementation."""
+    """Return a model config that resolves to an AFD model implementation.
+
+    On CUDA with a routed-experts connector, an architecture with an FFN-only
+    shell resolves to that shell (the FFN side); otherwise to its registered
+    AFD model (the Attention side, or the Worker FFN of other connectors).
+    """
 
     for model_arch in model_config.hf_config.architectures:
+        if routed_experts_connector and device_type == "cuda":
+            routed_architecture = _ROUTED_EXPERTS_MODEL_ARCHITECTURES.get(model_arch)
+            if routed_architecture is not None:
+                # deepcopy keeps the hf_text_config is hf_config identity.
+                afd_model_config = deepcopy(model_config)
+                afd_model_config.hf_config.architectures = [routed_architecture]
+                return afd_model_config
         if model_arch in _MODEL_REGISTRATIONS:
             if model_arch == "DSparkDraftModel" and device_type != "npu":
                 raise ValueError("AFD DSpark currently supports only the NPU backend")
@@ -45,19 +64,18 @@ def get_afd_model_config(
                     "AFD Qwen3.5/3.6 supports CUDA execution only; "
                     f"got device_type={device_type!r}",
                 )
+            # The model itself rejects connectors other than DeepEP M2N.
+            if model_arch in _CUDA_ONLY_MODEL_ARCHITECTURES and device_type != "cuda":
+                raise ValueError(
+                    f"AFD {model_arch} supports CUDA execution only; "
+                    f"got device_type={device_type!r}",
+                )
             # deepcopy preserves aliasing within the copied object graph, so
             # the pure-text identity hf_text_config is hf_config is retained
             # automatically. vLLM Ascend uses that identity to distinguish
             # text models from multimodal models.
             afd_model_config = deepcopy(model_config)
-            routed_architecture = (
-                _ROUTED_EXPERTS_MODEL_ARCHITECTURES.get(model_arch)
-                if routed_experts_connector and device_type == "cuda"
-                else None
-            )
-            afd_model_config.hf_config.architectures = [
-                routed_architecture or f"AFD{model_arch}"
-            ]
+            afd_model_config.hf_config.architectures = [f"AFD{model_arch}"]
             return afd_model_config
     return model_config
 

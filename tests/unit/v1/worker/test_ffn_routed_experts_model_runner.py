@@ -216,8 +216,18 @@ def test_local_experts_reject_backends_that_reorder_weights(fp8, backend):
         local_experts_from_vllm(_routed_experts(fp8=fp8, backend=backend))
 
 
-def _kernel_config(moe_backend: str) -> SimpleNamespace:
-    return SimpleNamespace(kernel_config=SimpleNamespace(moe_backend=moe_backend))
+def _kernel_config(moe_backend: str, quant_config=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+        quant_config=quant_config,
+    )
+
+
+def _deepseek_v4_quant_config(expert_dtype: str) -> SimpleNamespace:
+    """vLLM's DeepSeek-V4/V4.1 quantization config, reduced to what the pin reads."""
+    return SimpleNamespace(
+        get_name=lambda: "deepseek_v4_fp8", expert_dtype=expert_dtype
+    )
 
 
 def test_routed_ffn_pins_auto_moe_backend_to_triton():
@@ -241,3 +251,33 @@ def test_routed_ffn_rejects_other_explicit_moe_backends(configured):
     """
     with pytest.raises(RuntimeError, match="moe-backend triton"):
         select_routed_moe_backend(_kernel_config(configured))
+
+
+@pytest.mark.parametrize(
+    "expert_dtype, configured, pinned",
+    [
+        ("fp4", "auto", "marlin"),
+        ("fp4", "marlin", "marlin"),
+        ("fp8", "auto", "triton"),
+    ],
+    ids=["mxfp4-auto", "mxfp4-marlin", "fp8-experts-auto"],
+)
+def test_routed_ffn_pins_marlin_for_mxfp4_experts(expert_dtype, configured, pinned):
+    """DeepSeek-V4.1 MXFP4 experts pin Marlin; its FP8-expert variant keeps
+    Triton.
+
+    Why: the M2N ``marlin`` executor reads vLLM's Marlin repack, and ``auto``
+    may pick Humming on SM90, whose layout it cannot read.
+    """
+    vllm_config = _kernel_config(configured, _deepseek_v4_quant_config(expert_dtype))
+
+    select_routed_moe_backend(vllm_config)
+
+    assert vllm_config.kernel_config.moe_backend == pinned
+
+
+def test_routed_ffn_rejects_triton_for_mxfp4_experts():
+    with pytest.raises(RuntimeError, match="moe-backend marlin"):
+        select_routed_moe_backend(
+            _kernel_config("triton", _deepseek_v4_quant_config("fp4"))
+        )

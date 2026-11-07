@@ -102,6 +102,12 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
             if registration.device == "npu"
             else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
         ),
+        "AFDDeepseekV41ForCausalLM": (
+            "afd_plugin.model_executor.models.deepseek_v41:AFDDeepseekV41ForCausalLM"
+        ),
+        "AFDDeepseekV41RoutedExperts": (
+            "afd_plugin.model_executor.models.deepseek_v41:AFDDeepseekV41RoutedExperts"
+        ),
         "AFDDSparkDraftModel": (
             "afd_plugin.model_executor.models.npu.deepseek_v4_dspark:"
             "AFDDSparkDeepseekV4ForCausalLM"
