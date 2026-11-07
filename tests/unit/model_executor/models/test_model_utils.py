@@ -64,6 +64,7 @@ def model_utils(monkeypatch):
         ("DeepseekV2ForCausalLM", "cuda"),
         ("DeepseekV2ForCausalLM", "npu"),
         ("DeepseekV4ForCausalLM", "cuda"),
+        ("DeepseekV41ForCausalLM", "cuda"),
         ("Qwen3MoeForCausalLM", "cuda"),
         ("Qwen3MoeForCausalLM", "npu"),
         ("Qwen3_5MoeForConditionalGeneration", "cuda"),
@@ -109,31 +110,23 @@ def test_routed_connector_selects_the_ffn_only_shell(
     assert hf_config.architectures == [architecture]
 
 
-@pytest.mark.parametrize(
-    "device_type,routed_experts_connector",
-    [("cuda", False), ("npu", True)],
-    ids=["cuda-without-routed-connector", "npu"],
-)
-def test_deepseek_v41_has_only_the_cuda_routed_experts_shell(
-    model_utils, device_type, routed_experts_connector
+@pytest.mark.parametrize("routed_experts_connector", [False, True])
+def test_deepseek_v41_is_rejected_off_cuda_without_mutation(
+    model_utils, routed_experts_connector
 ):
-    """DeepSeek-V4.1 keeps its native architecture outside the CUDA routed
-    path, so the runner's M2N allowlist (or native vLLM) decides.
+    """DeepSeek-V4.1 has only CUDA AFD models (Attention and FFN shell).
 
-    Why: no full AFD V4.1 model exists yet; a rewrite to an unregistered
-    ``AFDDeepseekV41ForCausalLM`` would fail later with a less clear error.
+    Why: the registration points at the CUDA module; on NPU it would fail
+    later inside vLLM-Ascend with a less clear error.
     """
-    original = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-    )
-
-    mapped = model_utils.get_afd_model_config(
-        original,
-        device_type=device_type,
-        routed_experts_connector=routed_experts_connector,
-    )
-
-    assert mapped is original
+    hf_config = SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+    with pytest.raises(ValueError, match="supports CUDA execution only"):
+        model_utils.get_afd_model_config(
+            SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config),
+            device_type="npu",
+            routed_experts_connector=routed_experts_connector,
+        )
+    assert hf_config.architectures == ["DeepseekV41ForCausalLM"]
 
 
 def test_model_config_preserves_distinct_nested_text_config(model_utils):

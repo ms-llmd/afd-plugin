@@ -112,6 +112,11 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         if importlib.util.find_spec("torch_npu") is not None
         else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
     ),
+    # CUDA only, DeepEP M2N only: the Attention-role model. The FFN side
+    # resolves to the routed-experts shell below (model_utils).
+    "DeepseekV41ForCausalLM": (
+        "afd_plugin.model_executor.models.deepseek_v41:AFDDeepseekV41ForCausalLM"
+    ),
     # FFN-only shell for routed-experts connectors on CUDA; selected through
     # model_utils._ROUTED_EXPERTS_MODEL_ARCHITECTURES, never by a checkpoint.
     "DeepseekV41RoutedExperts": (

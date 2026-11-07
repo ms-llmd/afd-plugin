@@ -20,6 +20,10 @@ _ROUTED_EXPERTS_MODEL_ARCHITECTURES: Final[dict[str, str]] = {
     "Qwen3MoeForCausalLM": "AFDQwen3MoeRoutedExperts",
     "DeepseekV41ForCausalLM": "AFDDeepseekV41RoutedExperts",
 }
+# Registered architectures with only a CUDA AFD implementation.
+_CUDA_ONLY_MODEL_ARCHITECTURES: Final[frozenset[str]] = frozenset(
+    {"DeepseekV41ForCausalLM"}
+)
 
 
 def has_afd_model_registration(model_config: ModelConfig) -> bool:
@@ -40,8 +44,8 @@ def get_afd_model_config(
     """Return a model config that resolves to an AFD model implementation.
 
     On CUDA with a routed-experts connector, an architecture with an FFN-only
-    shell resolves to that shell, even when no full AFD model is registered
-    for it (DeepSeek-V4.1 has only the FFN shell so far).
+    shell resolves to that shell (the FFN side); otherwise to its registered
+    AFD model (the Attention side, or the Worker FFN of other connectors).
     """
 
     for model_arch in model_config.hf_config.architectures:
@@ -58,6 +62,12 @@ def get_afd_model_config(
             if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
                 raise ValueError(
                     "AFD Qwen3.5/3.6 supports CUDA execution only; "
+                    f"got device_type={device_type!r}",
+                )
+            # The model itself rejects connectors other than DeepEP M2N.
+            if model_arch in _CUDA_ONLY_MODEL_ARCHITECTURES and device_type != "cuda":
+                raise ValueError(
+                    f"AFD {model_arch} supports CUDA execution only; "
                     f"got device_type={device_type!r}",
                 )
             # deepcopy preserves aliasing within the copied object graph, so
