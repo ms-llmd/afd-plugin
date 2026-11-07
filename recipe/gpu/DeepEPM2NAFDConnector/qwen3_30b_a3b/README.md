@@ -9,7 +9,10 @@ the model.
 prefill_decode_colocation/
 ├── graph.sh   # FULL_DECODE_ONLY CUDA graphs
 ├── eager.sh   # eager
-└── dbo.sh     # graph + DBO
+├── dbo.sh     # graph + DBO
+├── graph-faas.sh  # FULL_DECODE_ONLY CUDA graphs with the standalone FFN service
+├── eager-faas.sh  # eager with the standalone FFN service
+└── dbo-faas.sh    # graph + DBO with the standalone FFN service
 ```
 
 ## Defaults
