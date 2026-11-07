@@ -44,6 +44,13 @@ and extra script arguments go to the Attention `vllm serve`.
   rejects the rest.
 - The FFN must use the Marlin expert backend; vLLM's `auto` MoE backend picks
   a different MXFP4 kernel on SM90.
+- Do not install the external DeepGEMM wheel (`deep_gemm` 2.8.2, used by the
+  M2N `deepgemm` expert backend of other models) in this environment. vLLM
+  prefers an installed `deep_gemm` over its vendored copy, and that build's
+  paged MQA logits assert `block_kv == 64`, while the V4.1 indexer passes its
+  compressed block size: the Attention ranks then fail during CUDA graph
+  profiling with `Assertion error (csrc/apis/attention.hpp:165)`. The Marlin
+  FFN does not need DeepGEMM.
 
 ## Limitations
 
