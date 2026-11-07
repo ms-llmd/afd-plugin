@@ -24,9 +24,13 @@ Every model directory holds the same three scripts in
 ```text
 .
 ├── deepseek_v2_lite/       # BF16 payload
+├── deepseek_v41_flash/     # BF16 payload, MXFP4 Marlin experts; FFN service only
 ├── qwen3_30b_a3b/          # BF16 payload
 └── qwen3_235b_a22b_fp8/    # FP8 payload (fp8_block128_fp32)
 ```
+
+`deepseek_v41_flash/` holds only the standalone FFN service variants
+(`*-faas.sh`); see its README.
 
 Each script is self-contained, so it can be copied or mounted on its own (the
 `deploy-afd-k8s` skill mounts the single file). Above the line
