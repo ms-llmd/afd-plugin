@@ -6,6 +6,7 @@ owners:
   - "@hsliuustc0106"
   - "@jiangkuaixue123"
 primary_code_paths:
+  - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
@@ -26,6 +27,8 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/ffn_faas/test_*.py"
+  - "tests/gpu/test_ffn_faas_gpu.py"
   - "tests/unit/model_executor/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
@@ -33,12 +36,14 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
+  - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
   - "tests/unit/connectors/test_base.py"
   - "tests/unit/connectors/npu/test_async_cam_session.py"
   - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
+  - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -93,15 +98,94 @@ read-only `comm_args` property.
 
 ## Runtime selection
 
-FFN is launched as a `vllm serve` process, and AFD config normalization selects
+The traditional FFN is launched as a `vllm serve` process, and AFD config normalization selects
 its role-specific worker when `worker_cls="auto"`. It does not serve requests.
 Attention and FFN may be started in either order. Send API traffic only to
 Attention.
+
+DeepSeek-V4 Flash per-channel W4A8 also has a standalone F entry point,
+`python -m afd_plugin.ffn_faas serve`, implementing independent-service
+ownership under [RFC #391](https://github.com/vllm-project/afd-plugin/issues/391).
+It composes `CAMAsyncAFDConnector` and `AsyncNPUFFNModelRunner` without creating
+a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
+Attention retains its existing model, connector and DBO path. Configuration,
+parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
+
+The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
+the backend before preparation, and owns the receiving thread and failure
+boundary. `FFNService` manages host status and stop requests. Platform options
+and native composition live under `ffn_faas/platforms/npu/`:
+
+- `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
+  and native post-warmup CPU affinity. These groups coexist with the separate
+  A/F CAM group throughout execution.
+- `CAMRoutedModel` manages parameter loading, local placement checks, storage
+  accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
+  to provide checkpoint metadata and native owner construction. The backend
+  uses the common resource without model-specific branching.
+- `v4_model.py` contains V4 checkpoint metadata and `V4ModelAdapter`;
+  `v4_weights.py` contains the lazily imported native parameter owner. Native
+  routed modules, expert-map managers and quantizers remain resident. The
+  loader adapter delegates to the native V4 loader; dependency upgrades must
+  preserve its documented receiver and factory contracts.
+- Platform settings enforce static CAM placement and reject EPLB, elastic EP
+  and redundant experts. Retaining native expert state does not enable these
+  algorithms.
+
+`FFNBackend` is a runtime lifecycle interface. Its `execute_step()` delegates
+communication, computation and Graph execution to the Async CAM
+runtime. A shared cross-platform, cross-connector Step Loop and a pure
+`compute(item)` backend are not implemented. The runtime consumes the existing
+`LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
+there is no
+separate V4 execution runtime.
+
+`attach_model` lends independently loaded parameters to the runtime. After
+receiver exit and device completion, shutdown releases CAM/Graph resources,
+then native compute groups, and finally the routed owner. Failed or pending
+native work retains all owners until whole-pair process isolation. A host
+`/stop` request cannot cancel an outstanding CAM DR.
+See the [standalone service guide](../../npu/STANDALONE_FFN_SERVICE.md) for
+supported configuration, launch and shutdown behavior.
+
+CUDA routed-experts models over `DeepEPM2NAFDConnector` have a GPU standalone
+F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
+
+- `GPUDeepEPM2NAdapter` and `GPUFFNConfig` are CPU-only: launcher world,
+  ModelRunnerV2 environment, connector JSON structure and lane parity with
+  `--dbo` are checked before any device work. The adapter resolves the model
+  path but does not parse or name a model family.
+- `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
+  the F-only `VllmConfig` (`external_launcher`, DP = F ranks, TP 1, EP), selects
+  the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
+  before any FusedMoE is built, and creates the F-only world through vLLM's
+  `init_worker_distributed_environment`.
+- The AFD model registry selects the FFN-only shell for the configured model.
+  For example, `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
+  (native `Qwen3MoeSparseMoeBlock`) and loads through vLLM's
+  `DefaultModelLoader`, so the EP weight filter, FusedMoE expert loading and
+  strict loaded-weights check run unchanged; the embedding, final norm and LM
+  head are not allocated.
+- `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, loads the
+  shell through that runner, starts the connector, and delegates each step to
+  `execute_connector_driven_step()`, the method the Worker loop also calls.
+  CUDA graphs are captured lazily from Attention's payloads, as on the Worker
+  path, so `/ready` means paired and receiving.
+
+`FFNBackend.execute_step()` returns `False` only when `cancel_receive()` ended
+an idle receive; the host calls `cancel_receive()` after a stop request and
+before joining the receiver. The GPU backend closes the M2N control plane
+(aborting its own NCCL group); the NPU backend's `cancel_receive()` is a no-op.
+Releasing DeepEP lanes is a barrier over every M2N rank, so a stopped GPU F
+completes its release when Attention shuts down too. See the
+[GPU standalone service guide](../../gpu/STANDALONE_FFN_SERVICE.md).
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
+| CUDA standalone (`ffn_faas`, no Worker) | `DeepEPM2NFFNBackend` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` |
+| NPU standalone (`ffn_faas`, no Worker) | `CAMFFNBackend` | `AsyncNPUFFNModelRunner` | `CAMAsyncAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. The CUDA
@@ -238,6 +322,11 @@ daemon thread:
   -> synchronize the current accelerator
   -> repeat
 ```
+
+On CUDA, one iteration is `GPUFFNModelRunner.execute_connector_driven_step()`,
+shared by `AFDFFNWorker` and the standalone GPU FFN backend. It returns
+`False` only for a receive cancelled by a requested stop; a closed control
+plane without a stop request, and every other failure, raises.
 
 ### Connector-driven loop
 
