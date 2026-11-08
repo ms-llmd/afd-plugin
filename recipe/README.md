@@ -18,7 +18,9 @@ recipe/
 │   │   ├── qwen3_235b_a22b_fp8/
 │   │   └── qwen3_30b_a3b/
 │   └── P2pNcclAFDConnector/
-│       └── deepseek_v2_lite/
+│       ├── deepseek_v2_lite/
+│       ├── qwen3_235b_a22b_fp8/
+│       └── qwen3_30b_a3b/
 └── npu/
     ├── CAMAsyncAFDConnector/
     │   └── deepseek_v3_2/
@@ -39,8 +41,8 @@ Directory names follow these conventions:
 | Hardware | Connector | Model | Recommended stage | Status | Recipe |
 | --- | --- | --- | --- | --- | --- |
 | GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Deployment examples; see the linked README for validation scope | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
-| GPU (SM90+) | `DeepEPM2NAFDConnector` | Qwen3-30B-A3B | Decode | Same 2A2F layouts as the Qwen3 MoE DeepEP M2N E2E cases | [Launch examples](gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/README.md) |
-| GPU (SM90+) | `DeepEPM2NAFDConnector` | Qwen3-235B-A22B-FP8 | Decode | 4A2F FP8-payload configuration run on H200 | [Launch examples](gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md) |
+| GPU (SM90+ for `DeepEPM2NAFDConnector`) | `DeepEPM2NAFDConnector` or `P2pNcclAFDConnector` | Qwen3-30B-A3B | Prefill / decode; decode-only benchmark | Same 2A2F layouts as the Qwen3 MoE DeepEP M2N E2E cases; serving smoke and decode-only benchmark on both connectors | [2A2F single node](gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/README.md) |
+| GPU (SM90+ for `DeepEPM2NAFDConnector`) | `DeepEPM2NAFDConnector` or `P2pNcclAFDConnector` | Qwen3-235B-A22B-FP8 | Prefill / decode; decode-only benchmark | 4A2F FP8-payload configuration and decode-only benchmark run on H200 | [4A2F single node](gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes; standard V3.2 is unsupported by the current Async CAM path | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; eager A TP1, F layered eager/FULL. W4A8 PD: native full-draft P TP4, A DP2, F EP4. W8A8 A/F: A DP2, F EP8; PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
