@@ -64,6 +64,7 @@ def model_utils(monkeypatch):
         ("DeepseekV2ForCausalLM", "cuda"),
         ("DeepseekV2ForCausalLM", "npu"),
         ("DeepseekV4ForCausalLM", "cuda"),
+        ("DeepseekV41ForCausalLM", "cuda"),
         ("Qwen3MoeForCausalLM", "cuda"),
         ("Qwen3MoeForCausalLM", "npu"),
         ("Qwen3_5MoeForConditionalGeneration", "cuda"),
@@ -84,17 +85,18 @@ def test_model_config_rewrites_architecture_in_private_copy(
 
 
 @pytest.mark.parametrize(
-    "routed_experts_connector,expected_architecture",
+    "architecture,routed_experts_connector,expected_architecture",
     [
-        (False, "AFDQwen3MoeForCausalLM"),
-        (True, "AFDQwen3MoeRoutedExperts"),
+        ("Qwen3MoeForCausalLM", False, "AFDQwen3MoeForCausalLM"),
+        ("Qwen3MoeForCausalLM", True, "AFDQwen3MoeRoutedExperts"),
+        ("DeepseekV41ForCausalLM", True, "AFDDeepseekV41RoutedExperts"),
     ],
-    ids=["full-model", "routed-experts-shell"],
+    ids=["qwen3-full-model", "qwen3-routed-shell", "dsv41-routed-shell"],
 )
-def test_qwen3_routed_connector_selects_the_ffn_only_shell(
-    model_utils, routed_experts_connector, expected_architecture
+def test_routed_connector_selects_the_ffn_only_shell(
+    model_utils, architecture, routed_experts_connector, expected_architecture
 ):
-    hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+    hf_config = SimpleNamespace(architectures=[architecture])
     original = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
 
     mapped = model_utils.get_afd_model_config(
@@ -104,7 +106,27 @@ def test_qwen3_routed_connector_selects_the_ffn_only_shell(
     )
 
     assert mapped.hf_config.architectures == [expected_architecture]
-    assert hf_config.architectures == ["Qwen3MoeForCausalLM"]
+    assert mapped.hf_text_config is mapped.hf_config
+    assert hf_config.architectures == [architecture]
+
+
+@pytest.mark.parametrize("routed_experts_connector", [False, True])
+def test_deepseek_v41_is_rejected_off_cuda_without_mutation(
+    model_utils, routed_experts_connector
+):
+    """DeepSeek-V4.1 has only CUDA AFD models (Attention and FFN shell).
+
+    Why: the registration points at the CUDA module; on NPU it would fail
+    later inside vLLM-Ascend with a less clear error.
+    """
+    hf_config = SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+    with pytest.raises(ValueError, match="supports CUDA execution only"):
+        model_utils.get_afd_model_config(
+            SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config),
+            device_type="npu",
+            routed_experts_connector=routed_experts_connector,
+        )
+    assert hf_config.architectures == ["DeepseekV41ForCausalLM"]
 
 
 def test_model_config_preserves_distinct_nested_text_config(model_utils):

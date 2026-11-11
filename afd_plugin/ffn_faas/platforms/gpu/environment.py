@@ -26,7 +26,11 @@ if TYPE_CHECKING:
 # fail only after 27 GiB of experts were read.
 AFDEP_TRANSPORT_MODULE = "afdep.deepep"
 DEEPGEMM_MODULE = "deep_gemm"
+# Expert backends that do not run DeepGEMM: vLLM's Triton reference and the
+# MXFP4 Marlin executor (Marlin kernels are vLLM ``_C`` ops).
 FUSED_EXPERTS_BACKEND = "fused_experts"
+MARLIN_BACKEND = "marlin"
+NON_DEEPGEMM_EXPERT_BACKENDS = frozenset({FUSED_EXPERTS_BACKEND, MARLIN_BACKEND})
 # Set by torchrun: rendezvous in its workers join the agent's TCP store.
 TORCHELASTIC_AGENT_STORE_ENV = "TORCHELASTIC_USE_AGENT_STORE"
 # vLLM's GPU Worker gives DBO two workspace slots.
@@ -70,7 +74,7 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
 
         importlib.import_module(AFDEP_TRANSPORT_MODULE)
         expert_backend = settings.connector_extra_config.get("expert_backend")
-        if expert_backend != FUSED_EXPERTS_BACKEND:
+        if expert_backend not in NON_DEEPGEMM_EXPERT_BACKENDS:
             importlib.import_module(DEEPGEMM_MODULE)
         # Importable only after the afdEP preflight above.
         from afd_plugin.connectors.gpu.deepep_m2n.connector import MIN_SM_MAJOR
@@ -98,10 +102,11 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         patches, which accept DBO without a DeepEP all2all backend), then
         re-asserts the ``external_launcher`` executor, swaps in the
         FFN-only routed-experts architecture that ``AFDFFNWorker.init_device``
-        selects for this connector, and pins vLLM's MoE backend to Triton as
-        ``AFDFFNWorker._make_model_runner`` does. The pin must happen before
-        any FusedMoE is constructed: FusedMoE picks its weight layout at
-        construction, and a reordered layout would be read silently wrong.
+        selects for this connector, and pins vLLM's MoE backend (Triton, or
+        Marlin for MXFP4 experts) as ``AFDFFNWorker._make_model_runner``
+        does. The pin must happen before any FusedMoE is constructed:
+        FusedMoE picks its weight layout at construction, and a reordered
+        layout would be read silently wrong.
         """
         from vllm.engine.arg_utils import EngineArgs
 

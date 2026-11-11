@@ -10,10 +10,17 @@ prefill_decode_colocation/
 ├── graph.sh   # FULL_DECODE_ONLY CUDA graphs
 ├── eager.sh   # eager
 ├── dbo.sh     # graph + DBO
-├── graph-faas.sh  # FULL_DECODE_ONLY CUDA graphs with the standalone FFN service
-├── eager-faas.sh  # eager with the standalone FFN service
-└── dbo-faas.sh    # graph + DBO with the standalone FFN service
+├── graph-faas.sh   # graph + standalone FFN service
+├── eager-faas.sh   # eager + standalone FFN service
+└── dbo-faas.sh     # graph + DBO + standalone FFN service
 ```
+
+The `-faas` scripts keep the Attention side in `vllm serve` and replace only
+the FFN side with `torchrun -m afd_plugin.ffn_faas serve`. They support the
+same single-pod layouts as the colocated recipes, place Attention on the first
+GPUs and the standalone FFN service on the remaining GPUs, and use the
+service's management endpoint for readiness and teardown. See
+[Standalone GPU FFN service](../../../docs/gpu/STANDALONE_FFN_SERVICE.md).
 
 ## Defaults
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import DPMetadata
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
 from afd_plugin.connectors import (
     AFDConnectorBase,
@@ -17,6 +18,11 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     FFNLocalExperts,
     LocalExpertWeights,
+)
+from afd_plugin.connectors.gpu.deepep_m2n.mxfp4_experts import (
+    MARLIN_EXPERT_BACKEND,
+    has_mxfp4_experts,
+    mxfp4_marlin_weights_from_vllm,
 )
 from afd_plugin.connectors.metadata import FP8_DTYPE
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -31,26 +37,36 @@ if TYPE_CHECKING:
 # swaps w13 to [up; gate]; TRT-LLM and Marlin also shuffle), which yields wrong
 # outputs with no error.
 ROUTED_MOE_BACKEND = "triton"
+# MXFP4 experts: the connector's ``marlin`` executor reads vLLM's Marlin
+# repack, so these checkpoints pin Marlin instead.
+MXFP4_ROUTED_MOE_BACKEND = MARLIN_EXPERT_BACKEND
 _LAYOUT_PRESERVING_BACKENDS = frozenset({"TRITON"})
 
 
 def select_routed_moe_backend(vllm_config: VllmConfig) -> None:
-    """Pin the FFN's vLLM MoE backend to one that keeps the expert layout.
+    """Pin the FFN's vLLM MoE backend to one whose layout the executor reads.
 
     vLLM's MoE forward never runs on a routed-experts FFN; its backend only
-    decides how the expert weights are processed at load. ``auto`` picks
-    FlashInfer CUTLASS on Hopper with EP > 1 for block FP8, which reorders
-    w13, so ``auto`` becomes ``triton`` and any other explicit choice fails.
+    decides how the expert weights are processed at load. For BF16 and block
+    FP8, ``auto`` picks FlashInfer CUTLASS on Hopper with EP > 1, which
+    reorders w13, so ``auto`` becomes ``triton``. For MXFP4 experts ``auto``
+    may pick Humming, so it becomes ``marlin``. Any other explicit choice
+    fails.
     """
     kernel_config = vllm_config.kernel_config
+    required = (
+        MXFP4_ROUTED_MOE_BACKEND
+        if has_mxfp4_experts(vllm_config)
+        else ROUTED_MOE_BACKEND
+    )
     backend = str(kernel_config.moe_backend)
     if backend == "auto":
-        kernel_config.moe_backend = ROUTED_MOE_BACKEND
-    elif backend != ROUTED_MOE_BACKEND:
+        kernel_config.moe_backend = required
+    elif backend != required:
         raise RuntimeError(
-            f"routed-experts AFD FFN needs --moe-backend {ROUTED_MOE_BACKEND} (or "
-            f"auto); moe_backend={backend!r} reorders the expert weights the "
-            "connector reads"
+            f"routed-experts AFD FFN needs --moe-backend {required} (or auto) "
+            f"for this checkpoint's experts; moe_backend={backend!r} lays out "
+            "the expert weights differently from what the connector reads"
         )
 
 
@@ -75,8 +91,11 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
 
     Read after ``process_weights_after_loading``, which must have kept the
     FusedMoE layout (``select_routed_moe_backend``); checked here because a
-    reordered layout keeps dtypes and shapes.
+    reordered layout keeps dtypes and shapes. MXFP4 experts come back as
+    vLLM's Marlin repack (``Mxfp4MarlinExpertWeights``).
     """
+    if isinstance(routed_experts.quant_method, Mxfp4MoEMethod):
+        return mxfp4_marlin_weights_from_vllm(routed_experts)
     _check_expert_layout(routed_experts)
     w13 = routed_experts.w13_weight.data
     w2 = routed_experts.w2_weight.data

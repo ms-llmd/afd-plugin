@@ -15,6 +15,7 @@ Recipes are organized by hardware backend, connector, and model:
 recipe/
 ├── gpu/
 │   ├── DeepEPM2NAFDConnector/
+│   │   ├── deepseek_v41_flash/
 │   │   ├── qwen3_235b_a22b_fp8/
 │   │   └── qwen3_30b_a3b/
 │   └── P2pNcclAFDConnector/
@@ -43,6 +44,7 @@ Directory names follow these conventions:
 | GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Deployment examples; see the linked README for validation scope | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
 | GPU (SM90+ for `DeepEPM2NAFDConnector`) | `DeepEPM2NAFDConnector` or `P2pNcclAFDConnector` | Qwen3-30B-A3B | Prefill / decode; decode-only benchmark | Graph, eager and DBO scripts for any `LAYOUT` (default 2A2F; multi-pod such as `2A0F,0A2F` or `1A1F,1A1F`), the layouts of the Qwen3 MoE DeepEP M2N E2E cases | [Graph, eager, DBO](gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/README.md) |
 | GPU (SM90+ for `DeepEPM2NAFDConnector`) | `DeepEPM2NAFDConnector` or `P2pNcclAFDConnector` | Qwen3-235B-A22B-FP8 | Prefill / decode; decode-only benchmark | FP8-payload graph, eager and DBO scripts for any `LAYOUT` (2A2F, 4A2F, 2 x 4A1F, ...); H200-class FFN GPUs | [Graph, eager, DBO](gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md) |
+| GPU (SM90+) | `DeepEPM2NAFDConnector` | DeepSeek-V4.1-Flash (MXFP4) | Prefill / decode | Graph, eager and graph + DSpark scripts with the standalone FFN service (Marlin experts) for a one-pod `LAYOUT` (default 4A4F on 8 x H200) | [Graph, eager, DSpark](gpu/DeepEPM2NAFDConnector/deepseek_v41_flash/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes; standard V3.2 is unsupported by the current Async CAM path | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; eager A TP1, F layered eager/FULL. W4A8 PD: native full-draft P TP4, A DP2, F EP4. W8A8 A/F: A DP2, F EP8; PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
