@@ -9,7 +9,7 @@ source revision. See [installation](installation.md) for the pinned runtime stac
 | Model family | Execution scope |
 | --- | --- |
 | DeepSeek V2 / V3 / V3.2 | CUDA P2P and synchronous Ascend paths; DeepEP M2N admits V2 only. Each role loads its required components. |
-| GLM-5.x (`GlmMoeDsaForCausalLM`) | CUDA DeepEP M2N on vLLM's NVIDIA DSA model, Attention TP1, MXFP4 (Marlin) or block-128 FP8 experts; MTP on the Attention ranks; DBO eager with decode-only micro-batching. Rejects P2P, Attention TP > 1, PP, SP MoE, MTP together with DBO, micro-batched prefill and DBO with CUDA graphs. Ascend keeps the DeepSeek V2-derived path. |
+| GLM-5.x (`GlmMoeDsaForCausalLM`) | CUDA DeepEP M2N on vLLM's NVIDIA DSA model, Attention TP1, MXFP4 (Marlin) or block-128 FP8 experts; MTP on the Attention ranks; DBO eager or graph with decode-only micro-batching (MTP with DBO eager only). Rejects P2P, Attention TP > 1, PP, SP MoE, micro-batched prefill and MTP with graph DBO. Ascend keeps the DeepSeek V2-derived path. |
 | DeepSeek V4 Flash | CUDA P2P or Ascend CAMP2P / Async CAM; backend-specific limits are in the matrix below. |
 | Qwen3 MoE | CUDA; P2P gates on FFN, DeepEP M2N gates on Attention. Rejects sequence-parallel MoE, EPLB, PP, speculative decoding, LoRA and NPU. |
 | Qwen3.5 / Qwen3.6 MoE | CUDA text-only with `--language-model-only`; evidence covers Qwen3.6-35B-A3B native DP4/TP1/EP4 and synchronous AFD 2A1F eager/graph. GDN DBO, Attention-side routing, PP, async and multi-node execution are unsupported; NPU/multimodal are unsupported or unverified, quantization is unverified, and no performance claim is made. |

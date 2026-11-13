@@ -9,6 +9,9 @@ the model.
 prefill_decode_colocation/
 ├── 4a4f_eager_dp4tp1.sh             # MXFP4xFP8, eager, one 8-GPU node
 ├── 4a4f_graph_dp4tp1.sh             # MXFP4xFP8, graph, one 8-GPU node
+├── 4a4f_graph_mtp_dp4tp1.sh         # MXFP4xFP8, graph, MTP on Attention
+├── 4a4f_dbo_dp4tp1.sh               # MXFP4xFP8, DBO, MODE=graph (default) or eager
+├── 4a4f_mtp_dbo_dp4tp1.sh           # MXFP4xFP8, MTP + DBO, eager
 └── multipod_4a4f_4a4f_fp8_graph.sh  # block-128 FP8, graph, two 8-GPU pods
 ```
 
@@ -26,7 +29,7 @@ The native vLLM control on the same node is
 
 | Setting | All recipes |
 | --- | --- |
-| `--max-num-seqs` | 64 per Attention DP rank |
+| `--max-num-seqs` | 64 per Attention DP rank (128 in `4a4f_dbo_dp4tp1.sh`) |
 | `--max-num-batched-tokens` | 4096 |
 | `--max-model-len` | 8192 |
 | `--kv-cache-dtype` | `fp8` (vLLM's `fp8_ds_mla` sparse MLA cache on Hopper) |
@@ -56,7 +59,10 @@ The native vLLM control on the same node is
   next layer's RMSNorm, so Attention TP > 1 is rejected.
 - MTP (`4a4f_graph_mtp_dp4tp1.sh`) runs the native draft model on the
   Attention ranks; only the Attention role takes the speculative config.
-- DBO (`4a4f_dbo_dp4tp1.sh`) is eager and micro-batches decode steps only;
-  micro-batched prefill and DBO with CUDA graphs are rejected, as is MTP
-  together with DBO (vLLM ModelRunnerV2).
+- DBO (`4a4f_dbo_dp4tp1.sh`, `4a4f_mtp_dbo_dp4tp1.sh`) micro-batches decode
+  steps only, eager or with CUDA graphs: `--dbo-prefill-token-threshold` must
+  stay above `--max-num-batched-tokens`, because micro-batched GLM prefill is
+  not yet correct. MTP with DBO is eager only; verification steps split on
+  request boundaries and the decode threshold is raised to one request per
+  micro-batch (a backport of vLLM #61464).
 - No P2P connector.

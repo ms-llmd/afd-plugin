@@ -55,8 +55,9 @@ def require_supported_deployment(
 ) -> None:
     """Fail closed outside the GLM-5.x CUDA contract.
 
-    MTP is accepted on the Attention role only. DBO is accepted eager and
-    with decode-only micro-batching, with or without MTP.
+    MTP is accepted on the Attention role only. DBO is accepted with
+    decode-only micro-batching, eager or with CUDA graphs; MTP with DBO is
+    accepted eager only.
     Attention TP > 1 is rejected because the native decoder layer leaves the
     MLP output un-reduced and all-reduces it in the next layer's RMSNorm,
     while the connector returns complete rows on every TP rank; the sum would
@@ -92,12 +93,6 @@ def require_supported_deployment(
             "AFD GLM-5.x DBO micro-batches decode steps only: set "
             "--dbo-prefill-token-threshold above --max-num-batched-tokens"
         )
-    if parallel_config.use_ubatching and not vllm_config.model_config.enforce_eager:
-        # With CUDA graphs the padded split can leave a micro-batch holding
-        # only padding (one request with zero query tokens); vLLM 0.32's sparse
-        # FP8 MLA metadata builder asserts on it
-        # (FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode).
-        raise RuntimeError("AFD GLM-5.x DBO requires --enforce-eager")
     speculative_config = vllm_config.speculative_config
     if speculative_config is None:
         return
@@ -113,6 +108,11 @@ def require_supported_deployment(
             f"AFD GLM-5.x supports only {MTP_METHOD!r} speculative decoding, "
             f"got {speculative_config.method!r}"
         )
+    if parallel_config.use_ubatching and not vllm_config.model_config.enforce_eager:
+        # MTP + graph DBO hit an illegal memory access on GLM-5.3: the FULL
+        # draft-prefill graphs still capture on the target's attention
+        # builders (vLLM #61464's capture-group switch is not backported).
+        raise RuntimeError("AFD GLM-5.x MTP with DBO requires --enforce-eager")
 
 
 class AFDDeepseekV32DecoderLayer(native.DeepseekV32DecoderLayer):

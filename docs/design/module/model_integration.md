@@ -162,9 +162,15 @@ native draft model and its local experts. Under DBO,
 gives each micro-batch its own DSA top-k buffer and index groups (the
 layers that reuse an indexer layer's top-k would otherwise read the other
 micro-batch's) and leases the micro-batch compute SM budget to the indexer
-planner. DBO is limited to eager, decode-only micro-batching; micro-batched
-prefill, DBO with CUDA graphs, and MTP together with DBO (rejected by
-ModelRunnerV2) fail at construction. MXFP4 routed experts, including
+planner. DBO is limited to decode-only micro-batching, so micro-batched
+prefill fails at construction. With CUDA graphs,
+[`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py)
+falls back to an eager micro-batched step whenever a rank's trailing
+micro-batch would be padding only, which the sparse FP8 MLA builder rejects.
+MTP together with DBO uses a scoped backport of vLLM #61464 (request-aligned
+split of verification steps, draft-prefill metadata rebuild) and is eager
+only: its FULL draft-prefill graphs would still capture on the target's
+builders. MXFP4 routed experts, including
 compressed-tensors W4A8 MXFP4, run on the connector's `marlin` expert backend;
 block-128 FP8 experts run on DeepGEMM with the FP8 payload.
 
