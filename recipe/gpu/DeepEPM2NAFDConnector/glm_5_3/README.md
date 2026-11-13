@@ -54,4 +54,9 @@ The native vLLM control on the same node is
 
 - Attention TP1 only: the native DSA layer reduces the MLP output inside the
   next layer's RMSNorm, so Attention TP > 1 is rejected.
-- No MTP, no DBO, no P2P connector.
+- MTP (`4a4f_graph_mtp_dp4tp1.sh`) runs the native draft model on the
+  Attention ranks; only the Attention role takes the speculative config.
+- DBO (`4a4f_dbo_dp4tp1.sh`) is eager and micro-batches decode steps only;
+  micro-batched prefill and DBO with CUDA graphs are rejected, as is MTP
+  together with DBO (vLLM ModelRunnerV2).
+- No P2P connector.

@@ -155,8 +155,16 @@ common paths to both.
 
 The wrapper requires `DeepEPM2NAFDConnector` with
 `compute_gate_on_attention=true` and rejects Attention TP > 1 (the native
-layer would all-reduce the connector's complete rows TP times), PP,
-sequence-parallel MoE, DBO/ubatching and MTP. MXFP4 routed experts, including
+layer would all-reduce the connector's complete rows TP times), PP and
+sequence-parallel MoE. MTP runs natively on the Attention ranks with the
+native draft model and its local experts. Under DBO,
+[`gpu_deepseek_v32_dbo.py`](../../../afd_plugin/compat/patches/gpu_deepseek_v32_dbo.py)
+gives each micro-batch its own DSA top-k buffer and index groups (the
+layers that reuse an indexer layer's top-k would otherwise read the other
+micro-batch's) and leases the micro-batch compute SM budget to the indexer
+planner. DBO is limited to eager, decode-only micro-batching; micro-batched
+prefill, DBO with CUDA graphs, and MTP together with DBO (rejected by
+ModelRunnerV2) fail at construction. MXFP4 routed experts, including
 compressed-tensors W4A8 MXFP4, run on the connector's `marlin` expert backend;
 block-128 FP8 experts run on DeepGEMM with the FP8 payload.
 
