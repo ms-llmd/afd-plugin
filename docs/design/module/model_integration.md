@@ -24,6 +24,7 @@ upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.model_executor.models.deepseek_v2"
+  - "vLLM vllm.models.deepseek_v32.nvidia.model"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
   - "vLLM vllm.model_executor.model_loader"
@@ -61,6 +62,7 @@ make a backend-specific worker class the shared model API.
 | --- | --- | --- |
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py), model and accuracy E2E suites |
+| GLM-5.x CUDA DSA role boundary | [`deepseek_v32.py`](../../../afd_plugin/model_executor/models/deepseek_v32.py) | [`test_deepseek_v32_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v32_construction.py), [`test_deepseek_v32_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v32_weight_policy.py), [GLM-5.3 E2E](../../../tests/e2e/models/glm_5_3/test_glm_5_3.py) |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
@@ -86,7 +88,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
 | `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (Async CAM: eager/native decode Graph A, eager/FULL F) |
-| `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
+| `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` (CUDA: NVIDIA DSA wrapper; NPU: DeepSeek V2-derived) |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
 
@@ -94,9 +96,10 @@ Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
-The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
-V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
-separate wrapper around their matching native architecture. These aliases
+The DeepSeek and DeepSeek V2/V3/V3.2 aliases, and the GLM alias on NPU, share
+the DeepSeek V2-derived implementation. GLM-5.x on CUDA, DeepSeek V4, Qwen3
+MoE, and Qwen3.5/3.6 each have a separate wrapper around their matching native
+architecture. These aliases
 express known compatible architecture families; they do not make any wrapper
 a generic MoE model API.
 
@@ -132,6 +135,30 @@ explicitly.
 The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require
 vLLM-Ascend.
+
+### GLM-5.x CUDA boundary
+
+vLLM serves `GlmMoeDsaForCausalLM` on CUDA with its NVIDIA DSA model
+(`vllm.models.deepseek_v32.nvidia.model`): DeepSeek V2/V3 orchestration with
+MLA plus the lightning indexer, fused embedding/RMSNorm, and an MLP output
+left un-reduced until the next layer's fused all-reduce + RMSNorm.
+[`deepseek_v32.py`](../../../afd_plugin/model_executor/models/deepseek_v32.py)
+keeps that native forward and loader and copies only the decoder layer and
+model constructors. Attention builds the DSA attention and the indexer top-k
+buffer, the dense MLPs of the first `first_k_dense_replace` layers, and, per
+MoE layer, the routed-experts shell `AFDDeepseekV2RoutedExpertsMoE` (gate,
+native router, shared experts, dispatch/combine). FFN builds only the routed
+experts (native `DeepseekV2MoE` without shared experts, external routing). A
+one-pass checkpoint filter sends `self_attn` (indexer included), dense MLP and
+shared-expert paths to Attention, routed experts to FFN, and the gate and
+common paths to both.
+
+The wrapper requires `DeepEPM2NAFDConnector` with
+`compute_gate_on_attention=true` and rejects Attention TP > 1 (the native
+layer would all-reduce the connector's complete rows TP times), PP,
+sequence-parallel MoE, DBO/ubatching and MTP. MXFP4 routed experts, including
+compressed-tensors W4A8 MXFP4, run on the connector's `marlin` expert backend;
+block-128 FP8 experts run on DeepGEMM with the FP8 payload.
 
 ### DeepSeek V4 CUDA boundary
 
