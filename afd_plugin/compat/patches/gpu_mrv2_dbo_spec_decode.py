@@ -29,7 +29,7 @@ Removal: delete when the pinned vLLM contains #61464.
 """
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -40,6 +40,9 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
+    speculator as speculator_module,
+)
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
@@ -165,6 +168,34 @@ def _build_drafter_attn_metadata(
     )
 
 
+@contextmanager
+def _eager_draft_prefill(speculator: TargetDependentARSpeculator) -> Iterator[None]:
+    """Run this step's draft prefill eager; draft decode keeps its graphs.
+
+    At this pin the FULL draft-prefill graphs are captured on the target's
+    attention builders and replay whatever full-batch metadata the target
+    forward last wrote there. A microbatched target forward writes none, so a
+    replay would read stale sequence lengths and block tables (illegal memory
+    access with MTP + graph DBO). Every DP rank microbatched this step, so all
+    of them take this eager path and agree without a new collective.
+    """
+    native_dispatch = speculator_module.dispatch_cg_and_sync_dp
+    prefill_manager = speculator.prefill_cudagraph_manager
+
+    def dispatch_cg_and_sync_dp(
+        cudagraph_manager: Any, *args: Any, **kwargs: Any
+    ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+        if cudagraph_manager is prefill_manager:
+            kwargs["need_eager"] = True
+        return native_dispatch(cudagraph_manager, *args, **kwargs)
+
+    speculator_module.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
+    try:
+        yield
+    finally:
+        speculator_module.dispatch_cg_and_sync_dp = native_dispatch
+
+
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
 # vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py::
 # TargetDependentARSpeculator.propose.
@@ -199,33 +230,36 @@ def propose(
         TargetDependentARSpeculator, _ORIGINAL_PROPOSE_ATTR
     )
     # ### PATCH START: rebuild draft-prefill metadata after a microbatched step.
+    draft_prefill_scope: AbstractContextManager[None] = nullcontext()
     if (
         attn_metadata is None
         and self.vllm_config.parallel_config.use_ubatching
         and not (dummy_run and skip_attn_for_dummy_run)
     ):
         attn_metadata, slot_mappings = _build_drafter_attn_metadata(self, input_batch)
-    # ### PATCH END: rebuild draft-prefill metadata after a microbatched step.
-    return original(
-        self,
-        input_batch,
-        attn_metadata,
-        slot_mappings,
-        last_hidden_states,
-        aux_hidden_states,
-        num_sampled,
-        num_rejected,
-        last_sampled,
-        next_prefill_tokens,
-        temperature,
-        seeds,
-        dp_sync_state=dp_sync_state,
-        dummy_run=dummy_run,
-        skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-        mm_inputs=mm_inputs,
-        is_profile=is_profile,
-        num_speculative_tokens=num_speculative_tokens,
-    )
+        draft_prefill_scope = _eager_draft_prefill(self)
+    with draft_prefill_scope:
+        # ### PATCH END: rebuild draft-prefill metadata after a microbatched step.
+        return original(
+            self,
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            dp_sync_state=dp_sync_state,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            mm_inputs=mm_inputs,
+            is_profile=is_profile,
+            num_speculative_tokens=num_speculative_tokens,
+        )
 
 
 def apply_mrv2_dbo_spec_decode_backport() -> None:

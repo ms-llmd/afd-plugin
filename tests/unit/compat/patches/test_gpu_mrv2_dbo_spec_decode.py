@@ -80,6 +80,7 @@ def _speculator(*, use_ubatching: bool) -> SimpleNamespace:
         model_state=SimpleNamespace(prepare_attn=prepare_attn),
         attn_groups=["draft groups"],
         kv_cache_config="kv",
+        prefill_cudagraph_manager="prefill graphs",
         prepared=prepared,
     )
 
@@ -128,6 +129,43 @@ def test_microbatched_step_rebuilds_draft_prefill_metadata(native_propose):
     assert [len(table) for table in block_tables] == [3, 3]
     assert target_slots.shape == (2, 12)
     assert slot_mappings["draft_layer"] is target_slots
+
+
+def test_microbatched_step_runs_only_draft_prefill_eager(monkeypatch):
+    # FULL draft-prefill graphs replay the target builders' full-batch
+    # metadata, which a microbatched target forward never writes.
+    speculator = _speculator(use_ubatching=True)
+    dispatched: list[tuple[str, bool]] = []
+
+    def fake_native_dispatch(manager, *args, need_eager=False, **kwargs):
+        dispatched.append((manager, need_eager))
+        return "descriptor", None
+
+    def original(self, *args, **kwargs):
+        # Native propose dispatches draft prefill, then draft decode.
+        dispatch = backport.speculator_module.dispatch_cg_and_sync_dp
+        dispatch("prefill graphs", 1, 12, 4, 1, 0, need_eager=False)
+        dispatch("decode graphs", 1, 3, 1, 1, 0, need_eager=False)
+        return "draft tokens"
+
+    monkeypatch.setattr(
+        backport.TargetDependentARSpeculator,
+        backport._ORIGINAL_PROPOSE_ATTR,
+        original,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backport, "build_slot_mappings_by_layer", lambda slots, kv: {"l": slots}
+    )
+    monkeypatch.setattr(
+        backport.speculator_module, "dispatch_cg_and_sync_dp", fake_native_dispatch
+    )
+
+    assert _propose(speculator, None, None) == "draft tokens"
+
+    assert dispatched == [("prefill graphs", True), ("decode graphs", False)]
+    # The scope restores the module binding it replaced.
+    assert backport.speculator_module.dispatch_cg_and_sync_dp is fake_native_dispatch
 
 
 @pytest.mark.parametrize(

@@ -56,8 +56,7 @@ def require_supported_deployment(
     """Fail closed outside the GLM-5.x CUDA contract.
 
     MTP is accepted on the Attention role only. DBO is accepted with
-    decode-only micro-batching, eager or with CUDA graphs; MTP with DBO is
-    accepted eager only.
+    decode-only micro-batching, eager or with CUDA graphs, with or without MTP.
     Attention TP > 1 is rejected because the native decoder layer leaves the
     MLP output un-reduced and all-reduces it in the next layer's RMSNorm,
     while the connector returns complete rows on every TP rank; the sum would
@@ -108,11 +107,6 @@ def require_supported_deployment(
             f"AFD GLM-5.x supports only {MTP_METHOD!r} speculative decoding, "
             f"got {speculative_config.method!r}"
         )
-    if parallel_config.use_ubatching and not vllm_config.model_config.enforce_eager:
-        # MTP + graph DBO hit an illegal memory access on GLM-5.3: the FULL
-        # draft-prefill graphs still capture on the target's attention
-        # builders (vLLM #61464's capture-group switch is not backported).
-        raise RuntimeError("AFD GLM-5.x MTP with DBO requires --enforce-eager")
 
 
 class AFDDeepseekV32DecoderLayer(native.DeepseekV32DecoderLayer):

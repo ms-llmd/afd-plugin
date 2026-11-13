@@ -5,8 +5,7 @@
 # GLM-5.3 MXFP4xFP8 on DeepEPM2NAFDConnector, 4A4F with MTP and DBO (two
 # micro-batches) on one 8-GPU node: FFN DP4 x TP1 (Marlin MXFP4 experts) and
 # Attention DP4 x TP1. The MTP draft runs on the Attention ranks only
-# (NUM_SPECULATIVE_TOKENS, default 3). Eager only: MTP with graph DBO is
-# rejected (the draft-prefill graphs capture on the target's builders).
+# (NUM_SPECULATIVE_TOKENS, default 3). MODE is graph (default) or eager.
 # Settings and running in a pod: recipe/gpu/common/README.md
 # shellcheck disable=SC1090,SC2034  # the sourced launcher reads these variables
 
@@ -14,7 +13,9 @@ AFD_CONNECTOR=${AFD_CONNECTOR:-DeepEPM2NAFDConnector}
 LAYOUT=${LAYOUT:-4A4F}
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/GLM-5.3-MXFP4xFP8}
 CONNECTOR_CONFIG='"expert_backend": "marlin"'   # MXFP4 experts, BF16 payload
-MODE=eager
+MODE=${MODE:-graph}
+# Decode steps carry 1 + NUM_SPECULATIVE_TOKENS tokens per request.
+CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-4,8,16,32,64,96,128,192,256}
 SPECULATIVE_CONFIG="{\"method\":\"mtp\",\"num_speculative_tokens\":${NUM_SPECULATIVE_TOKENS:-3}}"
 ATTN_ARGS="--speculative-config=${SPECULATIVE_CONFIG} ${ATTN_ARGS:-}"
 # DBO splits decode (verification) steps only; the AFD gate raises the decode
