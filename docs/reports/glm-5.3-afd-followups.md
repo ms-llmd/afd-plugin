@@ -20,8 +20,9 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
    workspaces (per micro-batch), MLA prefill backend and chunked-context
    workspace (per builder), CuTe input alignment, the Marlin FFN executor,
    stream ordering. Leading hypothesis: a prefill request straddling the
-   token-midpoint split. Diagnostics: D-B (prefix caching off) was running
-   when work stopped; next D-A (request-aligned split for all micro-batched
+   token-midpoint split. D-B (prefix caching off, prefill DBO on): 1 garbled
+   answer of 200 (doc 138) instead of several, so prefix-cache hits make the
+   corruption much more frequent but do not explain all of it. Next: D-A (request-aligned split for all micro-batched
    batches; needs a DP-agreed split, e.g. under Attention DP1 / `1A4F`), then
    a per-layer DBO vs non-DBO hidden-state comparison. Until then the adapter
    requires `--dbo-prefill-token-threshold` > `--max-num-batched-tokens`.
