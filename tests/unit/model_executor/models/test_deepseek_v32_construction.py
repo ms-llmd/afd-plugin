@@ -183,6 +183,7 @@ MTP = SimpleNamespace(method="mtp")
         pytest.param({}, None, id="m2n"),
         pytest.param({"use_ubatching": True}, None, id="dbo"),
         pytest.param({}, MTP, id="mtp-on-attention"),
+        pytest.param({"use_ubatching": True}, MTP, id="mtp-with-dbo"),
     ],
 )
 def test_supported_deployments_are_accepted(parallel_changes, speculative):
@@ -225,9 +226,6 @@ def test_supported_deployments_are_accepted(parallel_changes, speculative):
             id="sp-moe",
         ),
         pytest.param({"role": "ffn"}, {}, MTP, "Attention role only", id="mtp-on-ffn"),
-        pytest.param(
-            {}, {"use_ubatching": True}, MTP, "MTP together with DBO", id="mtp-dbo"
-        ),
         pytest.param(
             {}, {}, SimpleNamespace(method="eagle"), "supports only", id="eagle"
         ),

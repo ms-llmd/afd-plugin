@@ -57,6 +57,7 @@ def registration(monkeypatch, request):
     for name in (
         "async_dp_engine",
         "async_dp_forward_context",
+        "config_dbo_spec_decode",
         "config_validation",
         "engine_core",
     ):

@@ -18,8 +18,9 @@ and loader and only makes construction and checkpoint loading role-aware:
 The wrapper is limited to the DeepEP M2N connector with Attention TP = 1.
 MTP runs natively on the Attention ranks (its draft experts are local there);
 DBO (eager, decode steps only) gives each micro-batch its own DSA top-k
-state (``gpu_deepseek_v32_dbo``). MTP together with DBO (rejected by vLLM
-ModelRunnerV2) and other deployments fail at construction.
+state (``gpu_deepseek_v32_dbo``) and runs together with MTP through the
+vLLM #61464 backport (``gpu_mrv2_dbo_spec_decode``). Other deployments fail
+at construction.
 """
 
 from collections.abc import Iterable
@@ -54,8 +55,8 @@ def require_supported_deployment(
 ) -> None:
     """Fail closed outside the GLM-5.x CUDA contract.
 
-    MTP is accepted on the Attention role only, not together with DBO. DBO
-    is accepted eager and with decode-only micro-batching.
+    MTP is accepted on the Attention role only. DBO is accepted eager and
+    with decode-only micro-batching, with or without MTP.
     Attention TP > 1 is rejected because the native decoder layer leaves the
     MLP output un-reduced and all-reduces it in the next layer's RMSNorm,
     while the connector returns complete rows on every TP rank; the sum would
@@ -111,13 +112,6 @@ def require_supported_deployment(
         raise RuntimeError(
             f"AFD GLM-5.x supports only {MTP_METHOD!r} speculative decoding, "
             f"got {speculative_config.method!r}"
-        )
-    if parallel_config.use_ubatching:
-        # vLLM 0.32 ModelRunnerV2, which AFD requires, rejects DBO together
-        # with speculative decoding at config validation.
-        raise RuntimeError(
-            "AFD GLM-5.x does not support MTP together with DBO: vLLM "
-            "ModelRunnerV2 does not support DBO with speculative decoding"
         )
 
 
