@@ -45,6 +45,10 @@ The native vLLM control on the same node is
   control with the same `--moe-backend marlin`.
 - The FP8 recipe needs DeepGEMM (see the connector guide). The MXFP4 recipes
   do not; leave vLLM's bundled DeepGEMM in place for the DSA indexer.
+- `vllm/vllm-openai:v0.32.0` ships `nvidia-nccl-cu13` 2.29.7, which lacks the
+  NCCL GIN request API afdEP-comm's kernels compile against. Install
+  `nvidia-nccl-cu13==2.30.7` and export `AFDEP_NCCL_ROOT` and
+  `LD_LIBRARY_PATH` as the connector recipes README shows.
 
 ## Limitations
 
