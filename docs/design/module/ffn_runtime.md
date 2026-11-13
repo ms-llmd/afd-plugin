@@ -13,9 +13,10 @@ primary_code_paths:
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
-  - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -27,6 +28,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
+  - "tests/gpu/test_ffn_faas_gpu.py"
   - "tests/unit/model_executor/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
@@ -34,10 +36,12 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
-  - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
-  - "tests/unit/test_async_cam_startup_wiring.py"
-  - "tests/unit/connectors/test_async_cam_startup.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
@@ -61,7 +65,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-26
+last_reviewed: 2026-11-09
 ---
 
 # FFN runtime
@@ -81,6 +85,17 @@ FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
 
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
+
 ## Runtime selection
 
 The traditional FFN is launched as a `vllm serve` process, and AFD config normalization selects
@@ -96,10 +111,16 @@ a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
 Attention retains its existing model, connector and DBO path. Configuration,
 parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
 
+The standalone Ascend CLI reuses vLLM engine argument definitions, parsing and
+configuration construction. Existing AFD options remain in `additional_config`;
+only host management and shutdown options are standalone-specific. The host
+entry delegates parser creation to its selected platform, so CPU-only service
+and host-loop imports remain independent of vLLM.
+
 The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
 the backend before preparation, and owns the receiving thread and failure
 boundary. `FFNService` manages host status and stop requests. Platform options
-and native composition live under `ffn_faas/platforms/npu/`:
+and CAM runtime composition live under `ffn_faas/platforms/npu/`.
 
 - `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
   and native post-warmup CPU affinity. These groups coexist with the separate
@@ -108,17 +129,18 @@ and native composition live under `ffn_faas/platforms/npu/`:
   accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
   to provide checkpoint metadata and native owner construction. The backend
   uses the common resource without model-specific branching.
-- `v4_model.py` contains V4 checkpoint metadata and `V4ModelAdapter`;
-  `v4_weights.py` contains the lazily imported native parameter owner. Native
-  routed modules, expert-map managers and quantizers remain resident. The
-  loader adapter delegates to the native V4 loader; dependency upgrades must
-  preserve its documented receiver and factory contracts.
+- Model-specific code follows `ffn_faas/platforms/ffn_model/<model>/<backend>/`.
+  Under `deepseek_v4/npu/`, `v4_model.py` contains V4 checkpoint metadata and
+  `V4ModelAdapter`. `v4_weights.py` contains the lazily imported native parameter
+  owner. Native routed modules, expert-map managers and quantizers remain
+  resident. The loader adapter delegates to the native V4 loader. Dependency
+  upgrades must preserve its documented receiver and factory contracts.
 - Platform settings enforce static CAM placement and reject EPLB, elastic EP
   and redundant experts. Retaining native expert state does not enable these
   algorithms.
 
 `FFNBackend` is a runtime lifecycle interface. Its `execute_step()` delegates
-communication, computation, Graph and two-stream scheduling to the Async CAM
+communication, computation and Graph execution to the Async CAM
 runtime. A shared cross-platform, cross-connector Step Loop and a pure
 `compute(item)` backend are not implemented. The runtime consumes the existing
 `LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
@@ -133,10 +155,47 @@ native work retains all owners until whole-pair process isolation. A host
 See the [standalone service guide](../../npu/STANDALONE_FFN_SERVICE.md) for
 supported configuration, launch and shutdown behavior.
 
+CUDA routed-experts models over `DeepEPM2NAFDConnector` have a GPU standalone
+F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
+
+- `GPUDeepEPM2NAdapter` reuses the shared native engine CLI and F-only
+  launcher checks of `ffn_faas/platforms/launch.py`; with `GPUFFNConfig` it
+  checks on the CPU, before any device work, the M2N connector, TP 1 with EP,
+  the FULL_DECODE_ONLY or eager mode, the BF16 payload and lane parity with
+  `--enable-dbo`. The adapter resolves the model path but does not parse or
+  name a model family.
+- `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
+  the F-only `VllmConfig` with `EngineArgs.from_cli_args` (`external_launcher`,
+  DP = F ranks, TP 1, EP), selects
+  the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
+  before any FusedMoE is built, and creates the F-only world through vLLM's
+  `init_worker_distributed_environment`.
+- The AFD model registry selects the FFN-only shell for the configured model.
+  For example, `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
+  (native `Qwen3MoeSparseMoeBlock`) and loads through vLLM's
+  `DefaultModelLoader`, so the EP weight filter, FusedMoE expert loading and
+  strict loaded-weights check run unchanged; the embedding, final norm and LM
+  head are not allocated.
+- `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, loads the
+  shell through that runner, starts the connector, and delegates each step to
+  `execute_connector_driven_step()`, the method the Worker loop also calls.
+  CUDA graphs are captured lazily from Attention's payloads, as on the Worker
+  path, so `/ready` means paired and receiving.
+
+`FFNBackend.execute_step()` returns `False` only when `cancel_receive()` ended
+an idle receive; the host calls `cancel_receive()` after a stop request and
+before joining the receiver. The GPU backend closes the M2N control plane
+(aborting its own NCCL group); the NPU backend's `cancel_receive()` is a no-op.
+Releasing DeepEP lanes is a barrier over every M2N rank, so a stopped GPU F
+completes its release when Attention shuts down too. See the
+[GPU standalone service guide](../../gpu/STANDALONE_FFN_SERVICE.md).
+
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
+| CUDA standalone (`ffn_faas`, no Worker) | `DeepEPM2NFFNBackend` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` |
+| NPU standalone (`ffn_faas`, no Worker) | `CAMFFNBackend` | `AsyncNPUFFNModelRunner` | `CAMAsyncAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. The CUDA
@@ -214,7 +273,7 @@ The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
 Attention DP1 or DP > 1. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
 configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
 the same DBO setting on both roles; see the
@@ -226,21 +285,6 @@ supports eager Attention DBO at DP1 or DP > 1, and rejects native DBO flags on
 FFN. Async FFN FULL accepts eager Attention DBO and continues to receive work
 items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
-
-Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8/W8A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
-two slots, compute/send streams and ready/done events. FULL owns four private
-graph pools and four graphs; eager retires each slot only after its send is
-observed complete. Both modes retain the bounded batch fence. Enabled eager
-and FULL agree on executor, layer, capacity and core signatures before HCCL
-creation. Attention must use eager MRV2 with PP=PCP=DCP=1, MoE sequence
-parallelism and FlashComm1 disabled, and no speculative decoding. Attention DBO
-remains supported with exactly two native microbatches under the existing
-DP/TP constraints; FFN DBO stays disabled. Shutdown requires receiver
-exit and device completion before release. Partial native failures retain
-resources and remain visible to repeated health checks. Host tests do not
-qualify native window reuse, graph capture or stream overlap; see the
-[Async runtime guide](../../npu/ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution).
 
 ## Daemon step selection
 
@@ -289,11 +333,18 @@ daemon thread:
   -> repeat
 ```
 
+On CUDA, one iteration is `GPUFFNModelRunner.execute_connector_driven_step()`,
+shared by `AFDFFNWorker` and the standalone GPU FFN backend. It returns
+`False` only for a receive cancelled by a requested stop; a closed control
+plane without a stop request, and every other failure, raises.
+
 ### Connector-driven loop
 
 The Ascend worker checks `connector.control_plane`. When it is `None`, as for
-CAM async, the worker calls `execute_connector_driven_step()` instead of a
-control-plane receive. For each layer, the runner:
+CAM async, the worker calls `execute_connector_driven_step(shutdown_requested)`
+instead of a control-plane receive. The runner asks the execution session once
+per step whether to keep serving, so Pull adds no extra Store round trip to the
+loop. For each layer, the runner:
 
 1. receives a capacity-sized payload and its original CAM metadata through
    `connector.recv_attn_output()`;
@@ -305,7 +356,7 @@ control-plane receive. For each layer, the runner:
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
 selection. The independent Async runner owns one graph and stable resources;
-see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
+see [Async FFN runtime](../npu/async_ffn_runtime.md) for startup, supported
 W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
 DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
@@ -421,7 +472,7 @@ thread does not exit, native resources are not released underneath it. The
 connector then releases its remaining communication resources during runner
 shutdown. An earlier daemon failure is still surfaced after the join. Ascend
 uses its own connector close or asynchronous drain path before joining the
-daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
+daemon; see the [Async FFN runtime](../npu/async_ffn_runtime.md).
 
 ## Candidate invariants
 
@@ -445,16 +496,8 @@ async model E2E coverage.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. Ascend V1 native DBO accepts
-exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
-V2-compatible construction and forward-context seam. CUDA FFN consumes the
-two-stage control layout and replays the matching graph when requested;
-Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
-CAM async instead uses eager connector work items; native DBO runs only on
-Attention and does not create a separate FFN stage scheduler.
-Platform-specific limits are centralized in
-[execution platforms](execution_platforms.md#tested-runtime-matrix).
+Platform-specific execution limits and validation evidence are centralized in
+[support matrix](../../support.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the
 optional control-plane split. Connector metadata ownership, transfer state

@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import atexit
 import json
-import os
 import sys
 import threading
+from argparse import ArgumentParser, Namespace
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,18 +72,59 @@ def write_v4_checkpoint(root: Path, *, layers: int = 2, experts: int = 4) -> Pat
     return root
 
 
+# The shape of Qwen/Qwen3-30B-A3B's config.json (no shared-expert field).
+QWEN3_30B_A3B_CONFIG = {
+    "architectures": ["Qwen3MoeForCausalLM"],
+    "model_type": "qwen3_moe",
+    "torch_dtype": "bfloat16",
+    "hidden_size": 2048,
+    "num_hidden_layers": 48,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 768,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
+    "norm_topk_prob": True,
+}
+
+
+def write_qwen3_checkpoint(root: Path, **overrides) -> Path:
+    """A Qwen3 MoE ``config.json`` only; ``None`` values remove a key."""
+    root.mkdir(parents=True, exist_ok=True)
+    config = {**QWEN3_30B_A3B_CONFIG, **overrides}
+    config = {key: value for key, value in config.items() if value is not None}
+    (root / "config.json").write_text(json.dumps(config))
+    return root
+
+
 class HostBackend:
     """Exercise host ownership rules, without simulating device completion."""
 
     def __init__(
-        self, *, stop_during_prepare: bool = False, fail: str = "", block: bool = False
+        self,
+        *,
+        stop_during_prepare: bool = False,
+        fail: str = "",
+        block: bool = False,
+        cancellable: bool = False,
+        end_receive: bool = False,
     ) -> None:
+        """Configure one host-contract behavior.
+
+        ``block`` keeps ``execute_step`` waiting like an idle receive;
+        ``cancellable`` lets ``cancel_receive`` end that wait the way the GPU
+        M2N control plane does; ``end_receive`` makes the first step report a
+        cancelled receive without any host stop.
+        """
         self.stop_during_prepare = stop_during_prepare
         self.fail = fail
         self.block = block
+        self.cancellable = cancellable
+        self.end_receive = end_receive
         self.entered = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        self.cancelled = False
         self.released = False
         self.service: FFNService | None = None
 
@@ -99,15 +140,27 @@ class HostBackend:
         if self.fail == "activate":
             raise RuntimeError("receiver activation failed")
 
-    def execute_step(self) -> None:
+    def execute_step(self) -> bool:
+        """Return ``False`` for a cancelled receive, else request a stop."""
         assert self.service is not None
         self.entered.set()
+        if self.end_receive:
+            return False
         if self.block:
             self.release.wait()
+            if self.cancelled:
+                return False
         if self.fail == "execute":
             self.finished.set()
             raise RuntimeError("execute failed")
         self.service.request_stop()
+        return True
+
+    def cancel_receive(self) -> None:
+        """End a blocked receive only when this fake models a cancellable one."""
+        if self.cancellable:
+            self.cancelled = True
+            self.release.set()
 
     def receiver_exited(self) -> None:
         self.finished.set()
@@ -123,16 +176,16 @@ class HostBackend:
 class HostPlatformAdapter:
     """An independent CPU host contract; it has no model/device requirements."""
 
-    def add_arguments(self, parser) -> None:
-        pass
+    def create_parser(self) -> ArgumentParser:
+        return ArgumentParser()
 
     def configure(self, args) -> FFNLaunch:
         return FFNLaunch(
             rank=3,
             local_rank=0,
-            model_path=str(args.model),
+            model_path=str(args.model_tag),
             backend_name="host-contract",
-            shutdown_timeout=args.shutdown_timeout,
+            shutdown_timeout=args.receiver_shutdown_timeout,
             backend_factory=HostBackend,
         )
 
@@ -151,7 +204,7 @@ def run_cpu_platform(model: str, status: str) -> int:
         "0",
         "--status-file",
         status,
-        "--shutdown-timeout",
+        "--receiver-shutdown-timeout",
         "0.1",
     ]
     with (
@@ -171,24 +224,12 @@ def run_cli_host_case(model: str, marker: str, fault: str, released: bool) -> in
     from afd_plugin.ffn_faas import __main__ as cli
 
     atexit.register(lambda: Path(marker).write_text("ordinary shutdown"))
-    os.environ.update(
-        RANK="0",
-        LOCAL_RANK="0",
-        WORLD_SIZE="1",
-        LOCAL_WORLD_SIZE="1",
-        VLLM_USE_V2_MODEL_RUNNER="1",
-        AFD_ASYNC_CAM_LAYERED_GMM="1",
-    )
     args = [
         "ffn_faas",
         "serve",
         model,
-        "--attention-ranks",
-        "1",
-        "--attention-tp",
-        "1",
-        "--ffn-ranks",
-        "1",
+        "--backend",
+        "host-contract",
         "--status-port",
         "0",
     ]
@@ -244,7 +285,39 @@ def run_cli_host_case(model: str, marker: str, fault: str, released: bool) -> in
                 if not released and fault != "returned_unreleased":
                     raise RuntimeError("host-only unreleased session")
 
+        patches.enter_context(
+            patch.object(cli, "SUPPORTED_BACKENDS", ("host-contract",))
+        )
+        patches.enter_context(
+            patch.object(cli, "get_platform_adapter", lambda _: HostPlatformAdapter())
+        )
         patches.enter_context(patch.object(cli, "FFNService", HostService))
         patches.enter_context(patch.object(cli, "FFNModelRunner", HostRunner))
         patches.enter_context(patch.object(sys, "argv", args))
         return cli.main()
+
+
+def cam_cli_args(model: Path, **overrides) -> Namespace:
+    """Parsed engine arguments for CPU-only standalone launch admission tests."""
+    values = {
+        "model": str(model),
+        "model_tag": None,
+        "data_parallel_size": 2,
+        "data_parallel_rank": None,
+        "distributed_executor_backend": "external_launcher",
+        "receiver_shutdown_timeout": 5.0,
+        "additional_config": {
+            "enable_cpu_binding": False,
+            "afd": {
+                "connector": "CAMAsyncAFDConnector",
+                "role": "ffn",
+                "async_dp": True,
+                "compute_gate_on_attention": True,
+                "num_attention_ranks": 12,
+                "num_ffn_ranks": 2,
+                "connector_extra_config": {"dynamicQuant": 1, "attn_ranks_per_dp": 4},
+            },
+        },
+    }
+    values.update(overrides)
+    return Namespace(**values)
