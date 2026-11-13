@@ -116,8 +116,12 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         "afd_plugin.model_executor.models.npu.deepseek_v4_dspark:"
         "AFDDSparkDeepseekV4ForCausalLM"
     ),
+    # CUDA follows native vLLM, which serves GLM-5.x with the NVIDIA DSA model;
+    # NPU keeps the DeepSeek V2-derived wrapper.
     "GlmMoeDsaForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDGlmMoeDsaForCausalLM"
+        if importlib.util.find_spec("torch_npu") is not None
+        else "afd_plugin.model_executor.models.deepseek_v32:AFDGlmMoeDsaForCausalLM"
     ),
 }
 

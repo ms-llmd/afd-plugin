@@ -96,7 +96,11 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
         "AFDDeepseekV2ForCausalLM": deepseek + "AFDDeepseekV2ForCausalLM",
         "AFDDeepseekV3ForCausalLM": deepseek + "AFDDeepseekV3ForCausalLM",
         "AFDDeepseekV32ForCausalLM": deepseek + "AFDDeepseekV3ForCausalLM",
-        "AFDGlmMoeDsaForCausalLM": deepseek + "AFDGlmMoeDsaForCausalLM",
+        "AFDGlmMoeDsaForCausalLM": (
+            deepseek + "AFDGlmMoeDsaForCausalLM"
+            if registration.device == "npu"
+            else "afd_plugin.model_executor.models.deepseek_v32:AFDGlmMoeDsaForCausalLM"
+        ),
         "AFDDeepseekV4ForCausalLM": (
             "afd_plugin.model_executor.models.npu.deepseek_v4:AFDDeepseekV4ForCausalLM"
             if registration.device == "npu"
