@@ -33,10 +33,9 @@ Supported models:
   (`RedHatAI/GLM-5.3-MXFP4xFP8`) need `expert_backend: "marlin"`; the
   block-128 FP8 checkpoint (`zai-org/GLM-5.3`) uses the FP8 payload and
   DeepGEMM. MTP runs natively on the Attention ranks (its draft experts
-  stay local). DBO runs eager or with CUDA graphs (MTP with DBO eager
-  only), with decode-only micro-batching, each micro-batch keeping its own
-  DSA top-k state. Attention TP > 1, micro-batched prefill and MTP with
-  graph DBO are rejected.
+  stay local). DBO runs eager or with CUDA graphs, with or without MTP,
+  with decode-only micro-batching, each micro-batch keeping its own DSA
+  top-k state. Attention TP > 1 and micro-batched prefill are rejected.
 
 DeepSeek-V3 and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
 

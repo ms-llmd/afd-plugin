@@ -19,9 +19,12 @@ This worker-side module backports, for the AFD Attention runner:
 
 1. a request-boundary split of uniform multi-token batches, fed the uniform
    token count the target dispatch agreed across DP ranks;
-2. a draft-prefill pre-step that rebuilds full-batch metadata on the draft's
-   own builders after a microbatched target forward (eager only; FULL draft
-   prefill graphs are captured on the target's builders at this pin).
+2. draft prefill on the draft's own builders under DBO: its FULL graphs are
+   captured there, each replay first refreshes them with this batch's
+   full-batch metadata, and an eager draft prefill after a microbatched
+   target forward gets that metadata rebuilt (the pin captures on, and
+   reuses, the target's builders, whose full-batch buffers a microbatched
+   forward never writes).
 
 The config gate lives in ``config_dbo_spec_decode``.
 
@@ -40,15 +43,13 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
-    speculator as speculator_module,
-)
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
 from vllm.v1.worker.ubatch_utils import UBatchSlice, UBatchSlices
 
 _ORIGINAL_PROPOSE_ATTR = "_afd_original_target_dependent_ar_propose"
+_ORIGINAL_CAPTURE_ATTR = "_afd_original_target_dependent_ar_capture"
 
 
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
@@ -143,11 +144,15 @@ def use_request_aligned_ubatch_split() -> Iterator[None]:
 
 
 def _build_drafter_attn_metadata(
-    speculator: TargetDependentARSpeculator, input_batch: InputBatch
+    speculator: TargetDependentARSpeculator,
+    input_batch: InputBatch,
+    cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    for_capture: bool = False,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     """#61464's ``DraftModelSpeculator._build_drafter_attn_metadata`` for the
     rebuild branch: full-batch draft-prefill metadata on the draft's own
-    builders, from the block tables and slot mappings the target prepared."""
+    builders, from the block tables and slot mappings the target prepared.
+    With ``FULL`` it refreshes the buffers the draft-prefill graphs captured."""
     block_tables = tuple(
         block_table[: input_batch.num_reqs_after_padding]
         for block_table in speculator.block_tables.input_block_tables
@@ -157,11 +162,12 @@ def _build_drafter_attn_metadata(
     ]
     attn_metadata = speculator.model_state.prepare_attn(
         input_batch,
-        CUDAGraphMode.NONE,
+        cg_mode,
         block_tables,
         target_slot_mappings,
         speculator.attn_groups,
         speculator.kv_cache_config,
+        for_capture=for_capture,
     )
     return attn_metadata, build_slot_mappings_by_layer(
         target_slot_mappings, speculator.kv_cache_config
@@ -169,31 +175,57 @@ def _build_drafter_attn_metadata(
 
 
 @contextmanager
-def _eager_draft_prefill(speculator: TargetDependentARSpeculator) -> Iterator[None]:
-    """Run this step's draft prefill eager; draft decode keeps its graphs.
+def _refresh_draft_prefill_graph(
+    speculator: TargetDependentARSpeculator, input_batch: InputBatch, dummy_run: bool
+) -> Iterator[None]:
+    """Refresh the draft builders' buffers before a FULL draft-prefill replay.
 
-    At this pin the FULL draft-prefill graphs are captured on the target's
-    attention builders and replay whatever full-batch metadata the target
-    forward last wrote there. A microbatched target forward writes none, so a
-    replay would read stale sequence lengths and block tables (illegal memory
-    access with MTP + graph DBO). Every DP rank microbatched this step, so all
-    of them take this eager path and agree without a new collective.
+    Under DBO the draft-prefill graphs are captured on the draft's own
+    builders (see ``capture``), so every replay first writes this batch's
+    full-batch metadata there, as #61464 does before ``run_fullgraph``.
     """
-    native_dispatch = speculator_module.dispatch_cg_and_sync_dp
-    prefill_manager = speculator.prefill_cudagraph_manager
+    manager = speculator.prefill_cudagraph_manager
+    native_run_fullgraph = manager.run_fullgraph
 
-    def dispatch_cg_and_sync_dp(
-        cudagraph_manager: Any, *args: Any, **kwargs: Any
-    ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
-        if cudagraph_manager is prefill_manager:
-            kwargs["need_eager"] = True
-        return native_dispatch(cudagraph_manager, *args, **kwargs)
+    def run_fullgraph(desc: BatchExecutionDescriptor) -> Any:
+        _build_drafter_attn_metadata(
+            speculator, input_batch, desc.cg_mode, for_capture=dummy_run
+        )
+        return native_run_fullgraph(desc)
 
-    speculator_module.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
+    manager.run_fullgraph = run_fullgraph
     try:
         yield
     finally:
-        speculator_module.dispatch_cg_and_sync_dp = native_dispatch
+        del manager.run_fullgraph
+
+
+# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py::
+# TargetDependentARSpeculator.capture.
+# Patch reason: draft prefill captures its FULL graphs on the target's
+# attention builders, whose full-batch buffers a microbatched target forward
+# never refreshes (illegal memory access with MTP + graph DBO).
+# Patch functionality: under DBO, capture them on the draft's own builders,
+# as #61464 does (``can_reuse_target_attn_metadata`` is False with DBO).
+# Expansion exception: the upstream method is about 50 lines and passes the
+# groups by attribute; the backport swaps that attribute around the call.
+# Signature: matches upstream.
+def capture(self) -> None:
+    original: Callable[[Any], None] = getattr(
+        TargetDependentARSpeculator, _ORIGINAL_CAPTURE_ATTR
+    )
+    # ### PATCH START: capture draft prefill on the draft builders under DBO.
+    if not self.vllm_config.parallel_config.use_ubatching:
+        original(self)
+        return
+    target_attn_groups = self.target_attn_groups
+    self.target_attn_groups = self.attn_groups
+    try:
+        original(self)
+    finally:
+        self.target_attn_groups = target_attn_groups
+    # ### PATCH END: capture draft prefill on the draft builders under DBO.
 
 
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
@@ -229,17 +261,19 @@ def propose(
     original: Callable[..., torch.Tensor] = getattr(
         TargetDependentARSpeculator, _ORIGINAL_PROPOSE_ATTR
     )
-    # ### PATCH START: rebuild draft-prefill metadata after a microbatched step.
+    # ### PATCH START: draft-prefill metadata on the draft builders under DBO.
     draft_prefill_scope: AbstractContextManager[None] = nullcontext()
-    if (
-        attn_metadata is None
-        and self.vllm_config.parallel_config.use_ubatching
-        and not (dummy_run and skip_attn_for_dummy_run)
+    if self.vllm_config.parallel_config.use_ubatching and not (
+        dummy_run and skip_attn_for_dummy_run
     ):
-        attn_metadata, slot_mappings = _build_drafter_attn_metadata(self, input_batch)
-        draft_prefill_scope = _eager_draft_prefill(self)
+        if attn_metadata is None:
+            # Eager draft prefill after a microbatched target forward.
+            attn_metadata, slot_mappings = _build_drafter_attn_metadata(
+                self, input_batch
+            )
+        draft_prefill_scope = _refresh_draft_prefill_graph(self, input_batch, dummy_run)
     with draft_prefill_scope:
-        # ### PATCH END: rebuild draft-prefill metadata after a microbatched step.
+        # ### PATCH END: draft-prefill metadata on the draft builders under DBO.
         return original(
             self,
             input_batch,
@@ -263,7 +297,7 @@ def propose(
 
 
 def apply_mrv2_dbo_spec_decode_backport() -> None:
-    """Install the draft-prefill pre-step once (worker process)."""
+    """Install the draft-prefill capture and pre-step once (worker process)."""
     if hasattr(TargetDependentARSpeculator, _ORIGINAL_PROPOSE_ATTR):
         return
     setattr(
@@ -271,7 +305,13 @@ def apply_mrv2_dbo_spec_decode_backport() -> None:
         _ORIGINAL_PROPOSE_ATTR,
         TargetDependentARSpeculator.propose,
     )
+    setattr(
+        TargetDependentARSpeculator,
+        _ORIGINAL_CAPTURE_ATTR,
+        TargetDependentARSpeculator.capture,
+    )
     TargetDependentARSpeculator.propose = propose
+    TargetDependentARSpeculator.capture = capture
 
 
 apply_mrv2_dbo_spec_decode_backport()

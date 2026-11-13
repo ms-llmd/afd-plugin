@@ -11,7 +11,7 @@ prefill_decode_colocation/
 ├── 4a4f_graph_dp4tp1.sh             # MXFP4xFP8, graph, one 8-GPU node
 ├── 4a4f_graph_mtp_dp4tp1.sh         # MXFP4xFP8, graph, MTP on Attention
 ├── 4a4f_dbo_dp4tp1.sh               # MXFP4xFP8, DBO, MODE=graph (default) or eager
-├── 4a4f_mtp_dbo_dp4tp1.sh           # MXFP4xFP8, MTP + DBO, eager
+├── 4a4f_mtp_dbo_dp4tp1.sh           # MXFP4xFP8, MTP + DBO, MODE=graph (default) or eager
 └── multipod_4a4f_4a4f_fp8_graph.sh  # block-128 FP8, graph, two 8-GPU pods
 ```
 
@@ -62,7 +62,8 @@ The native vLLM control on the same node is
 - DBO (`4a4f_dbo_dp4tp1.sh`, `4a4f_mtp_dbo_dp4tp1.sh`) micro-batches decode
   steps only, eager or with CUDA graphs: `--dbo-prefill-token-threshold` must
   stay above `--max-num-batched-tokens`, because micro-batched GLM prefill is
-  not yet correct. MTP with DBO is eager only; verification steps split on
-  request boundaries and the decode threshold is raised to one request per
-  micro-batch (a backport of vLLM #61464).
+  not yet correct. With MTP, verification steps split on request boundaries,
+  the decode threshold is raised to one request per micro-batch, and draft
+  prefill runs on the draft's own attention builders (a backport of vLLM
+  #61464).
 - No P2P connector.

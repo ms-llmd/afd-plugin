@@ -61,12 +61,26 @@ def test_split_keeps_the_midpoint_when_it_cannot_align(
     assert first.token_slice.stop == midpoint
 
 
+class _GraphManager:
+    """The SpeculatorCudaGraphManager replay the backport wraps."""
+
+    def __init__(self, events: list[tuple]):
+        self.events = events
+
+    def run_fullgraph(self, desc):
+        self.events.append(("replay", desc.cg_mode))
+
+
 def _speculator(*, use_ubatching: bool) -> SimpleNamespace:
     """The TargetDependentARSpeculator state the rebuild reads."""
     prepared: list[tuple] = []
 
-    def prepare_attn(input_batch, cg_mode, block_tables, slot_mappings, groups, kv):
+    def prepare_attn(
+        input_batch, cg_mode, block_tables, slot_mappings, groups, kv, for_capture
+    ):
         prepared.append((cg_mode, block_tables, slot_mappings, groups))
+        if cg_mode == backport.CUDAGraphMode.FULL:
+            prepared.append(("refresh", for_capture))
         return {"draft_layer": "draft metadata"}
 
     return SimpleNamespace(
@@ -80,7 +94,7 @@ def _speculator(*, use_ubatching: bool) -> SimpleNamespace:
         model_state=SimpleNamespace(prepare_attn=prepare_attn),
         attn_groups=["draft groups"],
         kv_cache_config="kv",
-        prefill_cudagraph_manager="prefill graphs",
+        prefill_cudagraph_manager=_GraphManager(prepared),
         prepared=prepared,
     )
 
@@ -131,21 +145,20 @@ def test_microbatched_step_rebuilds_draft_prefill_metadata(native_propose):
     assert slot_mappings["draft_layer"] is target_slots
 
 
-def test_microbatched_step_runs_only_draft_prefill_eager(monkeypatch):
-    # FULL draft-prefill graphs replay the target builders' full-batch
-    # metadata, which a microbatched target forward never writes.
+@pytest.mark.parametrize("dummy_run", [False, True], ids=["step", "dummy-run"])
+@pytest.mark.parametrize("target_metadata", [None, {"layer": "target"}])
+def test_full_draft_prefill_replay_refreshes_the_draft_builders_first(
+    monkeypatch, dummy_run, target_metadata
+):
+    # Under DBO the draft-prefill graphs are captured on the draft builders,
+    # so each replay must first write this batch's metadata there.
     speculator = _speculator(use_ubatching=True)
-    dispatched: list[tuple[str, bool]] = []
-
-    def fake_native_dispatch(manager, *args, need_eager=False, **kwargs):
-        dispatched.append((manager, need_eager))
-        return "descriptor", None
+    manager = speculator.prefill_cudagraph_manager
 
     def original(self, *args, **kwargs):
-        # Native propose dispatches draft prefill, then draft decode.
-        dispatch = backport.speculator_module.dispatch_cg_and_sync_dp
-        dispatch("prefill graphs", 1, 12, 4, 1, 0, need_eager=False)
-        dispatch("decode graphs", 1, 3, 1, 1, 0, need_eager=False)
+        self.prefill_cudagraph_manager.run_fullgraph(
+            SimpleNamespace(cg_mode=backport.CUDAGraphMode.FULL)
+        )
         return "draft tokens"
 
     monkeypatch.setattr(
@@ -157,15 +170,43 @@ def test_microbatched_step_runs_only_draft_prefill_eager(monkeypatch):
     monkeypatch.setattr(
         backport, "build_slot_mappings_by_layer", lambda slots, kv: {"l": slots}
     )
-    monkeypatch.setattr(
-        backport.speculator_module, "dispatch_cg_and_sync_dp", fake_native_dispatch
+
+    assert (
+        _propose(speculator, target_metadata, None, dummy_run=dummy_run)
+        == "draft tokens"
     )
 
-    assert _propose(speculator, None, None) == "draft tokens"
+    refresh_and_replay = [
+        event for event in speculator.prepared if event[0] in ("refresh", "replay")
+    ]
+    assert refresh_and_replay == [
+        ("refresh", dummy_run),
+        ("replay", backport.CUDAGraphMode.FULL),
+    ]
+    # The replay seam is removed with the step.
+    assert "run_fullgraph" not in vars(manager)
 
-    assert dispatched == [("prefill graphs", True), ("decode graphs", False)]
-    # The scope restores the module binding it replaced.
-    assert backport.speculator_module.dispatch_cg_and_sync_dp is fake_native_dispatch
+
+@pytest.mark.parametrize("use_ubatching", [True, False], ids=["dbo", "no-dbo"])
+def test_capture_uses_the_draft_builders_only_under_dbo(monkeypatch, use_ubatching):
+    speculator = _speculator(use_ubatching=use_ubatching)
+    speculator.target_attn_groups = ["target groups"]
+    captured_with: list[list[str]] = []
+
+    def original(self):
+        captured_with.append(self.target_attn_groups)
+
+    monkeypatch.setattr(
+        backport.TargetDependentARSpeculator,
+        backport._ORIGINAL_CAPTURE_ATTR,
+        original,
+        raising=False,
+    )
+
+    backport.capture(speculator)
+
+    assert captured_with == [["draft groups"] if use_ubatching else ["target groups"]]
+    assert speculator.target_attn_groups == ["target groups"]
 
 
 @pytest.mark.parametrize(

@@ -167,10 +167,11 @@ prefill fails at construction. With CUDA graphs,
 [`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py)
 falls back to an eager micro-batched step whenever a rank's trailing
 micro-batch would be padding only, which the sparse FP8 MLA builder rejects.
-MTP together with DBO uses a scoped backport of vLLM #61464 (request-aligned
-split of verification steps, draft-prefill metadata rebuild) and is eager
-only: its FULL draft-prefill graphs would still capture on the target's
-builders. MXFP4 routed experts, including
+MTP together with DBO uses a scoped backport of vLLM #61464: verification
+steps split on request boundaries, and under DBO draft prefill runs on the
+draft's own builders (FULL graphs captured there and refreshed before each
+replay; eager steps rebuild the metadata), because a micro-batched target
+forward never writes the target's full-batch buffers. MXFP4 routed experts, including
 compressed-tensors W4A8 MXFP4, run on the connector's `marlin` expert backend;
 block-128 FP8 experts run on DeepGEMM with the FP8 payload.
 

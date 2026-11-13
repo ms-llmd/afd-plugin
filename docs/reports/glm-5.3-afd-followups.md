@@ -13,6 +13,7 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
 | AFD eager DBO, decode-only micro-batching | 0.93 (conc 32), 0.91 (conc 64) |
 | AFD graph DBO, decode-only micro-batching | 0.93 (conc 64) |
 | AFD eager MTP (3 tokens) + DBO, decode-only | 0.94 (conc 32, acceptance 3.35-3.73) |
+| AFD graph MTP (3 tokens) + DBO, decode-only | 0.95 (conc 32, acceptance 3.30-3.69) |
 
 ## Open work
 
@@ -50,14 +51,20 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
    whose guard is exact for the midpoint split
    (`min <= (n - 1) * (padded // n)`), used by AFD's DP1 path too. Graph DBO
    GSM8K-200 0.93; the eager-only rule is lifted.
-3. **MTP + DBO: eager validated, graph rejected.** vLLM #61464 backported as
-   scoped patches (`config_dbo_spec_decode`, `gpu_mrv2_dbo_spec_decode`: gate,
-   threshold raise, request-boundary split of verification batches,
-   draft-prefill metadata rebuild). Eager MTP + DBO 0.94 (MTP alone 0.92).
-   Graph MTP + DBO hit `illegal memory access` about ten minutes into GSM8K:
-   the FULL draft-prefill graphs still capture on the target's builders
-   (#61464's capture-group switch is not backported), so the adapter rejects
-   MTP with DBO unless `--enforce-eager`.
+3. **MTP + DBO: done, eager and graph.** vLLM #61464 backported as scoped
+   patches (`config_dbo_spec_decode`, `gpu_mrv2_dbo_spec_decode`: gate,
+   threshold raise, request-boundary split of verification batches, draft
+   prefill on the draft's own builders). Eager MTP + DBO 0.94 (MTP alone
+   0.92). Graph MTP + DBO first hit `illegal memory access` about ten minutes
+   into GSM8K: the pinned speculator captures the FULL draft-prefill graphs on
+   the target's attention builders and replays whatever full-batch metadata
+   the target last wrote there, and a micro-batched target forward writes
+   only per-micro-batch metadata (micro-batch 0 shares the full-batch slot).
+   Confirmed by running only that draft prefill eager after micro-batched
+   steps (0.92, no errors), then fixed as #61464 does: under DBO the draft
+   prefill graphs are captured on the draft's builders and each replay first
+   refreshes them with this batch's metadata (graph MTP + DBO 0.95, acceptance
+   3.30-3.69, lost 4 / gained 11 against non-DBO eager).
 4. Attention TP > 1 (connector rows must be returned as a partial for the
    native fused all-reduce + RMSNorm).
 5. FP8 checkpoint on two pods (`multipod_4a4f_4a4f_fp8_graph.sh`) not
@@ -76,5 +83,5 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
 | Sparse FP8 builder assumes a non-empty first request | Same assert | Return empty decode metadata when the micro-batch has no real tokens |
 | Prefill straddling the token-midpoint split | GLM prefill DBO garbles answers with the midpoint split; a request-aligned split removes them (0 garbled of 200) | Request-aligned split for prefill (RFC #50738 open question 2), and find why a straddling sparse-MLA prefill reads wrong context |
 | #61464 test coverage | E2E uses ngram only | Add MTP/EAGLE + DBO GSM8K, and a DSA model |
-| Graph DBO with a target-dependent drafter | GLM MTP + graph DBO: illegal memory access | Land #61464's draft capture-group switch together with the split |
+| Graph DBO with a target-dependent drafter | GLM MTP + graph DBO: illegal memory access until draft prefill captured on, and refreshed through, the draft builders (then 0.95) | #61464 already does this; extend its E2E to graph DBO with MTP |
 | Non-uniform-shaped draft buffer sharing | `eagle/utils.py` re-points draft top-k buffers to the target's | Keep in mind if drafting is ever micro-batched |
