@@ -19,6 +19,7 @@ else:
 
 pytest.importorskip("vllm")
 
+from afd_plugin.compat.patches import gpu_deepseek_v32_dbo as dbo_patch  # noqa: E402
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v32 as adapter  # noqa: E402
 from tests.unit.fakes.glm_moe_dsa import (  # noqa: E402
@@ -56,10 +57,13 @@ def _vllm_config(**parallel_overrides):
         "tensor_parallel_size": 1,
         "use_sequence_parallel_moe": False,
         "use_ubatching": False,
+        "num_ubatches": 2,
+        # Decode-only DBO: prefill steps never reach the micro-batch threshold.
+        "dbo_prefill_token_threshold": MAX_NUM_BATCHED_TOKENS + 1,
         **parallel_overrides,
     }
     return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=glm53_hf_config()),
+        model_config=SimpleNamespace(hf_config=glm53_hf_config(), enforce_eager=True),
         parallel_config=SimpleNamespace(**parallel),
         quant_config=None,
         scheduler_config=SimpleNamespace(
@@ -108,10 +112,12 @@ def build_model(monkeypatch):
     )
     monkeypatch.setattr(adapter, "current_platform", SimpleNamespace(device_type="cpu"))
 
-    def build(role: str):
+    def build(role: str, **parallel_overrides):
         afd_config = replace(M2N_AFD_CONFIG, role=role)
         monkeypatch.setattr(adapter, "parse_afd_config", lambda *a, **k: afd_config)
-        model = adapter.AFDDeepseekV32Model(vllm_config=_vllm_config(), prefix="model")
+        model = adapter.AFDDeepseekV32Model(
+            vllm_config=_vllm_config(**parallel_overrides), prefix="model"
+        )
         return model, calls
 
     return build
@@ -155,8 +161,35 @@ def test_ffn_builds_only_routed_experts_without_shared_experts(build_model):
     assert model.get_experts_layer_indices() == GLM53_MOE_LAYERS
 
 
-def test_supported_m2n_deployment_is_accepted():
-    adapter.require_supported_deployment(_vllm_config(), M2N_AFD_CONFIG)
+def test_attention_dbo_gives_each_micro_batch_its_own_topk_buffer(
+    build_model, monkeypatch
+):
+    model, _ = build_model("attention", use_ubatching=True)
+
+    monkeypatch.setattr(dbo_patch, "dbo_current_ubatch_id", lambda: 0)
+    first = model.topk_indices_buffer
+    monkeypatch.setattr(dbo_patch, "dbo_current_ubatch_id", lambda: 1)
+    second = model.topk_indices_buffer
+
+    assert first is not second and first.shape == second.shape
+
+
+MTP = SimpleNamespace(method="mtp")
+
+
+@pytest.mark.parametrize(
+    "parallel_changes, speculative",
+    [
+        pytest.param({}, None, id="m2n"),
+        pytest.param({"use_ubatching": True}, None, id="dbo"),
+        pytest.param({}, MTP, id="mtp-on-attention"),
+    ],
+)
+def test_supported_deployments_are_accepted(parallel_changes, speculative):
+    vllm_config = _vllm_config(**parallel_changes)
+    vllm_config.speculative_config = speculative
+
+    adapter.require_supported_deployment(vllm_config, M2N_AFD_CONFIG)
 
 
 @pytest.mark.parametrize(
@@ -191,9 +224,20 @@ def test_supported_m2n_deployment_is_accepted():
             "sequence-parallel",
             id="sp-moe",
         ),
-        pytest.param({}, {"enable_dbo": True}, None, "DBO", id="dbo"),
-        pytest.param({}, {"use_ubatching": True}, None, "DBO", id="ubatching"),
-        pytest.param({}, {}, SimpleNamespace(method="mtp"), "MTP", id="mtp"),
+        pytest.param({"role": "ffn"}, {}, MTP, "Attention role only", id="mtp-on-ffn"),
+        pytest.param(
+            {}, {"use_ubatching": True}, MTP, "MTP together with DBO", id="mtp-dbo"
+        ),
+        pytest.param(
+            {}, {}, SimpleNamespace(method="eagle"), "supports only", id="eagle"
+        ),
+        pytest.param(
+            {},
+            {"use_ubatching": True, "dbo_prefill_token_threshold": 8},
+            None,
+            "decode steps only",
+            id="dbo-prefill",
+        ),
     ],
 )
 def test_unsupported_deployments_fail_at_construction(
@@ -206,3 +250,11 @@ def test_unsupported_deployments_fail_at_construction(
         adapter.require_supported_deployment(
             vllm_config, replace(M2N_AFD_CONFIG, **afd_changes)
         )
+
+
+def test_dbo_with_cuda_graphs_fails_at_construction():
+    vllm_config = _vllm_config(use_ubatching=True)
+    vllm_config.model_config.enforce_eager = False
+
+    with pytest.raises(RuntimeError, match="enforce-eager"):
+        adapter.require_supported_deployment(vllm_config, M2N_AFD_CONFIG)

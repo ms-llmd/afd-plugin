@@ -126,6 +126,15 @@ def _use_afd_ubatch_preparation(
         )
 
         model_preparation = _use_v4_ubatch_preparation(runner)
+    elif (
+        runner.vllm_config.model_config.hf_config.model_type == "glm_moe_dsa"
+        and runner.device.type == "cuda"
+    ):
+        from afd_plugin.compat.patches.gpu_deepseek_v32_dbo import (
+            use_dsa_indexer_sm_budget,
+        )
+
+        model_preparation = use_dsa_indexer_sm_budget(ubatch_runner)
     with model_preparation:
         state = vars(ubatch_runner)
         had_override = "prepare" in state

@@ -15,8 +15,11 @@ and loader and only makes construction and checkpoint loading role-aware:
 - FFN builds only each MoE layer's routed experts (native ``DeepseekV2MoE``
   without shared experts); the connector runs them on the dispatched rows.
 
-The first version is limited to the DeepEP M2N connector with Attention
-TP = 1, no MTP and no DBO. Other deployments fail at construction.
+The wrapper is limited to the DeepEP M2N connector with Attention TP = 1.
+MTP runs natively on the Attention ranks (its draft experts are local there);
+DBO (eager, decode steps only) gives each micro-batch its own DSA top-k
+state (``gpu_deepseek_v32_dbo``). MTP together with DBO (rejected by vLLM
+ModelRunnerV2) and other deployments fail at construction.
 """
 
 from collections.abc import Iterable
@@ -28,6 +31,9 @@ from vllm.config import VllmConfig
 from vllm.models.deepseek_v32.nvidia import model as native
 from vllm.platforms import current_platform
 
+from afd_plugin.compat.patches.gpu_deepseek_v32_dbo import (
+    install_per_ubatch_topk_indices,
+)
 from afd_plugin.config import DEEPEP_M2N_CONNECTORS, AFDConfig, parse_afd_config
 from afd_plugin.model_executor.models.deepseek_v2 import (
     AFDDeepseekV2RoutedExpertsMoE,
@@ -39,14 +45,17 @@ if TYPE_CHECKING:
 
 _ATTENTION_ROLE = "attention"
 _FFN_ROLE = "ffn"
+MTP_METHOD = "mtp"
 
 
 def require_supported_deployment(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
 ) -> None:
-    """Fail closed outside the first GLM-5.x CUDA contract.
+    """Fail closed outside the GLM-5.x CUDA contract.
 
+    MTP is accepted on the Attention role only, not together with DBO. DBO
+    is accepted eager and with decode-only micro-batching.
     Attention TP > 1 is rejected because the native decoder layer leaves the
     MLP output un-reduced and all-reduces it in the next layer's RMSNorm,
     while the connector returns complete rows on every TP rank; the sum would
@@ -70,10 +79,46 @@ def require_supported_deployment(
         or parallel_config.use_sequence_parallel_moe
     ):
         raise RuntimeError("AFD GLM-5.x does not support PP or sequence-parallel MoE")
-    if parallel_config.enable_dbo or parallel_config.use_ubatching:
-        raise RuntimeError("AFD GLM-5.x does not support DBO/ubatching")
-    if vllm_config.speculative_config is not None:
-        raise RuntimeError("AFD GLM-5.x does not support MTP/speculative decoding")
+    if (
+        parallel_config.use_ubatching
+        and parallel_config.dbo_prefill_token_threshold
+        <= vllm_config.scheduler_config.max_num_batched_tokens
+    ):
+        # Micro-batched prefill still corrupts a fraction of requests on
+        # GLM-5.3 (GSM8K-200 0.90 vs 0.93) after the per-micro-batch top-k fix;
+        # micro-batched decode matches the non-DBO result.
+        raise RuntimeError(
+            "AFD GLM-5.x DBO micro-batches decode steps only: set "
+            "--dbo-prefill-token-threshold above --max-num-batched-tokens"
+        )
+    if parallel_config.use_ubatching and not vllm_config.model_config.enforce_eager:
+        # With CUDA graphs the padded split can leave a micro-batch holding
+        # only padding (one request with zero query tokens); vLLM 0.32's sparse
+        # FP8 MLA metadata builder asserts on it
+        # (FlashMLASparseMetadataBuilder._build_fp8_separate_prefill_decode).
+        raise RuntimeError("AFD GLM-5.x DBO requires --enforce-eager")
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        return
+    # The MTP draft runs natively on the Attention ranks, with its own experts;
+    # the FFN serves the target model's routed experts only.
+    if afd_config.role != _ATTENTION_ROLE:
+        raise RuntimeError(
+            "AFD GLM-5.x takes the MTP speculative config on the Attention role "
+            "only; the FFN role serves no draft model"
+        )
+    if speculative_config.method != MTP_METHOD:
+        raise RuntimeError(
+            f"AFD GLM-5.x supports only {MTP_METHOD!r} speculative decoding, "
+            f"got {speculative_config.method!r}"
+        )
+    if parallel_config.use_ubatching:
+        # vLLM 0.32 ModelRunnerV2, which AFD requires, rejects DBO together
+        # with speculative decoding at config validation.
+        raise RuntimeError(
+            "AFD GLM-5.x does not support MTP together with DBO: vLLM "
+            "ModelRunnerV2 does not support DBO with speculative decoding"
+        )
 
 
 class AFDDeepseekV32DecoderLayer(native.DeepseekV32DecoderLayer):
@@ -254,6 +299,11 @@ class AFDDeepseekV32Model(native.DeepseekV32Model):
             ),
             prefix=f"{prefix}.layers",
         )
+        # ### PATCH END
+
+        # ### PATCH START: per-micro-batch DSA top-k state under DBO.
+        if afd_role == _ATTENTION_ROLE and parallel_config.use_ubatching:
+            install_per_ubatch_topk_indices(self, parallel_config.num_ubatches)
         # ### PATCH END
 
         if native.get_pp_group().is_last_rank:
