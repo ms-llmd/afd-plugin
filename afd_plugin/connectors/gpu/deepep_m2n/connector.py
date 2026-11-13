@@ -104,6 +104,14 @@ from afd_plugin.connectors.gpu.deepep_m2n.layout import (
     TransportLayout,
     plan_transport_layout,
 )
+from afd_plugin.connectors.gpu.deepep_m2n.mxfp4_experts import (
+    MARLIN_EXPERT_BACKEND,
+    MARLIN_TILE_SIZE,
+    MXFP4_MARLIN_WEIGHTS,
+    Mxfp4MarlinExpertWeights,
+    has_mxfp4_experts,
+    marlin_mxfp4_expected_tensors,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.network import (
     NetworkConfig,
     NetworkPlan,
@@ -141,12 +149,13 @@ BF16_PAYLOAD = "bf16"
 FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
 FP8_GROUP_SIZE = 128
-# Expert weight formats the FFN must load for each payload format.
+# Expert weight formats the FFN may load for each payload format. MXFP4
+# experts run as W4A16 Marlin on BF16 rows.
 BF16_WEIGHTS = "bf16"
 FP8_BLOCK128_WEIGHTS = "fp8_block128"
-PAYLOAD_WEIGHT_FORMATS = {
-    BF16_PAYLOAD: BF16_WEIGHTS,
-    FP8_PAYLOAD: FP8_BLOCK128_WEIGHTS,
+PAYLOAD_ALLOWED_WEIGHT_FORMATS: Mapping[str, frozenset[str]] = {
+    BF16_PAYLOAD: frozenset({BF16_WEIGHTS, MXFP4_MARLIN_WEIGHTS}),
+    FP8_PAYLOAD: frozenset({FP8_BLOCK128_WEIGHTS}),
 }
 # vLLM's all2all backend on the FFN. The connector already moved the rows, so
 # vLLM's own MoE all-to-all never runs; this backend allocates no buffers and
@@ -184,7 +193,9 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             uses vLLM's micro-batch count: two under DBO, otherwise one
             (``resolve_num_lanes``).
         payload_format: Dispatch wire format.
-        expert_backend: ``deepgemm`` (fast) or ``fused_experts`` (reference).
+        expert_backend: ``deepgemm`` (fast), ``fused_experts`` (reference) or
+            ``marlin`` (MXFP4 experts after vLLM's Marlin repack; required for
+            MXFP4 checkpoints and rejected for others, checked on the FFN).
         network: Fabric settings (GIN, hybrid mode, traffic class); see
             ``network.NetworkConfig``. NICs are NCCL's own per-GPU choice.
         bucket_granularity: Dispatch bucket is rounded up to this multiple,
@@ -466,6 +477,28 @@ def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
     return f"unsupported ({quant_config.get_name()})"
 
 
+def ffn_expert_weight_format(vllm_config: VllmConfig) -> str:
+    """Expert weight format of an FFN deployment, MXFP4 included.
+
+    MXFP4 experts are readable only after vLLM's Marlin repack, so they count
+    as ``mxfp4_marlin_w4a16`` with ``moe_backend=marlin`` and as unsupported
+    with any other backend.
+    """
+    if has_mxfp4_experts(vllm_config):
+        moe_backend = str(vllm_config.kernel_config.moe_backend)
+        if moe_backend == MARLIN_EXPERT_BACKEND:
+            return MXFP4_MARLIN_WEIGHTS
+        return f"unsupported (mxfp4 with moe_backend={moe_backend})"
+    return expert_weight_format(vllm_config.quant_config)
+
+
+def local_weight_format(weights: LocalExpertWeights) -> str:
+    """Format name of loaded expert weights, as ``ffn_expert_weight_format``."""
+    if isinstance(weights, Mxfp4MarlinExpertWeights):
+        return weights.weight_format
+    return FP8_BLOCK128_WEIGHTS if weights.is_fp8 else BF16_WEIGHTS
+
+
 def ffn_deployment_info(vllm_config: VllmConfig) -> dict[str, Any]:
     """FFN-side vLLM settings that decide which experts each rank loads."""
     parallel_config = vllm_config.parallel_config
@@ -477,7 +510,7 @@ def ffn_deployment_info(vllm_config: VllmConfig) -> dict[str, Any]:
         "expert_placement_strategy": parallel_config.expert_placement_strategy,
         "eplb": parallel_config.enable_eplb,
         "all2all_backend": parallel_config.all2all_backend,
-        "weight_format": expert_weight_format(vllm_config.quant_config),
+        "weight_format": ffn_expert_weight_format(vllm_config),
     }
 
 
@@ -554,20 +587,23 @@ def _check_ffn_deployment(
     """
     if deployment is None:
         raise RuntimeError(f"FFN world rank {world_rank} sent no deployment info")
-    expected = {
+    allowed_formats = PAYLOAD_ALLOWED_WEIGHT_FORMATS[payload_format]
+    expected: dict[str, Any] = {
         "expert_parallel": True,
         "ep_size": layout.ffn_size,
         "tensor_parallel_size": 1,
         "expert_placement_strategy": "linear",
         "eplb": False,
         "all2all_backend": IDLE_ALL2ALL_BACKEND,
-        "weight_format": PAYLOAD_WEIGHT_FORMATS[payload_format],
     }
     mismatches = {
         key: deployment[key]
         for key, value in expected.items()
         if deployment[key] != value
     }
+    if deployment["weight_format"] not in allowed_formats:
+        mismatches["weight_format"] = deployment["weight_format"]
+        expected["weight_format"] = f"one of {sorted(allowed_formats)}"
     if mismatches:
         required = {key: expected[key] for key in mismatches}
         raise RuntimeError(
@@ -608,6 +644,13 @@ def validate_handshake(
     for world_rank, info in enumerate(infos[: layout.ffn_size]):
         _check_ffn_deployment(
             world_rank, info["ffn_deployment"], layout, info["payload_format"]
+        )
+    weight_formats = {
+        info["ffn_deployment"]["weight_format"] for info in infos[: layout.ffn_size]
+    }
+    if len(weight_formats) != 1:
+        raise RuntimeError(
+            f"FFN ranks disagree on the expert weight format: {sorted(weight_formats)}"
         )
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
@@ -692,6 +735,7 @@ def local_model_info(
         experts = {
             layer_idx: {
                 "ids": list(layer_experts.expert_ids),
+                "weight_format": local_weight_format(layer_experts.weights),
                 "w13": _describe_tensor(layer_experts.weights.w13),
                 "w2": _describe_tensor(layer_experts.weights.w2),
                 "w13_scale": _describe_tensor(layer_experts.weights.w13_scale),
@@ -707,8 +751,13 @@ def _expected_expert_tensors(
     hidden_size: int,
     intermediate_size: int,
     payload_format: str,
+    weight_format: str,
 ) -> dict[str, list[Any] | None]:
     """dtype and shape of every ``LocalExpertWeights`` tensor."""
+    if weight_format == MXFP4_MARLIN_WEIGHTS:
+        return dict(
+            marlin_mxfp4_expected_tensors(num_experts, hidden_size, intermediate_size)
+        )
     if payload_format == BF16_PAYLOAD:
         weight_dtype = str(torch.bfloat16)
         w13_scale = w2_scale = None
@@ -775,9 +824,26 @@ def validate_model_infos(
                     f"[{expected_ids[0]}, {expected_ids[-1] + 1}) to it: use "
                     "linear expert placement with EP size = num_ffn_ranks"
                 )
-            intermediate_size = described["w2"][1][2]
+            weight_format = described["weight_format"]
+            if weight_format not in PAYLOAD_ALLOWED_WEIGHT_FORMATS[payload_format]:
+                raise RuntimeError(
+                    f"FFN world rank {world_rank} layer {layer_idx} expert weights "
+                    f"{weight_format!r} do not match payload_format="
+                    f"{payload_format!r}"
+                )
+            # w2 is [E, H, I] in FusedMoE layout and [E, I / 16, 2 H] after
+            # the Marlin repack.
+            intermediate_size = (
+                described["w2"][1][1] * MARLIN_TILE_SIZE
+                if weight_format == MXFP4_MARLIN_WEIGHTS
+                else described["w2"][1][2]
+            )
             expected = _expected_expert_tensors(
-                layout.experts_per_rank, hidden_size, intermediate_size, payload_format
+                layout.experts_per_rank,
+                hidden_size,
+                intermediate_size,
+                payload_format,
+                weight_format,
             )
             wrong = {
                 name: described[name]
@@ -961,6 +1027,14 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.payload_dtype = FP8_DTYPE if self.is_fp8_payload else self.dtype
         if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
             raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
+        if self.is_ffn and has_mxfp4_experts(vllm_config) != (
+            self.config.expert_backend == MARLIN_EXPERT_BACKEND
+        ):
+            raise ValueError(
+                f"expert_backend={self.config.expert_backend!r} does not match the "
+                "checkpoint's experts: MXFP4 experts need expert_backend "
+                f"{MARLIN_EXPERT_BACKEND!r}, and only they can use it"
+            )
         self.world_rank = self.layout.world_rank(afd_config.role, role_rank)
         # The FFN runs without TP and learns the Attention TP size and the
         # resulting capacity in the handshake (``_handshake``).

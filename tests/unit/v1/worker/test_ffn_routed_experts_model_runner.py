@@ -11,6 +11,10 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E402, E501
+    CompressedTensorsConfig,
+)
+
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E402
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
     GPUFFNRoutedExpertsModelRunner,
@@ -19,6 +23,11 @@ from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
 )
 from tests.unit.fakes.connector import (  # noqa: E402
     FakeRoutedConnector,
+)
+from tests.unit.fakes.glm_moe_dsa import (  # noqa: E402
+    GLM53_MXFP4XFP8_QUANTIZATION_CONFIG,
+    glm53_fp8_experts_quantization_config,
+    glm53_hf_config,
 )
 
 MOE_LAYERS = (1, 3)
@@ -216,8 +225,18 @@ def test_local_experts_reject_backends_that_reorder_weights(fp8, backend):
         local_experts_from_vllm(_routed_experts(fp8=fp8, backend=backend))
 
 
-def _kernel_config(moe_backend: str) -> SimpleNamespace:
-    return SimpleNamespace(kernel_config=SimpleNamespace(moe_backend=moe_backend))
+def _kernel_config(moe_backend: str, quant_config=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+        quant_config=quant_config,
+    )
+
+
+def _deepseek_v4_quant_config(expert_dtype: str) -> SimpleNamespace:
+    """vLLM's DeepSeek-V4/V4.1 quantization config, reduced to what the pin reads."""
+    return SimpleNamespace(
+        get_name=lambda: "deepseek_v4_fp8", expert_dtype=expert_dtype
+    )
 
 
 def test_routed_ffn_pins_auto_moe_backend_to_triton():
@@ -241,3 +260,63 @@ def test_routed_ffn_rejects_other_explicit_moe_backends(configured):
     """
     with pytest.raises(RuntimeError, match="moe-backend triton"):
         select_routed_moe_backend(_kernel_config(configured))
+
+
+@pytest.mark.parametrize(
+    "expert_dtype, configured, pinned",
+    [
+        ("fp4", "auto", "marlin"),
+        ("fp4", "marlin", "marlin"),
+        ("fp8", "auto", "triton"),
+    ],
+    ids=["mxfp4-auto", "mxfp4-marlin", "fp8-experts-auto"],
+)
+def test_routed_ffn_pins_marlin_for_mxfp4_experts(expert_dtype, configured, pinned):
+    """DeepSeek-V4.1 MXFP4 experts pin Marlin; its FP8-expert variant keeps
+    Triton.
+
+    Why: the M2N ``marlin`` executor reads vLLM's Marlin repack, and ``auto``
+    may pick Humming on SM90, whose layout it cannot read.
+    """
+    vllm_config = _kernel_config(configured, _deepseek_v4_quant_config(expert_dtype))
+
+    select_routed_moe_backend(vllm_config)
+
+    assert vllm_config.kernel_config.moe_backend == pinned
+
+
+def test_routed_ffn_rejects_triton_for_mxfp4_experts():
+    with pytest.raises(RuntimeError, match="moe-backend marlin"):
+        select_routed_moe_backend(
+            _kernel_config("triton", _deepseek_v4_quant_config("fp4"))
+        )
+
+
+@pytest.mark.parametrize(
+    "quantization_config, configured, pinned",
+    [
+        (GLM53_MXFP4XFP8_QUANTIZATION_CONFIG, "auto", "marlin"),
+        (GLM53_MXFP4XFP8_QUANTIZATION_CONFIG, "marlin", "marlin"),
+        (glm53_fp8_experts_quantization_config(), "auto", "triton"),
+    ],
+    ids=["mxfp4xfp8-auto", "mxfp4xfp8-marlin", "fp8-experts-auto"],
+)
+def test_routed_ffn_pins_backend_from_compressed_tensors_expert_scheme(
+    quantization_config, configured, pinned
+):
+    """GLM-5.3 MXFP4xFP8 routed experts pin Marlin; FP8 experts keep Triton.
+
+    Why: vLLM loads compressed-tensors W4A8 MXFP4 experts with an
+    ``Mxfp4MoEMethod`` subclass, and the M2N ``marlin`` executor reads only
+    vLLM's Marlin repack. The FP8 block group targets attention, shared
+    experts and the MTP layer by name, so only the experts' own scheme decides.
+    """
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend=configured),
+        model_config=SimpleNamespace(hf_text_config=glm53_hf_config()),
+        quant_config=CompressedTensorsConfig.from_config(quantization_config),
+    )
+
+    select_routed_moe_backend(vllm_config)
+
+    assert vllm_config.kernel_config.moe_backend == pinned

@@ -13,6 +13,9 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from vllm.model_executor.layers.fused_moe.activation import (  # noqa: E402
+    ApplyMoEActivationConfig,
+)
 from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
 
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
@@ -65,6 +68,10 @@ from afd_plugin.connectors.gpu.deepep_m2n.layout import (  # noqa: E402
     DeepEPM2NLayout,
     RankPlacement,
     plan_transport_layout,
+)
+from afd_plugin.connectors.gpu.deepep_m2n.mxfp4_experts import (  # noqa: E402
+    Mxfp4MarlinExpertWeights,
+    marlin_mxfp4_expected_tensors,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
@@ -1098,6 +1105,42 @@ def test_handshake_accepts_fp8_block_weights_for_fp8_payload():
     validate_handshake(infos, layout, NetworkConfig())
 
 
+@pytest.mark.parametrize(
+    "payload_format, weight_formats, error",
+    [
+        ("bf16", ("mxfp4_marlin_w4a16", "mxfp4_marlin_w4a16"), None),
+        (
+            "fp8_block128_fp32",
+            ("mxfp4_marlin_w4a16", "mxfp4_marlin_w4a16"),
+            "is deployed with .*weight_format",
+        ),
+        ("bf16", ("mxfp4_marlin_w4a16", "bf16"), "disagree on the expert weight"),
+    ],
+    ids=["bf16-payload", "fp8-payload", "mixed-formats"],
+)
+def test_handshake_feeds_mxfp4_marlin_experts_only_bf16_rows(
+    payload_format, weight_formats, error
+):
+    """MXFP4 experts (W4A16 Marlin) take BF16 rows; an FP8 payload or FFN
+    ranks loading different formats fail the handshake on every rank.
+
+    Why: Marlin W4A16 has no FP8 row input, and a mixed F would compute some
+    tokens with other numerics.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    infos = _handshake(
+        layout, {(rank, "payload_format"): payload_format for rank in range(4)}
+    )
+    for rank, weight_format in enumerate(weight_formats):
+        infos[rank]["ffn_deployment"] = _ffn_deployment(layout, weight_format)
+
+    if error is None:
+        validate_handshake(infos, layout, NetworkConfig())
+        return
+    with pytest.raises(RuntimeError, match=error):
+        validate_handshake(infos, layout, NetworkConfig())
+
+
 def test_handshake_requires_gate_on_attention():
     """Both roles must route on Attention; a mix, or false everywhere, fails.
 
@@ -1222,6 +1265,74 @@ def test_model_check_rejects_what_would_compute_wrong_rows(
             SMALL_LAYOUT,
             hidden_size=SMALL_HIDDEN,
             payload_format=payload_format,
+        )
+
+
+def _mxfp4_local_experts(
+    expert_ids: range, *, w2_scale_shape: list[int] | None = None
+) -> FFNLocalExperts:
+    """MXFP4 experts with the shapes vLLM's Marlin repack leaves (no data)."""
+    expected = marlin_mxfp4_expected_tensors(
+        len(expert_ids), SMALL_HIDDEN, SMALL_INTERMEDIATE
+    )
+    shapes = {name: spec[1] for name, spec in expected.items()}
+    if w2_scale_shape is not None:
+        shapes["w2_scale"] = w2_scale_shape
+
+    def e8m0(shape):
+        return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+    weights = Mxfp4MarlinExpertWeights(
+        w13=torch.zeros(shapes["w13"], dtype=torch.int32),
+        w2=torch.zeros(shapes["w2"], dtype=torch.int32),
+        w13_scale=e8m0(shapes["w13_scale"]),
+        w2_scale=e8m0(shapes["w2_scale"]),
+        quant_type_id=0,
+        activation_config=ApplyMoEActivationConfig(clamp_limit=10.0),
+    )
+    return FFNLocalExperts(expert_ids=tuple(expert_ids), weights=weights)
+
+
+def _mxfp4_model_infos(**kwargs) -> list:
+    infos = [
+        local_model_info(
+            MOE_LAYERS,
+            {layer: _mxfp4_local_experts(experts, **kwargs) for layer in MOE_LAYERS},
+        )
+        for experts in (range(0, 4), range(4, 8))
+    ]
+    infos.append(local_model_info(MOE_LAYERS, None))
+    return infos
+
+
+@pytest.mark.parametrize(
+    "infos_kwargs, payload_format, message",
+    [
+        ({}, "bf16", None),
+        ({}, "fp8_block128_fp32", "do not match payload_format"),
+        ({"w2_scale_shape": [4, 2, SMALL_HIDDEN]}, "bf16", "w2_scale"),
+    ],
+    ids=["accepted", "fp8-payload", "scale-shape"],
+)
+def test_model_check_reads_mxfp4_marlin_expert_shapes(
+    infos_kwargs, payload_format, message
+):
+    """MXFP4 experts are checked against the Marlin repack's shapes and fed
+    only BF16 rows; a wrong scale shape fails after loading.
+
+    Why: Marlin-packed tensors keep their expert dimension but not the
+    FusedMoE shapes, so the BF16/FP8 rules would reject a valid deployment
+    and miss a wrong one.
+    """
+    infos = _mxfp4_model_infos(**infos_kwargs)
+    if message is None:
+        validate_model_infos(
+            infos, SMALL_LAYOUT, hidden_size=SMALL_HIDDEN, payload_format=payload_format
+        )
+        return
+    with pytest.raises(RuntimeError, match=message):
+        validate_model_infos(
+            infos, SMALL_LAYOUT, hidden_size=SMALL_HIDDEN, payload_format=payload_format
         )
 
 
