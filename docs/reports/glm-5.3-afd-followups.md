@@ -8,7 +8,7 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
 | Cell | GSM8K-200 |
 | --- | --- |
 | Native DP8 + EP eager (Marlin) | 0.925 |
-| AFD DeepEP M2N 4A4F eager / graph | 0.930 / 0.935 |
+| AFD DeepEP M2N 4A4F eager / graph | 0.930 (0.915 on a second run) / 0.935 |
 | Native / AFD graph + MTP (3 tokens) | 0.93 / 0.92 (acceptance 3.4-3.5 / 3.4) |
 | AFD eager DBO, decode-only micro-batching | 0.93 (conc 32), 0.91 (conc 64) |
 | AFD graph DBO, decode-only micro-batching | 0.93 (conc 64) |
@@ -31,10 +31,14 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
    other micro-batch as a chunked prefill over context written by the first
    one in the same layer); the kernel-level cause is still open. Under M2N
    eager the Attention DP ranks need not agree on per-micro-batch token
-   counts, so the aligned split ran at DP4. Remaining before lifting the
-   rule: the accuracy gap to non-DBO eager (see the flip comparison below), and
-   steps with a single request (no boundary; they still straddle, and all DP
-   ranks must micro-batch alike). Until then the adapter requires
+   counts, so the aligned split ran at DP4. Flip comparison against a
+   non-DBO eager run on the same node (0.915): D-A lost 8 and gained 4
+   questions, all coherent reasoning slips (graph DBO: lost 6, gained 9; eager
+   MTP + DBO: lost 3, gained 8), so the remaining gap is within run-to-run
+   spread (0.915-0.930 for non-DBO eager). Fix direction: a request-aligned
+   split for micro-batched prefill. Remaining before lifting the rule: steps
+   with a single request (no boundary; they would still straddle, and all
+   Attention ranks must micro-batch alike), and the kernel-level cause. Until then the adapter requires
    `--dbo-prefill-token-threshold` > `--max-num-batched-tokens`.
 2. **Graph DBO: done.** Off-by-one in the "empty second microbatch" guard:
    `sync_cudagraph_and_dp_padding` (vllm/v1/worker/gpu/dp_utils.py) falls
