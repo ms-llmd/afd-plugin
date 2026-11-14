@@ -230,7 +230,9 @@ def test_dp1_thresholds_select_eager_microbatches_without_handshake(
 @pytest.mark.parametrize(
     "num_tokens, capture_tokens, expected_mode, expected_tokens",
     [
-        (8, 16, _CUDAGraphMode.FULL, 16),
+        (9, 16, _CUDAGraphMode.FULL, 16),
+        # Exactly half: the second microbatch would be padding only.
+        (8, 16, _CUDAGraphMode.NONE, 8),
         (3, 16, _CUDAGraphMode.NONE, 3),
         (8, None, _CUDAGraphMode.NONE, 8),
     ],
@@ -254,6 +256,87 @@ def test_dp1_uses_microbatch_graph_bucket_or_native_eager_padding_fallback(
     assert desc.cg_mode is expected_mode
     assert desc.num_tokens == expected_tokens
     assert desc.num_ubatches == 2
+
+
+@pytest.mark.parametrize(
+    "min_tokens, padded_tokens, num_ubatches, padding_only",
+    [
+        (8, 16, 2, True),
+        (9, 16, 2, False),
+        (7, 15, 2, True),
+        (8, 15, 2, False),
+        (10, 15, 3, True),
+        (11, 15, 3, False),
+    ],
+)
+def test_trailing_microbatch_padding_matches_the_midpoint_split(
+    patches, min_tokens, padded_tokens, num_ubatches, padding_only
+):
+    # The last microbatch starts at (n - 1) * (padded // n).
+    assert (
+        patches._trailing_ubatch_is_padding(min_tokens, padded_tokens, num_ubatches)
+        is padding_only
+    )
+
+
+@pytest.mark.parametrize(
+    "num_tokens, expected_mode, expected_tokens",
+    [(9, "FULL", 16), (8, "NONE", 8)],
+)
+def test_dp2_padding_sync_rejects_a_padding_only_trailing_microbatch(
+    monkeypatch, num_tokens, expected_mode, expected_tokens
+):
+    pytest.importorskip("torch")
+    pytest.importorskip("vllm")
+    import inspect
+
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu import dp_utils
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from afd_plugin.compat.patches import gpu_mrv2_ubatching as patch
+
+    assert inspect.signature(patch.sync_cudagraph_and_dp_padding) == (
+        inspect.signature(dp_utils.sync_cudagraph_and_dp_padding)
+    )
+
+    class Manager:
+        def dispatch(self, num_reqs, num_tokens, uniform_token_count, **kwargs):
+            assert kwargs["num_ubatches"] == 2
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=16,
+                num_reqs=16,
+                uniform_token_count=uniform_token_count,
+                num_ubatches=2,
+            )
+
+    # Every rank reports this rank's counts, so min(tokens) is num_tokens.
+    monkeypatch.setattr(patch, "should_skip_dp_coordination", lambda: True)
+    monkeypatch.setattr(patch, "get_dp_group", lambda: SimpleNamespace(cpu_group=None))
+    desired = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=num_tokens, num_reqs=num_tokens
+    )
+
+    descriptor, sync = patch.sync_cudagraph_and_dp_padding(
+        Manager(),
+        desired,
+        num_tokens,
+        num_tokens,
+        1,
+        2,
+        0,
+        parallel_config=_parallel(dp_size=2),
+        allow_ubatching=True,
+        uniform_decode=True,
+    )
+
+    assert descriptor.cg_mode == CUDAGraphMode[expected_mode]
+    assert descriptor.num_tokens == expected_tokens
+    assert descriptor.num_ubatches == 2
+    assert sync is not None
+    assert sync.eager is (expected_mode == "NONE")
+    assert sync.num_tokens_across_dp.tolist() == [expected_tokens] * 2
 
 
 def test_profile_dispatch_does_not_select_a_graph(patches):

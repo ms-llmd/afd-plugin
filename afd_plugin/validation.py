@@ -53,6 +53,7 @@ GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
 ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
     "Qwen3MoeForCausalLM",
     "DeepseekV2ForCausalLM",
+    "GlmMoeDsaForCausalLM",
 )
 
 

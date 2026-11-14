@@ -16,11 +16,13 @@ Recipe names encode their layout, DP/TP shape, and mode. DeepSeek-V2-Lite and
 Qwen3-30B-A3B provide `2a2f_{eager,graph,graph_dbo}_dp2tp1.sh` plus
 `2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `4a2f` eager, graph and
 DBO recipes plus `multipod_4a1f_4a1f_dbo.sh`. Each model README lists its
-exact filenames and defaults.
+exact filenames and defaults. GLM-5.3 provides MXFP4 `4a4f` eager and graph
+recipes on one 8-GPU node and an FP8 two-pod graph recipe.
 
 ```text
 .
 ├── deepseek_v2_lite/       # BF16 payload
+├── glm_5_3/                # MXFP4 experts on Marlin (BF16 payload) or FP8 payload
 ├── qwen3_30b_a3b/          # BF16 payload
 └── qwen3_235b_a22b_fp8/    # FP8 payload (fp8_block128_fp32)
 ```

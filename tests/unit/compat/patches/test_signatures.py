@@ -411,7 +411,9 @@ def test_patch_preserves_upstream_signature(
             scope = adapter._use_afd_ubatch_preparation(
                 SimpleNamespace(
                     ubatch_runner=binding,
-                    vllm_config=SimpleNamespace(model_config=model),
+                    vllm_config=SimpleNamespace(
+                        model_config=model, speculative_config=None
+                    ),
                 )
             )
         else:

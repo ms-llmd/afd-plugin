@@ -27,8 +27,17 @@ Supported models:
   Attention runs the dense layers and the shared experts; the shared experts
   overlap the dispatch and the FFN. With Attention TP > 1 each TP rank runs
   them, with replicated weights, on the token slice it dispatches.
+- GLM-5.x (`GlmMoeDsaForCausalLM`, validated with GLM-5.3 MXFP4xFP8) on vLLM's
+  NVIDIA DSA model. Attention runs the DSA attention, the three dense layers
+  and the shared expert; the FFN runs the routed experts. MXFP4 experts
+  (`RedHatAI/GLM-5.3-MXFP4xFP8`) need `expert_backend: "marlin"`; the
+  block-128 FP8 checkpoint (`zai-org/GLM-5.3`) uses the FP8 payload and
+  DeepGEMM. MTP runs natively on the Attention ranks (its draft experts
+  stay local). DBO runs eager or with CUDA graphs, with or without MTP,
+  with decode-only micro-batching, each micro-batch keeping its own DSA
+  top-k state. Attention TP > 1 and micro-batched prefill are rejected.
 
-DeepSeek-V3, GLM-DSA and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
+DeepSeek-V3 and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
 
 ## How it works
 
@@ -139,7 +148,8 @@ The connector needs three components in addition to the plugin and vLLM:
      `cusparse.h` and other CUDA headers shipped by the `nvidia-*` wheels.
      Add that wheel `include` directory to `CPLUS_INCLUDE_PATH` for the build.
    - The `fused_experts` expert backend (vLLM's Triton kernels) runs without
-     DeepGEMM; it is a reference backend.
+     DeepGEMM; it is a reference backend. The `marlin` backend (MXFP4
+     experts) also runs without DeepGEMM.
 
 3. A GPU with compute capability 9.0 or newer on every rank.
 
@@ -185,7 +195,7 @@ Unknown keys are rejected. All keys are optional.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `payload_format` | `str` | `"bf16"` | Dispatch wire format: `"bf16"` or `"fp8_block128_fp32"` (FP8 e4m3 rows with one fp32 scale per 128 channels). The FFN must load matching expert weights: BF16 weights for `bf16`, block-128 FP8 weights (for example an FP8 checkpoint with `weight_block_size=[128, 128]`) for `fp8_block128_fp32`. |
-| `expert_backend` | `str` | `"deepgemm"` | `"deepgemm"` (DeepGEMM grouped GEMMs) or `"fused_experts"` (vLLM `fused_experts`, a reference path). |
+| `expert_backend` | `str` | `"deepgemm"` | `"deepgemm"` (DeepGEMM grouped GEMMs), `"fused_experts"` (vLLM `fused_experts`, a reference path) or `"marlin"` (MXFP4 experts after vLLM's Marlin repack, W4A16; required for MXFP4 checkpoints, including compressed-tensors W4A8 MXFP4 experts such as GLM-5.3 MXFP4xFP8, and rejected for others; BF16 payload only). |
 | `capacity_tokens_per_rank` | `int \| null` | `null` | Largest dispatch one Attention rank issues per call (with Attention TP, its slice); sizes the transport buffers. `null` uses the larger of `max_num_batched_tokens` and the largest CUDA-graph capture size, divided by the Attention TP size. |
 | `num_lanes` | `int \| null` | `null` | In-flight micro-batches, one transport buffer each, `1` or `2`. `null` uses vLLM's micro-batch count: 2 with DBO, otherwise 1. |
 | `bucket_granularity` | `int` | `1` | Dispatch buckets are rounded up to this multiple, then to the next rung of the bucket ladder derived from the CUDA-graph capture sizes. Every step uses one of a few kernel sets compiled at startup. |
@@ -223,7 +233,7 @@ that sets `capacity_tokens_per_rank` explicitly must agree with Attention.
 | `--tensor-parallel-size` | FFN | Must be `1`. Attention may use TP > 1. |
 | Expert placement | FFN | `linear` (vLLM's default `--expert-placement-strategy`). |
 | `--all2all-backend` | FFN | `allgather_reducescatter` (vLLM's default). The connector moves the rows itself, so vLLM's MoE all-to-all never runs; this backend allocates no buffers and keeps vLLM's own DeepEP out of the process. |
-| `--moe-backend` | FFN | `triton` or `auto`. `auto` is pinned to `triton`; any other backend is rejected because it reorders the expert weights that the connector reads. |
+| `--moe-backend` | FFN | `triton` or `auto` for BF16 and FP8 experts; `auto` is pinned to `triton`. `marlin` or `auto` for MXFP4 experts; `auto` is pinned to `marlin`. Any other backend is rejected because it lays out the expert weights differently from what the connector reads. |
 | `--enable-eplb` | Both | Not supported. |
 | `--enable-dbo` | Both | Optional, but must match on both roles. DBO uses exactly two micro-batches. |
 | CUDA graphs | Both | Eager or `FULL_DECODE_ONLY`. |

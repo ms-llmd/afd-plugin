@@ -126,7 +126,28 @@ def _use_afd_ubatch_preparation(
         )
 
         model_preparation = _use_v4_ubatch_preparation(runner)
-    with model_preparation:
+    elif (
+        runner.vllm_config.model_config.hf_config.model_type == "glm_moe_dsa"
+        and runner.device.type == "cuda"
+    ):
+        from afd_plugin.compat.patches.gpu_deepseek_v32_dbo import (
+            use_dsa_indexer_sm_budget,
+        )
+
+        model_preparation = use_dsa_indexer_sm_budget(ubatch_runner)
+    spec_decode_split: AbstractContextManager[None] = nullcontext()
+    if (
+        runner.vllm_config.speculative_config is not None
+        and runner.device.type == "cuda"
+    ):
+        # Backport of vLLM #61464: verification batches split on request
+        # boundaries, and draft prefill rebuilds its full-batch metadata.
+        from afd_plugin.compat.patches.gpu_mrv2_dbo_spec_decode import (
+            use_request_aligned_ubatch_split,
+        )
+
+        spec_decode_split = use_request_aligned_ubatch_split()
+    with model_preparation, spec_decode_split:
         state = vars(ubatch_runner)
         had_override = "prepare" in state
         previous_override = state.get("prepare")
