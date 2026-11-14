@@ -85,3 +85,28 @@ Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
 | #61464 test coverage | E2E uses ngram only | Add MTP/EAGLE + DBO GSM8K, and a DSA model |
 | Graph DBO with a target-dependent drafter | GLM MTP + graph DBO: illegal memory access until draft prefill captured on, and refreshed through, the draft builders (then 0.95) | #61464 already does this; extend its E2E to graph DBO with MTP |
 | Non-uniform-shaped draft buffer sharing | `eagle/utils.py` re-points draft top-k buffers to the target's | Keep in mind if drafting is ever micro-batched |
+
+## Upstream status after v0.32.0 (checked 2026-11-14)
+
+Checked against vLLM `main` at `449576cd` (2026-11-14) and the
+`releases/v0.33.0` branch (v0.33.0rc3; cut from `main` at `4135590f` on
+2026-10-26). "main only" means merged after the v0.33 branch cut, so not in
+v0.33.0. All open PRs below are unmerged; none changes the AFD patches yet.
+
+| Item | vLLM issue / PR | Status | Coverage |
+| --- | --- | --- | --- |
+| DSA top-k state shared across DBO micro-batches | [#60734](https://github.com/vllm-project/vllm/pull/60734) Keep DSA shared-indexer top-k state per DBO microbatch | Open, `needs-rebase`, last update 2026-10-20 | Full: per-micro-batch top-k and index-group state for `index_topk_freq > 1` (GLM-5.x), GLM-5.3 GSM8K 0.61 -> 0.92 under DBO. Main still has one model-level `topk_indices_buffer`. |
+| (same class) | [#56476](https://github.com/vllm-project/vllm/pull/56476) Isolate sparse index state across microbatches (DSv4.1) | Open, `needs-rebase` | DeepSeek-V4.1 only; #60734 would reuse its helper if it lands first. |
+| (same class, PP) | [#59961](https://github.com/vllm-project/vllm/pull/59961) Carry the shared indexer top-k across pipeline stages ([#63170](https://github.com/vllm-project/vllm/issues/63170)) | Merged 2026-11-01, main only | Not DBO: stale shared top-k at a PP stage start. Confirms the shared top-k hazard upstream. |
+| Indexer SM budget under DBO | [#60732](https://github.com/vllm-project/vllm/pull/60732) Re-plan DSA indexer decode schedule for DBO's reduced DeepGEMM SM count | Open, `needs-rebase`, last update 2026-10-14 | Full. |
+| Empty-second-micro-batch guard off by one | none | Not fixed: `sync_cudagraph_and_dp_padding` on main still uses `2 * min(tokens) < padded` | Related: [#63823](https://github.com/vllm-project/vllm/pull/63823) (open draft) removes the guard and replays an all-padding FULL region with zero-length rows. For DSA that reaches the sparse FP8 assert below unless the builder is fixed too. [#63556](https://github.com/vllm-project/vllm/pull/63556) (open) stages MLA decode rows instead. |
+| Sparse FP8 builder assumes a non-empty first request | [#66734](https://github.com/vllm-project/vllm/pull/66734) DBO and async EP fixes (padding-only DBO microbatch) | Open | Partial: an eager micro-batch wholly in DP padding skips attention (`cg_mode != FULL` only), found on MiniMax-M3's `assert decode_query_len > 0`. `FlashMLASparseMetadataBuilder` still asserts; its `num_tokens == 0` early return predates v0.32 (PCP). |
+| Prefill straddling the token-midpoint split | RFC [#50738](https://github.com/vllm-project/vllm/issues/50738) | Closed 2026-11-09 by its author after the stale notice, no linked change | None. Main splits on a request boundary only for uniform spec-decode verification batches (#61464); prefill still splits at the token midpoint. |
+| (related) | [#63706](https://github.com/vllm-project/vllm/pull/63706) `--dbo-scope {all,prefill}` | Open | Opposite scope (prefill-only DBO); would expose the straddle on GLM. |
+| (related, ruled out for AFD) | [#61584](https://github.com/vllm-project/vllm/pull/61584) Reserve peer microbatch workspaces after profiling ([#61487](https://github.com/vllm-project/vllm/issues/61487)) | Open | Workspace sizing for micro-batches other than 0; AFD already ruled out workspaces for the prefill corruption. |
+| MTP + DBO (#61464 backport) | [#61464](https://github.com/vllm-project/vllm/pull/61464) Support DBO with speculative decoding and DCP | Merged 2026-10-28, main only | Full; AFD carries it as scoped patches until the pin moves past it. |
+| #61464 test coverage | #61464 tests | Merged as is | Gap remains: E2E `tests/v1/distributed/test_dbo.py` uses ngram only; no MTP/EAGLE, graph DBO or DSA model. |
+| Graph DBO with a target-dependent drafter | #61464 | Merged 2026-10-28, main only | Full (draft prefill graphs on the draft builders). |
+| Draft buffer sharing if drafting is micro-batched | RFC [#65119](https://github.com/vllm-project/vllm/issues/65119) DBO for the MTP/EAGLE drafter forward | Open RFC | Would micro-batch the drafter; `eagle/utils.py` on main still re-points draft top-k buffers to the target's, so the hazard applies if it lands. |
+| Attention TP > 1 (open work 4) | [#60477](https://github.com/vllm-project/vllm/pull/60477) DSA: all-reduce partial hidden_states before PP send; [#62947](https://github.com/vllm-project/vllm/pull/62947) honor the decoder's deferred MoE all-reduce on the naive all2all path | #60477 merged 2026-10-29 (main only); #62947 open | Not an AFD fix. Both handle the same deferred reduction (the MLP output is reduced in the next layer's fused all-reduce + RMSNorm) at a PP boundary and on the all-gather/reduce-scatter path; #60477 is the pattern for returning connector rows as a partial. |
+| NCCL in the image (open work 6) | [#58768](https://github.com/vllm-project/vllm/pull/58768) add vllm-openai-efa target | On `releases/v0.33.0` | `docker/Dockerfile` `NCCL_VERSION` goes 2.30.7 (already the v0.32.0 value) -> 2.31.2. The v0.32.0 image used here still reported 2.29.7, so check the published v0.33.0 image before dropping the NCCL 2.30.7 wheel step. |
