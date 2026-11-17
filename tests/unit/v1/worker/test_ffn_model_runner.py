@@ -24,10 +24,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
-from afd_plugin.connectors.base import (  # noqa: E402
-    AFDControlPlaneClosedError,
-    AFDRoutedExpertsConnector,
-)
+from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
@@ -37,6 +34,7 @@ from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     _set_moe_layer_index,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import ConnectorDrivenConnector  # noqa: E402
 from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
 )
@@ -795,24 +793,13 @@ def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
     assert exc.value.__cause__ is expected_error
 
 
-class _ConnectorDrivenRoutedConnector(AFDRoutedExpertsConnector):
-    """Only what the FFN worker reads: the connector-driven capability."""
-
-    control_plane = None
-    is_initialized = True
-    connector_driven = True
-
-
-_ConnectorDrivenRoutedConnector.__abstractmethods__ = frozenset()
-
-
 def _connector_driven_worker(runner) -> AFDFFNWorker:
     worker = object.__new__(AFDFFNWorker)
     worker._ffn_thread = None
     worker._ffn_shutdown_event = threading.Event()
     worker._ffn_loop_error = None
     worker.device = SimpleNamespace(type="cpu")
-    runner.connector = object.__new__(_ConnectorDrivenRoutedConnector)
+    runner.connector = ConnectorDrivenConnector()
     runner.model = "owned weights"
     worker.model_runner = runner
     return worker

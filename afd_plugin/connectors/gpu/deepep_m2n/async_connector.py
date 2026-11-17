@@ -25,6 +25,12 @@ rank pads with empty steps up to S. Then all ranks meet at a store barrier and
 run afdEP-comm's collective close. If the agreement fails (a rank is missing
 or past S), the rank releases host references only.
 
+vLLM runs this shutdown only when it gives the processes time: serve with
+``--shutdown-timeout`` (engines; the default 0 force-kills them) and raise
+``VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS`` (workers; default 5 s) above the FFN
+loop's stop plus ``CLOSE_BARRIER_TIMEOUT_S``. Otherwise the processes are
+killed as with the sync connector.
+
 Step counting: an Attention rank counts its lane-0 dispatches on the device,
 inside the dispatch op, so eager forwards, graph replays and capture warmups
 all count while capture-only forwards do not. Steps = dispatches / MoE layers.

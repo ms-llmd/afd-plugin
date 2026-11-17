@@ -42,6 +42,10 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import (  # noqa: E402
+    ConnectorDrivenConnector,
+    FakeRoutedConnector,
+)
 from tests.unit.fakes.deepseek_v4 import WorkspaceCase  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 from tests.unit.fakes.ubatching import (  # noqa: E402
@@ -1818,3 +1822,42 @@ def test_v2_connector_driven_forward_skips_dp_coordination_and_control(monkeypat
 
     assert result == "native-result"
     assert events == ["native skip_dp=True"]
+
+
+@pytest.mark.parametrize(
+    ("connector", "stopped", "expected"),
+    [
+        (ConnectorDrivenConnector(), False, ["dummy", "synchronize"]),
+        (FakeRoutedConnector(), False, ["dummy"]),
+        (ConnectorDrivenConnector(), True, ["dummy"]),
+    ],
+    ids=["connector-driven-waits", "control-plane-no-wait", "stopped-stops"],
+)
+def test_attention_worker_idle_step_stays_one_step_ahead(
+    monkeypatch, connector, stopped, expected
+):
+    """A connector-driven idle rank waits for each dummy step on the GPU, so
+    its host never queues steps past an agreed stop step; after the stop the
+    worker stops pumping instead of failing the engine.
+
+    Why: with steps queued past the stop step, the rank waits on the GPU for
+    an FFN that has already stopped, and the engine never shuts down.
+    """
+    events: list[str] = []
+
+    def native_dummy(self):
+        events.append("dummy")
+        if stopped:
+            raise AFDConnectorStoppedError("ranks agreed to stop")
+
+    monkeypatch.setattr(attention_worker.Worker, "execute_dummy_batch", native_dummy)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device=None: events.append("synchronize")
+    )
+    worker = object.__new__(attention_worker.AFDAttentionWorker)
+    worker.device = torch.device("cpu")
+    worker.model_runner = SimpleNamespace(connector=connector)
+
+    worker.execute_dummy_batch()
+
+    assert events == expected

@@ -10,7 +10,10 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu_worker import Worker
 
-from afd_plugin.connectors.base import AFDConnectorStoppedError
+from afd_plugin.connectors.base import (
+    AFDConnectorStoppedError,
+    AFDRoutedExpertsConnector,
+)
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
@@ -90,20 +93,29 @@ class AFDAttentionWorker(Worker):
     # Upstream source: vLLM v0.32.0, vllm/v1/worker/gpu_worker.py,
     # Worker.execute_dummy_batch; 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Patch reason: an idle async afdEP Attention rank steps dummy batches from
-    # the engine busy loop; once the ranks agreed to stop, the connector
-    # refuses further steps (AFDConnectorStoppedError) before any forward work.
-    # Patch functionality: an idle rank then stops pumping instead of failing
-    # the engine while the deployment shuts down.
+    # the engine busy loop. A dummy step returns without waiting for the GPU,
+    # so the host could queue many steps ahead of what the FFN has served,
+    # beyond any stop step the ranks agree on; and once they agreed to stop,
+    # the connector refuses further steps (AFDConnectorStoppedError).
+    # Patch functionality: wait for each dummy step on the GPU (at most one
+    # idle step in flight), and stop pumping after the agreed stop step instead
+    # of failing the engine while the deployment shuts down.
     # Signature: matches Worker.execute_dummy_batch exactly: (self) -> None.
     # Delegation exception: the native dummy run stays in super().
     # Removal plan: remove with the async afdEP idle pump.
     def execute_dummy_batch(self) -> None:
-        # ### PATCH START: stop pumping after the agreed stop step.
+        # ### PATCH START: one idle step in flight; stop after the agreed step.
         try:
             super().execute_dummy_batch()
         except AFDConnectorStoppedError:
             return
-        # ### PATCH END: stop pumping after the agreed stop step.
+        connector = self.model_runner.connector
+        if (
+            isinstance(connector, AFDRoutedExpertsConnector)
+            and connector.connector_driven
+        ):
+            torch.cuda.synchronize(self.device)
+        # ### PATCH END: one idle step in flight; stop after the agreed step.
 
 
 __all__ = ["AFDAttentionWorker"]

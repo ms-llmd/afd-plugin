@@ -7,6 +7,9 @@
 # FULL_DECODE_ONLY CUDA graphs and DBO. Attention ranks schedule on their own
 # (no DP coordination); every dispatch uses the max-num-batched-tokens bucket.
 # ASYNC=0 runs the same connector as synchronous DeepEP M2N (A/B switch).
+# Graceful stop (agreed stop step, collective close) needs time from vLLM:
+#   VLLM_ARGS="--shutdown-timeout 60" VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=30
+# Without it vLLM force-kills the processes on SIGTERM.
 # Settings and running in a pod: recipe/gpu/common/README.md
 # shellcheck disable=SC1090,SC2034  # the sourced launcher reads these variables
 
