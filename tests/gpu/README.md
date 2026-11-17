@@ -7,6 +7,7 @@ server, and run outside CI.
 | File | Needs | Purpose |
 | --- | --- | --- |
 | `test_deepep_m2n_gpu.py` | pytest, up to 6 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
+| `test_deepep_m2n_bf16_act.py` | pytest, 1 GPU | The count-aware BF16 activation (`bf16_act.py`): received rows match an fp32 reference, rows past the last expert are untouched |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
 | `__init__.py` | - | Package marker |
 

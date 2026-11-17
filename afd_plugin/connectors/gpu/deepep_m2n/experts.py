@@ -19,9 +19,11 @@ Payloads:
 Backends:
 
 - ``deepgemm``: FastAFD's path. DeepGEMM grouped GEMMs consume DeepEP's
-  per-expert prefix sum directly (no re-permutation). BF16: GEMM, vLLM
-  ``silu_and_mul``, GEMM, weight multiply. FP8: GEMM, fused SiLU-mul with the
-  top-k weight folded in and FP8 requant (``fp8_quant.py``), GEMM. Requires
+  per-expert prefix sum directly (no re-permutation). BF16: GEMM, fused
+  SiLU-mul with the top-k weight folded in (``bf16_act.py``), GEMM. FP8: GEMM,
+  fused SiLU-mul with the top-k weight folded in and FP8 requant
+  (``fp8_quant.py``), GEMM. Both fused steps skip rows past the last expert's
+  end, so a worst-case receive costs what its real rows cost. Requires
   ``expert_alignment`` equal to the DeepGEMM contiguous-layout M alignment.
 - ``fused_experts``: vLLM's Triton ``fused_experts`` with ``top_k=1`` on the
   valid rows (FP8 inputs and weights are dequantized to BF16 first). Reads the
@@ -33,10 +35,10 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
-import vllm._custom_ops  # noqa: F401  (registers torch.ops._C.silu_and_mul)
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
 from afd_plugin.connectors.gpu.deepep_m2n import deepgemm
+from afd_plugin.connectors.gpu.deepep_m2n.bf16_act import silu_mul_weight_bf16
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
     dequantize_fp8_block128,
     dequantize_fp8_rows,
@@ -155,15 +157,13 @@ class DeepEPM2NExperts:
         deepgemm.m_grouped_bf16_gemm_nt_psum(
             recv_x, weights.w13, gate_up, recv_count_psum, expected_m
         )
-        activated = torch.empty(
-            (num_rows, intermediate_x2 // 2), dtype=torch.bfloat16, device=recv_x.device
-        )
-        torch.ops._C.silu_and_mul(activated, gate_up)
+        # Combine is an unweighted sum, so fold each row's top-k weight into the
+        # second GEMM's (linear) input. Only received rows are computed, so a
+        # worst-case receive (no host sync) costs what its real rows cost.
+        activated = silu_mul_weight_bf16(gate_up, recv_count_psum, recv_topk_weights)
         deepgemm.m_grouped_bf16_gemm_nt_psum(
             activated, weights.w2, out, recv_count_psum, expected_m
         )
-        # Combine is an unweighted sum, so apply each row's top-k weight here.
-        out.mul_(recv_topk_weights[:num_rows].to(torch.bfloat16).view(-1, 1))
         return out
 
     def _run_deepgemm_fp8(
