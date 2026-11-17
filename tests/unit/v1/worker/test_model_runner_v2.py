@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from vllm.forward_context import (  # noqa: E402
     ForwardContext,
     override_forward_context,
 )
+from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers  # noqa: E402
@@ -25,6 +27,7 @@ from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
+from afd_plugin.connectors.base import AFDConnectorStoppedError  # noqa: E402
 from afd_plugin.model_executor.models import (  # noqa: E402
     forward_context as afd_forward_context,
 )
@@ -59,7 +62,7 @@ TEST_CUDAGRAPH_CAPTURE_SIZE = 8
 class _RecordingConnector:
     def __init__(self, events: list[str]):
         self.events = events
-        self.control_plane = self
+        self.control_plane: _RecordingConnector | None = self
         self.closed = False
 
     def update_state_from_dp_metadata(self, payload):
@@ -73,6 +76,10 @@ class _RecordingConnector:
     def send_attn_output(self, hidden_states, context, **kwargs):
         self.events.append("data")
         self.last_attn_output = hidden_states
+
+    def attention_step(self):
+        # AFDConnectorBase's default: no step bookkeeping.
+        return nullcontext()
 
     def close(self):
         self.closed = True
@@ -1770,3 +1777,44 @@ def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_c
         {"platform_stage": 1},
     ]
     assert events == []
+
+
+class _ConnectorDrivenConnector(_RecordingConnector):
+    """No control plane; the step gate refuses once ``stopped`` is set."""
+
+    def __init__(self, events: list[str]):
+        super().__init__(events)
+        self.control_plane = None
+        self.stopped = False
+
+    def attention_step(self):
+        if self.stopped:
+            raise AFDConnectorStoppedError("ranks agreed to stop")
+        return nullcontext()
+
+
+def test_v2_connector_driven_forward_skips_dp_coordination_and_control(monkeypatch):
+    """A connector-driven forward runs native execution with DP coordination
+    skipped and publishes no control; after the agreed stop the connector's
+    step gate refuses the forward before native execution.
+
+    Why: async ranks schedule alone (a DP all-reduce would couple them), and
+    a step after the agreed stop step would leave the FFN waiting.
+    """
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner.connector = _ConnectorDrivenConnector(events)
+
+    def native_execute(self, *args, **kwargs):
+        events.append(f"native skip_dp={should_skip_dp_coordination()}")
+        return "native-result"
+
+    monkeypatch.setattr(native_v2.GPUModelRunner, "execute_model", native_execute)
+
+    result = AFDAttentionModelRunnerV2.execute_model(runner, _scheduler_output(3))
+    runner.connector.stopped = True
+    with pytest.raises(AFDConnectorStoppedError):
+        AFDAttentionModelRunnerV2.execute_model(runner, _scheduler_output(3))
+
+    assert result == "native-result"
+    assert events == ["native skip_dp=True"]

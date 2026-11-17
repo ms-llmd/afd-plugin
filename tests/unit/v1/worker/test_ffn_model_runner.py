@@ -821,7 +821,7 @@ def _connector_driven_worker(runner) -> AFDFFNWorker:
 def test_ffn_worker_runs_connector_driven_steps_then_drains():
     """A connector-driven runner steps until it reports the agreed stop, then
     drains and finishes the receiver, without a shutdown request."""
-    events = []
+    events: list[object] = []
     results = iter([True, True, False])
 
     def step(shutdown_requested):
@@ -844,11 +844,16 @@ def test_ffn_worker_stops_connector_driven_loop_at_the_agreed_step(monkeypatch):
     """Shutdown proposes the stop step, waits for the loop to leave after it,
     and only then releases native resources."""
     stop_requested = threading.Event()
+
+    def request_stop():
+        stop_requested.set()
+        return 7
+
     runner = SimpleNamespace(
         execute_connector_driven_step=lambda shutdown: not stop_requested.is_set(),
         drain=lambda: None,
         session=SimpleNamespace(finish_receiver=lambda: None),
-        request_stop=lambda: stop_requested.set() or 7,
+        request_stop=request_stop,
     )
     worker = _connector_driven_worker(runner)
     worker.start_ffn_server_loop()

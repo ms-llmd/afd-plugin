@@ -40,10 +40,12 @@ def _runner(log: list, *, use_cuda_graph: bool, stop_step: int | None = None):
     connector = object.__new__(AsyncAfdEPConnector)
     connector._stop_step = stop_step
     connector._ffn_steps_done = 0
-    connector.recv_attn_output = lambda ubatch_idx: (
+
+    def recv_attn_output(ubatch_idx):
         log.append(f"D{ubatch_idx}")
-        or SimpleNamespace(context=SimpleNamespace(lane=ubatch_idx))
-    )
+        return SimpleNamespace(context=SimpleNamespace(lane=ubatch_idx))
+
+    connector.recv_attn_output = recv_attn_output
     connector.run_experts = lambda payload, weights: payload.context.lane
     connector.send_ffn_output = lambda out, context: log.append(f"C{context.lane}")
     connector.synchronize_lanes = lambda: log.append("join")

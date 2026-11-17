@@ -13,6 +13,8 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
+from afd_plugin.config import is_afd_async_dp
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PATCH_PATH = REPO_ROOT / "afd_plugin/compat/patches/gpu_mrv2_ubatching.py"
 RUNNER_PATH = REPO_ROOT / "afd_plugin/v1/worker/attention_model_runner_v2.py"
@@ -156,6 +158,7 @@ def patches():
             attn_metadata=attn, vllm_config=config, **kwargs
         ),
         "check_ubatch_thresholds": check_thresholds,
+        "is_afd_async_dp": is_afd_async_dp,
         "get_num_ubatches": lambda config: (
             config.num_ubatches if config.use_ubatching else 1
         ),
@@ -167,12 +170,14 @@ def patches():
 
 
 def test_disabled_dbo_does_not_construct_runner(patches):
-    config = SimpleNamespace(parallel_config=_parallel(use_ubatching=False))
+    config = SimpleNamespace(
+        additional_config={}, parallel_config=_parallel(use_ubatching=False)
+    )
     assert patches.maybe_build_ubatch_runner(config, None, None, [], None, 32) is None
 
 
 def test_dp1_native_child_metadata_keeps_stage_counts_and_context_fields(patches):
-    config = SimpleNamespace(parallel_config=_parallel())
+    config = SimpleNamespace(additional_config={}, parallel_config=_parallel())
     runner = patches.maybe_build_ubatch_runner(config, None, None, [], None, 32)
     slices = [SimpleNamespace(num_tokens=3), SimpleNamespace(num_tokens=5)]
     attention = [{"layer": object()}, {"layer": object()}]
@@ -193,6 +198,29 @@ def test_dp1_native_child_metadata_keeps_stage_counts_and_context_fields(patches
         assert context.is_padding is padding[index]
         assert context.vllm_config is config
         assert context.cudagraph_runtime_mode is _CUDAGraphMode.NONE
+
+
+def test_async_child_contexts_carry_no_dp_metadata_at_any_dp_size(patches):
+    """Async connector-driven Attention binds the local child factory at DP>1
+    too, and its micro-batch contexts carry no DP metadata.
+
+    Why: async ranks schedule alone; native DP metadata would imply a DP
+    all-reduce and per-rank padding the FFN no longer uses.
+    """
+    config = SimpleNamespace(
+        parallel_config=_parallel(dp_size=2),
+        additional_config={"afd": {"connector": "AsyncAfdEPConnector", "async": True}},
+    )
+    runner = patches.maybe_build_ubatch_runner(config, None, None, [], None, 32)
+
+    contexts = runner._make_forward_contexts(
+        [SimpleNamespace(num_tokens=3), SimpleNamespace(num_tokens=5)],
+        [{}, {}],
+        [{}, {}],
+        [None, None],
+    )
+
+    assert [context.dp_metadata for context in contexts] == [None, None]
 
 
 @pytest.mark.parametrize(
@@ -321,7 +349,7 @@ def test_kv_initialization_scopes_dp1_metadata(patches, fail):  # long-test: KV 
     class NativeRunner:
         def initialize_kv_cache(self, *args, **kwargs):
             self.ubatch_runner = patches.model_runner.maybe_build_ubatch_runner(
-                SimpleNamespace(parallel_config=_parallel()),
+                SimpleNamespace(additional_config={}, parallel_config=_parallel()),
                 None,
                 None,
                 [],
@@ -359,7 +387,12 @@ def test_kv_initialization_scopes_dp1_metadata(patches, fail):  # long-test: KV 
         attention_runner.initialize_kv_cache(kv_config, True, allocation_context)
     assert (
         patches.model_runner.maybe_build_ubatch_runner(
-            SimpleNamespace(parallel_config=_parallel()), None, None, [], kv_config, 32
+            SimpleNamespace(additional_config={}, parallel_config=_parallel()),
+            None,
+            None,
+            [],
+            kv_config,
+            32,
         )
         is None
     )
