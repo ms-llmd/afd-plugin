@@ -304,6 +304,14 @@ class AFDControlPlaneClosedError(RuntimeError):
     """A receive was cancelled by an explicit local control-plane close."""
 
 
+class AFDConnectorStoppedError(RuntimeError):
+    """The ranks agreed to stop; this rank must issue no further step.
+
+    A connector-driven connector raises it from ``attention_step()`` on the
+    forward after the agreed stop step, while the deployment shuts down.
+    """
+
+
 class AFDRoutedExpertsConnector(AFDConnectorBase):
     """A connector whose FFN side receives routed (token, local expert) rows.
 
@@ -319,6 +327,13 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
     ``init_afd_connector`` after weights load, here with what it loaded. The
     FFN worker selects the routed-experts runner for these connectors.
     """
+
+    @property
+    def connector_driven(self) -> bool:
+        """True when this connector runs without a control plane: the FFN runs
+        the connector-driven loop and Attention publishes no per-step metadata.
+        Implies ``control_plane is None``."""
+        return False
 
     # Extends AFDConnectorBase.init_afd_connector with optional keywords only,
     # so calls through the base contract stay valid.

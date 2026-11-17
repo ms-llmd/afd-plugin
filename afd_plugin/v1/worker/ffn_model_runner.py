@@ -25,6 +25,7 @@ from afd_plugin.compat.profiler import (
 )
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
+    AFDConnectorBase,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDControlPlane,
@@ -53,9 +54,8 @@ class GPUFFNModelRunner:
     """FFN model runner for AFD GPU execution.
 
     FFN steps are driven by the connector control plane rather than the vLLM
-    scheduler. GPU only supports control-plane-driven connectors, so the runner
-    asserts ``connector.control_plane is not None`` at construction; connectors
-    without a control plane (``control_plane is None``) are not supported.
+    scheduler. This runner requires a control plane (``_check_connector``);
+    ``GPUFFNAsyncRoutedExpertsModelRunner`` drives connectors without one.
     """
 
     afd_expected_role = "ffn"
@@ -83,10 +83,7 @@ class GPUFFNModelRunner:
             vllm_config,
             self.afd_config,
         )
-        # TODO: Async GPU connector will be supported in the future
-        assert self.connector.control_plane is not None, (
-            "GPU model runner only supports control-plane-driven connectors"
-        )
+        self._check_connector(self.connector)
 
         self.model: Any | None = None
         self.model_memory_usage = 0
@@ -97,6 +94,13 @@ class GPUFFNModelRunner:
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
         self.prof = create_afd_gpu_profiler("ffn")
+
+    def _check_connector(self, connector: AFDConnectorBase) -> None:
+        """Reject connectors this runner cannot drive; subclasses that run a
+        connector-driven loop accept connectors without a control plane."""
+        assert connector.control_plane is not None, (
+            "GPU model runner only supports control-plane-driven connectors"
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

@@ -87,6 +87,7 @@ Every setting is an environment variable; the defaults reproduce the recipe.
 | `AFD_CONNECTOR` | recipe | Connector class, for example `P2pNcclAFDConnector` to run an M2N recipe on NCCL P2P. |
 | `VLLM_ARGS` | empty | Extra `vllm serve` flags for both roles. |
 | `ATTN_ARGS` / `FFN_ARGS` | empty | Extra `vllm serve` flags for one role. |
+| `ASYNC` | recipe, else `0` | `1` adds `"async": true` to the `afd` block of both roles (`AsyncAfdEPConnector` async mode). |
 | `M2N_EXTRA_CONFIG` | empty | Extra `connector_extra_config` members, for example `'"expert_num_sms": 130'`. |
 | `DECODE_BENCH` | empty | `kv_connector_extra_config` JSON of the decode-only benchmark connector on Attention (`{}` is enough); see [`tools/benchmarks`](../../../tools/benchmarks/). |
 | `AFD_REPO` | current directory | Repository root that holds `tools/benchmarks` (with `DECODE_BENCH`). |

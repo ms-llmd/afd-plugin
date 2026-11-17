@@ -131,17 +131,28 @@ def test_parse_async_dp_config_from_async_alias():
     assert config.async_dp is True
 
 
-def test_async_dp_requires_async_connector():
-    with pytest.raises(ValueError, match="requires connector='CAMAsyncAFDConnector'"):
-        parse_afd_config(
-            {
-                "afd": {
-                    "connector": "CAMP2pAFDConnector",
-                    "role": "attention",
-                    "async": True,
-                },
-            },
-        )
+@pytest.mark.parametrize(
+    ("connector", "accepted"),
+    [
+        ("CAMAsyncAFDConnector", True),
+        ("AsyncAfdEPConnector", True),
+        ("CAMP2pAFDConnector", False),
+        ("DeepEPM2NAFDConnector", False),
+    ],
+)
+def test_async_dp_is_accepted_only_for_async_connectors(connector, accepted):
+    """``async: true`` parses only for the connectors that implement it.
+
+    Why: a sync connector with the async engine patches would run without the
+    DP coordination its control plane depends on.
+    """
+    raw = {"afd": {"connector": connector, "role": "attention", "async": True}}
+
+    if accepted:
+        assert parse_afd_config(raw).async_dp is True
+    else:
+        with pytest.raises(ValueError, match="AFD async mode requires connector in"):
+            parse_afd_config(raw)
 
 
 def test_original_common_afd_field_aliases_are_supported():
@@ -193,6 +204,9 @@ def test_is_afd_active_requires_common_config_validity():
         ("CAMAsyncAFDConnector", True, True),
         ("CAMAsyncAFDConnector", False, False),
         ("CAMP2pAFDConnector", False, False),
+        ("AsyncAfdEPConnector", True, True),
+        ("AsyncAfdEPConnector", False, False),
+        ("DeepEPM2NAFDConnector", False, False),
     ],
 )
 def test_is_afd_async_dp_is_selector_not_activation_validator(

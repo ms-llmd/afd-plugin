@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    ASYNC_AFDEP_CONNECTOR,
     CAMP2P_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
     AFDConfig,
@@ -53,6 +54,8 @@ ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
     "Qwen3MoeForCausalLM",
     "DeepseekV2ForCausalLM",
 )
+# Models validated with AsyncAfdEPConnector in async mode.
+ASYNC_AFDEP_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = ("Qwen3MoeForCausalLM",)
 
 
 CAM_MAX_RECEIVE_TOKENS = 262144
@@ -107,6 +110,34 @@ def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
         raise RuntimeError("Async CAM Attention graph does not support PP or CP")
 
 
+def _validate_async_afdep(vllm_config: VllmConfig, afd_config: AFDConfig) -> None:
+    """Deployment limits of ``AsyncAfdEPConnector`` with ``async: true``.
+
+    The FFN finds a step's boundary by counting MoE layers on both DBO lanes,
+    so every rank runs two lanes and the same MoE layer sequence each step
+    (no speculative decoding). Only Qwen3 MoE is validated in async mode.
+    """
+    parallel = vllm_config.parallel_config
+    if not parallel.use_ubatching or parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
+        raise RuntimeError(
+            f"{afd_config.connector} async mode requires --enable-dbo "
+            f"({GPU_MRV2_NUM_UBATCHES} micro-batches) on both roles"
+        )
+    if vllm_config.speculative_config is not None:
+        raise RuntimeError(
+            f"{afd_config.connector} async mode does not support speculative decoding"
+        )
+    architectures = vllm_config.model_config.hf_config.architectures
+    if not any(
+        architecture.removeprefix("AFD") in ASYNC_AFDEP_MODEL_ARCHITECTURES
+        for architecture in architectures
+    ):
+        raise RuntimeError(
+            f"{afd_config.connector} async mode supports only "
+            f"{ASYNC_AFDEP_MODEL_ARCHITECTURES}, got {architectures}"
+        )
+
+
 def validate_gpu_model_runner_v2_config(
     vllm_config: VllmConfig,
     *,
@@ -159,6 +190,8 @@ def validate_gpu_model_runner_v2_config(
                 f"{afd_config.connector} supports only "
                 f"{ATTENTION_ROUTING_MODEL_ARCHITECTURES}, got {architectures}"
             )
+    if afd_config.connector == ASYNC_AFDEP_CONNECTOR and afd_config.async_dp:
+        _validate_async_afdep(vllm_config, afd_config)
     if (
         parallel.pipeline_parallel_size,
         parallel.prefill_context_parallel_size,

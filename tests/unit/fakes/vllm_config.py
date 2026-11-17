@@ -211,8 +211,15 @@ def m2n_vllm_config(
     extra_config: dict[str, Any],
     port: int,
     host: str = "127.0.0.1",
+    *,
+    connector: str = "DeepEPM2NAFDConnector",
+    async_dp: bool = False,
+    num_ubatches: int = 1,
 ) -> SimpleNamespace:
-    """A ``vllm_config`` for one DeepEP M2N rank of ``topology``."""
+    """A ``vllm_config`` for one DeepEP M2N rank of ``topology``.
+
+    ``num_ubatches=2`` runs vLLM DBO (two lanes).
+    """
     # Deferred: this fakes module must import on CPU-only hosts without torch.
     import torch
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -237,7 +244,8 @@ def m2n_vllm_config(
     return SimpleNamespace(
         additional_config={
             "afd": {
-                "connector": "DeepEPM2NAFDConnector",
+                "connector": connector,
+                "async": async_dp,
                 "role": role,
                 "host": host,
                 "port": port,
@@ -269,8 +277,8 @@ def m2n_vllm_config(
             expert_placement_strategy="linear",
             enable_eplb=False,
             all2all_backend="allgather_reducescatter",
-            use_ubatching=False,
-            num_ubatches=1,
+            use_ubatching=num_ubatches > 1,
+            num_ubatches=num_ubatches,
         ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=M2N_MAX_NUM_BATCHED_TOKENS

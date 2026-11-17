@@ -10,6 +10,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu_worker import Worker
 
+from afd_plugin.connectors.base import AFDConnectorStoppedError
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
@@ -85,6 +86,24 @@ class AFDAttentionWorker(Worker):
     def _make_model_runner(self) -> GPUModelRunner:
         """Construct the AFD runner through the native worker factory hook."""
         return AFDAttentionModelRunnerV2(self.vllm_config, self.device)  # type: ignore[return-value]
+
+    # Upstream source: vLLM v0.32.0, vllm/v1/worker/gpu_worker.py,
+    # Worker.execute_dummy_batch; 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Patch reason: an idle async afdEP Attention rank steps dummy batches from
+    # the engine busy loop; once the ranks agreed to stop, the connector
+    # refuses further steps (AFDConnectorStoppedError) before any forward work.
+    # Patch functionality: an idle rank then stops pumping instead of failing
+    # the engine while the deployment shuts down.
+    # Signature: matches Worker.execute_dummy_batch exactly: (self) -> None.
+    # Delegation exception: the native dummy run stays in super().
+    # Removal plan: remove with the async afdEP idle pump.
+    def execute_dummy_batch(self) -> None:
+        # ### PATCH START: stop pumping after the agreed stop step.
+        try:
+            super().execute_dummy_batch()
+        except AFDConnectorStoppedError:
+            return
+        # ### PATCH END: stop pumping after the agreed stop step.
 
 
 __all__ = ["AFDAttentionWorker"]

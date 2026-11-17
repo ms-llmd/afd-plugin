@@ -99,6 +99,11 @@ AFDConnectorFactory.register_connector(
     "DeepEPM2NAFDConnector",
 )
 AFDConnectorFactory.register_connector(
+    "AsyncAfdEPConnector",
+    "afd_plugin.connectors.gpu.deepep_m2n.async_connector",
+    "AsyncAfdEPConnector",
+)
+AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",

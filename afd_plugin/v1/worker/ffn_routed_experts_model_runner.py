@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -162,8 +163,12 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
                 is_warmup=is_warmup,
                 is_graph_replaying=is_graph_replaying,
             )
-        connector = self.routed_connector
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
+        return self._run_routed_step(stage_ids)
+
+    def _run_routed_step(self, stage_ids: Sequence[int]) -> torch.Tensor | None:
+        """One step: every MoE layer on every stage, then join the lanes."""
+        connector = self.routed_connector
         ffn_output = None
         # Each stage's combine waits until just before that stage's next
         # dispatch, matching Attention's DBO micro-batch order
