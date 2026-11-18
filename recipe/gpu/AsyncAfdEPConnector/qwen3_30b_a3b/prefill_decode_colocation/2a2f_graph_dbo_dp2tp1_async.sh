@@ -18,7 +18,11 @@ ASYNC=${ASYNC:-1}
 LAYOUT=${LAYOUT:-2A2F}
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3-30B-A3B}
 ATTN_TP=${ATTN_TP:-1} FFN_TP=${FFN_TP:-1}
-MODE=graph CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,16,32,64}   # ascending
+# Each Attention rank pads to the smallest graph that fits its own tokens, and a
+# DBO step whose padding fills its second micro-batch (2 x tokens < graph size)
+# runs eager (several times slower). Sizes 1, 2, 4 and steps under 2x keep every
+# decode batch on a graph.
+MODE=graph CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-1,2,4,8,12,16,24,32,48,64}   # ascending
 SERVE_ARGS=(--enable-ep-weight-filter --max-num-seqs 64 --max-num-batched-tokens 4096 --max-model-len 4096
             --enable-dbo --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 8)
 
