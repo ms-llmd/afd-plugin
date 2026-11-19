@@ -45,6 +45,7 @@ def npu_parallel_config(**overrides):
         "pipeline_parallel_size": 1,
         "use_sequence_parallel_moe": False,
         "enable_eplb": False,
+        "enable_expert_parallel": True,
         "enable_elastic_ep": False,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
@@ -71,8 +72,24 @@ def npu_vllm_config(
     compute_gate_on_attention = bool(
         parallel_overrides.pop("compute_gate_on_attention", False),
     )
-    num_attention_ranks = int(parallel_overrides.pop("num_attention_ranks", 1))
-    num_ffn_ranks = int(parallel_overrides.pop("num_ffn_ranks", 1))
+    role_size = parallel_overrides.get(
+        "data_parallel_size", 1
+    ) * parallel_overrides.get("tensor_parallel_size", 1)
+    num_attention_ranks = int(
+        parallel_overrides.pop(
+            "num_attention_ranks", role_size if role == "attention" else 1
+        )
+    )
+    num_ffn_ranks = int(
+        parallel_overrides.pop("num_ffn_ranks", role_size if role == "ffn" else 1)
+    )
+    hf_config = SimpleNamespace(
+        model_type="deepseek_v2",
+        architectures=["DeepseekV2ForCausalLM"],
+        hidden_size=32,
+        num_experts_per_tok=2,
+        n_routed_experts=4,
+    )
     return SimpleNamespace(
         use_v2_model_runner=use_v2_model_runner,
         additional_config={
@@ -89,7 +106,8 @@ def npu_vllm_config(
         parallel_config=npu_parallel_config(**parallel_overrides),
         model_config=SimpleNamespace(
             enforce_eager=True,
-            hf_text_config=SimpleNamespace(model_type="deepseek_v2"),
+            hf_config=hf_config,
+            hf_text_config=hf_config,
             use_mla=use_mla,
         ),
         compilation_config=SimpleNamespace(
@@ -123,7 +141,9 @@ def npu_async_cam_target_graph_config(**parallel_overrides):
     config.model_config.enforce_eager = False
     config.model_config.hf_config = config.model_config.hf_text_config = (
         SimpleNamespace(
-            model_type="deepseek_v4", architectures=["DeepseekV4ForCausalLM"]
+            model_type="deepseek_v4",
+            architectures=["DeepseekV4ForCausalLM"],
+            n_routed_experts=config.model_config.hf_config.n_routed_experts,
         )
     )
     config.compilation_config.mode = 0
@@ -211,8 +231,15 @@ def m2n_vllm_config(
     extra_config: dict[str, Any],
     port: int,
     host: str = "127.0.0.1",
+    *,
+    connector: str = "DeepEPM2NAFDConnector",
+    async_dp: bool = False,
+    num_ubatches: int = 1,
 ) -> SimpleNamespace:
-    """A ``vllm_config`` for one DeepEP M2N rank of ``topology``."""
+    """A ``vllm_config`` for one DeepEP M2N rank of ``topology``.
+
+    ``num_ubatches=2`` runs vLLM DBO (two lanes).
+    """
     # Deferred: this fakes module must import on CPU-only hosts without torch.
     import torch
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -237,7 +264,8 @@ def m2n_vllm_config(
     return SimpleNamespace(
         additional_config={
             "afd": {
-                "connector": "DeepEPM2NAFDConnector",
+                "connector": connector,
+                "async": async_dp,
                 "role": role,
                 "host": host,
                 "port": port,
@@ -269,8 +297,8 @@ def m2n_vllm_config(
             expert_placement_strategy="linear",
             enable_eplb=False,
             all2all_backend="allgather_reducescatter",
-            use_ubatching=False,
-            num_ubatches=1,
+            use_ubatching=num_ubatches > 1,
+            num_ubatches=num_ubatches,
         ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=M2N_MAX_NUM_BATCHED_TOKENS

@@ -13,8 +13,12 @@ from vllm.config import VllmConfig
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
-from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
+from afd_plugin.config import ASYNC_AFDEP_CONNECTOR, parse_afd_config
+from afd_plugin.connectors import (
+    AFDConnectorBase,
+    AFDConnectorFactory,
+    AFDRoutedExpertsConnector,
+)
 from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -31,6 +35,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 FFN_LOOP_JOIN_TIMEOUT_S = 5
+# A connector-driven loop runs a few more steps, up to the agreed stop step,
+# before it leaves.
+ASYNC_FFN_STOP_TIMEOUT_S = 10
+
+
+def _is_connector_driven(connector: AFDConnectorBase) -> bool:
+    return (
+        isinstance(connector, AFDRoutedExpertsConnector) and connector.connector_driven
+    )
 
 
 class AFDFFNWorker(Worker):
@@ -81,7 +94,7 @@ class AFDFFNWorker(Worker):
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
         )
-        validate_gpu_model_runner_v2_config(
+        self.afd_cudagraph_policy = validate_gpu_model_runner_v2_config(
             self.vllm_config,
             expected_role="ffn",
             device_type=self.device_config.device_type,
@@ -105,6 +118,20 @@ class AFDFFNWorker(Worker):
         """Construct the connector-driven runner via the native factory hook."""
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
         connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+        if afd_config.async_dp and afd_config.connector == ASYNC_AFDEP_CONNECTOR:
+            from afd_plugin.v1.worker.ffn_async_routed_experts_model_runner import (
+                GPUFFNAsyncRoutedExpertsModelRunner,
+            )
+            from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
+                select_routed_moe_backend,
+            )
+
+            select_routed_moe_backend(self.vllm_config)
+            return GPUFFNAsyncRoutedExpertsModelRunner(
+                self.vllm_config,
+                self.device,
+                afd_cudagraph_policy=self.afd_cudagraph_policy,
+            )  # type: ignore[return-value]
         if issubclass(connector_cls, AFDRoutedExpertsConnector):
             from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
                 GPUFFNRoutedExpertsModelRunner,
@@ -112,8 +139,16 @@ class AFDFFNWorker(Worker):
             )
 
             select_routed_moe_backend(self.vllm_config)
-            return GPUFFNRoutedExpertsModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
-        return GPUFFNModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
+            return GPUFFNRoutedExpertsModelRunner(
+                self.vllm_config,
+                self.device,
+                afd_cudagraph_policy=self.afd_cudagraph_policy,
+            )  # type: ignore[return-value]
+        return GPUFFNModelRunner(
+            self.vllm_config,
+            self.device,
+            afd_cudagraph_policy=self.afd_cudagraph_policy,
+        )  # type: ignore[return-value]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """FFN workers do not allocate KV cache."""
@@ -181,6 +216,15 @@ class AFDFFNWorker(Worker):
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
 
+        if _is_connector_driven(self.model_runner.connector):
+            # The runner leaves after the agreed stop step; the event is set
+            # only after that, so it never ends the loop mid-protocol.
+            while self.model_runner.execute_connector_driven_step(event.is_set()):
+                pass
+            self.model_runner.drain()
+            self.model_runner.session.finish_receiver()
+            return
+
         while not event.is_set():
             control_plane = self.model_runner.connector.control_plane
             if control_plane is None:
@@ -227,6 +271,9 @@ class AFDFFNWorker(Worker):
             raise RuntimeError("AFD FFN worker loop failed") from error
 
     def stop_ffn_server_loop(self) -> None:
+        if _is_connector_driven(self.model_runner.connector):
+            self._stop_connector_driven_loop()
+            return
         event = self._ffn_shutdown_event
         if event is not None:
             event.set()
@@ -238,6 +285,30 @@ class AFDFFNWorker(Worker):
             thread.join(timeout=FFN_LOOP_JOIN_TIMEOUT_S)
             if thread.is_alive():
                 raise RuntimeError("AFD FFN worker loop did not stop before shutdown")
+        self._ffn_thread = None
+        self._ffn_shutdown_event = None
+        self.raise_ffn_loop_error_if_any()
+
+    def _stop_connector_driven_loop(self) -> None:
+        """Agree a stop step with every rank and let the loop run up to it.
+
+        On a join timeout the loop thread (a daemon) is still blocked in a GPU
+        wait; log it and continue, so the connector takes its local-release
+        fallback instead of the worker failing shutdown.
+        """
+        thread = self._ffn_thread
+        if thread is not None and thread.is_alive():
+            stop_step = self.model_runner.request_stop()
+            thread.join(timeout=ASYNC_FFN_STOP_TIMEOUT_S)
+            if thread.is_alive():
+                logger.error(
+                    "AFD FFN loop did not reach the agreed stop step %d within %d s",
+                    stop_step,
+                    ASYNC_FFN_STOP_TIMEOUT_S,
+                )
+        event = self._ffn_shutdown_event
+        if event is not None:
+            event.set()
         self._ffn_thread = None
         self._ffn_shutdown_event = None
         self.raise_ffn_loop_error_if_any()

@@ -13,7 +13,7 @@
 #   SERVE_ARGS                          array of model/tuning flags, both roles
 #   CONNECTOR_CONFIG                    optional connector_extra_config members
 # Run settings (environment): POD, ATTN_TP, FFN_TP, VLLM_ARGS, ATTN_ARGS,
-#   FFN_ARGS, M2N_EXTRA_CONFIG, DECODE_BENCH, AFD_REPO, HEAD_HOST,
+#   FFN_ARGS, ASYNC, M2N_EXTRA_CONFIG, DECODE_BENCH, AFD_REPO, HEAD_HOST,
 #   ATTN_HEAD_HOST, FFN_HEAD_HOST, SERVE_HOST, AFD_DRY_RUN.
 
 ATTN_PORT=18000 FFN_PORT=18001 AFD_PORT=6239 ATTN_DP_RPC_PORT=13345 FFN_DP_RPC_PORT=13355
@@ -43,7 +43,7 @@ role_dp() {
 
 afd_json() {  # The AFD rendezvous runs on the pod that holds FFN rank 0.
     cat <<JSON
-{"afd": {"role": "$1", "connector": "${AFD_CONNECTOR}",
+{"afd": {"role": "$1", "connector": "${AFD_CONNECTOR}"${ASYNC_FIELD},
  "host": "${FFN_HEAD_HOST:-${HEAD_HOST:-vllm-ffn-p2p-service}}", "port": ${AFD_PORT},
  "num_attention_ranks": ${NUM_ATTN}, "num_ffn_ranks": ${NUM_FFN},
  "compute_gate_on_attention": ${GATE_ON_ATTENTION}, "afd_process_group_timeout_s": 3600${CONNECTOR_CONFIG}}}
@@ -73,6 +73,8 @@ afd_colocation_serve() {
     esac
 
     GATE_ON_ATTENTION=true
+    ASYNC_FIELD=
+    [[ ${ASYNC:-0} == 1 ]] && ASYNC_FIELD=', "async": true'
     CONNECTOR_CONFIG=${CONNECTOR_CONFIG:-}${M2N_EXTRA_CONFIG:+${CONNECTOR_CONFIG:+, }$M2N_EXTRA_CONFIG}
     # P2P routes on the FFN and takes no connector_extra_config.
     [[ $AFD_CONNECTOR == P2pNcclAFDConnector ]] && GATE_ON_ATTENTION=false CONNECTOR_CONFIG=

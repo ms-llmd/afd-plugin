@@ -57,7 +57,11 @@ class AFDConnectorFactory:
         vllm_config: VllmConfig,
         afd_config: AFDConfig | None = None,
     ) -> AFDConnectorBase:
-        config = afd_config or parse_afd_config(vllm_config)
+        if afd_config is None:
+            config = parse_afd_config(vllm_config)
+        else:
+            afd_config.validate()
+            config = afd_config
         if config.connector not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {config.connector}")
         connector_cls = cls._registry[config.connector]()
@@ -97,6 +101,11 @@ AFDConnectorFactory.register_connector(
     "DeepEPM2NAFDConnector",
     "afd_plugin.connectors.gpu.deepep_m2n.connector",
     "DeepEPM2NAFDConnector",
+)
+AFDConnectorFactory.register_connector(
+    "AsyncAfdEPConnector",
+    "afd_plugin.connectors.gpu.deepep_m2n.async_connector",
+    "AsyncAfdEPConnector",
 )
 AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",

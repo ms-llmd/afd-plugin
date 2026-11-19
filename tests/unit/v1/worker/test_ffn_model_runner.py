@@ -34,6 +34,7 @@ from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     _set_moe_layer_index,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import ConnectorDrivenConnector  # noqa: E402
 from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
 )
@@ -790,3 +791,90 @@ def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
     with pytest.raises(RuntimeError, match="AFD FFN worker loop failed") as exc:
         worker.raise_ffn_loop_error_if_any()
     assert exc.value.__cause__ is expected_error
+
+
+def _connector_driven_worker(runner) -> AFDFFNWorker:
+    worker = object.__new__(AFDFFNWorker)
+    worker._ffn_thread = None
+    worker._ffn_shutdown_event = threading.Event()
+    worker._ffn_loop_error = None
+    worker.device = SimpleNamespace(type="cpu")
+    runner.connector = ConnectorDrivenConnector()
+    runner.model = "owned weights"
+    worker.model_runner = runner
+    return worker
+
+
+def test_ffn_worker_runs_connector_driven_steps_then_drains():
+    """A connector-driven runner steps until it reports the agreed stop, then
+    drains and finishes the receiver, without a shutdown request."""
+    events: list[object] = []
+    results = iter([True, True, False])
+
+    def step(shutdown_requested):
+        events.append(("step", shutdown_requested))
+        return next(results)
+
+    runner = SimpleNamespace(
+        execute_connector_driven_step=step,
+        drain=lambda: events.append("drain"),
+        session=SimpleNamespace(finish_receiver=lambda: events.append("finish")),
+    )
+    worker = _connector_driven_worker(runner)
+
+    worker._run_ffn_server_loop()
+
+    assert events == [("step", False)] * 3 + ["drain", "finish"]
+
+
+def test_ffn_worker_stops_connector_driven_loop_at_the_agreed_step(monkeypatch):
+    """Shutdown proposes the stop step, waits for the loop to leave after it,
+    and only then releases native resources."""
+    stop_requested = threading.Event()
+
+    def request_stop():
+        stop_requested.set()
+        return 7
+
+    runner = SimpleNamespace(
+        execute_connector_driven_step=lambda shutdown: not stop_requested.is_set(),
+        drain=lambda: None,
+        session=SimpleNamespace(finish_receiver=lambda: None),
+        request_stop=request_stop,
+    )
+    worker = _connector_driven_worker(runner)
+    worker.start_ffn_server_loop()
+    thread = worker._ffn_thread
+
+    def native_shutdown(self):
+        if thread.is_alive():
+            raise RuntimeError("loop still uses runner resources")
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+    worker.shutdown()
+
+    assert stop_requested.is_set()
+    assert runner.model is None
+
+
+def test_ffn_worker_releases_resources_when_the_loop_misses_the_stop(
+    monkeypatch, caplog
+):
+    """A loop that does not reach the agreed step in time is logged, not
+    raised, so the connector can take its local-release fallback."""
+    runner = SimpleNamespace(request_stop=lambda: 7)
+    worker = _connector_driven_worker(runner)
+    worker._ffn_thread = SimpleNamespace(
+        join=lambda timeout: None, is_alive=lambda: True
+    )
+
+    def native_shutdown(self):
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+    with caplog.at_level(logging.ERROR, logger="afd_plugin.v1.worker.ffn_worker"):
+        worker.shutdown()
+
+    assert "did not reach the agreed stop step 7" in caplog.text
+    assert runner.model is None

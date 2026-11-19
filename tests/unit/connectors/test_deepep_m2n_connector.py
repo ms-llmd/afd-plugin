@@ -424,9 +424,9 @@ def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     """A step planned as graph on one rank and eager on another gets the same
     bucket, both on the ladder (8 tokens) and above it (40).
 
-    Why: an FFN eager fallback can plan a step Attention replays in another
-    mode, and DeepEP needs the same bucket on every rank; a capacity bucket
-    chosen by the sync decision broke test_graph_and_eager_plans_mixed_across_ranks.
+    Why: DeepEP needs the same bucket on every rank whatever mode a rank plans
+    the step in; a capacity bucket chosen by the sync decision once broke
+    ranks that planned the same step in different modes.
     """
     buckets = {
         plan_stage(
@@ -634,12 +634,14 @@ def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, messa
         ({(2, "sm"): [8, 0]}, "SM90 or newer"),
         # Protocol 1 ranks may still build a gloo control group.
         ({(1, "protocol"): "deepep_m2n/1"}, "disagree on protocol"),
+        # An async rank sends no control payload a sync rank waits for.
+        ({(3, "async_mode"): True}, "disagree on async_mode"),
     ],
 )
 def test_handshake_rejects_mismatches(overrides, message):
     """One rank's record differs (hidden size, payload format, expert
-    alignment, role order, a pre-Hopper GPU, or the handshake protocol): the
-    handshake raises.
+    alignment, role order, a pre-Hopper GPU, the handshake protocol, or sync
+    versus async mode): the handshake raises.
 
     Why: disagreeing ranks would corrupt data or hang; fail before buffers.
     """

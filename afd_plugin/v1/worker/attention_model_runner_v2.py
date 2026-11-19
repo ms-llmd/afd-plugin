@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -41,12 +42,11 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDRoutedExpertsConnector,
 )
-from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
-from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -311,10 +311,11 @@ def _use_afd_fullgraph_replay_hook(
             runner._is_warmup = False
             runner._afd_is_graph_capturing = False
             runner._afd_is_graph_replaying = True
-            runner.send_dp_metadata(
-                runner.build_capture_dp_metadata(padded_tokens),
-                None,
-            )
+            if runner.connector.control_plane is not None:
+                runner.send_dp_metadata(
+                    runner.build_capture_dp_metadata(padded_tokens),
+                    None,
+                )
             result = original_run_fullgraph(desc)
         finally:
             runner._afd_is_graph_replaying = previous_is_graph_replaying
@@ -356,8 +357,18 @@ def _use_afd_execution_context(
         if use_fullgraph_replay_hook
         else nullcontext()
     )
+    # A connector-driven connector coordinates nothing between DP ranks: each
+    # rank picks its own graph size and DBO split (no DP all-reduce).
+    dp_coordination = (
+        skip_dp_coordination()
+        if runner.connector.control_plane is None
+        else nullcontext()
+    )
     try:
         with (
+            # Connector step bookkeeping (a no-op for synchronous connectors).
+            runner.connector.attention_step(),
+            dp_coordination,
             use_gpu_mrv2_dbo_dispatch(),
             replay_scope,
             _use_afd_ubatch_preparation(runner),
@@ -390,11 +401,6 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        validate_gpu_model_runner_v2_config(
-            vllm_config,
-            expected_role="attention",
-            device_type=device.type,
-        )
         super().__init__(vllm_config, device)
         self._afd_v4_ubatch_inputs: _AFDV4UBatchInputs | None = None
         connector: AFDConnectorBase | None = None
@@ -411,9 +417,13 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             # The connector rendezvous is deferred to the end of ``load_model()``
             # so Attention and FFN weight loading overlap, matching the V1
             # Attention runner lifecycle.
-            if connector.control_plane is None:
+            if connector.control_plane is None and not (
+                isinstance(connector, AFDRoutedExpertsConnector)
+                and connector.connector_driven
+            ):
                 raise RuntimeError(
-                    "AFD ModelRunnerV2 requires a control-plane-driven connector",
+                    "AFD ModelRunnerV2 requires a control-plane-driven or "
+                    "connector-driven connector",
                 )
             self._is_warmup = False
             self._afd_is_graph_capturing = False

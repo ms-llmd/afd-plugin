@@ -21,7 +21,21 @@ AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 DEEPEP_M2N_CONNECTOR: Final[str] = "DeepEPM2NAFDConnector"
-DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (DEEPEP_M2N_CONNECTOR,)
+# afdEP M2N with an optional async mode (``async: true``); with ``async: false``
+# it behaves exactly like DEEPEP_M2N_CONNECTOR.
+ASYNC_AFDEP_CONNECTOR: Final[str] = "AsyncAfdEPConnector"
+DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (
+    DEEPEP_M2N_CONNECTOR,
+    ASYNC_AFDEP_CONNECTOR,
+)
+# ``connector_extra_config`` key: sleep after each idle-rank dummy step
+# (AsyncAfdEPConnector async mode, read by the Attention engine's busy loop).
+ASYNC_AFDEP_IDLE_SLEEP_US_KEY: Final[str] = "idle_sleep_us"
+# Connectors that accept ``async: true``.
+AFD_ASYNC_CONNECTORS: Final[tuple[str, ...]] = (
+    AFD_ASYNC_CONNECTOR,
+    ASYNC_AFDEP_CONNECTOR,
+)
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
@@ -30,6 +44,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     DEEPEP_M2N_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
+    ASYNC_AFDEP_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -307,7 +322,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector == AFD_ASYNC_CONNECTOR
+        and config.connector in AFD_ASYNC_CONNECTORS
     )
 
 
@@ -331,9 +346,9 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.async_dp and config.connector not in AFD_ASYNC_CONNECTORS:
         raise ValueError(
-            "AFD async mode requires connector='CAMAsyncAFDConnector'",
+            f"AFD async mode requires connector in {AFD_ASYNC_CONNECTORS!r}",
         )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology
@@ -356,6 +371,9 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "AFD_ASYNC_CONNECTORS",
+    "ASYNC_AFDEP_CONNECTOR",
+    "ASYNC_AFDEP_IDLE_SLEEP_US_KEY",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",

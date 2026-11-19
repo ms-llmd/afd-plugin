@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from vllm.forward_context import (  # noqa: E402
     ForwardContext,
     override_forward_context,
 )
+from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers  # noqa: E402
@@ -25,9 +27,8 @@ from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
-from afd_plugin.model_executor.models import (  # noqa: E402
-    forward_context as afd_forward_context,
-)
+from afd_plugin import forward_context as afd_forward_context  # noqa: E402
+from afd_plugin.connectors.base import AFDConnectorStoppedError  # noqa: E402
 from afd_plugin.v1.worker import (  # noqa: E402
     attention_model_runner_v2 as v2_runner_module,
 )
@@ -39,6 +40,10 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import (  # noqa: E402
+    ConnectorDrivenConnector,
+    FakeRoutedConnector,
+)
 from tests.unit.fakes.deepseek_v4 import WorkspaceCase  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 from tests.unit.fakes.ubatching import (  # noqa: E402
@@ -59,7 +64,7 @@ TEST_CUDAGRAPH_CAPTURE_SIZE = 8
 class _RecordingConnector:
     def __init__(self, events: list[str]):
         self.events = events
-        self.control_plane = self
+        self.control_plane: _RecordingConnector | None = self
         self.closed = False
 
     def update_state_from_dp_metadata(self, payload):
@@ -74,13 +79,17 @@ class _RecordingConnector:
         self.events.append("data")
         self.last_attn_output = hidden_states
 
+    def attention_step(self):
+        # AFDConnectorBase's default: no step bookkeeping.
+        return nullcontext()
+
     def close(self):
         self.closed = True
         self.events.append("close")
 
 
 class _RunnerRecorder:
-    def __init__(self, vllm_config, device):
+    def __init__(self, vllm_config, device, *, afd_cudagraph_policy=None):
         self.model_config = vllm_config.model_config
         self.device = device
 
@@ -1337,13 +1346,6 @@ def _patch_v2_constructor_dependencies(monkeypatch, connector):
     config = _v2_config()
 
     monkeypatch.setattr(
-        (
-            "afd_plugin.v1.worker.attention_model_runner_v2."
-            "validate_gpu_model_runner_v2_config"
-        ),
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
         "afd_plugin.v1.worker.attention_model_runner_v2._resolve_world_ranks",
         lambda: (0, 0),
     )
@@ -1490,7 +1492,7 @@ def test_worker_factory_failure_preserves_native_construction(
     monkeypatch, gpu_worker_case
 ):
     class RaisingRunner:
-        def __init__(self, vllm_config, device):
+        def __init__(self, vllm_config, device, *, afd_cudagraph_policy=None):
             raise RuntimeError("runner construction failed")
 
     worker = _prepare_gpu_worker_runtime(monkeypatch, gpu_worker_case, RaisingRunner)
@@ -1770,3 +1772,83 @@ def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_c
         {"platform_stage": 1},
     ]
     assert events == []
+
+
+class _ConnectorDrivenConnector(_RecordingConnector):
+    """No control plane; the step gate refuses once ``stopped`` is set."""
+
+    def __init__(self, events: list[str]):
+        super().__init__(events)
+        self.control_plane = None
+        self.stopped = False
+
+    def attention_step(self):
+        if self.stopped:
+            raise AFDConnectorStoppedError("ranks agreed to stop")
+        return nullcontext()
+
+
+def test_v2_connector_driven_forward_skips_dp_coordination_and_control(monkeypatch):
+    """A connector-driven forward runs native execution with DP coordination
+    skipped and publishes no control; after the agreed stop the connector's
+    step gate refuses the forward before native execution.
+
+    Why: async ranks schedule alone (a DP all-reduce would couple them), and
+    a step after the agreed stop step would leave the FFN waiting.
+    """
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner.connector = _ConnectorDrivenConnector(events)
+
+    def native_execute(self, *args, **kwargs):
+        events.append(f"native skip_dp={should_skip_dp_coordination()}")
+        return "native-result"
+
+    monkeypatch.setattr(native_v2.GPUModelRunner, "execute_model", native_execute)
+
+    result = AFDAttentionModelRunnerV2.execute_model(runner, _scheduler_output(3))
+    runner.connector.stopped = True
+    with pytest.raises(AFDConnectorStoppedError):
+        AFDAttentionModelRunnerV2.execute_model(runner, _scheduler_output(3))
+
+    assert result == "native-result"
+    assert events == ["native skip_dp=True"]
+
+
+@pytest.mark.parametrize(
+    ("connector", "stopped", "expected"),
+    [
+        (ConnectorDrivenConnector(), False, ["dummy", "synchronize"]),
+        (FakeRoutedConnector(), False, ["dummy"]),
+        (ConnectorDrivenConnector(), True, ["dummy"]),
+    ],
+    ids=["connector-driven-waits", "control-plane-no-wait", "stopped-stops"],
+)
+def test_attention_worker_idle_step_stays_one_step_ahead(
+    monkeypatch, connector, stopped, expected
+):
+    """A connector-driven idle rank waits for each dummy step on the GPU, so
+    its host never queues steps past an agreed stop step; after the stop the
+    worker stops pumping instead of failing the engine.
+
+    Why: with steps queued past the stop step, the rank waits on the GPU for
+    an FFN that has already stopped, and the engine never shuts down.
+    """
+    events: list[str] = []
+
+    def native_dummy(self):
+        events.append("dummy")
+        if stopped:
+            raise AFDConnectorStoppedError("ranks agreed to stop")
+
+    monkeypatch.setattr(attention_worker.Worker, "execute_dummy_batch", native_dummy)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device=None: events.append("synchronize")
+    )
+    worker = object.__new__(attention_worker.AFDAttentionWorker)
+    worker.device = torch.device("cpu")
+    worker.model_runner = SimpleNamespace(connector=connector)
+
+    worker.execute_dummy_batch()
+
+    assert events == expected

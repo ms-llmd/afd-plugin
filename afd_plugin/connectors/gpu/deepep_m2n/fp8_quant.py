@@ -12,8 +12,10 @@ is needed before combine.
 Adapted from FastAFD ``kernel/deepgemm_fused_quant.py``
 (``_silu_mul_fp8_quant_psum_deep_gemm``, itself from vLLM), which only emits
 SM100 UE8M0 scales. Rows are processed in parallel blocks instead of per
-expert; rows past the last expert's end are skipped, and padding rows between
-expert groups are quantized but never read by combine.
+expert; blocks past the last expert's end return before loading anything, so a
+worst-case receive (no host sync, as in AsyncAfdEP async mode) costs what its
+real rows cost. Padding rows between expert groups are quantized but never
+read by combine.
 """
 
 from __future__ import annotations
@@ -60,6 +62,8 @@ def _silu_mul_fp8_quant_kernel(
     pid_m = tl.program_id(0)
     group = tl.program_id(1)
     valid_rows = tl.minimum(tl.load(psum_ptr + num_experts - 1), num_rows)
+    if pid_m * block >= valid_rows:
+        return
     rows = (pid_m * block + tl.arange(0, block)).to(tl.int64)
     row_mask = rows < valid_rows
     cols = group * group_size + tl.arange(0, group_size)
