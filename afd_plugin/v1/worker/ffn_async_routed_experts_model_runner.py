@@ -15,6 +15,7 @@ from vllm.distributed.parallel_state import graph_capture
 
 from afd_plugin.connectors import AFDConnectorBase
 from afd_plugin.connectors.gpu.deepep_m2n.async_connector import AsyncAfdEPConnector
+from afd_plugin.v1.worker.cuda_graph import AFDCUDAGraphPolicy
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
     GPUFFNRoutedExpertsModelRunner,
 )
@@ -40,8 +41,14 @@ class GPUFFNAsyncRoutedExpertsModelRunner(GPUFFNRoutedExpertsModelRunner):
     with the connector's default ``FFNExecutionSession``.
     """
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
-        super().__init__(vllm_config, device)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        *,
+        afd_cudagraph_policy: AFDCUDAGraphPolicy,
+    ) -> None:
+        super().__init__(vllm_config, device, afd_cudagraph_policy=afd_cudagraph_policy)
         self.session = self.connector.ffn_session()
         self._first_step = True
         self._steps_done = 0
