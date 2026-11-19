@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 
 import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -78,7 +79,33 @@ class GPUFFNAsyncRoutedExpertsModelRunner(GPUFFNRoutedExpertsModelRunner):
         return self.async_connector.request_stop()
 
     def _step(self) -> None:
-        self._run_routed_step(self._stage_ids)
+        if (
+            self.async_connector.combine_sm_handoff
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            self._run_handoff_step(self._stage_ids)
+        else:
+            self._run_routed_step(self._stage_ids)
+
+    def _run_handoff_step(self, stage_ids: Sequence[int]) -> None:
+        """One step for the captured graph with ``combine_sm_handoff``.
+
+        Each lane's combine is issued right after its own experts:
+        D0 E0 C0 D1 E1 C1 per layer, so the other lane's next expert pass can
+        wait on the GPU for that combine to start (the connector adds the
+        edge). Each lane keeps its own D, C, D order. The sync order defers
+        each combine to just before the lane's next dispatch because eager
+        dispatch and combine can block the host; a graph replay issues
+        nothing from the host, so this order is only used while capturing.
+        """
+        connector = self.async_connector
+        for layer_idx in self.moe_layer_indices:
+            weights = self.local_experts[layer_idx].weights
+            for stage_idx in stage_ids:
+                payload = connector.recv_attn_output(ubatch_idx=stage_idx)
+                ffn_output = connector.run_experts(payload, weights)
+                connector.send_ffn_output(ffn_output, payload.context)
+        connector.synchronize_lanes()
 
     @torch.inference_mode()
     def execute_connector_driven_step(self, shutdown_requested: bool = False) -> bool:
@@ -125,6 +152,14 @@ class GPUFFNAsyncRoutedExpertsModelRunner(GPUFFNRoutedExpertsModelRunner):
         finally:
             set_cudagraph_capturing_enabled(False)
         self._cuda_graphs[ASYNC_STEP_GRAPH_KEY] = {"graph": graph}
+        if self.async_connector.combine_sm_handoff:
+            edges, skipped = self.async_connector.take_handoff_counts()
+            logger.info(
+                "AsyncAfdEP FFN step graph: combine SM handoff on %d expert "
+                "passes, %d combines skipped",
+                edges,
+                skipped,
+            )
         logger.info(
             "AsyncAfdEP FFN captured its %d-lane step graph in %.1f s",
             len(self._stage_ids),

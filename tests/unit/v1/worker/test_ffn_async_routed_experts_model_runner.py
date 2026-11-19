@@ -22,6 +22,7 @@ from tests.unit.fakes.graph import Graph  # noqa: E402
 install_fake_afdep()
 try:
     from afd_plugin.connectors.gpu.deepep_m2n.async_connector import (  # noqa: E402
+        AsyncAfdEPConfig,
         AsyncAfdEPConnector,
     )
     from afd_plugin.v1.worker import (  # noqa: E402
@@ -34,12 +35,22 @@ MOE_LAYERS = (0, 1)
 LANES = (0, 1)
 
 
-def _runner(log: list, *, use_cuda_graph: bool, stop_step: int | None = None):
+def _runner(
+    log: list,
+    *,
+    use_cuda_graph: bool,
+    stop_step: int | None = None,
+    combine_sm_handoff: bool = False,
+):
     """The runner after ``initialize_afd_connector``, over a connector whose
     data path logs each exchange the FFN issues."""
     connector = object.__new__(AsyncAfdEPConnector)
+    connector._async = True
+    connector.config = AsyncAfdEPConfig(combine_sm_handoff=combine_sm_handoff)
     connector._stop_step = stop_step
     connector._ffn_steps_done = 0
+    connector._combine_launch = None
+    connector._handoff_edges = connector._handoff_skipped = 0
 
     def recv_attn_output(ubatch_idx):
         log.append(f"D{ubatch_idx}")
@@ -135,3 +146,61 @@ def test_runner_stops_serving_on_local_shutdown_before_any_stop_step(cpu_graphs)
     runner = _runner([], use_cuda_graph=False)
 
     assert runner.execute_connector_driven_step(shutdown_requested=True) is False
+
+
+@pytest.fixture
+def capturing(monkeypatch, cpu_graphs):
+    """``torch.cuda.is_current_stream_capturing`` is True inside capture."""
+    state = {"capturing": False}
+
+    @contextlib.contextmanager
+    def graph(graph, pool=None):
+        state["capturing"] = True
+        try:
+            yield
+        finally:
+            state["capturing"] = False
+
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: state["capturing"]
+    )
+    return cpu_graphs
+
+
+def test_handoff_graph_issues_each_combine_after_its_own_experts(capturing):
+    """With ``combine_sm_handoff`` the captured step issues D, E, C per lane;
+    the eager first step keeps the DBO order.
+
+    Why: the other lane's expert pass can only wait on the GPU for a combine
+    the host issued before it, and eager dispatch and combine can block the
+    host, so the new order is used only in the graph.
+    """
+    log: list = []
+    runner = _runner(log, use_cuda_graph=True, combine_sm_handoff=True)
+    run_experts = runner.connector.run_experts
+
+    def logged_run_experts(payload, weights):
+        log.append(f"E{payload.context.lane}")
+        return run_experts(payload, weights)
+
+    runner.connector.run_experts = logged_run_experts
+
+    for _ in range(3):
+        assert runner.execute_connector_driven_step() is True
+
+    eager = ["D0", "E0", "D1", "E1", "C0", "D0", "E0", "C1", "D1", "E1", "C0", "C1"]
+    handoff_layer = ["D0", "E0", "C0", "D1", "E1", "C1"]
+    assert log == eager + ["join"] + handoff_layer * len(MOE_LAYERS) + ["join"]
+    assert [graph.replay_count for graph in capturing] == [2]
+
+
+def test_runner_keeps_the_dbo_order_in_the_graph_without_handoff(capturing):
+    """Without the option the captured step is the sync runner's step."""
+    log: list = []
+    runner = _runner(log, use_cuda_graph=True)
+
+    for _ in range(2):
+        assert runner.execute_connector_driven_step() is True
+
+    assert log == ONE_STEP * 2

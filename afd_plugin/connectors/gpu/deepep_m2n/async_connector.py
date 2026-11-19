@@ -53,6 +53,7 @@ from vllm.v1.worker.ubatching import dbo_enabled
 
 from afd_plugin.config import ASYNC_AFDEP_IDLE_SLEEP_US_KEY, AFDConfig
 from afd_plugin.connectors.base import AFDConnectorStoppedError
+from afd_plugin.connectors.gpu.deepep_m2n import capture_edges
 from afd_plugin.connectors.gpu.deepep_m2n.connector import (
     MAX_LANES,
     DeepEPM2NAFDConnector,
@@ -61,7 +62,12 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import (
     StagePlan,
     resolve_capacity_tokens_per_rank,
 )
-from afd_plugin.connectors.metadata import FFNLocalExperts
+from afd_plugin.connectors.metadata import (
+    AFDA2FTransferPayload,
+    AFDTransferContext,
+    FFNLocalExperts,
+    LocalExpertWeights,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -93,9 +99,15 @@ class AsyncAfdEPConfig(DeepEPM2NConfig):
         idle_sleep_us: Async mode, Attention engine: sleep after each dummy
             step an idle rank runs. ``0`` (default) loops at full speed, the
             lowest latency for busy ranks, which every idle rank paces.
+        combine_sm_handoff: Async mode, FFN step graph: a lane's next expert
+            pass starts only once every block of the other lane's preceding
+            combine is running, so the combine gets SMs before the persistent
+            DeepGEMM grid takes them all (see ``_add_combine_handoff``). One
+            NVLink domain only; elsewhere the edge is skipped with a warning.
     """
 
     idle_sleep_us: int = 0
+    combine_sm_handoff: bool = False
 
     def validate(self) -> None:
         super().validate()
@@ -137,7 +149,18 @@ class AsyncAfdEPConnector(DeepEPM2NAFDConnector):
             int,
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
         ] = {}
+        # FFN combine SM handoff, while capturing: the latest combine's lane
+        # and kernel node, and this capture's edge counts.
+        self._combine_launch: tuple[int, Any] | None = None
+        # One-element kernel target that carries the launch-started edge.
+        self._handoff_gate: torch.Tensor | None = None
+        self._handoff_edges = 0
+        self._handoff_skipped = 0
         if not self._async:
+            if self._handoff_configured():
+                raise ValueError(
+                    "combine_sm_handoff needs AsyncAfdEPConnector async mode"
+                )
             return
         if self.num_lanes != MAX_LANES:
             raise ValueError(
@@ -199,6 +222,97 @@ class AsyncAfdEPConnector(DeepEPM2NAFDConnector):
             )
             for lane in range(self.num_lanes)
         }
+
+    # ==============================
+    # FFN combine SM handoff (combine_sm_handoff)
+    # ==============================
+
+    @property
+    def combine_sm_handoff(self) -> bool:
+        """Whether the FFN step graph hands SMs to each combine first; the
+        runner then issues each lane's combine right after its experts."""
+        return self._async and self._handoff_configured()
+
+    def _handoff_configured(self) -> bool:
+        config = self.config
+        return isinstance(config, AsyncAfdEPConfig) and config.combine_sm_handoff
+
+    def _handoff_capturing(self) -> bool:
+        return (
+            self.combine_sm_handoff
+            and bool(self.lane_streams)
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def send_ffn_output(
+        self,
+        ffn_output: torch.Tensor,
+        context: AFDTransferContext,
+        **kwargs: Any,
+    ) -> None:
+        super().send_ffn_output(ffn_output, context, **kwargs)
+        if self._handoff_capturing():
+            self._note_combine_launch(self._transfer_state(context))
+
+    def run_experts(
+        self, payload: AFDA2FTransferPayload, weights: LocalExpertWeights
+    ) -> torch.Tensor:
+        if self._handoff_capturing():
+            self._add_combine_handoff(self._transfer_state(payload.context))
+        return super().run_experts(payload, weights)
+
+    def _note_combine_launch(self, state: Any) -> None:
+        """Keep the kernel node of the combine ``send_ffn_output`` just captured.
+
+        In one NVLink domain afdEP-comm's FFN combine is one cooperative kernel
+        of ``handle.num_sms`` blocks, the last node on the lane's comm stream.
+        Anything else (another layout, another afdEP-comm version) is skipped.
+        """
+        comm_stream = self._lanes(state.lane).comm_stream
+        node = capture_edges.launched_kernel(comm_stream, grid_x=state.handle.num_sms)
+        if node is None:
+            self._combine_launch = None
+            self._handoff_skipped += 1
+            logger.warning_once(
+                "AsyncAfdEP combine_sm_handoff: the combine is not one %d-block "
+                "kernel on the lane's comm stream (multi-domain layout?); its "
+                "expert passes start without waiting for it",
+                state.handle.num_sms,
+            )
+            return
+        self._combine_launch = (state.lane, node)
+
+    def _add_combine_handoff(self, state: Any) -> None:
+        """Start this lane's experts only once the other lane's combine runs.
+
+        The combine is high priority but waits for free SMs, and the next
+        expert pass on the caller's stream becomes ready at the same moment
+        (both follow the previous pass) and fills every SM with persistent
+        DeepGEMM blocks. With a launch-completion edge from the combine kernel
+        the experts start on the SMs the combine leaves and pick up the rest
+        when it exits, instead of the combine waiting for the whole pass.
+        """
+        pending, self._combine_launch = self._combine_launch, None
+        if pending is None or pending[0] == state.lane:
+            return
+        current = torch.cuda.current_stream(self.device)
+        if self._handoff_gate is None:
+            # Allocated before the edge: the allocator cannot run while an
+            # annotated edge is pending (see capture_edges).
+            self._handoff_gate = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+        # Join the rows first, so the expert pass's kernels follow both.
+        current.wait_event(state.ready_event)
+        capture_edges.gate_on_launch_started(current, pending[1], self._handoff_gate)
+        self._handoff_edges += 1
+
+    def take_handoff_counts(self) -> tuple[int, int]:
+        """(edges added, combines skipped) since the last call."""
+        counts = (self._handoff_edges, self._handoff_skipped)
+        self._handoff_edges = self._handoff_skipped = 0
+        self._combine_launch = None
+        return counts
 
     # ==============================
     # Lifecycle

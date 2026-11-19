@@ -145,10 +145,16 @@ def cpu_cuda(monkeypatch):
     monkeypatch.setattr(m2n_module, "_keep_alive_on", lambda stream, *tensors: None)
 
 
-def _ready(role: str, log: list, store: _Store | None = None, role_rank: int = 0):
+def _ready(
+    role: str,
+    log: list,
+    store: _Store | None = None,
+    role_rank: int = 0,
+    extra: dict | None = None,
+):
     """An async connector in the state ``init_afd_connector`` leaves, without
     communicating: recording lanes, the fixed plan and the step counter."""
-    connector = _connector(role, role_rank=role_rank)
+    connector = _connector(role, role_rank=role_rank, extra=extra)
     connector.device = torch.device("cpu")
     connector.capacity_tokens_per_rank = connector.capacity_tokens_per_rank or 64
     connector.lanes = _Lanes([_Lane(i, log) for i in range(DBO_LANES)], log)
@@ -235,6 +241,10 @@ def test_async_mode_is_connector_driven_with_one_bucket(cpu_cuda, role):
         ({"num_ubatches": 1}, "needs 2 lanes"),
         ({"extra": {"capacity_tokens_per_rank": 64}}, "capacity_tokens_per_rank"),
         ({"extra": {"idle_sleep_us": -1}}, "idle_sleep_us"),
+        (
+            {"async_dp": False, "extra": {"combine_sm_handoff": True}},
+            "combine_sm_handoff",
+        ),
     ],
 )
 def test_async_mode_rejects_unsupported_deployments(kwargs, message):
@@ -397,3 +407,131 @@ def test_ffn_closes_lanes_only_at_the_agreed_step_with_every_rank(
 
     assert (("lanes_close",) in log) is collective
     assert connector.is_initialized is False
+
+
+COMBINE_SMS = 24
+
+
+class _LogStream(_Stream):
+    def __init__(self, name: str, log: list) -> None:
+        super().__init__(name)
+        self._log = log
+
+    def wait_event(self, event) -> None:
+        self._log.append(("wait", self.name, event))
+
+
+def _handoff_ffn(monkeypatch, log: list, *, capturing: bool, kernel_found: bool):
+    """An FFN connector with ``combine_sm_handoff`` whose parent data path,
+    capture state and capture-edge calls are logged."""
+    connector = _ready("ffn", log, extra={"combine_sm_handoff": True})
+    for index, lane in enumerate(connector.lanes):
+        lane.comm_stream = _Stream(f"comm{index}")
+    main = _LogStream("main", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: main)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(connector, "_transfer_state", lambda context: context.states)
+    parent = m2n_module.DeepEPM2NAFDConnector
+    monkeypatch.setattr(
+        parent,
+        "send_ffn_output",
+        lambda self, out, context, **kw: log.append(("C", context.states.lane)),
+    )
+    monkeypatch.setattr(
+        parent,
+        "run_experts",
+        lambda self, payload, weights: log.append(("E", payload.context.states.lane)),
+    )
+
+    def launched_kernel(stream, grid_x):
+        log.append(("tail", stream.name, grid_x))
+        return f"node-{stream.name}" if kernel_found else None
+
+    edges = async_module.capture_edges
+    monkeypatch.setattr(edges, "launched_kernel", launched_kernel)
+    monkeypatch.setattr(
+        edges,
+        "gate_on_launch_started",
+        lambda stream, node, gate: log.append(("edge", stream.name, node)),
+    )
+    return connector
+
+
+def _lane_context(lane: int):
+    states = SimpleNamespace(
+        lane=lane,
+        ready_event=f"ready{lane}",
+        handle=SimpleNamespace(num_sms=COMBINE_SMS),
+    )
+    return SimpleNamespace(context=SimpleNamespace(states=states))
+
+
+def _handoff_layers(connector, layers: int = 2) -> None:
+    """The captured FFN step's order: D, E, C per lane."""
+    for _ in range(layers):
+        for lane in range(DBO_LANES):
+            payload = _lane_context(lane)
+            out = connector.run_experts(payload, None)
+            connector.send_ffn_output(out, payload.context)
+
+
+def test_handoff_starts_experts_once_the_other_lanes_combine_runs(
+    cpu_cuda, monkeypatch
+):
+    """While capturing, each expert pass after the first waits for the rows,
+    then gets a launch-started edge from the other lane's combine kernel.
+
+    Why: the combine is high priority but needs free SMs; without the edge the
+    next expert pass fills every SM first and the combine waits for all of it.
+    """
+    log: list = []
+    connector = _handoff_ffn(monkeypatch, log, capturing=True, kernel_found=True)
+
+    _handoff_layers(connector)
+
+    assert log == [
+        ("E", 0),
+        ("C", 0),
+        ("tail", "comm0", COMBINE_SMS),
+        ("wait", "main", "ready1"),
+        ("edge", "main", "node-comm0"),
+        ("E", 1),
+        ("C", 1),
+        ("tail", "comm1", COMBINE_SMS),
+        ("wait", "main", "ready0"),
+        ("edge", "main", "node-comm1"),
+        ("E", 0),
+        ("C", 0),
+        ("tail", "comm0", COMBINE_SMS),
+        ("wait", "main", "ready1"),
+        ("edge", "main", "node-comm0"),
+        ("E", 1),
+        ("C", 1),
+        ("tail", "comm1", COMBINE_SMS),
+    ]
+    assert connector.take_handoff_counts() == (3, 0)
+
+
+def test_handoff_skips_a_combine_that_is_not_one_kernel(cpu_cuda, monkeypatch):
+    """A combine that is not one ``num_sms``-block kernel adds no edge.
+
+    Why: other layouts (several NVLink domains) add kernels after the combine;
+    an edge from one of those would not mean the combine holds its SMs.
+    """
+    log: list = []
+    connector = _handoff_ffn(monkeypatch, log, capturing=True, kernel_found=False)
+
+    _handoff_layers(connector, layers=1)
+
+    assert not any(entry[0] in ("edge", "wait") for entry in log)
+    assert connector.take_handoff_counts() == (0, 2)
+
+
+def test_handoff_does_nothing_outside_capture(cpu_cuda, monkeypatch):
+    """Eager steps run the parent's data path only."""
+    log: list = []
+    connector = _handoff_ffn(monkeypatch, log, capturing=False, kernel_found=True)
+
+    _handoff_layers(connector, layers=1)
+
+    assert log == [("E", 0), ("C", 0), ("E", 1), ("C", 1)]
