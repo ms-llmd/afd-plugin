@@ -4,7 +4,7 @@
 side and sends each token only to the FFN ranks that own its selected experts
 (an M:N, expert-routed exchange). Dispatch and combine run on
 [afdEP-comm](https://github.com/afdEP/afdEP-comm)'s DeepEP-derived
-`ElasticBuffer`; the FFN runs its local experts with
+transport, one `Buffer` per lane; the FFN runs its local experts with
 [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) grouped GEMMs by default.
 This guide documents installation, the configuration contract, the required
 vLLM settings, supported layouts, and operational limits.
