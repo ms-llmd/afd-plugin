@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 
 import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -81,13 +82,21 @@ class GPUFFNAsyncRoutedExpertsModelRunner(GPUFFNRoutedExpertsModelRunner):
         self._run_routed_step(self._stage_ids)
 
     @torch.inference_mode()
-    def execute_connector_driven_step(self, shutdown_requested: bool = False) -> bool:
-        """Run one step; False once the agreed stop step is done."""
+    def execute_connector_driven_step(
+        self, *, cancel_requested: Callable[[], bool]
+    ) -> bool:
+        """Run one step; False once the agreed stop step is done.
+
+        Overrides the control-plane step with the same contract. A local
+        ``cancel_requested`` goes to the session, which ends serving only
+        before any stop step is agreed; afterwards the runner keeps stepping
+        until the agreed stop step so every rank issues the same steps.
+        """
         connector = self.async_connector
         stop_step = connector.stop_step
         if stop_step is not None and self._steps_done >= stop_step:
             return False
-        if not self.session.keep_serving(shutdown_requested):
+        if not self.session.keep_serving(cancel_requested()):
             return False
         if self._first_step:
             self.session.before_first_step()

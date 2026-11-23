@@ -106,7 +106,10 @@ def test_runner_runs_every_layer_on_both_lanes_until_the_stop_step(cpu_graphs):
     log: list = []
     runner = _runner(log, use_cuda_graph=False, stop_step=2)
 
-    results = [runner.execute_connector_driven_step() for _ in range(3)]
+    results = [
+        runner.execute_connector_driven_step(cancel_requested=lambda: False)
+        for _ in range(3)
+    ]
 
     assert results == [True, True, False]
     assert log == ONE_STEP * 2
@@ -123,7 +126,9 @@ def test_runner_captures_after_the_first_eager_step_and_replays(cpu_graphs):
     runner = _runner(log, use_cuda_graph=True)
 
     for _ in range(4):
-        assert runner.execute_connector_driven_step() is True
+        assert (
+            runner.execute_connector_driven_step(cancel_requested=lambda: False) is True
+        )
 
     # The eager step, then the host code recorded once into the graph.
     assert log == ONE_STEP * 2
@@ -134,4 +139,4 @@ def test_runner_stops_serving_on_local_shutdown_before_any_stop_step(cpu_graphs)
     """The default session ends serving on a local shutdown request."""
     runner = _runner([], use_cuda_graph=False)
 
-    assert runner.execute_connector_driven_step(shutdown_requested=True) is False
+    assert runner.execute_connector_driven_step(cancel_requested=lambda: True) is False
