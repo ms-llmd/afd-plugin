@@ -95,7 +95,7 @@ def build_model(monkeypatch):
     monkeypatch.setattr(native, "RMSNorm", bind("norm"))
     monkeypatch.setattr(native, "make_input_embedding", bind("embed"))
     monkeypatch.setattr(native, "DeepseekV2MoE", _FakeRoutedExpertsMoE)
-    monkeypatch.setattr(adapter, "AFDDeepseekV2RoutedExpertsMoE", bind("routed_shell"))
+    monkeypatch.setattr(adapter, "AFDDeepseekV2RemoteExpertsMoE", bind("routed_shell"))
     monkeypatch.setattr(
         native,
         "get_pp_group",

@@ -14,6 +14,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from afd_plugin.ffn_faas.model_utils import parameter_storage_bytes
 from afd_plugin.ffn_faas.platforms.npu.settings import validate_native_expert_map
 
 if TYPE_CHECKING:
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
 class RoutedWeightOwner(Protocol):
@@ -32,7 +33,7 @@ class RoutedWeightOwner(Protocol):
     def routed_experts(self, layer_index: int) -> RoutedExperts: ...
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]: ...
     def finish_layer(self, layer_index: int) -> None: ...
-    def weight_views(self) -> tuple[LayeredFFNWeights, ...]: ...
+    def weight_views(self) -> tuple[QuantizedExpertWeights, ...]: ...
     def parameters(self) -> Iterator[nn.Parameter]: ...
 
 
@@ -65,7 +66,7 @@ class CAMRoutedModel:
         self.adapter, self.ffn_ranks, self.ffn_rank = adapter, ffn_ranks, ffn_rank
         self.local_experts = adapter.num_experts // ffn_ranks
         self._owner: RoutedWeightOwner | None = None
-        self._views: tuple[LayeredFFNWeights, ...] | None = None
+        self._views: tuple[QuantizedExpertWeights, ...] | None = None
         self._loading = False
         self._loaded = False
         self._parameter_bytes = adapter.estimated_parameter_bytes(self.local_experts)
@@ -79,7 +80,7 @@ class CAMRoutedModel:
         return self._parameter_bytes
 
     @property
-    def native_view(self) -> tuple[LayeredFFNWeights, ...]:
+    def native_view(self) -> tuple[QuantizedExpertWeights, ...]:
         if not self._loaded or self._views is None:
             raise RuntimeError("FFN weights have not been loaded")
         return self._views
@@ -166,18 +167,13 @@ class CAMRoutedModel:
             if tuple(view.layer_idx for view in views) != adapter.layer_indices:
                 raise ValueError("native views do not match the routed model layers")
             self._views = views
-            storage_sizes: dict[tuple[str, int], int] = {}
-            for parameter in owner.parameters():
-                storage = parameter.untyped_storage()
-                key = (str(parameter.device), storage.data_ptr())
-                storage_sizes[key] = storage.nbytes()
-            self._parameter_bytes = sum(storage_sizes.values())
+            self._parameter_bytes = parameter_storage_bytes(owner)
         self._loaded = True
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.adapter.layer_indices
 
-    def get_async_cam_layered_weights(self) -> tuple[list[LayeredFFNWeights], str]:
+    def get_quantized_expert_weights(self) -> tuple[list[QuantizedExpertWeights], str]:
         return list(self.native_view), ""
 
     def compute_ffn_output(

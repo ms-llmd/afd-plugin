@@ -25,9 +25,8 @@ from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
-from afd_plugin.model_executor.models import (  # noqa: E402
-    forward_context as afd_forward_context,
-)
+from afd_plugin import forward_context as afd_forward_context  # noqa: E402
+from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.v1.worker import (  # noqa: E402
     attention_model_runner_v2 as v2_runner_module,
 )
@@ -80,7 +79,7 @@ class _RecordingConnector:
 
 
 class _RunnerRecorder:
-    def __init__(self, vllm_config, device):
+    def __init__(self, vllm_config, device, *, afd_cudagraph_policy=None):
         self.model_config = vllm_config.model_config
         self.device = device
 
@@ -1337,13 +1336,6 @@ def _patch_v2_constructor_dependencies(monkeypatch, connector):
     config = _v2_config()
 
     monkeypatch.setattr(
-        (
-            "afd_plugin.v1.worker.attention_model_runner_v2."
-            "validate_gpu_model_runner_v2_config"
-        ),
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
         "afd_plugin.v1.worker.attention_model_runner_v2._resolve_world_ranks",
         lambda: (0, 0),
     )
@@ -1443,7 +1435,9 @@ def _prepare_gpu_worker_runtime(monkeypatch, worker_case, runner_cls):
     monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
     monkeypatch.setattr(worker_module.Worker, "init_device", _fake_worker_init)
     monkeypatch.setattr(
-        worker_module, "assert_compatible_afd_stack", lambda *args, **kwargs: None
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: AFDConfig(role=role),
     )
     monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
     return worker
@@ -1476,7 +1470,9 @@ def test_gpu_workers_reject_v1_before_native_or_plugin_runner_construction(
     monkeypatch.setattr(worker_module, runner_name, unexpected_construction)
     monkeypatch.setattr(worker_module.Worker, "init_device", unexpected_construction)
     monkeypatch.setattr(
-        worker_module, "assert_compatible_afd_stack", lambda *args, **kwargs: None
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: AFDConfig(role=role),
     )
 
     with pytest.raises(RuntimeError, match="requires ModelRunnerV2"):
@@ -1490,7 +1486,7 @@ def test_worker_factory_failure_preserves_native_construction(
     monkeypatch, gpu_worker_case
 ):
     class RaisingRunner:
-        def __init__(self, vllm_config, device):
+        def __init__(self, vllm_config, device, *, afd_cudagraph_policy=None):
             raise RuntimeError("runner construction failed")
 
     worker = _prepare_gpu_worker_runtime(monkeypatch, gpu_worker_case, RaisingRunner)

@@ -12,11 +12,11 @@ The V2 DP2 cases replace the duplicate GPU `afd-eager-2a2f`,
 baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
-The single-deployment inventory contains 48 definitions: 38 CUDA cases
-(18 DeepSeek-V2-Lite, nine Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
+The single-deployment inventory contains 52 definitions: 42 CUDA cases
+(18 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
-The CUDA counts include the local DeepEP M2N entries. CI still selects the
-same 15 unique node IDs across ready/merge and weekly gates. Definitions,
+The CUDA counts include the DeepEP M2N and standalone FFN service entries.
+CI selects 16 unique node IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
 
 The ten existing GPU multi-pod entries also use model-local Cases and the
@@ -112,7 +112,12 @@ AFD eager intentionally retains its required Hash probe.
 Deployment owns connector order (sync FFN then Attention; async CAM Attention
 then FFN), readiness, pre/post-workload liveness and cleanup. Its explicit
 `cleanup_profile` retains the scoped NPU async CAM exception; ordinary cases
-use strict cleanup. Per-role options, connector configuration, pinned Attention
+use strict cleanup. `Deployment.ffn_service` runs the FFN role as the
+standalone FFN service (`torchrun -m afd_plugin.ffn_faas serve`) on one host:
+the runner waits for every rank's `/ready`, ends the case with `/stop` on
+every rank followed by Attention shutdown, requires the launcher to exit 0 and
+every rank's status file to report released resources, and sweeps the
+torchrun workers by environment on cleanup. Per-role options, connector configuration, pinned Attention
 address and exact compilation settings preserve the existing NPU profiles.
 `Deployment.dbo` is the default for its roles. An explicit `Role.dbo` replaces
 that default; `Role.dbo=None` inherits it. `DboConfig()` enables DBO with native
@@ -283,15 +288,32 @@ devices and FFN DP2 on the other two.
 `tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` runs
 DeepSeek-V2-Lite through the same five scenarios.
 
-They need four SM90 or newer GPUs, afdEP-comm and DeepGEMM; see
+They need four SM90 or newer GPUs and afdEP-comm (DeepGEMM comes with vLLM);
+see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
-in the connector guide. CI does not run them.
+in the connector guide. Weekly CI runs the Qwen3 MoE
+`afd-deepep-m2n-graph-dbo-2a2f` scenario; the others are local-only.
 
 ```bash
 export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
 python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n
+```
+
+`test_qwen3_moe_deepep_m2n_ffn_service` runs the eager, graph, graph + DBO
+and Attention TP2 graph deployments (`afd-deepep-m2n-faas-*-2a2f`) with the
+FFN side served by the
+[standalone GPU FFN service](../../docs/gpu/STANDALONE_FFN_SERVICE.md)
+instead of `vllm serve`. Attention launches unchanged. Graph and DBO cases
+still require execution evidence from both roles: the service has no vLLM
+Worker, so its ranks run `tests.e2e.ffn_service_evidence`, which installs the
+same FFN probe and runs the unchanged CLI. It has the same requirements and is
+not run by CI.
+
+```bash
+python -m pytest -q -s \
+  tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n_ffn_service
 ```
 
 `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py` runs the eager,
@@ -380,10 +402,12 @@ do not establish numerical equivalence or full-dataset qualification.
 
 ### Weekly GSM8K
 
-The weekly pipeline runs eight scenarios: all four Qwen3 MoE cases
+The weekly pipeline runs nine scenarios: all four Qwen3 MoE cases
 (baseline, eager, graph, and graph+DBO), the three Qwen3.6 MoE cases
-(baseline, eager, and graph), and DeepSeek-V2-Lite `afd-graph-dbo-2a1f`,
-all with the default GSM8K sample limit. To reproduce locally:
+(baseline, eager, and graph), DeepSeek-V2-Lite `afd-graph-dbo-2a1f`, and the
+Qwen3 MoE DeepEP M2N `afd-deepep-m2n-graph-dbo-2a2f`, all with the default
+GSM8K sample limit. It also runs the DeepEP M2N device tests
+(`tests/gpu/test_deepep_m2n_gpu.py`). To reproduce locally:
 
 ```bash
 # Qwen3 MoE (all four P2P scenarios)
@@ -391,6 +415,10 @@ python -m pytest -q -s tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_
 
 # Qwen3.6 MoE (all three scenarios; GDN DBO unsupported)
 python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py
+
+# Qwen3 MoE DeepEP M2N graph+DBO (needs afdEP-comm, see the M2N section)
+python -m pytest -q -s \
+  "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n[afd-deepep-m2n-graph-dbo-2a2f]"
 ```
 
 For a full 1319-sample run, export `AFD_GSM8K_LIMIT=all` before invoking
@@ -643,3 +671,144 @@ the same four tests, and reports failures and process cleanup.
 Async CAM uses layered FFN execution with DeepSeek-V4 W4A8/W8A8. The
 DeepSeek-V2-Lite Async CAM smoke and ubatching scenarios have been retired;
 see the DeepSeek-V4 Async CAM profile above for the supported NPU entrypoint.
+
+## A3 Async CAM Pull MegaMoE
+
+Issue [#576](https://github.com/vllm-project/afd-plugin/issues/576) is covered by
+`afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8` in the model-owned `cases.py` and
+`test_async_cam_npu.py`. This is the opt-in `CAMAsyncAFDConnector` Pull path on
+Ascend A3/910C, using DeepSeek-V4-Flash per-channel W4A8 (or a compatible
+per-channel W8A8 checkpoint), sixteen NPU devices, Attention DP2/TP4 and FFN
+DP8/TP1/EP8. Both roles receive `ffn_mega_moe=true` and `dynamicQuant=1`.
+The existing `afd-dsv4-flash-async-cam-dp2tp4-ep8` remains Mega-off.
+
+Use the target branch's pinned vLLM/vLLM-Ascend stack (vLLM 0.32.0 target),
+CANN runtime, and plugin native operators built from the same source tip.
+Do not substitute A5 CAM async-megamoe operators or the FFN FULL helper (#509).
+The new case keeps both roles eager and the existing Attention DBO setting.
+Its test-only observers synchronize completed native work; use it for functional
+validation, never performance measurement.
+
+Use a clean committed checkout for qualification. Run from the repository root
+with the existing Async CAM prerequisites above:
+
+```bash
+set -o pipefail
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-W4A8
+export HCCL_IF_IP=<host-ip>
+export HCCL_SOCKET_IFNAME=<interface>
+export HF_HOME=/path/to/huggingface
+mkdir -p artifacts/pull-mega
+# Keep the exact tip, local changes, native libraries and software stack together.
+git rev-parse HEAD > artifacts/pull-mega/tip.txt
+git diff --binary > artifacts/pull-mega/source.patch
+python -m pip freeze > artifacts/pull-mega/packages.txt
+npu-smi info > artifacts/pull-mega/npu.txt
+find afd_plugin/_cann_ops_custom -type f -exec sha256sum {} + \
+  > artifacts/pull-mega/native-sha256.txt
+python -m pytest -s --basetemp=artifacts/pull-mega/pytest \
+  tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py \
+  2>&1 | tee artifacts/pull-mega/pytest.log
+```
+
+Enable `set -o pipefail` when using `tee` to preserve pytest's exit status.
+Record the container image digest and `cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg`
+(or the installed CANN version file) alongside these artifacts. A new source tip,
+model or rebuilt native package requires new evidence. Neither checkpoint mode
+has been qualified by adding this case; record the exact checkpoint path and
+quantization with every hardware run.
+
+Running this module selects both Mega-off and Mega-on sequentially with the
+same ten concurrent arithmetic requests and exact-answer/normal-stop criteria.
+For only Mega-on, append
+`::test_deepseek_v4_flash_async_cam[afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8]`
+to the module path. A registered entry does not by itself schedule weekly CI.
+
+Each case directory under `artifacts/pull-mega/pytest` contains `run.json`,
+`attention.log`, `ffn.log`, and `evaluation/completions.json`. Mega-on additionally
+requires `evaluation/mrv2.json`: every Attention rank must complete a Pull
+combine and every FFN rank must complete the actual native Mega executor with
+a nonempty, non-idle transaction after the evaluation window opens. Startup,
+dummy work before that window, missing ranks, and Push/Layered fallback fail.
+`run.json.cleanup` records cleanup errors, including orphan processes that were
+found and reaped. Cleanup is still attempted, but for this
+Mega case an exit or cleanup failure does not fail pytest after the workload and
+Pull execution checks pass. A failed startup, request, answer, or execution check
+still fails the case. Inspect the cleanup record for the separate shutdown result.
+The native worker extension is loaded only for the new case. Hardware execution
+and graceful shutdown must be assessed separately from the pytest result.
+
+## DSV4 Flash DSpark core cases (local A3)
+
+`test_dspark_npu.py` adds three opt-in, multi-deployment acceptance cases:
+
+| Case ID | Placement | Comparison |
+| --- | --- | --- |
+| `afd-dspark-eager` | Attention DP2/TP1, FFN EP4/TP1; eager | Same A/F deployment without DSpark |
+| `afd-dspark-graph` | Same A/F topology; Attention target/draft FULL_DECODE_ONLY, FFN FULL | Qualified same-topology DSpark eager run |
+| `pd-afd-dspark-graph` | Native Prefill TP4, the same A/F graph topology, MooncakeHybridConnector and proxy | Same PD+A/F deployment without DSpark |
+
+The model is DeepSeek-V4-Flash W4A8. Each case uses five speculative tokens,
+4096 maximum model length, 512 maximum batched tokens, four sequences per DP,
+128-token blocks, disabled prefix caching, and chunked prefill. A/F require six
+visible dies; PD requires ten. A reference is part of the acceptance case, not
+an additional scenario. The graph case creates and qualifies its own eager
+reference unless `AFD_DSPARK_EAGER_REFERENCE` names a completed eager case with
+matching source, native, runtime, model and A/F device identities. Runtime
+identity includes the vLLM and vLLM-Ascend Python/native package contents and
+the installed AFD CANN vendor package, including device kernels and metadata.
+It also records the selected service executable and verifies the actual A/F
+workers' interpreter, import paths, AFD plugin, vLLM, vLLM-Ascend, torch,
+torch-npu, NumPy, Transformers, safetensors and tokenizers package contents.
+The graph case compares its target workers with the eager reference workers.
+Both graph cases also compare their normal and instrumented workers. The
+non-speculative reference does not expose worker runtime observations; worker
+observations are checked after each observed deployment runs.
+Checkpoint identity records the resolved path, file sizes and modification
+times, and JSON content hashes; it does not hash weight contents. Do not alter
+or replace checkpoint files in place when reusing a reference.
+
+Each deployment records raw responses for fixed short, 1, 127, 128, 129 and 513
+input-token requests; A/F also tests a two-prompt batch. The workload tests four
+independent concurrent requests and repeats a request after early stop and stream
+abort. The concurrent client cancels pending requests on SIGTERM or SIGINT
+before service cleanup. Serial generated token IDs must match the reference.
+Counters are sampled before and after real requests; both Attention DPs must
+produce and accept draft tokens, and PD must receive external KV tokens on both
+DPs. The FFN workers must own the routed draft experts, and Attention workers
+must own attention and shared experts. Eager checks every target and draft FFN
+layer on every FFN rank.
+
+Graph cases first run ordinary grouped FFN execution and require actual request-time
+Attention target/draft and FFN graph replays on every rank. A separate deployment
+then forces one FFN replay per completion fence to inspect every target and draft
+layer and compare graph results with layered eager results. Its instrumentation
+changes submission grouping and adds synchronization; it is not evidence of the
+default grouping or a performance measurement. All three cases require their
+existing async CAM cleanup contract, and retain individual process exit statuses
+and cleanup results.
+
+```bash
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-W4A8
+export HCCL_IF_IP='<local-communication-ip>'
+export HCCL_SOCKET_IFNAME=eth0
+timeout --signal=TERM --kill-after=300s 21600s \
+  python -m pytest -q -s tests/e2e/models/deepseek_v4_flash/test_dspark_npu.py
+```
+
+Device IDs are assigned in A, F, then P order. Supply an actual device list,
+model, runtime and plugin-built Ascend operators; missing setup fails rather
+than skips. `AFD_NPU_E2E_VLLM_BIN`, `AFD_NPU_DSPARK_E2E_API_PORT`,
+`AFD_NPU_DSPARK_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT` override the
+executable, ports and startup timeout. Run records under each pytest temporary
+output include per-deployment `run.json`, requests, metrics, service logs,
+worker evidence and graph proof. Each deployment attempt gets a fresh directory;
+the top-level `run.json` records its actual paths under `stages`. Previous
+attempts are retained and cannot supply current worker evidence. The example
+sets an outer deadline and a cleanup grace period; use an appropriate scheduler
+deadline and preserve the cleanup grace when selecting individual cases. No CI
+gate or performance threshold is added.

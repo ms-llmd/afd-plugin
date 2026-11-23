@@ -25,6 +25,7 @@ at construction.
 
 from collections.abc import Iterable
 from copy import copy
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,9 +37,10 @@ from afd_plugin.compat.patches.gpu_deepseek_v32_dbo import (
     install_per_ubatch_topk_indices,
 )
 from afd_plugin.config import DEEPEP_M2N_CONNECTORS, AFDConfig, parse_afd_config
+from afd_plugin.model_executor.models._weight_utils import filter_role_weights
 from afd_plugin.model_executor.models.deepseek_v2 import (
-    AFDDeepseekV2RoutedExpertsMoE,
-    _iter_role_weights,
+    AFDDeepseekV2RemoteExpertsMoE,
+    _checkpoint_weight_roles,
 )
 
 if TYPE_CHECKING:
@@ -162,13 +164,14 @@ class AFDDeepseekV32DecoderLayer(native.DeepseekV32DecoderLayer):
                 index_group_builder=index_group_builder,
             )
             if self.is_moe_layer:
-                # Gate, native router and shared experts; the routed experts
-                # run on the FFN role behind the connector.
-                self.mlp = AFDDeepseekV2RoutedExpertsMoE(
+                # Gate, native router and shared experts in vLLM's MoE runner;
+                # the routed experts run on the FFN role behind the connector.
+                self.mlp = AFDDeepseekV2RemoteExpertsMoE(
                     config=config,
                     vllm_config=vllm_config,
-                    layer_idx=layer_idx,
                     prefix=f"{prefix}.mlp",
+                    compute_gate_on_attention=True,
+                    sends_routes=True,
                 )
             else:
                 self.mlp = native.DeepseekV2MLP(
@@ -318,8 +321,8 @@ class AFDDeepseekV32Model(native.DeepseekV32Model):
     def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
         """FFN only: the vLLM module holding one MoE layer's local experts.
 
-        Attention folds ``routed_scaling_factor`` into the top-k weights it
-        dispatches; the FFN never applies it.
+        Attention's MoE runner applies ``routed_scaling_factor`` to the
+        combined routed output; the FFN never applies it.
         """
         return self.layers[layer_idx].mlp.experts.routed_experts
 
@@ -344,12 +347,15 @@ class AFDGlmMoeDsaForCausalLM(native.DeepseekV32ForCausalLM):
         # The routed-experts connector runs the shared experts and the dense
         # MLPs on Attention; FFN keeps only the routed experts and the gate.
         return super().load_weights(
-            _iter_role_weights(
+            filter_role_weights(
                 weights,
                 role=self.afd_config.role,
-                config=self.config,
-                compute_gate_on_attention=True,
-                attention_shared_experts=True,
+                classify=partial(
+                    _checkpoint_weight_roles,
+                    config=self.config,
+                    compute_gate_on_attention=True,
+                    attention_shared_experts=True,
+                ),
             )
         )
 

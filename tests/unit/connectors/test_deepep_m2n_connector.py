@@ -28,7 +28,8 @@ from afd_plugin.connectors import (  # noqa: E402
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from tests.unit.fakes.afdep import (  # noqa: E402
-    FakeElasticBuffer,
+    FakeConfig,
+    FakeLanes,
     install_fake_afdep,
     uninstall_fake_afdep,
 )
@@ -62,7 +63,6 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
 )
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
     dequantize_fp8_block128,
-    quantize_fp8_block128,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.layout import (  # noqa: E402
     DeepEPM2NLayout,
@@ -87,6 +87,7 @@ from tests.unit.fakes.vllm_config import (  # noqa: E402
     M2NTopology,
     m2n_vllm_config,
 )
+from tests.unit.fakes.weights import quantize_fp8_block128  # noqa: E402
 
 CONNECTOR = "DeepEPM2NAFDConnector"
 HOPPER = (9, 0)
@@ -260,6 +261,62 @@ def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
         experts_module.DeepEPM2NExperts("deepgemm", 128, 134)
 
 
+UPSTREAM_DG = "deep_gemm"
+VLLM_DG = "vllm.third_party.deep_gemm"
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "expected"),
+    [
+        # An upstream deep_gemm is importable too; the bundled copy still wins.
+        (None, VLLM_DG),
+        # vLLM builds without DeepGEMM have no vllm.third_party package at all.
+        ("vllm.third_party", "bundled with vLLM"),
+        # The bundled copy is present but cannot load its own dependency.
+        ("deep_gemm_cpp", "deep_gemm_cpp"),
+    ],
+    ids=["vllm-copy-over-upstream", "not-bundled", "broken-bundled-copy"],
+)
+def test_deepgemm_uses_only_the_copy_bundled_with_vllm(
+    monkeypatch, missing_name, expected
+):
+    """The connector loads ``vllm.third_party.deep_gemm`` and never an upstream
+    ``deep_gemm``. Without the bundled copy the error points to the
+    ``fused_experts`` backend; any other import failure surfaces unchanged.
+
+    Why: the experts must run the DeepGEMM the pinned vLLM ships, whatever else
+    is installed, and a broken install must not be reported as a missing one.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import deepgemm as deepgemm_module
+
+    natives = {
+        package: SimpleNamespace(source=package) for package in (UPSTREAM_DG, VLLM_DG)
+    }
+
+    def import_module(name: str):
+        if missing_name is not None:
+            raise ModuleNotFoundError(
+                f"No module named {missing_name!r}", name=missing_name
+            )
+        return natives[name.removesuffix("._C")]
+
+    monkeypatch.setattr(
+        deepgemm_module, "importlib", SimpleNamespace(import_module=import_module)
+    )
+    deepgemm_module.load_deepgemm.cache_clear()
+    try:
+        if missing_name is None:
+            assert deepgemm_module.load_deepgemm().source == expected
+        else:
+            with pytest.raises(ModuleNotFoundError, match=expected) as raised:
+                deepgemm_module.load_deepgemm()
+            assert ("fused_experts" in str(raised.value)) == (
+                missing_name == "vllm.third_party"
+            )
+    finally:
+        deepgemm_module.load_deepgemm.cache_clear()
+
+
 def test_plan_stage_skips_host_sync_below_threshold():
     """With a threshold of 256, an eager 255-token step skips the host sync
     and a 256-token step keeps it.
@@ -283,12 +340,8 @@ def test_plan_stage_skips_host_sync_below_threshold():
     assert plan(256).do_cpu_sync
 
 
-def test_fp8_block128_round_trip():
-    """Block-128 FP8 quantization gives e4m3 values and one scale per
-    128x128 block, and dequantizes back within 5% relative error.
-
-    Why: test weights and the reference math rely on this helper.
-    """
+def test_fp8_block128_dequantization_recovers_weights():
+    """Production dequantization recovers block-FP8 test weights within 5%."""
     w = torch.randn(2, 256, 384)
 
     w_q, scale = quantize_fp8_block128(w)
@@ -316,15 +369,14 @@ def test_expert_weights_require_matching_fp8_scales():
 
 
 def test_layout_is_ffn_first_with_identity_expert_ids():
-    """2F3A with 128 experts: 64 experts per FFN rank, 5x64 DeepEP expert
-    slots, FFN ranks first in world order, FFN 1 owning experts 64-127.
+    """2F3A with 128 experts: 64 experts per FFN rank, FFN ranks first in
+    world order, FFN 1 owning experts 64-127.
 
     Why: real expert ids must equal DeepEP ids in the plugin's rank order.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=3, num_experts=128)
 
     assert layout.experts_per_rank == 64
-    assert layout.deepep_num_experts == 5 * 64
     assert layout.world_rank("ffn", 1) == 1
     assert layout.world_rank("attention", 0) == 2
     assert layout.expert_range(1) == range(64, 128)
@@ -379,9 +431,9 @@ def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     """A step planned as graph on one rank and eager on another gets the same
     bucket, both on the ladder (8 tokens) and above it (40).
 
-    Why: an FFN eager fallback can plan a step Attention replays in another
-    mode, and DeepEP needs the same bucket on every rank; a capacity bucket
-    chosen by the sync decision broke test_graph_and_eager_plans_mixed_across_ranks.
+    Why: DeepEP needs the same bucket on every rank whatever mode a rank plans
+    the step in; a capacity bucket chosen by the sync decision once broke
+    ranks that planned the same step in different modes.
     """
     buckets = {
         plan_stage(
@@ -457,19 +509,30 @@ def test_precompile_buckets(ladder, sync_min, expected):
 
 
 class _RecordingLane:
-    """A DeepEP buffer stand-in that records dispatch and combine calls."""
+    """An afdEP-comm ``Buffer`` stand-in that records each side's calls as the
+    dispatch and combine they are on the wire."""
+
+    topk_idx_dtype = torch.int64
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
-        self.calls.append(
-            ("dispatch", kwargs["bucket"], kwargs["do_cpu_sync"], x.shape[0])
-        )
+    def source_dispatch(
+        self, x, ids, weights, x_scale=None, *, bucket, read_host_counts
+    ):
+        assert ids.dtype == self.topk_idx_dtype and weights.dtype == torch.float32
+        self.calls.append(("dispatch", bucket, read_host_counts, x.shape[0]))
+
+    def source_collect(self):
+        self.calls.append(("combine", (0, M2N_HIDDEN_SIZE)))
+
+    def worker_receive(self, *, bucket, read_host_counts):
+        self.calls.append(("dispatch", bucket, read_host_counts, 0))
         return SimpleNamespace(handle=SimpleNamespace(recv_shape=(0, M2N_HIDDEN_SIZE)))
 
-    def combine(self, expert_output, handle):
-        self.calls.append(("combine", tuple(expert_output.shape)))
+    def worker_reply(self, rows, receipt):
+        assert tuple(rows.shape) == receipt.recv_shape
+        self.calls.append(("combine", tuple(rows.shape)))
 
 
 def test_precompile_runs_the_same_empty_steps_on_attention_and_ffn(monkeypatch):
@@ -489,8 +552,6 @@ def test_precompile_runs_the_same_empty_steps_on_attention_and_ffn(monkeypatch):
         connector.bucket_ladder = (8, 16, 64)
         connector.expert_alignment = DEEPGEMM_ALIGNMENT
         connector.lanes = [_RecordingLane(), _RecordingLane()]
-        if role == "attention":
-            connector._allocate_combine_zeros()
         connector._precompile_dispatch_kernels()
         calls[role] = [lane.calls for lane in connector.lanes]
 
@@ -892,9 +953,9 @@ def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
     """
     events = []
 
-    class Lane:
-        def destroy(self):
-            events.append("lane")
+    class OpenLanes:
+        def close(self):
+            events.append("lanes")
 
     monkeypatch.setattr(
         connector_module, "_abort_process_group", lambda group: events.append("control")
@@ -908,12 +969,12 @@ def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
     connector.group = SimpleNamespace()
     connector.bootstrap_group = SimpleNamespace()
     connector.transport_group = SimpleNamespace()
-    connector.lanes = [Lane()]
+    connector.lanes = OpenLanes()
 
     connector.close()
     connector.close()
 
-    assert events == ["control", "lane", "transport"]
+    assert events == ["control", "lanes", "transport"]
 
 
 @pytest.mark.parametrize(
@@ -1369,21 +1430,22 @@ def test_attention_init_rejects_local_experts_before_communicating():
         ("attention", 3, "ababab", 1),
     ],
 )
-def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
+def test_lanes_are_afdep_comm_buffers_with_the_role_counts(
     monkeypatch, role, role_rank, hosts, ffn_ranks_per_domain
 ):
-    """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
-    argument its constructor requires, the FFN rank count and the transport's
-    ``ffn_ranks_per_domain``, on the transport group.
+    """The transport is afdEP-comm's ``Lanes`` on the transport group, one lane
+    per micro-batch, configured with the real expert count, both role sizes
+    and the transport's ``ffn_ranks_per_domain``.
 
-    Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
-    buffer is unspecialized DeepEP V2), ``ffn_ranks_per_domain`` tells it
-    where the FFN ranks sit, and the stand-in fails on any argument set the
-    real constructor would refuse.
+    Why: afdEP-comm adds DeepEP's empty Attention expert blocks itself, so it
+    takes the real expert count; ``ffn_ranks_per_domain`` tells it where the
+    FFN ranks sit; and the stand-in fails on any field the real ``Config``
+    would refuse.
     """
-    monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
+    monkeypatch.setattr(connector_module, "Config", FakeConfig)
+    monkeypatch.setattr(connector_module, "Lanes", FakeLanes)
     topology = M2NTopology(ffn_size=2, attn_size=4)
-    connector = _connector(role, role_rank, topology, {})
+    connector = _connector(role, role_rank, topology, {"num_lanes": 2})
     connector.transport_group = SimpleNamespace()
     connector.transport = plan_transport_layout(
         [
@@ -1394,15 +1456,55 @@ def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
     )
     connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
     connector.capacity_tokens_per_rank = 64
+    connector.expert_alignment = DEEPGEMM_ALIGNMENT
 
-    buffer = connector._new_lane()
+    lanes = connector._new_lanes()
 
-    assert isinstance(buffer, FakeElasticBuffer)
-    assert buffer.kwargs["group"] is connector.transport_group
-    assert buffer.kwargs["ffn_ranks"] == 2
-    assert buffer.kwargs["ffn_ranks_per_domain"] == ffn_ranks_per_domain
-    assert buffer.kwargs["capacity_tokens_per_rank"] == 64
-    assert buffer.kwargs["allow_hybrid_mode"] is True
+    assert isinstance(lanes, FakeLanes)
+    assert lanes.group is connector.transport_group
+    assert len(lanes) == 2
+    config = lanes.config.kwargs
+    assert config["num_experts"] == connector.layout.num_experts
+    assert (config["ffn_ranks"], config["attention_ranks"]) == (2, 4)
+    assert config["ffn_ranks_per_domain"] == ffn_ranks_per_domain
+    assert config["capacity_tokens_per_rank"] == 64
+    assert config["expert_alignment"] == DEEPGEMM_ALIGNMENT
+    assert config["payload"] == "bf16"
+    assert config["allow_hybrid_mode"] is True
+
+
+@pytest.mark.parametrize(
+    ("role", "role_rank", "lane_role", "lane_index", "peer_error", "error_rank"),
+    [
+        ("ffn", 1, "ffn", 1, False, None),
+        ("attention", 1, "attention", 0, False, None),
+        ("ffn", 1, "ffn", 0, False, 1),
+        ("ffn", 1, "attention", 0, False, 1),
+        ("attention", 1, "attention", 0, True, 0),
+    ],
+)
+def test_lane_roles_must_match_the_layout(
+    monkeypatch, role, role_rank, lane_role, lane_index, peer_error, error_rank
+):
+    """A peer mismatch must stop warmup even when this rank agrees. Attention
+    indices may differ in per-domain mode and are not compared.
+    """
+    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=2))
+    connector.lanes = [SimpleNamespace(role=lane_role, role_rank=lane_index)]
+    connector.bootstrap_group = object()
+
+    def gather(errors, local_error, *, group):
+        assert group is connector.bootstrap_group
+        errors[connector.world_rank] = local_error
+        if peer_error:
+            errors[0] = "afdEP-comm placed world rank 0 as attention 0"
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    if error_rank is None:
+        connector._check_lane_roles()
+    else:
+        with pytest.raises(RuntimeError, match=f"placed world rank {error_rank}"):
+            connector._check_lane_roles()
 
 
 def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):
@@ -1451,41 +1553,6 @@ def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch)
 DEEPGEMM_ALIGNMENT = 128
 
 
-class _ReceivingLane(_RecordingLane):
-    """A transport that reports receive rows, which afdEP-comm never gives an
-    Attention rank."""
-
-    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
-        super().dispatch(x, x_scale, topk_ids, topk_weights, **kwargs)
-        return SimpleNamespace(handle=SimpleNamespace(recv_shape=(5, M2N_HIDDEN_SIZE)))
-
-
-def test_attention_combine_rejects_receive_rows(monkeypatch):
-    """An Attention rank's combine input is empty, so a transport that reports
-    receive rows for it raises instead of combining.
-
-    Why: afdEP-comm gives Attention ranks no receive rows, with or without the
-    host sync. The worst-case zero buffer this replaces took up to ~1 GiB per
-    Attention GPU before KV-cache sizing and was never read.
-    """
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
-    connector = _connector(
-        "attention",
-        0,
-        M2NTopology(ffn_size=2, attn_size=2),
-        {"capacity_tokens_per_rank": 64},
-    )
-    connector.device = torch.device("cpu")
-    connector.capacity_tokens_per_rank = 64
-    connector.bucket_ladder = (8,)
-    connector.expert_alignment = DEEPGEMM_ALIGNMENT
-    connector.lanes = [_ReceivingLane()]
-    connector._allocate_combine_zeros()
-
-    with pytest.raises(RuntimeError, match="receive rows"):
-        connector._precompile_dispatch_kernels()
-
-
 class _LoggedEvent:
     """CPU stand-in for ``torch.cuda.Event``: logs where it was recorded."""
 
@@ -1512,8 +1579,9 @@ class _LoggedStream:
 
 
 class _FFNLane:
-    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
-        rows = torch.zeros((0, M2N_HIDDEN_SIZE))
+    def worker_receive(self, *, bucket, read_host_counts):
+        # afdEP-comm allocates the received rows on the caller's stream.
+        rows = torch.empty((0, M2N_HIDDEN_SIZE))
         return SimpleNamespace(
             recv_x=rows,
             recv_scale=None,
@@ -1523,8 +1591,8 @@ class _FFNLane:
             handle=SimpleNamespace(recv_shape=(0, M2N_HIDDEN_SIZE)),
         )
 
-    def combine(self, expert_output, handle):
-        return expert_output
+    def worker_reply(self, rows, receipt):
+        return None
 
 
 def _logged_ffn_connector(monkeypatch, num_lanes: int):

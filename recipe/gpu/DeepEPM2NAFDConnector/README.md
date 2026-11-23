@@ -14,7 +14,7 @@ lists only its defaults and model-specific notes.
 
 Recipe names encode their layout, DP/TP shape, and mode. DeepSeek-V2-Lite and
 Qwen3-30B-A3B provide `2a2f_{eager,graph,graph_dbo}_dp2tp1.sh` plus
-`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `4a2f` eager, graph and
+`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `2a2f` eager, graph and
 DBO recipes plus `multipod_4a1f_4a1f_dbo.sh`. Each model README lists its
 exact filenames and defaults. GLM-5.3 provides MXFP4 `4a4f` eager and graph
 recipes on one 8-GPU node and an FP8 two-pod graph recipe.
@@ -33,12 +33,10 @@ every setting, and how to run a recipe directly or in a pod.
 
 ## Prerequisites
 
-- SM90 or newer GPUs. The DeepSeek and Qwen3-30B default `2A2F` layout uses
-  4 GPUs; Qwen3-235B defaults to `4A2F` on 6 GPUs. See the model README for
-  memory needs.
-- vLLM `v0.32.0`, the plugin, afdEP-comm (the `afdep` extra) and DeepGEMM
-  installed in one environment, with the elfutils headers available to
-  DeepGEMM's JIT. See
+- SM90 or newer GPUs. The default `2A2F` layout uses 4 GPUs on one host; see
+  the model README for memory needs.
+- vLLM `v0.32.0`, the plugin and afdEP-comm (the `afdep` extra) installed in
+  one environment. DeepGEMM is the copy bundled in the vLLM wheel. See
   [Installation](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation).
 - When afdEP-comm was built against the `nvidia-nccl` wheel, export its
   location before running a script:
@@ -53,7 +51,7 @@ every setting, and how to run a recipe directly or in a pod.
   `13355` (FFN DP RPC).
 
 The scripts call `vllm serve` directly rather than through `uv run`, so they
-use the environment that holds afdEP-comm and DeepGEMM.
+use the environment that holds afdEP-comm.
 
 ## Layout
 
@@ -90,7 +88,7 @@ Kubernetes.
 The **`deploy-afd-k8s`** skill (`.agents/skills/deploy-afd-k8s/SKILL.md`)
 deploys a recipe as one pod per `LAYOUT` entry; see
 [Running in a pod](../common/README.md#running-in-a-pod). The image must
-contain afdEP-comm and DeepGEMM.
+contain afdEP-comm; the `vllm/vllm-openai` image already bundles DeepGEMM.
 
 ## Checking a deployment
 
@@ -126,7 +124,9 @@ INPUT_LEN=1024 OUTPUT_LEN=256 NUM_PROMPTS=2000 \
 
 Drive the Attention port (18000). The benchmark works in every layout and
 mode; the connector is
-[`tools/benchmarks/decode_bench.py`](../../../tools/benchmarks/decode_bench.py).
+[`tools/benchmarks/decode_bench.py`](../../../tools/benchmarks/decode_bench.py),
+and [`tools/benchmarks/README.md`](../../../tools/benchmarks/README.md) covers
+the benchmark settings and running it against vanilla vLLM.
 
 ## Configuration notes
 
