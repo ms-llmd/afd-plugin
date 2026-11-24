@@ -78,6 +78,7 @@ class DeepEPM2NFFNBackend:
         """
         environment = self.environment
         config = environment.build_config(self.args)
+        self.settings.validate_checkpoint_format(config.quant_config)
         # No Worker runs here, so admit the deployment as AFDFFNWorker does.
         cudagraph_policy = validate_gpu_model_runner_v2_config(
             config, expected_role="ffn", device_type="cuda"

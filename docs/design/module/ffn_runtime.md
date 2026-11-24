@@ -169,15 +169,19 @@ F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
 - `GPUDeepEPM2NAdapter` reuses the shared native engine CLI and F-only
   launcher checks of `ffn_faas/platforms/launch.py`; with `GPUFFNConfig` it
   checks on the CPU, before any device work, the M2N connector, TP 1 with EP,
-  the FULL_DECODE_ONLY or eager mode, the BF16 payload and lane parity with
-  `--enable-dbo`. The adapter resolves the model path but does not parse or
-  name a model family.
+  the FULL_DECODE_ONLY or eager mode, the BF16 or block-128 FP8 payload and
+  lane parity with `--enable-dbo`. The adapter resolves the model path but
+  does not parse or name a model family.
 - `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
   the F-only `VllmConfig` with `EngineArgs.from_cli_args` (`external_launcher`,
   DP = F ranks, TP 1, EP), selects
   the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
   before any FusedMoE is built, and creates the F-only world through vLLM's
   `init_worker_distributed_environment`.
+- Before selecting a device, the backend checks the selected payload against
+  the checkpoint's vLLM quantization config. A BF16 payload requires
+  unquantized experts, and `fp8_block128_fp32` requires block-128 FP8 experts;
+  mismatches fail before expert weights are read.
 - The AFD model registry selects the FFN-only shell for the configured model.
   For example, `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
   (native `Qwen3MoeSparseMoeBlock`) and loads through vLLM's

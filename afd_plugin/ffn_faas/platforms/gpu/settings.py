@@ -15,12 +15,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from afd_plugin.connectors.deepep_m2n_formats import (
+    BF16_PAYLOAD,
+    PAYLOAD_FORMATS,
+    validate_payload_weight_format,
+)
 from afd_plugin.ffn_faas.platforms.launch import validate_ffn_rank_settings
 
-# The only qualified payload: BF16 rows against BF16 expert weights.
-BF16_PAYLOAD = "bf16"
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
+
 SINGLE_LANE = 1
 # DBO runs two micro-batches, one DeepEP lane each.
 DBO_LANES = 2
@@ -47,10 +55,11 @@ class GPUFFNConfig:
         """Reject launches no Attention peer could pair with, on the CPU.
 
         Checks this rank, the shutdown timeout, and the two connector options
-        the service fixes: ``payload_format`` must be ``bf16`` and an explicit
-        ``num_lanes`` must equal the lane count ``--enable-dbo`` implies (1
-        without, 2 with). Every other connector option is validated by
-        ``DeepEPM2NConfig.from_mapping`` once the backend runs.
+        the service fixes: ``payload_format`` must be BF16 or block-128 FP8,
+        and an explicit ``num_lanes`` must equal the lane count
+        ``--enable-dbo`` implies (1 without, 2 with). Every other connector
+        option is validated by ``DeepEPM2NConfig.from_mapping`` once the
+        backend runs.
         """
         validate_ffn_rank_settings(
             ffn_ranks=self.ffn_ranks,
@@ -59,10 +68,10 @@ class GPUFFNConfig:
             shutdown_timeout=self.shutdown_timeout,
         )
         payload_format = self.connector_extra_config.get("payload_format", BF16_PAYLOAD)
-        if payload_format != BF16_PAYLOAD:
+        if payload_format not in PAYLOAD_FORMATS:
             raise ValueError(
-                f"GPU standalone FFN supports only payload_format={BF16_PAYLOAD!r}, "
-                f"got {payload_format!r}"
+                f"payload_format must be one of {PAYLOAD_FORMATS}, got "
+                f"{payload_format!r}"
             )
         num_lanes = self.connector_extra_config.get("num_lanes")
         if num_lanes is not None and num_lanes != self.num_lanes:
@@ -76,6 +85,18 @@ class GPUFFNConfig:
     def num_lanes(self) -> int:
         """DeepEP lanes this rank creates: two under DBO, otherwise one."""
         return DBO_LANES if self.dbo else SINGLE_LANE
+
+    @property
+    def payload_format(self) -> str:
+        """Dispatch payload selected for this FFN rank."""
+        payload_format = self.connector_extra_config.get("payload_format", BF16_PAYLOAD)
+        return str(payload_format)
+
+    def validate_checkpoint_format(
+        self, quant_config: QuantizationConfig | None
+    ) -> None:
+        """Reject a payload/checkpoint mismatch before expert weights load."""
+        validate_payload_weight_format(self.payload_format, quant_config)
 
     @property
     def graph_mode(self) -> str:

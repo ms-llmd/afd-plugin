@@ -269,6 +269,35 @@ def test_routed_experts_shell_builds_only_native_moe_blocks(
     assert not model.is_unused_checkpoint_weight("model.layers.0.mlp.gate.weight")
 
 
+def test_routed_experts_shell_accepts_block_fp8_quantization(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    vllm_config = _model_config(layer_count=1)
+    vllm_config.quant_config = SimpleNamespace(
+        get_name=lambda: "fp8",
+        weight_block_size=[128, 128],
+    )
+    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: AFDConfig(
+            role="ffn",
+            connector=DEEPEP_M2N_CONNECTOR,
+            compute_gate_on_attention=True,
+        ),
+    )
+
+    model = adapter.AFDQwen3MoeRoutedExperts(
+        vllm_config=vllm_config,
+        prefix="draft",
+    )
+
+    assert construction_env["moe"] == ["draft.model.layers.0.mlp"]
+    assert model.get_experts_layer_indices() == (0,)
+
+
 def test_attention_causal_lm_reports_no_local_moe_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -46,6 +46,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
+  - "tests/e2e/models/qwen3_235b_fp8/test_qwen3_235b_fp8.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
   - "vLLM 0.32.0 CUDA serving, MRV2 execution and shutdown interfaces"
@@ -75,7 +76,7 @@ operator tests, benchmarks, and performance tests are outside this scope.
 ## Structure
 
 Single-deployment pytest entries use model-local `cases.py` builders for all
-48 existing definitions: 38 CUDA and ten NPU. Stable node IDs and the 15
+53 existing definitions: 43 CUDA and ten NPU. Stable node IDs and the 15
 existing CI selections stay unchanged. Collection reads IDs only. Builders
 resolve checkpoint-dependent profile settings inside the runner subprocess;
 the common `case_main` receives each model builder explicitly.

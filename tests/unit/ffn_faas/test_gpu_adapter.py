@@ -117,6 +117,15 @@ def test_eager_launch_runs_one_lane(launch_env, configure):
     assert launch.initial_status["dbo"] is False
 
 
+def test_fp8_launch_reports_the_configured_payload(launch_env, configure):
+    launch, _ = configure(
+        "--enforce-eager",
+        afd={"connector_extra_config": {"payload_format": "fp8_block128_fp32"}},
+    )
+
+    assert launch.initial_status["payload_format"] == "fp8_block128_fp32"
+
+
 @pytest.mark.parametrize(
     "env, options, afd, message",
     [
@@ -149,8 +158,14 @@ def test_eager_launch_runs_one_lane(launch_env, configure):
         (
             {},
             ("--enforce-eager",),
+            {"connector_extra_config": {"payload_format": "fp8"}},
+            "payload_format must be one of",
+        ),
+        (
+            {},
+            ("--enforce-eager", "--moe-backend", "marlin"),
             {"connector_extra_config": {"payload_format": "fp8_block128_fp32"}},
-            "payload_format='bf16'",
+            "does not support the marlin",
         ),
     ],
     ids=[
@@ -160,7 +175,8 @@ def test_eager_launch_runs_one_lane(launch_env, configure):
         "tensor-parallel",
         "connector",
         "lanes-vs-dbo",
-        "fp8-payload",
+        "unknown-payload",
+        "fp8-marlin",
     ],
 )
 def test_invalid_launch_is_rejected(

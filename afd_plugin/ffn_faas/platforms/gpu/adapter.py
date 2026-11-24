@@ -18,9 +18,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR
+from afd_plugin.connectors.deepep_m2n_formats import FP8_PAYLOAD
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
 from afd_plugin.ffn_faas.platforms.gpu.settings import (
-    BF16_PAYLOAD,
     FFN_GRAPH_MODE,
     GPUFFNConfig,
 )
@@ -118,6 +118,11 @@ class GPUDeepEPM2NAdapter:
             connector_extra_config=MappingProxyType(dict(afd.connector_extra_config)),
             shutdown_timeout=args.receiver_shutdown_timeout,
         )
+        if settings.payload_format == FP8_PAYLOAD and args.moe_backend == "marlin":
+            raise ValueError(
+                "GPU standalone FFN with fp8_block128_fp32 does not support "
+                "the marlin MoE backend"
+            )
         return FFNLaunch(
             rank=launcher.rank,
             local_rank=launcher.local_rank,
@@ -126,7 +131,7 @@ class GPUDeepEPM2NAdapter:
             shutdown_timeout=settings.shutdown_timeout,
             backend_factory=partial(create_backend, settings, args),
             initial_status={
-                "payload_format": BF16_PAYLOAD,
+                "payload_format": settings.payload_format,
                 "num_lanes": settings.num_lanes,
                 "graph_mode": settings.graph_mode,
                 "dbo": settings.dbo,

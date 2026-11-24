@@ -79,7 +79,6 @@ import torch.distributed as dist
 from afdep import Buffer, Config, DispatchHandle, Lanes
 from torch.distributed.distributed_c10d import _abort_process_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -93,6 +92,14 @@ from afd_plugin.connectors.base import (
     AFDControlPlaneClosedError,
     AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
+)
+from afd_plugin.connectors.deepep_m2n_formats import (
+    BF16_PAYLOAD,
+    FP8_GROUP_SIZE,
+    FP8_PAYLOAD,
+    PAYLOAD_FORMATS,
+    PAYLOAD_WEIGHT_FORMATS,
+    expert_weight_format,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     EXPERT_BACKENDS,
@@ -132,28 +139,13 @@ from afd_plugin.distributed import init_afd_process_group
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.model_executor.layers.quantization.base_config import (
-        QuantizationConfig,
-    )
 
 logger = init_logger(__name__)
 
 PROTOCOL_VERSION = "deepep_m2n/2"
-BF16_PAYLOAD = "bf16"
-# FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
-FP8_PAYLOAD = "fp8_block128_fp32"
-PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
-FP8_GROUP_SIZE = 128
 # afdEP-comm's names for the two payloads (``afdep.Config.payload``).
 AFDEP_BF16_PAYLOAD = "bf16"
 AFDEP_FP8_PAYLOAD = "fp8"
-# Expert weight formats the FFN must load for each payload format.
-BF16_WEIGHTS = "bf16"
-FP8_BLOCK128_WEIGHTS = "fp8_block128"
-PAYLOAD_WEIGHT_FORMATS = {
-    BF16_PAYLOAD: BF16_WEIGHTS,
-    FP8_PAYLOAD: FP8_BLOCK128_WEIGHTS,
-}
 # vLLM's all2all backend on the FFN. The connector already moved the rows, so
 # vLLM's own MoE all-to-all never runs; this backend allocates no buffers and
 # keeps vLLM's DeepEP out of the process.
@@ -458,18 +450,6 @@ class HandshakeResult:
     capacity_tokens_per_rank: int
     bucket_ladder: tuple[int, ...]
     transport: TransportLayout
-
-
-def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
-    """Expert weight format vLLM will load, named like ``payload_format``."""
-    if quant_config is None:
-        return BF16_WEIGHTS
-    if isinstance(quant_config, Fp8Config) and quant_config.weight_block_size == [
-        FP8_GROUP_SIZE,
-        FP8_GROUP_SIZE,
-    ]:
-        return FP8_BLOCK128_WEIGHTS
-    return f"unsupported ({quant_config.get_name()})"
 
 
 def ffn_deployment_info(vllm_config: VllmConfig) -> dict[str, Any]:

@@ -11,8 +11,8 @@ keeps its existing `vllm serve` launch, model, connector and DBO path.
 
 | Supported | Rejected at startup |
 | --- | --- |
-| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts |
-| `DeepEPM2NAFDConnector` with `payload_format: bf16` | P2P, afdEP-direct, flexible placement, FP8 payload |
+| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16 or block-128 FP8, every layer MoE, no shared experts | Unregistered models, unsupported quantization, dense or partial-MoE Qwen3, shared experts |
+| `DeepEPM2NAFDConnector` with `payload_format: bf16` or `fp8_block128_fp32` | P2P, afdEP-direct, flexible placement, a payload/checkpoint mismatch |
 | F TP=1, EP over all F ranks, linear expert placement | EPLB, elastic EP, redundant experts, PP/CP, LoRA, speculative decoding |
 | Eager, FULL_DECODE_ONLY CUDA graphs, DBO with two lanes (eager and graph) | Other graph modes, more than two micro-batches |
 | SM90 or newer (H100, H200, GB200) | Pre-Hopper GPUs |
@@ -43,10 +43,10 @@ norm and LM head (about 1.16 GiB per rank for Qwen3-30B-A3B).
 
 ## Launch
 
-Keep the Attention half of an existing recipe under
-`recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/` unchanged and replace only
-the FFN half. Example: 2A2F, graph and DBO on one node, Attention on GPUs 0
-and 1, F on GPUs 2 and 3:
+Keep the Attention half of the
+`recipe/gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/` recipe unchanged and
+replace only the FFN half. Example: 2A2F, block-128 FP8, graph and DBO on one
+node, Attention on GPUs 0 and 1, F on GPUs 2 and 3:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=1
@@ -54,10 +54,11 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve "$MODEL_PATH" \
   --data-parallel-size 2 --tensor-parallel-size 1 --enable-expert-parallel \
   --additional-config '{"afd":{"role":"attention","connector":"DeepEPM2NAFDConnector",
       "host":"127.0.0.1","port":6239,"num_attention_ranks":2,"num_ffn_ranks":2,
-      "compute_gate_on_attention":true,"afd_process_group_timeout_s":600}}' \
-  --max-num-seqs 64 --max-num-batched-tokens 4096 --max-model-len 4096 \
-  --max-cudagraph-capture-size 64 \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[8,16,32,64]}' \
+      "compute_gate_on_attention":true,"afd_process_group_timeout_s":600,
+      "connector_extra_config":{"payload_format":"fp8_block128_fp32"}}}' \
+  --max-num-seqs 512 --max-num-batched-tokens 3072 --max-model-len 4096 \
+  --max-cudagraph-capture-size 512 \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[8,16,32,64,96,128,192,256,384,512]}' \
   --enable-dbo --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 8 \
   --host 127.0.0.1 --port 18000 &
 
@@ -68,7 +69,7 @@ CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc-per-node=2 \
   --additional-config '{"afd":{"role":"ffn","connector":"DeepEPM2NAFDConnector",
       "host":"127.0.0.1","port":6239,"num_attention_ranks":2,"num_ffn_ranks":2,
       "compute_gate_on_attention":true,"afd_process_group_timeout_s":600,
-      "connector_extra_config":{}}}' \
+      "connector_extra_config":{"payload_format":"fp8_block128_fp32"}}}' \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --enable-dbo --status-port 29700
 ```
@@ -107,7 +108,7 @@ The handshake fails on both roles when they disagree:
 | `payload_format`, `network`, `bucket_granularity`, `cpu_sync_min_tokens` | `connector_extra_config` | `connector_extra_config` |
 | `num_lanes` | `--enable-dbo` | `--enable-dbo` (an explicit `num_lanes` must agree) |
 | `capacity_tokens_per_rank` | derived or explicit | adopted, or explicit and equal |
-| Hidden size, experts, top-k, BF16 | checkpoint | the same checkpoint files |
+| Hidden size, experts, top-k, model dtype | checkpoint | the same checkpoint files |
 
 `expert_backend`, `expert_num_sms`, `num_sms`, `num_qps` and the DeepEP
 timeouts are F-local tuning knobs.
@@ -124,9 +125,10 @@ sides to cover the expected start skew (600 s above).
 Each local F rank serves `--status-port + LOCAL_RANK` (`0` chooses a free
 port; each rank prints its address at start).
 
-- `/status`: phase, `loaded_experts`/`total_experts` (this rank's experts over
-  all layers; vLLM's loader reports no per-expert progress, so both values are
-  reported together after loading), `parameter_bytes`, `local_expert_first`/
+- `/status`: phase, `payload_format`,
+  `loaded_experts`/`total_experts` (this rank's experts over all layers;
+  vLLM's loader reports no per-expert progress, so both values are reported
+  together after loading), `parameter_bytes`, `local_expert_first`/
   `local_expert_last`, `m2n_paired`, `attn_tp_size`,
   `capacity_tokens_per_rank`, `num_buckets`, `network_hybrid`,
   `compute_ep_world_size`, `num_lanes`, `graph_mode`, `dbo` and
