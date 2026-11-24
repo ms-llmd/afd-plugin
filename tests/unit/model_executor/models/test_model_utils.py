@@ -107,6 +107,32 @@ def test_qwen3_routed_connector_selects_the_ffn_only_shell(
     assert hf_config.architectures == ["Qwen3MoeForCausalLM"]
 
 
+@pytest.mark.parametrize(
+    "device_type,routed_experts_connector,expected_architecture",
+    [
+        ("cuda", False, "AFDGlmMoeDsaForCausalLM"),
+        ("cuda", True, "AFDGlmMoeDsaRoutedExperts"),
+        # NPU keeps its DeepSeek V2-derived wrapper for both roles.
+        ("npu", True, "AFDGlmMoeDsaForCausalLM"),
+    ],
+    ids=["cuda-full-model", "cuda-ffn-only-model", "npu-full-model"],
+)
+def test_glm_routed_connector_selects_the_ffn_only_model_on_cuda(
+    model_utils, device_type, routed_experts_connector, expected_architecture
+):
+    hf_config = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+    original = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
+
+    mapped = model_utils.get_afd_model_config(
+        original,
+        device_type=device_type,
+        routed_experts_connector=routed_experts_connector,
+    )
+
+    assert mapped.hf_config.architectures == [expected_architecture]
+    assert hf_config.architectures == ["GlmMoeDsaForCausalLM"]
+
+
 def test_model_config_preserves_distinct_nested_text_config(model_utils):
     text = SimpleNamespace(model_type="qwen3_5_moe_text")
     original = SimpleNamespace(

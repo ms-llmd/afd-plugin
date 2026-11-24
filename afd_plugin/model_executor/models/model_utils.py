@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 _ROUTED_EXPERTS_MODEL_ARCHITECTURES: Final[dict[str, str]] = {
     "Qwen3MoeForCausalLM": "AFDQwen3MoeRoutedExperts",
+    "GlmMoeDsaForCausalLM": "AFDGlmMoeDsaRoutedExperts",
 }
 
 

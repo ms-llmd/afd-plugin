@@ -123,6 +123,11 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         if importlib.util.find_spec("torch_npu") is not None
         else "afd_plugin.model_executor.models.deepseek_v32:AFDGlmMoeDsaForCausalLM"
     ),
+    # FFN-only GLM-5.x model for routed-experts connectors (CUDA only; the
+    # routed-experts architecture map applies to CUDA).
+    "GlmMoeDsaRoutedExperts": (
+        "afd_plugin.model_executor.models.deepseek_v32:AFDGlmMoeDsaRoutedExperts"
+    ),
 }
 
 _QWEN_MODEL_REGISTRATIONS = {

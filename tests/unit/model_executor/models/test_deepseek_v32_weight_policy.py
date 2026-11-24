@@ -77,10 +77,10 @@ def _owner(name: str) -> frozenset[str]:
 
 
 @pytest.mark.parametrize("fmt", sorted(CHECKPOINT_SUFFIXES))
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_load_weights_passes_role_owned_tensors_to_native_loader_once(
-    monkeypatch, role, fmt
+def test_attention_load_weights_passes_its_tensors_to_native_loader_once(
+    monkeypatch, fmt
 ):
+    role = "attention"
     received: list[list[tuple[str, torch.Tensor]]] = []
 
     def native_load_weights(self, weights):
@@ -104,6 +104,66 @@ def test_load_weights_passes_role_owned_tensors_to_native_loader_once(
     assert len(received) == 1, "the native loader runs once over one iterator"
     assert [name for name, _ in received[0]] == [name for name, _ in expected]
     # Original tensor objects reach the native loader unchanged.
+    assert all(
+        got is want for (_, got), (_, want) in zip(received[0], expected, strict=True)
+    )
+    assert loaded == {name for name, _ in expected}
+
+
+# What the FFN-only model loads: the routed experts and the router of decoder
+# MoE layers. Not the MTP layer's experts (the native loader skips that layer),
+# the shared experts, norms, embedding or LM head.
+FFN_ONLY_MODULES = frozenset(
+    {"model.layers.3.mlp.gate", "model.layers.3.mlp.experts.255.up_proj"}
+)
+
+
+def _ffn_only_model():
+    model = object.__new__(adapter.AFDGlmMoeDsaRoutedExperts)
+    nn.Module.__init__(model)
+    model.config = glm53_hf_config()
+    model.model = object.__new__(adapter._GlmRoutedExpertsModel)
+    nn.Module.__init__(model.model)
+    return model
+
+
+@pytest.mark.parametrize("fmt", sorted(CHECKPOINT_SUFFIXES))
+def test_ffn_only_model_skips_every_tensor_it_does_not_load(fmt):
+    model = _ffn_only_model()
+
+    for name, _ in _checkpoint(fmt):
+        expected_unused = name.rsplit(".", 1)[0] not in FFN_ONLY_MODULES
+        assert model.is_unused_checkpoint_weight(name) is expected_unused, name
+
+
+@pytest.mark.parametrize("fmt", sorted(CHECKPOINT_SUFFIXES))
+def test_ffn_only_model_passes_routed_experts_to_native_dsa_loader_once(
+    monkeypatch, fmt
+):
+    received: list[list[tuple[str, torch.Tensor]]] = []
+
+    def native_load_weights(self, weights):
+        received.append(list(weights))
+        return {name for name, _ in received[-1]}
+
+    monkeypatch.setattr(
+        adapter.native.DeepseekV32Model, "load_weights", native_load_weights
+    )
+    model = _ffn_only_model()
+    checkpoint = _checkpoint(fmt)
+
+    loaded = model.load_weights(iter(checkpoint))
+
+    expected = [
+        (name, tensor)
+        for name, tensor in checkpoint
+        if name.rsplit(".", 1)[0] in FFN_ONLY_MODULES
+    ]
+    assert len(received) == 1, "the native loader runs once over one iterator"
+    # The native model loader sees its own (``model.``-relative) names.
+    assert [name for name, _ in received[0]] == [
+        name.removeprefix("model.") for name, _ in expected
+    ]
     assert all(
         got is want for (_, got), (_, want) in zip(received[0], expected, strict=True)
     )

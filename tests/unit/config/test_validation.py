@@ -298,6 +298,8 @@ def test_routed_transport_preserves_runner_and_gate_policy(
         pytest.param("AFDDeepseekV2ForCausalLM", True, id="afd-deepseek-v2"),
         pytest.param("GlmMoeDsaForCausalLM", True, id="glm-moe-dsa"),
         pytest.param("AFDGlmMoeDsaForCausalLM", True, id="afd-glm-moe-dsa"),
+        # The FFN-only model the routed-experts architecture map selects.
+        pytest.param("AFDGlmMoeDsaRoutedExperts", True, id="afd-glm-routed-experts"),
         pytest.param("DeepseekV3ForCausalLM", False, id="deepseek-v3"),
         pytest.param("AFDDeepseekV3ForCausalLM", False, id="afd-deepseek-v3"),
         pytest.param("Qwen3_5MoeForConditionalGeneration", False, id="qwen3-5-moe"),

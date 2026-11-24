@@ -156,7 +156,8 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
 | `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (Async CAM: eager/native decode Graph A, eager/FULL F) |
-| `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` (CUDA: NVIDIA DSA wrapper; NPU: DeepSeek V2-derived) |
+| `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` (CUDA: NVIDIA DSA wrapper, Attention role; NPU: DeepSeek V2-derived) |
+| `GlmMoeDsaRoutedExperts` | `AFDGlmMoeDsaRoutedExperts` | `AFDGlmMoeDsaRoutedExperts` (internal CUDA FFN-only alias) |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3MoeRoutedExperts` | `AFDQwen3MoeRoutedExperts` | `AFDQwen3MoeRoutedExperts` (internal FFN-only alias) |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
@@ -218,16 +219,21 @@ vLLM serves `GlmMoeDsaForCausalLM` on CUDA with its NVIDIA DSA model
 MLA plus the lightning indexer, fused embedding/RMSNorm, and an MLP output
 left un-reduced until the next layer's fused all-reduce + RMSNorm.
 [`deepseek_v32.py`](../../../afd_plugin/model_executor/models/deepseek_v32.py)
-keeps that native forward and loader and copies only the decoder layer and
-model constructors. Attention builds the DSA attention and the indexer top-k
-buffer, the dense MLPs of the first `first_k_dense_replace` layers, and, per
-MoE layer, the remote-experts shell `AFDDeepseekV2RemoteExpertsMoE` with
-`sends_routes` (gate, native router and shared experts in vLLM's MoE runner,
-which dispatches the routes and combines). FFN builds only the routed
-experts (native `DeepseekV2MoE` without shared experts, external routing). A
-one-pass checkpoint filter sends `self_attn` (indexer included), dense MLP and
-shared-expert paths to Attention, routed experts to FFN, and the gate and
-common paths to both.
+gives each role its own model. On Attention, `AFDGlmMoeDsaForCausalLM` keeps
+that native forward and loader and copies only the decoder layer and model
+constructors: it builds the DSA attention and the indexer top-k buffer, the
+dense MLPs of the first `first_k_dense_replace` layers, and, per MoE layer,
+the remote-experts shell `AFDDeepseekV2RemoteExpertsMoE` with `sends_routes`
+(gate, native router and shared experts in vLLM's MoE runner, which
+dispatches the routes and combines). A one-pass checkpoint filter keeps
+`self_attn` (indexer included), dense MLP, shared-expert, gate and common
+paths. On the FFN, the routed-experts architecture map selects the FFN-only
+`AFDGlmMoeDsaRoutedExperts` for both FFN hosts (the `vllm serve` FFN worker
+and the standalone FFN service): it builds only each MoE layer's native
+`DeepseekV2MoE` (no shared experts, external routing, no routed scale), loads
+it with the native DSA model loader inherited unchanged, and skips every
+checkpoint tensor except the routed experts and routers of decoder MoE
+layers. No embedding, norm, LM head or attention is allocated on the FFN.
 
 The wrapper requires `DeepEPM2NAFDConnector` with
 `compute_gate_on_attention=true` and rejects Attention TP > 1 (the native

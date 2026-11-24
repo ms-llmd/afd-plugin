@@ -45,8 +45,10 @@ class _FakeRoutedExpertsMoE(nn.Module):
     def __init__(self, *, config, **kwargs) -> None:
         super().__init__()
         self.n_shared_experts = config.n_shared_experts
+        self.prefix = kwargs["prefix"]
+        self.apply_routed_scale_to_output = kwargs["apply_routed_scale_to_output"]
         self.weight = nn.Parameter(torch.empty(1))
-        self.experts = SimpleNamespace(gate=object())
+        self.experts = SimpleNamespace(gate=object(), routed_experts=object())
 
 
 def _vllm_config(**parallel_overrides):
@@ -141,24 +143,10 @@ def test_attention_builds_dsa_attention_dense_mlps_and_routed_shells(build_model
     assert model.get_experts_layer_indices() == GLM53_MOE_LAYERS
 
 
-def test_ffn_builds_only_routed_experts_without_shared_experts(build_model):
-    model, calls = build_model("ffn")
-
-    assert calls["attention"] == []
-    assert calls["dense"] == []
-    assert calls["routed_shell"] == []
-    assert model.topk_indices_buffer is None
-    for idx, layer in enumerate(model.layers):
-        assert isinstance(layer.self_attn, adapter.native.PPMissingLayer)
-        if idx < GLM53_FIRST_K_DENSE_REPLACE:
-            assert isinstance(layer.mlp, adapter.native.PPMissingLayer)
-            continue
-        # Attention runs the shared experts; FFN builds the routed ones only
-        # and routes externally.
-        assert layer.mlp.n_shared_experts is None
-        assert layer.mlp.experts.gate is None
-    assert model.config.n_shared_experts == 1, "the model config is not mutated"
-    assert model.get_experts_layer_indices() == GLM53_MOE_LAYERS
+def test_attention_model_rejects_the_ffn_role(build_model):
+    # The FFN role loads AFDGlmMoeDsaRoutedExperts, never the decoder layers.
+    with pytest.raises(RuntimeError, match="Attention role only"):
+        build_model("ffn")
 
 
 def test_attention_dbo_gives_each_micro_batch_its_own_topk_buffer(
@@ -225,7 +213,7 @@ def test_supported_deployments_are_accepted(parallel_changes, speculative):
             "sequence-parallel",
             id="sp-moe",
         ),
-        pytest.param({"role": "ffn"}, {}, MTP, "Attention role only", id="mtp-on-ffn"),
+        pytest.param({"role": "ffn"}, {}, None, "Attention role only", id="ffn-role"),
         pytest.param(
             {}, {}, SimpleNamespace(method="eagle"), "supports only", id="eagle"
         ),
@@ -260,3 +248,103 @@ def test_dbo_with_cuda_graphs_is_accepted(speculative):
     vllm_config.speculative_config = speculative
 
     adapter.require_supported_deployment(vllm_config, M2N_AFD_CONFIG)
+
+
+@pytest.fixture
+def build_ffn_model(monkeypatch):
+    """Build the FFN-only model over a native ``DeepseekV2MoE`` stand-in."""
+    monkeypatch.setattr(adapter.native, "DeepseekV2MoE", _FakeRoutedExpertsMoE)
+    afd_config = replace(M2N_AFD_CONFIG, role="ffn")
+    monkeypatch.setattr(adapter, "parse_afd_config", lambda *a, **k: afd_config)
+
+    def build(**parallel_overrides):
+        return adapter.AFDGlmMoeDsaRoutedExperts(
+            vllm_config=_vllm_config(**parallel_overrides), prefix=""
+        )
+
+    return build
+
+
+def test_ffn_only_model_builds_the_routed_experts_of_moe_layers_only(
+    build_ffn_model,
+):
+    model = build_ffn_model()
+
+    # Nothing but the routed experts: no embedding, norm, LM head, attention,
+    # indexer buffer or dense MLP.
+    assert set(dict(model.named_children())) == {"model"}
+    assert set(dict(model.model.named_children())) == {"layers"}
+    layers = model.model.layers
+    assert len(layers) == GLM53_NUM_HIDDEN_LAYERS
+    for idx, layer in enumerate(layers):
+        if idx < GLM53_FIRST_K_DENSE_REPLACE:
+            assert isinstance(layer, adapter.native.PPMissingLayer)
+            continue
+        assert set(dict(layer.named_children())) == {"mlp"}
+        # Checkpoint paths match the native model's.
+        assert layer.mlp.prefix == f"model.layers.{idx}.mlp"
+        # Attention runs the shared experts and routes; the FFN never scales.
+        assert layer.mlp.n_shared_experts is None
+        assert layer.mlp.experts.gate is None
+        assert layer.mlp.apply_routed_scale_to_output is False
+        assert model.get_routed_experts(idx) is layer.mlp.experts.routed_experts
+    assert model.config.n_shared_experts == 1, "the model config is not mutated"
+    assert model.get_experts_layer_indices() == GLM53_MOE_LAYERS
+
+
+def test_ffn_only_model_reuses_the_native_dsa_loader():
+    # Inherited, not copied: a vLLM pin bump keeps the native expert mapping.
+    assert (
+        adapter._GlmRoutedExpertsModel.load_weights
+        is adapter.native.DeepseekV32Model.load_weights
+    )
+
+
+@pytest.mark.parametrize(
+    "parallel_changes",
+    [
+        pytest.param({}, id="m2n"),
+        pytest.param({"use_ubatching": True}, id="dbo"),
+    ],
+)
+def test_ffn_only_model_accepts_supported_deployments(parallel_changes):
+    adapter.require_supported_ffn_deployment(
+        _vllm_config(**parallel_changes), replace(M2N_AFD_CONFIG, role="ffn")
+    )
+
+
+@pytest.mark.parametrize(
+    "afd_changes, parallel_changes, speculative, match",
+    [
+        pytest.param({"role": "attention"}, {}, None, "FFN-only", id="attention"),
+        pytest.param(
+            {"connector": "P2pNcclAFDConnector"},
+            {},
+            None,
+            "supports only",
+            id="p2p-connector",
+        ),
+        pytest.param(
+            {"compute_gate_on_attention": False},
+            {},
+            None,
+            "compute_gate_on_attention",
+            id="gate-on-ffn",
+        ),
+        pytest.param(
+            {}, {"tensor_parallel_size": 2}, None, "tensor_parallel_size", id="tp2"
+        ),
+        pytest.param({}, {"pipeline_parallel_size": 2}, None, "PP", id="pp2"),
+        pytest.param({}, {}, MTP, "Attention role only", id="mtp-on-ffn"),
+    ],
+)
+def test_ffn_only_model_rejects_unsupported_deployments(
+    afd_changes, parallel_changes, speculative, match
+):
+    vllm_config = _vllm_config(**parallel_changes)
+    vllm_config.speculative_config = speculative
+
+    with pytest.raises(RuntimeError, match=match):
+        adapter.require_supported_ffn_deployment(
+            vllm_config, replace(replace(M2N_AFD_CONFIG, role="ffn"), **afd_changes)
+        )

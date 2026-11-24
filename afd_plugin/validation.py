@@ -55,6 +55,7 @@ ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
     "Qwen3MoeRoutedExperts",
     "DeepseekV2ForCausalLM",
     "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaRoutedExperts",
 )
 
 

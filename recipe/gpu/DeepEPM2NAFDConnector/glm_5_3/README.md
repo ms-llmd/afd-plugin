@@ -41,6 +41,9 @@ The native vLLM control on the same node is
 - Attention owns the DSA attention, the indexer, the three dense layers and
   the shared expert; Attention ranks hold no routed experts
   (`--enable-ep-weight-filter`).
+- FFN ranks load the FFN-only `AFDGlmMoeDsaRoutedExperts`: the routed experts
+  and routers of the 75 MoE layers, with no embedding, LM head, norms or
+  attention.
 - The FFN pins `--moe-backend marlin` for MXFP4 experts (vLLM loads the
   compressed-tensors W4A8 experts with its MXFP4 method and repacks them for
   Marlin). Marlin runs BF16 activations, as native vLLM does on Hopper, where
