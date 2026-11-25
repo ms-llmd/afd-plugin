@@ -522,6 +522,15 @@ _GPU_GRAPH = {
 }
 
 
+# AsyncAfdEPConnector in async mode on its validated model.
+_ASYNC_AFDEP = {
+    "afd.connector": "AsyncAfdEPConnector",
+    "afd.async": True,
+    "afd.compute_gate_on_attention": True,
+    "hf.architectures": ["Qwen3MoeForCausalLM"],
+}
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
@@ -624,6 +633,24 @@ _GPU_GRAPH = {
             {"hf.architectures": ["UnsupportedForCausalLM"]},
             _err("registered AFD model"),
             id="reject-unregistered-model",
+        ),
+        pytest.param(
+            {**_ASYNC_AFDEP, "par.use_ubatching": True, "par.num_ubatches": 2},
+            None,
+            id="accept-async-afdep-qwen3-dbo",
+        ),
+        pytest.param(
+            _ASYNC_AFDEP, _err("requires --enable-dbo"), id="reject-async-afdep-no-dbo"
+        ),
+        pytest.param(
+            {
+                **_ASYNC_AFDEP,
+                "par.use_ubatching": True,
+                "par.num_ubatches": 2,
+                "hf.architectures": ["DeepseekV2ForCausalLM"],
+            },
+            _err("async mode supports only"),
+            id="reject-async-afdep-unvalidated-model",
         ),
     ],
 )

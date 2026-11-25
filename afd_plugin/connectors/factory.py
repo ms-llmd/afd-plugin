@@ -130,6 +130,16 @@ AFDConnectorFactory.register_connector(
     ),
 )
 AFDConnectorFactory.register_connector(
+    "AsyncAfdEPConnector",
+    "afd_plugin.connectors.gpu.deepep_m2n.async_connector",
+    "AsyncAfdEPConnector",
+    # A DeepEP M2N subclass: same Attention-role routed-experts runner.
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.remote",
+        "AFDRoutedExpertsMoERunner",
+    ),
+)
+AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",

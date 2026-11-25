@@ -149,3 +149,17 @@ def install_proxy_context(monkeypatch, events, *, stage_idx=2):
     )
     monkeypatch.setattr(remote, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata
+
+
+class ConnectorDrivenConnector(FakeRoutedConnector):
+    """A routed connector without a control plane: the data plane drives
+    every step (async afdEP)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.control_plane = None  # type: ignore[assignment]
+        self.initialized = True
+
+    @property
+    def connector_driven(self) -> bool:
+        return True

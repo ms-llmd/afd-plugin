@@ -77,6 +77,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from afdep import Buffer, Config, DispatchHandle, Lanes
+from torch.distributed import Store
 from torch.distributed.distributed_c10d import _abort_process_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -506,6 +507,7 @@ def local_handshake_info(
     ffn_deployment: dict[str, Any] | None,
     sm: tuple[int, int],
     topology: RankTopology,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL_VERSION,
@@ -529,6 +531,7 @@ def local_handshake_info(
         "expert_alignment": expert_alignment,
         "ffn_deployment": ffn_deployment,
         "topology": topology.to_mapping(),
+        "async_mode": async_mode,
     }
 
 
@@ -544,6 +547,9 @@ _MUST_MATCH = (
     "network",
     "bucket_granularity",
     "cpu_sync_min_tokens",
+    # A sync rank and an async rank would deadlock: one waits for control
+    # payloads the other never sends.
+    "async_mode",
 )
 
 
@@ -982,17 +988,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         # from its CUDA-graph sizes, the FFN adopts them in the handshake.
         self.bucket_ladder: tuple[int, ...] | None = None
         if not self.is_ffn:
-            assert self.attn_tp_size is not None
-            assert self.capacity_tokens_per_rank is not None
-            self.bucket_ladder = bucket_ladder(
-                capacity_tokens_per_rank=self.capacity_tokens_per_rank,
-                cudagraph_capture_sizes=(
-                    vllm_config.compilation_config.cudagraph_capture_sizes or ()
-                ),
-                attn_tp_size=self.attn_tp_size,
-                bucket_granularity=self.config.bucket_granularity,
-                cpu_sync_min_tokens=self.config.cpu_sync_min_tokens,
-            )
+            self.bucket_ladder = self._resolve_bucket_ladder()
         self.num_lanes = resolve_num_lanes(self.config, vllm_config)
         # ``local_rank`` is vLLM's logical local rank (the world group's). The
         # worker runs on its visible ordinal, which differs under
@@ -1005,6 +1001,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._timeout = timedelta(seconds=afd_config.afd_process_group_timeout_s)
         self.group: dist.ProcessGroup | None = None
         self.bootstrap_group: dist.ProcessGroup | None = None
+        # The bootstrap group's rendezvous store (host traffic only).
+        self.bootstrap_store: Store | None = None
         # The lanes' group: the bootstrap group, or one in transport order.
         self.transport_group: dist.ProcessGroup | None = None
         self.transport: TransportLayout | None = None
@@ -1023,7 +1021,57 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._lanes_joined: set[int] = set()
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
-        self.control_plane: DeepEPM2NAFDControlPlane = DeepEPM2NAFDControlPlane(self)
+        self.control_plane: DeepEPM2NAFDControlPlane | None = self._make_control_plane()
+
+    # ==============================
+    # Extension hooks (subclasses change the step model; defaults are the
+    # synchronous control-plane connector)
+    # ==============================
+
+    @property
+    def async_mode(self) -> bool:
+        """Whether steps run without a control plane (reported in the
+        handshake, which rejects mixed sync and async ranks)."""
+        return False
+
+    def _make_control_plane(self) -> DeepEPM2NAFDControlPlane | None:
+        return DeepEPM2NAFDControlPlane(self)
+
+    def _needs_control_group(self) -> bool:
+        """The NCCL ``afd_deepep_m2n`` group carries only control payloads."""
+        return True
+
+    def _resolve_bucket_ladder(self) -> tuple[int, ...]:
+        """Attention: buckets below the capacity, from its CUDA-graph sizes."""
+        assert self.attn_tp_size is not None
+        assert self.capacity_tokens_per_rank is not None
+        return bucket_ladder(
+            capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            cudagraph_capture_sizes=(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes or ()
+            ),
+            attn_tp_size=self.attn_tp_size,
+            bucket_granularity=self.config.bucket_granularity,
+            cpu_sync_min_tokens=self.config.cpu_sync_min_tokens,
+        )
+
+    def _precompile_buckets(self) -> tuple[tuple[int, bool], ...]:
+        """``(bucket, do_cpu_sync)`` pairs compiled collectively at startup."""
+        assert self.bucket_ladder is not None
+        assert self.capacity_tokens_per_rank is not None
+        return precompile_buckets(
+            self.bucket_ladder,
+            self.capacity_tokens_per_rank,
+            self.config.cpu_sync_min_tokens,
+        )
+
+    def _initial_stage_plans(self) -> dict[int, StagePlan]:
+        """Plans installed after the handshake; the control plane fills them
+        per step."""
+        return {}
+
+    def _keep_bootstrap_store(self, store: Store) -> None:
+        self.bootstrap_store = store
 
     # ==============================
     # Lifecycle
@@ -1042,6 +1090,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             rank=self.world_rank,
             group_name=BOOTSTRAP_GROUP_NAME,
             timeout=self._timeout,
+            store_callback=self._keep_bootstrap_store,
         )
         local_alignment = None
         if self.is_ffn:
@@ -1070,6 +1119,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             ),
             sm=torch.cuda.get_device_capability(self.device),
             topology=discover_local_topology(self.world_rank, self.device),
+            async_mode=self.async_mode,
         )
         infos: list[dict[str, Any] | None] = [None] * self.layout.union_size
         dist.all_gather_object(infos, info, group=self.bootstrap_group)
@@ -1140,16 +1190,18 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             hidden_size=self.hidden_size,
             payload_format=self.config.payload_format,
         )
+        self.stage_plans = self._initial_stage_plans()
         # Never the lanes' bootstrap group: the control plane's close() aborts
         # this group to cancel a pending receive.
-        self.group = init_afd_process_group(
-            backend="nccl",
-            init_method=self._rendezvous,
-            world_size=self.layout.union_size,
-            rank=self.world_rank,
-            group_name=PROCESS_GROUP_NAME,
-            timeout=self._timeout,
-        )
+        if self._needs_control_group():
+            self.group = init_afd_process_group(
+                backend="nccl",
+                init_method=self._rendezvous,
+                world_size=self.layout.union_size,
+                rank=self.world_rank,
+                group_name=PROCESS_GROUP_NAME,
+                timeout=self._timeout,
+            )
         try:
             self.lanes = self._new_lanes()
             self._check_lane_roles()
@@ -1226,7 +1278,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     def close(self) -> None:
         """Cancel the control receive and destroy DeepEP buffers; safe after
         partial init and on repeat calls."""
-        self.control_plane.close()
+        if self.control_plane is not None:
+            self.control_plane.close()
         _CONNECTORS.pop(self._op_id, None)
         if self.lanes is not None:
             self.lanes.close()
@@ -1538,13 +1591,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         JIT builds them now instead of on the first step of each size. Graph
         buckets compile during CUDA-graph capture.
         """
-        assert self.bucket_ladder is not None
-        assert self.capacity_tokens_per_rank is not None
-        buckets = precompile_buckets(
-            self.bucket_ladder,
-            self.capacity_tokens_per_rank,
-            self.config.cpu_sync_min_tokens,
-        )
+        buckets = self._precompile_buckets()
         assert self.lanes is not None
         start = time.perf_counter()
         for lane in self.lanes:

@@ -8,6 +8,8 @@ server. Weekly CI runs the full suite on four H100 GPUs
 | File | Needs | Purpose |
 | --- | --- | --- |
 | `test_deepep_m2n_gpu.py` | pytest, up to 4 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
+| `test_deepep_m2n_bf16_act.py` | pytest, 1 GPU | The count-aware BF16 activation (`bf16_act.py`): received rows match an fp32 reference, rows past the last expert are untouched |
+| `test_deepep_m2n_fp8_act.py` | pytest, 1 GPU | The count-aware FP8 activation (`fp8_quant.py`): received rows and scales match an fp32 reference, a worst-case receive buffer gives the same rows as an exact one |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
 | `__init__.py` | - | Package marker |
 

@@ -31,12 +31,19 @@ from afd_plugin.compat.vllm import (
 from afd_plugin.compat.vllm import (
     is_target_vllm_compatible as _is_target_vllm_compatible,
 )
-from afd_plugin.config import AFDConfig, parse_optional_afd_config
+from afd_plugin.config import (
+    ASYNC_AFDEP_CONNECTOR,
+    ASYNC_AFDEP_IDLE_SLEEP_US_KEY,
+    AFDConfig,
+    parse_optional_afd_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.executor import Executor
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+MICROSECONDS_PER_SECOND = 1_000_000
 
 
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
@@ -433,9 +440,12 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
 # vllm/v1/engine/core.py::EngineCoreProc/DPEngineCoreProc.run_busy_loop.
 # Patch reason: AFD FFN ranks run a connector daemon, so the native busy loops
-# must not drive request scheduling on FFN engines.
-# Patch functionality: diverts AFD FFN engines to the connector loop while
-# preserving the target upstream tag's normal busy loops for all other engines.
+# must not drive request scheduling on FFN engines. Async afdEP Attention
+# engines must keep feeding the FFN's per-layer collectives while idle.
+# Patch functionality: diverts AFD FFN engines to the connector loop and async
+# afdEP Attention engines to a non-blocking loop that runs a dummy batch
+# whenever no step executed, preserving the target upstream tag's normal busy
+# loops for all other engines.
 # vLLM 0.32.0 publishes DP load-balancer request counts from the base busy
 # loop itself, so no AFD async-Attention loop is layered on top anymore.
 # Signature: matches upstream; no added parameters.
@@ -448,6 +458,11 @@ def run_busy_loop(self):
         result = _run_ffn_busy_loop(self, core_module)
         return result
     # ### PATCH END: AFD FFN connector busy loop
+    # ### PATCH START: AFD async afdEP Attention idle pump
+    idle_sleep_s = _async_afdep_idle_sleep_s(self)
+    if idle_sleep_s is not None:
+        _run_attention_idle_pump_loop(self, idle_sleep_s)
+    # ### PATCH END: AFD async afdEP Attention idle pump
 
     if isinstance(self, core_module.DPEngineCoreProc):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -719,6 +734,42 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             _stop_ffn_worker_loop(self)
 
     raise SystemExit
+
+
+def _run_attention_idle_pump_loop(self, idle_sleep_s: float) -> None:
+    """The native (non-DP) busy loop that never blocks while idle.
+
+    Every Attention rank must issue every step's exchanges, because the FFN
+    waits on the GPU for all of them; there are no DP waves in async mode.
+    So a rank with nothing to run steps a dummy batch, as vLLM's DP busy loop
+    does inside a wave, and polls the input queue instead of blocking on it.
+    """
+    self.process_input_queue_block = False
+    while self._handle_shutdown():
+        self._process_input_queue()
+        self._maybe_publish_request_counts()
+        executed = self._process_engine_step()
+        self._maybe_publish_request_counts()
+        if not executed and not self.model_executor.is_sleeping:
+            self.execute_dummy_batch()
+            if idle_sleep_s > 0:
+                time.sleep(idle_sleep_s)
+
+    raise SystemExit
+
+
+def _async_afdep_idle_sleep_s(self) -> float | None:
+    """Idle-step sleep for an async afdEP Attention engine, else None."""
+    config = _get_afd_config(getattr(self, "vllm_config", None))
+    if (
+        config is None
+        or config.role != "attention"
+        or not config.async_dp
+        or config.connector != ASYNC_AFDEP_CONNECTOR
+    ):
+        return None
+    sleep_us = int(config.connector_extra_config.get(ASYNC_AFDEP_IDLE_SLEEP_US_KEY, 0))
+    return sleep_us / MICROSECONDS_PER_SECOND
 
 
 def _stop_ffn_worker_loop(self) -> None:

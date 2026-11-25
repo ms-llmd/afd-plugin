@@ -10,6 +10,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
+  - "afd_plugin/v1/worker/ffn_async_routed_experts_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
@@ -38,6 +39,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
+  - "tests/unit/v1/worker/test_ffn_async_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
@@ -346,6 +348,10 @@ On CUDA, one iteration is `GPUFFNModelRunner.execute_connector_driven_step()`,
 shared by `AFDFFNWorker` and the standalone GPU FFN backend. It returns
 `False` only for a receive cancelled by a requested stop; a closed control
 plane without a stop request, and every other failure, raises.
+`GPUFFNAsyncRoutedExpertsModelRunner` (`AsyncAfdEPConnector` with
+`async: true`) overrides it with the same signature but no control plane: it
+runs one whole step and returns `False` once the agreed stop step is done; the
+Worker then calls `drain()` and the session's `finish_receiver()`.
 
 ### Connector-driven loop
 

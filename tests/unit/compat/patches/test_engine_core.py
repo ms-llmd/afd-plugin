@@ -305,7 +305,14 @@ def _load_patch_module() -> types.ModuleType:
     return importlib.import_module(module_name)
 
 
-def _config(role: str | None, *, async_dp: bool = False, device_type: str = "cuda"):
+def _config(
+    role: str | None,
+    *,
+    async_dp: bool = False,
+    device_type: str = "cuda",
+    connector: str = "CAMAsyncAFDConnector",
+    extra: dict[str, object] | None = None,
+):
     class Scheduler:
         connector = None
         ec_connector = None
@@ -358,7 +365,8 @@ def _config(role: str | None, *, async_dp: bool = False, device_type: str = "cud
         afd_config.update(
             {
                 "async": True,
-                "connector": "CAMAsyncAFDConnector",
+                "connector": connector,
+                "connector_extra_config": extra or {},
             }
         )
 
@@ -809,3 +817,70 @@ def test_engine_core_ffn_start_rpc_failure_emits_no_readiness_log(monkeypatch, c
         engine.run_busy_loop()
 
     assert "AFD FFN EngineCore started; workers run connector loop." not in caplog.text
+
+
+def test_async_afdep_attention_loop_pumps_dummy_steps_while_idle(
+    monkeypatch,
+):  # long-test: one engine with a minimal executor double, two loop turns
+    """An async afdEP Attention engine never blocks on its input queue and
+    runs a dummy batch (then the configured sleep) whenever no step ran.
+
+    Why: the FFN waits on the GPU for every Attention rank in every layer;
+    an idle rank that stops stepping stalls every busy rank.
+    """
+    core_module = _install_fake_vllm_core(monkeypatch)
+    patch_module = _load_patch_module()
+
+    class Executor:
+        max_concurrent_batches = 1
+        is_sleeping = False
+
+        def __init__(self, vllm_config):
+            self.vllm_config = vllm_config
+
+        def get_kv_cache_specs(self):
+            return []
+
+        def get_supported_kv_cache_layouts(self):
+            return ["layered"]
+
+        def set_kv_cache_layout(self, layout_name):
+            return None
+
+        def initialize_from_config(self, kv_cache_configs):
+            return None
+
+        def compile_or_warm_up_model(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+    engine = core_module.EngineCoreProc(
+        _config(
+            "attention",
+            async_dp=True,
+            connector="AsyncAfdEPConnector",
+            extra={"idle_sleep_us": 2000},
+        ),
+        Executor,
+        log_stats=False,
+    )
+    events: list = []
+    loop_states = iter((True, True, False))
+    executed = iter((True, False))
+    engine._handle_shutdown = lambda: next(loop_states)
+    engine._process_input_queue = lambda: events.append(
+        ("poll", engine.process_input_queue_block)
+    )
+    engine._process_engine_step = lambda: next(executed)
+    engine._maybe_publish_request_counts = lambda: None
+    engine.execute_dummy_batch = lambda: events.append("dummy")
+    sleeps: list = []
+    monkeypatch.setattr(patch_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    assert events == [("poll", False), ("poll", False), "dummy"]
+    assert sleeps == [0.002]
