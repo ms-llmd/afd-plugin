@@ -59,10 +59,29 @@ if TYPE_CHECKING:
 _ATTENTION_ROLE = "attention"
 _FFN_ROLE = "ffn"
 MTP_METHOD = "mtp"
-# The submodules of a decoder layer's MoE block that the FFN loads: the routed
-# experts, and the router (gate and its correction bias), which native MoE
-# construction always builds although the FFN never routes.
-_FFN_MOE_SUBMODULES = frozenset({"experts", "gate"})
+
+
+def _checkpoint_roles(config, name: str) -> frozenset[str]:
+    """AFD owner of one checkpoint tensor; both roles filter with this policy.
+
+    Attention routes and runs the shared experts, so the router is loaded on
+    both roles and the routed experts on the FFN only.
+    """
+    return _checkpoint_weight_roles(
+        name,
+        config,
+        compute_gate_on_attention=True,
+        attention_shared_experts=True,
+    )
+
+
+def _moe_layer_indices(config) -> tuple[int, ...]:
+    """Decoder MoE layers in order; both roles pair connector layers by it."""
+    return tuple(
+        layer_idx
+        for layer_idx in range(config.num_hidden_layers)
+        if _is_moe_layer(config, layer_idx)
+    )
 
 
 def _require_m2n_contract(vllm_config: VllmConfig, afd_config: AFDConfig) -> None:
@@ -234,14 +253,12 @@ class AFDDeepseekV32DecoderLayer(native.DeepseekV32DecoderLayer):
 
 
 class AFDDeepseekV32Model(native.DeepseekV32Model):
-    """Attention-role DSA model with routed-experts shells and DBO state."""
+    """Attention-role DSA model whose MoE layers are routed-experts shells."""
 
     fall_back_to_pt_during_load = False
 
-    # Patch reason: the native model always constructs native decoder layers
-    # and shares one indexer top-k buffer across DBO micro-batches.
-    # Patch functionality: construct the AFD decoder layers and, under DBO,
-    # give each micro-batch its own DSA top-k state.
+    # Patch reason: the native model always constructs native decoder layers.
+    # Patch functionality: construct the AFD decoder layers.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/models/deepseek_v32/nvidia/model.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -299,11 +316,6 @@ class AFDDeepseekV32Model(native.DeepseekV32Model):
         )
         # ### PATCH END
 
-        # ### PATCH START: per-micro-batch DSA top-k state under DBO.
-        if parallel_config.use_ubatching:
-            install_per_ubatch_topk_indices(self, parallel_config.num_ubatches)
-        # ### PATCH END
-
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -319,11 +331,7 @@ class AFDDeepseekV32Model(native.DeepseekV32Model):
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         """Decoder layers whose routed experts run behind the connector."""
-        return tuple(
-            layer_idx
-            for layer_idx, layer in enumerate(self.layers)
-            if isinstance(layer, AFDDeepseekV32DecoderLayer) and layer.is_moe_layer
-        )
+        return _moe_layer_indices(self.config)
 
 
 class AFDGlmMoeDsaForCausalLM(native.DeepseekV32ForCausalLM):
@@ -335,6 +343,11 @@ class AFDGlmMoeDsaForCausalLM(native.DeepseekV32ForCausalLM):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         require_supported_deployment(vllm_config, self.afd_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # The native model shares one indexer top-k buffer across DBO
+        # micro-batches; give each micro-batch its own DSA top-k state.
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.use_ubatching:
+            install_per_ubatch_topk_indices(self.model, parallel_config.num_ubatches)
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
@@ -346,12 +359,7 @@ class AFDGlmMoeDsaForCausalLM(native.DeepseekV32ForCausalLM):
             filter_role_weights(
                 weights,
                 role=self.afd_config.role,
-                classify=partial(
-                    _checkpoint_weight_roles,
-                    config=self.config,
-                    compute_gate_on_attention=True,
-                    attention_shared_experts=True,
-                ),
+                classify=partial(_checkpoint_roles, self.config),
             )
         )
 
@@ -359,21 +367,20 @@ class AFDGlmMoeDsaForCausalLM(native.DeepseekV32ForCausalLM):
 def is_ffn_routed_experts_weight(config, name: str) -> bool:
     """Whether the FFN-only model loads this checkpoint tensor.
 
-    True for the routed experts and the router of a decoder MoE layer. The
-    MTP layer (index ``num_hidden_layers``) is excluded, as the native loader
-    skips it; so are shared experts, attention, dense MLPs, norms, the
-    embedding and the LM head.
+    True for the MoE-block tensors the FFN owns under the shared role policy:
+    the routed experts and the router of a decoder MoE layer. The MTP layer
+    (index ``num_hidden_layers``) is excluded, as the native loader skips it;
+    so are shared experts, attention, dense MLPs, norms, the embedding and the
+    LM head, none of which the FFN-only model builds.
     """
     layer_path = layer_weight_path(name)
     if layer_path is None:
         return False
-    layer_idx, stage, remainder = layer_path
+    layer_idx, stage, _ = layer_path
     return (
         layer_idx < config.num_hidden_layers
         and stage == "mlp"
-        and _is_moe_layer(config, layer_idx)
-        and bool(remainder)
-        and remainder[0] in _FFN_MOE_SUBMODULES
+        and _FFN_ROLE in _checkpoint_roles(config, name)
     )
 
 
@@ -398,10 +405,6 @@ class _GlmRoutedExpertsLayer(nn.Module):
             # combined routed output; the FFN never applies it.
             apply_routed_scale_to_output=False,
         )
-        # Attention routes; the gate weights stay loadable but the runner never
-        # computes its own routing (gate is None means external routing in the
-        # v0.32 runner contract).
-        self.mlp.experts.gate = None
 
 
 class _GlmRoutedExpertsModel(native.DeepseekV32Model):
@@ -464,11 +467,7 @@ class AFDGlmMoeDsaRoutedExperts(nn.Module):
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         """Decoder layers whose routed experts run behind the connector."""
-        return tuple(
-            layer_idx
-            for layer_idx, layer in enumerate(self.model.layers)
-            if isinstance(layer, _GlmRoutedExpertsLayer)
-        )
+        return _moe_layer_indices(self.config)
 
     def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
         """The vLLM module holding one MoE layer's local experts."""

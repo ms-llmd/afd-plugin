@@ -149,17 +149,42 @@ def test_attention_model_rejects_the_ffn_role(build_model):
         build_model("ffn")
 
 
-def test_attention_dbo_gives_each_micro_batch_its_own_topk_buffer(
-    build_model, monkeypatch
+@pytest.mark.parametrize("use_ubatching", [False, True], ids=["no-dbo", "dbo"])
+def test_attention_causal_lm_installs_per_micro_batch_topk_only_under_dbo(
+    build_model, monkeypatch, use_ubatching
 ):
-    model, _ = build_model("attention", use_ubatching=True)
+    def native_causal_lm_init(self, *, vllm_config, prefix=""):
+        # The native CausalLM constructor reduced to building ``model_cls``.
+        nn.Module.__init__(self)
+        self.model = self.model_cls(vllm_config=vllm_config, prefix="model")
+
+    monkeypatch.setattr(
+        adapter.native.DeepseekV32ForCausalLM, "__init__", native_causal_lm_init
+    )
+    monkeypatch.setattr(adapter, "parse_afd_config", lambda *a, **k: M2N_AFD_CONFIG)
+    model = adapter.AFDGlmMoeDsaForCausalLM(
+        vllm_config=_vllm_config(use_ubatching=use_ubatching)
+    ).model
 
     monkeypatch.setattr(dbo_patch, "dbo_current_ubatch_id", lambda: 0)
     first = model.topk_indices_buffer
     monkeypatch.setattr(dbo_patch, "dbo_current_ubatch_id", lambda: 1)
     second = model.topk_indices_buffer
 
-    assert first is not second and first.shape == second.shape
+    assert (first is not second) is use_ubatching
+    assert first.shape == second.shape
+
+
+def test_attention_model_constructor_leaves_topk_state_shared(build_model, monkeypatch):
+    # The per-micro-batch install belongs to the CausalLM constructor, so the
+    # copied native model constructor carries only the decoder-layer patch.
+    model, _ = build_model("attention", use_ubatching=True)
+
+    monkeypatch.setattr(dbo_patch, "dbo_current_ubatch_id", lambda: 0)
+    first = model.topk_indices_buffer
+    monkeypatch.setattr(dbo_patch, "dbo_current_ubatch_id", lambda: 1)
+
+    assert model.topk_indices_buffer is first
 
 
 MTP = SimpleNamespace(method="mtp")
@@ -285,7 +310,6 @@ def test_ffn_only_model_builds_the_routed_experts_of_moe_layers_only(
         assert layer.mlp.prefix == f"model.layers.{idx}.mlp"
         # Attention runs the shared experts and routes; the FFN never scales.
         assert layer.mlp.n_shared_experts is None
-        assert layer.mlp.experts.gate is None
         assert layer.mlp.apply_routed_scale_to_output is False
         assert model.get_routed_experts(idx) is layer.mlp.experts.routed_experts
     assert model.config.n_shared_experts == 1, "the model config is not mutated"
