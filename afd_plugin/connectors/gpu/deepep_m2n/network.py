@@ -146,11 +146,18 @@ def nvlink_domain_id(gpu_pci: str | None) -> str | None:
         return None
     from vllm.third_party import pynvml
 
-    info = pynvml.c_nvmlGpuFabricInfo_t()
     try:
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByPciBusId(gpu_pci.upper())
-        pynvml.nvmlDeviceGetGpuFabricInfo(handle, ctypes.byref(info))
+        if hasattr(pynvml, "nvmlDeviceGetGpuFabricInfoV"):
+            # The versioned query: the legacy one reports state 0 / clique 0 on
+            # GB200 with driver 580, which split an NVL72 clique into hosts.
+            info = pynvml.c_nvmlGpuFabricInfoV_t()
+            info.version = pynvml.nvmlGpuFabricInfo_v2
+            pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
+        else:
+            info = pynvml.c_nvmlGpuFabricInfo_t()
+            pynvml.nvmlDeviceGetGpuFabricInfo(handle, ctypes.byref(info))
     except pynvml.NVMLError:
         # Not an NVLink-fabric GPU (e.g. HGX H100): NOT_SUPPORTED.
         return None
