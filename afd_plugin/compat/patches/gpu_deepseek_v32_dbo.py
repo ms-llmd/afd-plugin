@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Per-micro-batch DSA top-k indices for CUDA GLM-5.x DBO on vLLM 0.32.0.
+"""Per-micro-batch DSA top-k indices for CUDA GLM-5.x DBO on vLLM 0.34.0.
 
-Upstream pin: 5df63a7203cdb9328d824a27b682e77c7b9928be.
+Upstream pin: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
 
 GLM-5.x runs its lightning indexer on one decoder layer in four
 (``index_topk_freq``); the following layers reuse that layer's top-k. The
@@ -12,7 +12,7 @@ one ``SparseMLAIndexGroup`` per indexer layer (physical indices, valid counts,
 a side stream and two events). Every DBO micro-batch writes those same rows,
 and the routed-experts connector yields between consecutive decoder layers, so
 the other micro-batch would overwrite the top-k a reusing layer still has to
-read. vLLM 0.32 keeps no per-micro-batch copy, and native DBO has the same gap.
+read. vLLM 0.34 keeps no per-micro-batch copy, and native DBO has the same gap.
 
 ``install_per_ubatch_topk_indices`` gives each micro-batch its own buffer and
 group copies. Each object that holds them (model, DSA attention, indexer,
@@ -33,12 +33,13 @@ from types import MethodType
 
 import torch
 from torch import nn
-from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.mla.index_group import (
     HiSparseMLAIndexGroup,
     SparseMLAIndexGroup,
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -189,15 +190,16 @@ def use_dsa_indexer_sm_budget(ubatch_runner: UBatchRunner) -> Iterator[None]:
     # Patch functionality: lease the UBatchRunner compute SM budget to the
     # native indexer builders during preparation and restore it on exit.
     # Signature: matches UBatchRunner.prepare in
-    # vllm/v1/worker/gpu/ubatch_utils.py at vLLM
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be. Delegation keeps native slicing
+    # vllm/v1/worker/gpu/ubatch_utils.py at vLLM v0.34.0
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca. Delegation keeps native slicing
     # and metadata construction. Remove when the pin contains #60732.
     def prepare(
         self: UBatchRunner,
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        batch_desc: BatchExecutionDescriptor,
+        dp_sync_state: DPSyncState | None = None,
         for_capture: bool = False,
     ) -> UBatchState:
         # ### PATCH START: lease the compute SM budget to the DSA indexer.
@@ -211,7 +213,12 @@ def use_dsa_indexer_sm_budget(ubatch_runner: UBatchRunner) -> Iterator[None]:
                             budgets.append((builder, builder.num_sms))
                             builder.num_sms = self.sm_control.compute_sms
             return original_prepare(
-                input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                input_batch,
+                block_tables,
+                slot_mappings,
+                batch_desc,
+                dp_sync_state,
+                for_capture,
             )
         finally:
             # Reverse order also restores correctly if groups share a builder.

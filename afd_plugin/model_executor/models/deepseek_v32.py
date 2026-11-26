@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """CUDA AFD models for vLLM's NVIDIA DSA model (GLM-5.x).
 
-vLLM v0.32.0 serves ``GlmMoeDsaForCausalLM`` on CUDA with
+vLLM v0.34.0 serves ``GlmMoeDsaForCausalLM`` on CUDA with
 ``vllm.models.deepseek_v32.nvidia.model.DeepseekV32ForCausalLM``: DeepSeek
 V2/V3 orchestration with a DSA backbone (MLA + lightning indexer), fused
 embedding/RMSNorm, and an MLP output that stays un-reduced until the next
@@ -22,9 +22,9 @@ layer's fused all-reduce + RMSNorm. Each AFD role gets its own model:
 The models are limited to the DeepEP M2N connector with Attention TP = 1.
 MTP runs natively on the Attention ranks (its draft experts are local there);
 DBO (eager, decode steps only) gives each micro-batch its own DSA top-k
-state (``gpu_deepseek_v32_dbo``) and runs together with MTP through the
-vLLM #61464 backport (``gpu_mrv2_dbo_spec_decode``). Other deployments fail
-at construction.
+state (``gpu_deepseek_v32_dbo``) and runs together with MTP through vLLM's
+native DBO with speculative decoding (#61464, in vLLM 0.34). Other
+deployments fail at construction.
 """
 
 from collections.abc import Iterable
@@ -178,8 +178,8 @@ class AFDDeepseekV32DecoderLayer(native.DeepseekV32DecoderLayer):
     # Patch functionality: construct the routed-experts connector shell in
     # place of the native MoE; the native forward is kept.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/models/deepseek_v32/nvidia/model.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # Upstream: vLLM v0.34.0, vllm/models/deepseek_v32/nvidia/model.py
+    # Commit: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -260,8 +260,8 @@ class AFDDeepseekV32Model(native.DeepseekV32Model):
     # Patch reason: the native model always constructs native decoder layers.
     # Patch functionality: construct the AFD decoder layers.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/models/deepseek_v32/nvidia/model.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # Upstream: vLLM v0.34.0, vllm/models/deepseek_v32/nvidia/model.py
+    # Commit: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         torch.nn.Module.__init__(self)
 
@@ -320,9 +320,12 @@ class AFDDeepseekV32Model(native.DeepseekV32Model):
             self.norm = native.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = native.PPMissingLayer()
+        self.pp_buffers = native.pp_topk_buffers(
+            config, self.topk_indices_buffer, range(config.num_hidden_layers)
+        )
         self.make_empty_intermediate_tensors = (
             native.make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size
+                ["hidden_states"], config.hidden_size, self.pp_buffers
             )
         )
 

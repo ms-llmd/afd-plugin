@@ -67,6 +67,6 @@ The native vLLM control on the same node is
   stay above `--max-num-batched-tokens`, because micro-batched GLM prefill is
   not yet correct. With MTP, verification steps split on request boundaries,
   the decode threshold is raised to one request per micro-batch, and draft
-  prefill runs on the draft's own attention builders (a backport of vLLM
+  prefill runs on the draft's own attention builders (native vLLM 0.34,
   #61464).
 - No P2P connector.

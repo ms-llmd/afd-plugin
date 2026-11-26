@@ -134,14 +134,12 @@ class Mxfp4MarlinExpertWeights(LocalExpertWeights):
         w2_scale: ``[E_local, I / 32, H]`` e8m0 Marlin-permuted scales.
         quant_type_id: Marlin weight scalar type (``float4_e2m1f``).
         activation_config: The SwiGLU clamp vLLM's ``MarlinExperts`` applies.
-        input_dtype: Marlin activation quantization (``None`` = BF16, W4A16).
     """
 
     w13_scale: torch.Tensor
     w2_scale: torch.Tensor
     quant_type_id: int
     activation_config: ApplyMoEActivationConfig
-    input_dtype: torch.dtype | None = None
     weight_format: str = field(default=MXFP4_MARLIN_WEIGHTS)
 
     def __post_init__(self) -> None:
@@ -163,7 +161,7 @@ def marlin_mxfp4_expected_tensors(
 ) -> dict[str, list[object]]:
     """dtype and shape of every ``Mxfp4MarlinExpertWeights`` tensor.
 
-    Mirrors ``prepare_moe_mxfp4_layer_for_marlin`` (vLLM v0.32.0) for BF16
+    Mirrors ``prepare_moe_mxfp4_layer_for_marlin`` (vLLM v0.34.0) for BF16
     activations: ``gptq_marlin_repack`` gives ``[K / 16, N * 2]`` int32 per
     expert, and the permuted scales keep ``[K / 32, N]``.
     """
@@ -196,13 +194,14 @@ def marlin_mxfp4_expected_tensors(
 
 
 def mxfp4_marlin_weights_from_vllm(
-    routed_experts: RoutedExperts,
+    routed_experts: RoutedExperts, expert_ids: tuple[int, ...]
 ) -> FFNLocalExperts:
     """This rank's experts of one MXFP4 vLLM MoE layer, after the Marlin repack.
 
     Reads the parameters ``prepare_moe_mxfp4_layer_for_marlin`` left on the
     layer and the ``MarlinExperts`` object vLLM built for it (scales, clamp,
-    quant type, activation dtype), so the executor matches native.
+    quant type), so the executor matches native. ``expert_ids`` are this
+    rank's global expert ids in the connector's linear placement.
     """
     method = routed_experts.quant_method
     if not isinstance(method, Mxfp4MoEMethod):
@@ -224,7 +223,7 @@ def mxfp4_marlin_weights_from_vllm(
         raise RuntimeError("MXFP4 experts with biases are not supported on M2N")
     assert experts.w1_scale is not None and experts.w2_scale is not None
     return FFNLocalExperts(
-        expert_ids=tuple(routed_experts.expert_map_manager.get_local_expert_ids()),
+        expert_ids=expert_ids,
         weights=Mxfp4MarlinExpertWeights(
             w13=routed_experts.w13_weight.data,
             w2=routed_experts.w2_weight.data,
@@ -232,7 +231,6 @@ def mxfp4_marlin_weights_from_vllm(
             w2_scale=experts.w2_scale,
             quant_type_id=experts.quant_type_id,
             activation_config=experts.activation_config,
-            input_dtype=experts.input_dtype,
         ),
     )
 
@@ -297,7 +295,6 @@ def run_marlin_experts(
         expert_map=expert_map,
         workspace=workspace,
         output=out,
-        input_dtype=weights.input_dtype,
         activation_config=weights.activation_config,
     )
 

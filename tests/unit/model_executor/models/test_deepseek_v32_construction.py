@@ -267,7 +267,8 @@ def test_unsupported_deployments_fail_at_construction(
 def test_dbo_with_cuda_graphs_is_accepted(speculative):
     # The padding-only trailing microbatch that the sparse FP8 MLA builder
     # rejects is kept eager by the padding sync (gpu_mrv2_ubatching), and draft
-    # prefill after a microbatched step is rebuilt (gpu_mrv2_dbo_spec_decode).
+    # prefill after a microbatched step uses the draft's own builders (native
+    # vLLM #61464).
     vllm_config = _vllm_config(use_ubatching=True)
     vllm_config.model_config.enforce_eager = False
     vllm_config.speculative_config = speculative

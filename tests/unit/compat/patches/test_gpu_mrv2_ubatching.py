@@ -313,10 +313,12 @@ def test_dp2_padding_sync_rejects_a_padding_only_trailing_microbatch(
 
     # Every rank reports this rank's counts, so min(tokens) is num_tokens.
     monkeypatch.setattr(patch, "should_skip_dp_coordination", lambda: True)
-    monkeypatch.setattr(patch, "get_dp_group", lambda: SimpleNamespace(cpu_group=None))
     desired = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.FULL, num_tokens=num_tokens, num_reqs=num_tokens
     )
+
+    parallel_config = _parallel(dp_size=2)
+    parallel_config.enable_fault_tolerance = False
 
     descriptor, sync = patch.sync_cudagraph_and_dp_padding(
         Manager(),
@@ -326,7 +328,7 @@ def test_dp2_padding_sync_rejects_a_padding_only_trailing_microbatch(
         1,
         2,
         0,
-        parallel_config=_parallel(dp_size=2),
+        parallel_config=parallel_config,
         allow_ubatching=True,
         uniform_decode=True,
     )

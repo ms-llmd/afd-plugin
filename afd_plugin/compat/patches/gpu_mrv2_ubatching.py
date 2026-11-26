@@ -19,7 +19,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.config.fault_tolerance import ft_tp_barrier_required
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.forward_context import DPMetadata, ForwardContext, create_forward_context
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
@@ -45,7 +46,7 @@ from vllm.v1.worker.utils import AttentionGroup
 # DP1 child-context metadata factory.
 # Signature: matches maybe_build_ubatch_runner exactly at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/ubatch_utils.py, maybe_build_ubatch_runner;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
 # Removal plan: remove when native GPU DBO supports DP1.
 def maybe_build_ubatch_runner(
     vllm_config: VllmConfig,
@@ -81,7 +82,7 @@ def maybe_build_ubatch_runner(
 # runner instance. Native context fields, token counts and SP methods are kept.
 # Signature: matches UBatchRunner._make_forward_contexts at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/ubatch_utils.py, UBatchRunner._make_forward_contexts;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
 # Removal plan: remove when native child contexts support DP1 metadata.
 def _make_forward_contexts(
     self,
@@ -123,7 +124,11 @@ def _make_forward_contexts(
 # retain native DP>1 coordination and native descriptor selection.
 # Signature: matches dispatch_cg_and_sync_dp exactly at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/dp_utils.py, dispatch_cg_and_sync_dp;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
+# 0.34 added `allow_skip_drafts`: the native call site passes it
+# unconditionally, so it must be accepted here. AFD's DP1 branch returns before
+# any cross-rank agreement exists (its sync is None), which makes the flag
+# irrelevant there; the DP>1 path forwards it to the native helper.
 # Removal plan: remove when native dispatch selects DP1 microbatch descriptors.
 def dispatch_cg_and_sync_dp(
     cudagraph_manager: CudaGraphManager | None,
@@ -138,6 +143,7 @@ def dispatch_cg_and_sync_dp(
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
+    allow_skip_drafts: bool = False,
     dp_sync_state: DPSyncState | None = None,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
@@ -270,6 +276,7 @@ def dispatch_cg_and_sync_dp(
         parallel_config=parallel_config,
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
+        allow_skip_drafts=allow_skip_drafts,
     )
 
 
@@ -298,8 +305,9 @@ def _trailing_ubatch_is_padding(
 # microbatched graph is rejected whenever the trailing microbatch is padding.
 # Signature: matches sync_cudagraph_and_dp_padding exactly at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/dp_utils.py, sync_cudagraph_and_dp_padding;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
-# Removal plan: remove when the native guard rejects a padding-only microbatch.
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
+# Removal plan: remove when the native guard rejects a padding-only microbatch
+# (https://github.com/vllm-project/vllm/pull/65128).
 def sync_cudagraph_and_dp_padding(
     cudagraph_manager: CudaGraphManager | None,
     desired_batch_desc: BatchExecutionDescriptor,
@@ -313,34 +321,52 @@ def sync_cudagraph_and_dp_padding(
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
+    allow_skip_drafts: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
-
-    `parallel_config` is only needed to decide whether to microbatch, so callers
-    that never do (`allow_ubatching=False`) can leave it out.
 
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
+    tensor[6][dp_rank] = int(allow_skip_drafts)
     if should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
-        dist.all_reduce(tensor, group=group)
+        get_dp_group().cpu_all_reduce_(tensor)
 
+    # Full width, dead slots included: returned in DPSyncState, whose
+    # consumers index it by original dp_rank.
+    num_tokens_across_dp_full = tensor[0]
+
+    if parallel_config is not None and parallel_config.enable_fault_tolerance:
+        # Per-step barrier over the TP cpu group: a faulted sibling stops
+        # arriving, so survivors fail here on the host instead of leaving
+        # an orphaned TP collective running on device.
+        if ft_tp_barrier_required(parallel_config):
+            dist.barrier(group=get_tp_group().cpu_group)
+
+        if dead_dp_ranks := get_dp_group().dead_dp_ranks:
+            # Drop the failed ranks' columns so the min / all(==1) agreements
+            # below only see ranks that are still running.
+            tensor = tensor[:, [r for r in range(dp_size) if r not in dead_dp_ranks]]
+
+    # With dead DP ranks (FT), the dead ranks' columns were dropped above:
+    # dim 1 (per-rank) of these rows covers live ranks only.
     num_tokens_across_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
     uniform_token_counts_across_dp = tensor[2]
     max_query_lens_across_dp = tensor[3]
     allow_ubatching_across_dp = tensor[4]
     num_reqs_across_dp = tensor[5]
+    allow_skip_drafts_across_dp = tensor[6]
+    skip_drafts = bool(torch.all(allow_skip_drafts_across_dp == 1))
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -348,6 +374,11 @@ def sync_cudagraph_and_dp_padding(
         uniform_token_counts_across_dp == synced_uniform_token_count
     ):
         synced_uniform_token_count = None
+
+    # Varlen decode graphs need the same query-length bound on every rank.
+    synced_max_query_len: int | None = None
+    if bool(torch.all(max_query_lens_across_dp != -1)):
+        synced_max_query_len = int(max_query_lens_across_dp.max())
 
     if torch.all(num_tokens_across_dp == 0).item():
         synced_desc = BatchExecutionDescriptor(
@@ -404,17 +435,15 @@ def sync_cudagraph_and_dp_padding(
                 )
             # Refresh the token count to include CUDA graph padding.
             ubatch_num_tokens = ubatch_desc.num_tokens
-            num_reqs = int(num_reqs_across_dp.max())
-            if ubatch_desc.cg_mode == CUDAGraphMode.FULL:
-                assert ubatch_desc.num_reqs is not None
-                num_reqs = ubatch_desc.num_reqs
             return ubatch_desc, DPSyncState(
                 num_tokens_across_dp=torch.full_like(
-                    num_tokens_across_dp, ubatch_num_tokens
+                    num_tokens_across_dp_full, ubatch_num_tokens
                 ),
                 uniform_token_count=synced_uniform_token_count,
+                max_query_len=synced_max_query_len,
                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
-                num_reqs=num_reqs,
+                num_reqs=int(num_reqs_across_dp.max()),
+                skip_drafts=skip_drafts,
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
@@ -429,10 +458,12 @@ def sync_cudagraph_and_dp_padding(
                 num_active_loras=desired_batch_desc.num_active_loras,
             ),
             DPSyncState(
-                num_tokens_across_dp=num_tokens_across_dp,
+                num_tokens_across_dp=num_tokens_across_dp_full,
                 uniform_token_count=synced_uniform_token_count,
+                max_query_len=synced_max_query_len,
                 eager=True,
                 num_reqs=int(num_reqs_across_dp.max()),
+                skip_drafts=skip_drafts,
             ),
         )
 
@@ -441,12 +472,6 @@ def sync_cudagraph_and_dp_padding(
         "where synced_cg_mode must be NONE across all DP ranks"
     )
     synced_num_tokens = int(num_tokens_across_dp.max())
-
-    # Varlen decode graphs are selected by the query-length bound, so ranks must agree
-    # on it or they pad to different token counts below.
-    synced_max_query_len: int | None = None
-    if bool(torch.all(max_query_lens_across_dp != -1)):
-        synced_max_query_len = int(max_query_lens_across_dp.max())
 
     # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
     # so we don't perform request padding for PIECEWISE graphs.
@@ -460,18 +485,15 @@ def sync_cudagraph_and_dp_padding(
     )
 
     # Update num_tokens_across_dp to reflect padded size.
-    num_tokens_across_dp[:] = synced_desc.num_tokens
+    num_tokens_across_dp_full[:] = synced_desc.num_tokens
 
     return synced_desc, DPSyncState(
-        num_tokens_across_dp=num_tokens_across_dp,
+        num_tokens_across_dp=num_tokens_across_dp_full,
         uniform_token_count=synced_uniform_token_count,
+        max_query_len=synced_max_query_len,
         eager=False,
-        num_reqs=(
-            synced_desc.num_reqs
-            if synced_desc.cg_mode == CUDAGraphMode.FULL
-            and synced_desc.num_reqs is not None
-            else int(num_reqs_across_dp.max())
-        ),
+        num_reqs=int(num_reqs_across_dp.max()),
+        skip_drafts=skip_drafts,
     )
 
 

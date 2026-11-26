@@ -1,7 +1,9 @@
 # GLM-5.3 on AFD: follow-ups and upstream suggestions
 
-Status of branch `glm-5.3-afd` (vLLM 0.32.0 pin). GPU evidence: one
-8 x H200 node, `RedHatAI/GLM-5.3-MXFP4xFP8`, GSM8K-200.
+Status of branch `glm-5.3-afd`. Pinned to vLLM 0.34.0 since the 2026-11-26
+merge of `main` (see [vLLM 0.34.0 pin](#vllm-0340-pin-2026-11-26)); the
+results below were taken on 0.32.0. GPU evidence: one 8 x H200 node,
+`RedHatAI/GLM-5.3-MXFP4xFP8`, GSM8K-200.
 
 ## Validated
 
@@ -110,3 +112,24 @@ v0.33.0. All open PRs below are unmerged; none changes the AFD patches yet.
 | Draft buffer sharing if drafting is micro-batched | RFC [#65119](https://github.com/vllm-project/vllm/issues/65119) DBO for the MTP/EAGLE drafter forward | Open RFC | Would micro-batch the drafter; `eagle/utils.py` on main still re-points draft top-k buffers to the target's, so the hazard applies if it lands. |
 | Attention TP > 1 (open work 4) | [#60477](https://github.com/vllm-project/vllm/pull/60477) DSA: all-reduce partial hidden_states before PP send; [#62947](https://github.com/vllm-project/vllm/pull/62947) honor the decoder's deferred MoE all-reduce on the naive all2all path | #60477 merged 2026-10-29 (main only); #62947 open | Not an AFD fix. Both handle the same deferred reduction (the MLP output is reduced in the next layer's fused all-reduce + RMSNorm) at a PP boundary and on the all-gather/reduce-scatter path; #60477 is the pattern for returning connector rows as a partial. |
 | NCCL in the image (open work 6) | [#58768](https://github.com/vllm-project/vllm/pull/58768) add vllm-openai-efa target | On `releases/v0.33.0` | `docker/Dockerfile` `NCCL_VERSION` goes 2.30.7 (already the v0.32.0 value) -> 2.31.2. The v0.32.0 image used here still reported 2.29.7, so check the published v0.33.0 image before dropping the NCCL 2.30.7 wheel step. |
+
+## vLLM 0.34.0 pin (2026-11-26)
+
+`main` moved to vLLM 0.34.0 (`62d4bc3c`, #654). What the GLM-5.x code needed:
+
+| AFD code | 0.34.0 | Action |
+| --- | --- | --- |
+| `config_dbo_spec_decode`, `gpu_mrv2_dbo_spec_decode` (#61464 backport: DBO gate, threshold raise, request-boundary split, draft prefill on the draft builders) | #61464 is in v0.34.0: `VllmConfig._raise_dbo_thresholds_for_spec_decode`, `UBatchRunner.prepare` splits by the DP-agreed uniform count, `can_reuse_target_attn_metadata = False` under DBO | Deleted with their tests and the Attention runner wiring |
+| `AFDDeepseekV32Model.__init__` (copied constructor) | #59961 adds `pp_topk_buffers` and the `["hidden_states"]` intermediate-tensor factory; the native forward reads `self.pp_buffers` | Copied again from v0.34.0 |
+| `gpu_mrv2_ubatching.sync_cudagraph_and_dp_padding` (exact padding-only guard) | Guard still `2 * min(tokens) < padded`; the function gained `allow_skip_drafts`, fault-tolerant DP rank dropping, `cpu_all_reduce_`, `max_query_len`/`skip_drafts` in `DPSyncState` | Copied again from v0.34.0 with only the guard changed |
+| `gpu_deepseek_v32_dbo.use_dsa_indexer_sm_budget` | `UBatchRunner.prepare` takes `batch_desc, dp_sync_state` instead of `cg_mode`; indexer builder `num_sms` and `sm_control.compute_sms` unchanged | Signature updated |
+| `gpu_deepseek_v32_dbo.install_per_ubatch_topk_indices` | Still one model-level `topk_indices_buffer`; `SparseMLAIndexGroup` fields unchanged; the indexer op reads `self.topk_indices_buffer` | Kept as is |
+| `mxfp4_experts` (Marlin MXFP4 executor) | #65542 removed 8-bit activations from Marlin (`fused_marlin_moe` has no `input_dtype`); `ExpertMapManager.get_local_expert_ids` is gone; the BF16 repack and scale permutation are unchanged; `CompressedTensorsW4A8Mxfp4MoEMethod` still subclasses `Mxfp4MoEMethod` | Dropped `input_dtype` (GLM always ran W4A16, as native does on Hopper); the FFN runner passes the local expert ids |
+
+Still not upstream in v0.34.0 (checked 2026-11-26; all open): per-micro-batch
+DSA top-k (#60734), indexer SM budget (#60732), the padding-only micro-batch
+guard (#65128, #63823), the FlashMLASparse `decode_query_len > 0` assert
+(#66734; #68585 is PCP-only), and the prefill straddle (no PR). For the next
+pin bump, #66859 (merged on `main` after v0.34.0) replaces
+`apply_routed_scale_to_output` with `RoutedScaleMode`, which the FFN-only GLM
+model and `build_expert` use.

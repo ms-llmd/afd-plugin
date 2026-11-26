@@ -28,7 +28,7 @@ qualify every model/topology combination on the current target.
 | --- | --- | --- | --- | --- |
 | CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP1 or DP > 1 | Model-specific gate placement; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | Source-specific GPU validation is linked below; coverage is limited to the recorded model/topology combinations. DeepSeek-V2-Lite has known DBO shutdown failures. Qwen3.5/3.6 GDN DBO is unsupported. |
 | CUDA V2 + `DeepEPM2NAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph; SM90 or newer | Exactly two native microbatches, enabled on both roles; Attention DP1 or DP > 1, TP1 or TP2 | Qwen3 MoE (all layers MoE, no shared expert), DeepSeek-V2 or GLM-5.x; `compute_gate_on_attention=true`; FFN TP1 with EP over all FFN ranks, linear placement, `allgather_reducescatter` all2all and the Triton MoE weight layout (Marlin for MXFP4 experts); BF16 or block-128 FP8 payload; EPLB, PP/CP and SP MoE rejected | Historical vLLM 0.30 Qwen3-30B-A3B 2A2F GSM8K E2E for eager, graph, graph + DBO, and Attention TP2 eager/graph on H100 and H200, and for eager, graph and graph + DBO on GB200; two-node 2A2F eager, graph and graph + DBO with Attention and FFN on separate nodes. DeepSeek-V2-Lite: [E2E definitions](../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py). GLM-5.3 MXFP4xFP8 on one 8 x H200 node (vLLM 0.32.0, afdEP-comm v1.1.0 on NCCL 2.30.7): GSM8K-200 native DP8 + EP eager 0.925, M2N 4A4F eager 0.930 and graph 0.935; with MTP (3 tokens) native graph 0.93 vs M2N graph 0.92, mean acceptance length 3.4-3.5 vs 3.4; DBO eager with decode-only micro-batching 0.93 (concurrency 32) and 0.91 (64), where micro-batched prefill dropped to 0.90 with garbled outputs and to 0.685 without per-micro-batch top-k ([E2E definitions](../tests/e2e/models/glm_5_3/test_glm_5_3.py)); the FP8 two-pod recipe is not GPU-validated. [GPU connector device tests](../tests/gpu/README.md) |
-| Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager or graph native DBO with two ubatches and Attention DP > 1; plain MLA graph DBO requires `FULL_DECODE_ONLY` | `compute_gate_on_attention` may be `false`, or `true` for DeepSeek-V4 at TP=1 without DBO/ubatching; PP/CP, elastic EP and EPLB rejected; model-specific SP policy; role ranks equal DP x TP | Historical 0.30 V2-Lite 2A2F FULL 300-question comparison and 2A1F functional checks; current 0.32 Lite evidence is in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507) |
+| Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager or graph native DBO with two ubatches and Attention DP > 1; plain MLA graph DBO requires `FULL_DECODE_ONLY` | `compute_gate_on_attention` may be `false`, or `true` for DeepSeek-V4 at TP=1 (DBO needs Attention DP > 1 with two ubatches); `connector_extra_config.quant_mode` may be `0`, or `4` for the MXFP8 transport (equal Attention/FFN rank counts, at least three AIV cores, `a2e` build that takes `x_scale` and `quant_mode`); PP/CP, elastic EP and EPLB rejected; model-specific SP policy; role ranks equal DP x TP | Historical 0.30 V2-Lite 2A2F FULL 300-question comparison and 2A1F functional checks; current 0.32 Lite evidence is in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507). `quant_mode=4` has no device run in this repository yet. |
 | Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention; layered FFN eager or FULL | Two native DBO microbatches on Attention, including DP1 and with FFN FULL; FFN stays outside the native DBO schedule | Experimental DeepSeek-V4 W4A8/W8A8 on A3/910C; `async_dp=true`, `compute_gate_on_attention=true`, and `dynamicQuant=1`; PP/CP unsupported; plugin-owned async CAM ops required | Historical DSV4 layered comparisons and limitations are in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507); they predate removal of the legacy path |
 
 The 300-question Ascend evidence in this table is historical. The 0.32
@@ -46,13 +46,21 @@ FFN remains connector-driven. The row's upgrade evidence retains its original
 scope; MRV2 deployment settings are documented in the
 [CAM async guide](npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
 
-Both backends target vLLM `0.32.0` (`5df63a72`); Ascend additionally targets
-vLLM-Ascend `bd42eea0`. Source-specific
-H20 model, topology, execution-mode and accuracy results are recorded in
-the [GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)
+The GPU backend targets vLLM `0.34.0` (`62d4bc3c`). The single-node H20-3e
+upgrade validation used the first 300 GSM8K samples per case. It covers V4
+Flash AFD eager and graph DBO and five DeepEP M2N scenarios each for
+DeepSeek-V2-Lite and Qwen3-30B-A3B. The M2N cases cover eager and graph DP2,
+graph + DBO DP2, and eager and graph TP2. The record also carries forward
+earlier vLLM 0.34 GPU gates for V2-Lite, Qwen3, Qwen3.6, and V4 Flash with
+their recorded provenance. See the [0.34 upgrade record](https://github.com/vllm-project/afd-plugin/pull/617).
+
+The Ascend backend targets vLLM `0.34.0` (`62d4bc3c`) and vLLM-Ascend
+`7dcdb690` on Ubuntu 22.04 arm64 with CANN 9.3.0. See the
+[pinned A3 environment](installation.md#ascend-npu-installation) and
+[NPU upgrade scope](https://github.com/vllm-project/afd-plugin/issues/613).
+Historical H20 GPU results for the 0.32 upgrade are in the
+[GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)
 and [runtime-fix validation matrix](https://github.com/vllm-project/afd-plugin/pull/502).
-Those records identify the exact tested revisions. Earlier GPU results on
-vLLM 0.30 do not establish vLLM 0.32 hardware qualification.
 
 ## Validation limits
 
@@ -60,11 +68,11 @@ vLLM 0.30 do not establish vLLM 0.32 hardware qualification.
   full-dataset accuracy, numerical equivalence, or performance improvement.
 - DeepSeek-V2-Lite TP2 Graph + DBO and DP2 eager DBO can require force
   killing during shutdown. Inference success does not imply graceful exit.
-- Native V4 DBO requires a compatible upstream communication backend. The
-  recorded native V4 accuracy reference uses Graph without DBO.
-- NPU 0.32 evidence is limited to the configurations and checks in the
-  [validation record](https://github.com/vllm-project/afd-plugin/pull/507); the seven AFD Lite
-  cases failed graceful exit. Historical NPU results do not qualify 0.32.
+- On H20, the two native V4 DBO controls on vLLM 0.34 failed during warmup
+  because the CUDA CuTeDSL compressor received an unaligned positions tensor.
+  The passing native V4 controls use eager and Graph without DBO.
+- The historical NPU 0.32 [validation record](https://github.com/vllm-project/afd-plugin/pull/507)
+  records graceful-exit failures in seven AFD Lite cases.
 
 Historical [NPU validation](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)
 and [DBO repair](https://github.com/vllm-project/afd-plugin/pull/430#issuecomment-6063840311)
@@ -74,6 +82,4 @@ their [E2E limits](../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requ
 GPU/NPU rank topology and connector resource rules remain owned by
 [connector contracts](design/module/connector_contracts.md).
 
-The repository does not record a canonical CUDA container or assert an
-official tag for the Ascend source pin `bd42eea0`; environment evidence is
-not an authoritative package tag.
+The repository does not record a canonical CUDA container.
