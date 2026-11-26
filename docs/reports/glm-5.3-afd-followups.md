@@ -72,8 +72,9 @@ results below were taken on 0.32.0. GPU evidence: one 8 x H200 node,
 5. FP8 checkpoint on two pods (`multipod_4a4f_4a4f_fp8_graph.sh`) not
    GPU-validated; E2E case not run through the harness; no performance
    numbers; DeepSeek-V3.2 still on the legacy wrapper.
-6. Image: vllm-openai v0.32.0 ships NCCL 2.29.7; afdEP-comm v1.1.0 needs
-   2.30.7 (GIN request API).
+6. Image: done on vLLM 0.34.0. The v0.32.0 image shipped NCCL 2.29.7 and
+   afdEP-comm needed the 2.30.7 wheel (GIN request API); afdEP-comm 1.2.1
+   builds against the v0.34.0 image's own NCCL wheel (2.31.2).
 
 ## Suggested upstream (vLLM) changes
 
@@ -125,6 +126,15 @@ v0.33.0. All open PRs below are unmerged; none changes the AFD patches yet.
 | `gpu_deepseek_v32_dbo.use_dsa_indexer_sm_budget` | `UBatchRunner.prepare` takes `batch_desc, dp_sync_state` instead of `cg_mode`; indexer builder `num_sms` and `sm_control.compute_sms` unchanged | Signature updated |
 | `gpu_deepseek_v32_dbo.install_per_ubatch_topk_indices` | Still one model-level `topk_indices_buffer`; `SparseMLAIndexGroup` fields unchanged; the indexer op reads `self.topk_indices_buffer` | Kept as is |
 | `mxfp4_experts` (Marlin MXFP4 executor) | #65542 removed 8-bit activations from Marlin (`fused_marlin_moe` has no `input_dtype`); `ExpertMapManager.get_local_expert_ids` is gone; the BF16 repack and scale permutation are unchanged; `CompressedTensorsW4A8Mxfp4MoEMethod` still subclasses `Mxfp4MoEMethod` | Dropped `input_dtype` (GLM always ran W4A16, as native does on Hopper); the FFN runner passes the local expert ids |
+
+GPU evidence on vLLM 0.34.0 (2026-11-26, one 8 x H200 node, stock
+`vllm/vllm-openai:v0.34.0`, afdEP-comm 1.2.1 on the image's NCCL):
+
+| Cell | Result |
+| --- | --- |
+| Repository harness `tests/e2e/models/glm_5_3` (GSM8K-50, threshold 0.85) | 3/3 passed: native DP8 + EP eager 0.90, M2N 4A4F eager 0.86, graph 0.86 |
+| M2N 4A4F graph + MTP (3 tokens), GSM8K-200 at concurrency 32 | 0.925, acceptance 3.38-3.44 (0.32: 0.92, 3.4) |
+| M2N 4A4F graph + MTP + DBO, decode-only, GSM8K-200 at concurrency 32 | 0.935, acceptance 3.40-3.44 (0.32 with the backport: 0.95); vLLM's own threshold raise (2 -> 8) logged |
 
 Still not upstream in v0.34.0 (checked 2026-11-26; all open): per-micro-batch
 DSA top-k (#60734), indexer SM budget (#60732), the padding-only micro-batch
