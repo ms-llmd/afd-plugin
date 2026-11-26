@@ -167,11 +167,16 @@ def test_nvl72_domain_uses_the_versioned_fabric_query(monkeypatch):
 
 def test_nvl72_domain_falls_back_to_the_legacy_query(monkeypatch):
     """Without the versioned query, the legacy one still names the clique."""
+    from vllm.third_party import pynvml
+
     _fake_fabric(
         monkeypatch, versioned_state=0, legacy_state=_completed(), has_versioned=False
     )
 
-    assert nvlink_domain_id("0008:01:00.0") == f"nvl:{_CLUSTER.hex()}:3143"
+    # The id is the whole UUID field, which is wider in the legacy struct.
+    width = pynvml.c_nvmlGpuFabricInfo_t.clusterUuid.size
+    expected = _CLUSTER.ljust(width, b"\0").hex()
+    assert nvlink_domain_id("0008:01:00.0") == f"nvl:{expected}:3143"
 
 
 def test_incomplete_fabric_is_one_domain_per_host(monkeypatch):

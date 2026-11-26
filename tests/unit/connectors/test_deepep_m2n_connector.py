@@ -261,6 +261,95 @@ def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
         experts_module.DeepEPM2NExperts("deepgemm", 128, 134)
 
 
+def _experts_on(monkeypatch, capability: int):
+    """A DeepGEMM executor on a fake device of compute capability ``capability``.x,
+    with requant and scale packing recorded instead of run."""
+    from afd_plugin.connectors.gpu.deepep_m2n import experts as experts_module
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        experts_module.deepgemm, "set_contiguous_m_alignment", lambda a: None
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: (capability, 0)
+    )
+    monkeypatch.setattr(
+        experts_module,
+        "requant_weight_ue8m0_inplace",
+        lambda w, s, block: calls.append(f"requant{tuple(w.shape)}"),
+    )
+    monkeypatch.setattr(
+        experts_module.deepgemm,
+        "pack_weight_scales",
+        lambda scale, n, k: calls.append(f"pack{(n, k)}") or scale.int(),
+    )
+    return experts_module.DeepEPM2NExperts("deepgemm", 128), calls
+
+
+def _fp8_weights():
+    from afd_plugin.connectors.metadata import FP8_DTYPE, LocalExpertWeights
+
+    return LocalExpertWeights(
+        w13=torch.zeros(2, 256, 128, dtype=FP8_DTYPE),
+        w2=torch.zeros(2, 128, 128, dtype=FP8_DTYPE),
+        w13_scale=torch.ones(2, 2, 1),
+        w2_scale=torch.ones(2, 1, 1),
+    )
+
+
+def test_sm100_fp8_weights_are_requantized_and_packed_once(monkeypatch):
+    """On SM100+ DeepGEMM, FP8 expert weights get power-of-two scales, packed once.
+
+    Why: DeepGEMM's SM100 FP8 kernels read packed UE8M0 scales; vLLM's fp32
+    block scales made them assert on the first FFN step.
+    """
+    executor, calls = _experts_on(monkeypatch, 10)
+    weights = _fp8_weights()
+
+    executor.prepare_weights(weights)
+    executor.prepare_weights(weights)
+
+    assert executor.use_ue8m0
+    assert calls == [
+        "requant(2, 256, 128)",
+        "requant(2, 128, 128)",
+        "pack(256, 128)",
+        "pack(128, 128)",
+    ]
+
+
+def test_sm90_and_bf16_weights_are_left_as_loaded(monkeypatch):
+    """SM90 keeps the validated fp32-scale path; BF16 weights need nothing.
+
+    Why: requantizing to power-of-two scales costs FP8 precision.
+    """
+    from afd_plugin.connectors.metadata import LocalExpertWeights
+
+    executor, calls = _experts_on(monkeypatch, 9)
+    executor.prepare_weights(_fp8_weights())
+    assert not executor.use_ue8m0
+
+    executor, calls = _experts_on(monkeypatch, 10)
+    executor.prepare_weights(
+        LocalExpertWeights(w13=torch.zeros(2, 256, 128), w2=torch.zeros(2, 128, 128))
+    )
+    assert calls == []
+
+
+def test_sm100_fp8_weights_are_not_prepared_during_capture(monkeypatch):
+    """Preparing (an in-place requant) inside a CUDA-graph capture is refused.
+
+    Why: the connector prepares at init; a first use inside a capture means the
+    weights bypassed it.
+    """
+    executor, calls = _experts_on(monkeypatch, 10)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="before CUDA-graph capture"):
+        executor.prepare_weights(_fp8_weights())
+    assert calls == []
+
+
 UPSTREAM_DG = "deep_gemm"
 VLLM_DG = "vllm.third_party.deep_gemm"
 

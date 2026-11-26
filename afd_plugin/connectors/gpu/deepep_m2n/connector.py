@@ -94,6 +94,7 @@ from afd_plugin.connectors.base import (
     AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
 )
+from afd_plugin.connectors.gpu.deepep_m2n import deepgemm
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     EXPERT_BACKENDS,
     DeepEPM2NExperts,
@@ -1031,6 +1032,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.is_ffn = afd_config.role == "ffn"
         self.is_fp8_payload = self.config.payload_format == FP8_PAYLOAD
         self.payload_dtype = FP8_DTYPE if self.is_fp8_payload else self.dtype
+        # SM100+: power-of-two (UE8M0) FP8 payload scales, the ones DeepGEMM's
+        # FP8 kernels there read (set at init, on the rank's device).
+        self.fp8_ue8m0_scales = False
         if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
             raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
         if self.is_ffn and has_mxfp4_experts(vllm_config) != (
@@ -1198,6 +1202,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if local_experts is not None and not self.is_ffn:
             raise ValueError("only FFN ranks hold local experts")
         torch.cuda.set_device(self.device)
+        self.fp8_ue8m0_scales = self.is_fp8_payload and deepgemm.uses_ue8m0_scales(
+            self.device
+        )
         self._handshake()
         _register_custom_ops()
         assert self.bootstrap_group is not None and self.network_plan is not None
@@ -1238,6 +1245,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                     self.expert_alignment,
                     self.config.expert_num_sms,
                 )
+                # Before any CUDA-graph capture (SM100+ FP8 requantizes them).
+                for layer_experts in (local_experts or {}).values():
+                    self.experts.prepare_weights(layer_experts.weights)
             self._precompile_dispatch_kernels()
         except Exception:
             self.close()
@@ -1395,7 +1405,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             x, x_scale = hidden_states, None
             if self.is_fp8_payload:
                 x, x_scale = per_token_group_quant_fp8(
-                    hidden_states, FP8_GROUP_SIZE, use_ue8m0=False
+                    hidden_states, FP8_GROUP_SIZE, use_ue8m0=self.fp8_ue8m0_scales
                 )
             # afdEP-comm takes exact dtypes and contiguous tensors; the lane
             # raises if the stage's previous exchange was not collected.

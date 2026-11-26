@@ -99,12 +99,14 @@ def m_grouped_fp8_gemm_nt_psum(
     psum_rows_per_expert: torch.Tensor,
     expected_m: int,
 ) -> None:
-    """FP8 version of ``m_grouped_bf16_gemm_nt_psum`` (SM90 "1d2d" recipe).
+    """FP8 version of ``m_grouped_bf16_gemm_nt_psum`` (the "1d2d" recipe).
 
     ``a``: ``[M, K]`` FP8 with ``a_scale`` ``[M, K/128]`` fp32 (one scale per row
     and 128 channels; MN-major TMA-aligned avoids a transpose). ``b``:
     ``[E, N, K]`` FP8 with ``b_scale`` ``[E, N/128, K/128]`` fp32 block scales
-    (vLLM's block-FP8 layout). ``out``: ``[M, N]`` BF16.
+    (vLLM's block-FP8 layout). ``out``: ``[M, N]`` BF16. On SM100 and newer both
+    scales are packed UE8M0 instead (``pack_activation_scales``,
+    ``pack_weight_scales``).
     """
     load_deepgemm().m_grouped_fp8_gemm_nt_contiguous(
         (a, a_scale),
@@ -113,4 +115,55 @@ def m_grouped_fp8_gemm_nt_psum(
         psum_rows_per_expert,
         use_psum_layout=True,
         expected_m_for_psum_layout=expected_m,
+    )
+
+
+# FP8 block-128 recipe: (activation granularity along M, weight granularity
+# along N, granularity along K).
+FP8_RECIPE = (1, 128, 128)
+
+
+def uses_ue8m0_scales(device: torch.device | int | None = None) -> bool:
+    """Whether DeepGEMM's FP8 kernels on ``device`` read UE8M0 scales.
+
+    SM90 reads fp32 scales as they are. SM100 and newer read power-of-two
+    (UE8M0) scales packed four per int32 in DeepGEMM's own layout, so the
+    activations must be quantized with power-of-two scales and every scale
+    tensor packed before the GEMM.
+    """
+    return torch.cuda.get_device_capability(device)[0] >= 10
+
+
+def pack_activation_scales(scale: torch.Tensor, k: int) -> torch.Tensor:
+    """Power-of-two fp32 activation scales ``[M, K/128]`` -> packed UE8M0 SFA.
+
+    Rows nobody reads (past the last expert's rows, or padding between expert
+    groups) hold whatever the buffer held, and DeepGEMM's UE8M0 cast faults on
+    any scale that is not a power of two in the UE8M0 range (negative, NaN,
+    huge, subnormal or just not a power of two). Every scale is therefore
+    rounded up to such a power of two; the real rows' scales already are one
+    and pass through unchanged.
+    """
+    sf = torch.nan_to_num_(scale.abs(), nan=1.0, posinf=1.0)
+    sf = torch.exp2(torch.ceil(torch.log2(sf)).clamp_(-126.0, 126.0))
+    return load_deepgemm().transform_sf_into_required_layout(
+        sf=sf,
+        mn=scale.shape[0],
+        k=k,
+        recipe=FP8_RECIPE,
+        is_sfa=True,
+        disable_ue8m0_cast=False,
+    )
+
+
+def pack_weight_scales(scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """Power-of-two fp32 block scales ``[E, N/128, K/128]`` -> packed UE8M0 SFB."""
+    return load_deepgemm().transform_sf_into_required_layout(
+        sf=scale,
+        mn=n,
+        k=k,
+        recipe=FP8_RECIPE,
+        num_groups=scale.shape[0],
+        is_sfa=False,
+        disable_ue8m0_cast=False,
     )

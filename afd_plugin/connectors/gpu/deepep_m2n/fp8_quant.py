@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""FP8 block-128 helpers for the DeepEP M2N expert path (SM90, fp32 scales).
+"""FP8 block-128 helpers for the DeepEP M2N expert path (fp32 scales).
 
 ``silu_mul_fp8_quant`` is the fused step between the two FP8 grouped GEMMs:
 ``fp8(silu(gate) * up * topk_weight)`` with one fp32 scale per row and
 128-channel group, written in the MN-major, TMA-aligned layout DeepGEMM's SM90
-kernel reads without a transpose. Folding the top-k weight in here makes the
+kernel reads without a transpose (for SM100 the scales are rounded up to powers
+of two, which DeepGEMM then packs). Folding the top-k weight in here makes the
 second GEMM's output already weighted (it is linear), so no separate multiply
 is needed before combine.
 
@@ -52,6 +53,7 @@ def _silu_mul_fp8_quant_kernel(
     intermediate: tl.constexpr,
     group_size: tl.constexpr,
     apply_topk_weight: tl.constexpr,
+    round_scale_to_pow2: tl.constexpr,
     block: tl.constexpr,
     eps: tl.constexpr,
     fp8_min: tl.constexpr,
@@ -73,6 +75,9 @@ def _silu_mul_fp8_quant_kernel(
         weights = tl.load(topk_weights_ptr + rows, mask=row_mask, other=0.0)
         y = y * weights.to(tl.float32)[:, None]
     scale = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
+    if round_scale_to_pow2:
+        # UE8M0: the next power of two, so the values still fit in FP8.
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
     y_q = tl.clamp(y / scale[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
     tl.store(
         y_q_ptr + rows[:, None] * stride_yq_m + cols[None, :],
@@ -86,10 +91,13 @@ def silu_mul_fp8_quant(
     gate_up: torch.Tensor,
     recv_count_psum: torch.Tensor,
     topk_weights: torch.Tensor | None,
+    round_scale_to_pow2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``gate_up`` ``[M, 2I]`` BF16 -> FP8 ``[M, I]`` and fp32 scales ``[M, I/128]``.
 
     The scales are MN-major with a TMA-aligned M stride (DeepGEMM SM90 SFA).
+    ``round_scale_to_pow2`` rounds each scale up to a power of two, as
+    DeepGEMM's SM100 UE8M0 scales need.
     """
     num_rows, intermediate_x2 = gate_up.shape
     intermediate = intermediate_x2 // 2
@@ -121,6 +129,7 @@ def silu_mul_fp8_quant(
         intermediate=intermediate,
         group_size=GROUP_SIZE,
         apply_topk_weight=topk_weights is not None,
+        round_scale_to_pow2=round_scale_to_pow2,
         block=BLOCK_M,
         eps=EPS,
         fp8_min=FP8_MIN,
