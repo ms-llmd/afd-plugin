@@ -19,6 +19,8 @@ else:
 
 pytest.importorskip("vllm")
 
+from vllm.distributed import parallel_state  # noqa: E402
+
 from afd_plugin.compat.patches import gpu_deepseek_v32_dbo as dbo_patch  # noqa: E402
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v32 as adapter  # noqa: E402
@@ -98,11 +100,10 @@ def build_model(monkeypatch):
     monkeypatch.setattr(native, "make_input_embedding", bind("embed"))
     monkeypatch.setattr(native, "DeepseekV2MoE", _FakeRoutedExpertsMoE)
     monkeypatch.setattr(adapter, "AFDDeepseekV2RemoteExpertsMoE", bind("routed_shell"))
-    monkeypatch.setattr(
-        native,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True, world_size=1)
+    monkeypatch.setattr(native, "get_pp_group", lambda: pp_group)
+    # pp_topk_buffers (vLLM 0.34) reads the PP group from parallel_state.
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(
         native,
         "make_layers",
