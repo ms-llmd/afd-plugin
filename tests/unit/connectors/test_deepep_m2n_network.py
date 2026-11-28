@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 
 import pytest
@@ -15,6 +16,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
     apply_gin_environment,
+    nvlink_domain_id,
     plan_network,
 )
 
@@ -115,3 +117,70 @@ def test_gin_environment_follows_the_plan(monkeypatch):
 
     apply_gin_environment(plan_network(_two_hosts(), NetworkConfig()))
     assert "EP_DISABLE_GIN" not in os.environ
+
+
+_CLUSTER = bytes.fromhex("cd490bd7b71d464ca344f8dd11e69dde")
+
+
+def _fake_fabric(monkeypatch, *, versioned_state, legacy_state, has_versioned=True):
+    """Patch vLLM's pynvml so each fabric query reports its state and clique 3143."""
+    from vllm.third_party import pynvml
+
+    def fill(ref, state):
+        info = ref._obj
+        info.state = state
+        info.cliqueId = 3143
+        field = type(info).clusterUuid
+        ctypes.memmove(ctypes.addressof(info) + field.offset, _CLUSTER, len(_CLUSTER))
+
+    monkeypatch.setattr(pynvml, "nvmlInit", lambda: None)
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetHandleByPciBusId", lambda pci: pci)
+    monkeypatch.setattr(
+        pynvml, "nvmlDeviceGetGpuFabricInfo", lambda h, ref: fill(ref, legacy_state)
+    )
+    if has_versioned:
+        monkeypatch.setattr(
+            pynvml,
+            "nvmlDeviceGetGpuFabricInfoV",
+            lambda h, ref: fill(ref, versioned_state),
+        )
+    else:
+        monkeypatch.delattr(pynvml, "nvmlDeviceGetGpuFabricInfoV", raising=False)
+
+
+def _completed() -> int:
+    from vllm.third_party import pynvml
+
+    return pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+
+
+def test_nvl72_domain_uses_the_versioned_fabric_query(monkeypatch):
+    """The versioned NVML query names the NVL72 clique.
+
+    Why: on GB200 with driver 580 the legacy query reports state 0, which split
+    one NVL72 clique into per-host domains and made afdEP-comm reject the plan.
+    """
+    _fake_fabric(monkeypatch, versioned_state=_completed(), legacy_state=0)
+
+    assert nvlink_domain_id("0008:01:00.0") == f"nvl:{_CLUSTER.hex()}:3143"
+
+
+def test_nvl72_domain_falls_back_to_the_legacy_query(monkeypatch):
+    """Without the versioned query, the legacy one still names the clique."""
+    from vllm.third_party import pynvml
+
+    _fake_fabric(
+        monkeypatch, versioned_state=0, legacy_state=_completed(), has_versioned=False
+    )
+
+    # The id is the whole UUID field, which is wider in the legacy struct.
+    width = pynvml.c_nvmlGpuFabricInfo_t.clusterUuid.size
+    expected = _CLUSTER.ljust(width, b"\0").hex()
+    assert nvlink_domain_id("0008:01:00.0") == f"nvl:{expected}:3143"
+
+
+def test_incomplete_fabric_is_one_domain_per_host(monkeypatch):
+    """A fabric that is not COMPLETED gives no clique id (host fallback)."""
+    _fake_fabric(monkeypatch, versioned_state=0, legacy_state=0)
+
+    assert nvlink_domain_id("0008:01:00.0") is None

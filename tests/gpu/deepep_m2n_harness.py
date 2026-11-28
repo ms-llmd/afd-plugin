@@ -67,6 +67,13 @@ FP8_TOLERANCES = {
     "experts_vs_fused_rel_err": 4e-2,  # worst seen 2.87e-2
     "combine_rel_err": 9e-2,  # worst seen 6.87e-2
 }
+# SM100+: activations and weights carry power-of-two (UE8M0) scales, which costs
+# FP8 precision end to end (as in vLLM's own SM100 DeepGEMM MoE); the kernel
+# checks are unchanged.
+FP8_UE8M0_TOLERANCES = {
+    **FP8_TOLERANCES,
+    "combine_rel_err": 1.2e-1,  # worst seen 9.11e-2 (GB200)
+}
 RANK_TIMEOUT_S = 900
 # Rendezvous ports come from [PORT_RANGE_LOW, ephemeral range start).
 PORT_RANGE_LOW = 20_000
@@ -570,17 +577,29 @@ def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
     )
 
 
+def prepared_local_weights(connector: Any) -> Any:
+    """This FFN rank's expert weights, prepared by its executor (before capture)."""
+    weights, _, _ = local_weights(
+        connector.layout.expert_range(connector.role_rank),
+        connector.config.payload_format,
+    )
+    connector.experts.prepare_weights(weights)
+    return weights
+
+
 def as_sent(x: torch.Tensor, payload_format: str) -> torch.Tensor:
     """What the FFN side receives for ``x`` (dequantized when FP8), in fp32."""
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         per_token_group_quant_fp8,
     )
 
+    from afd_plugin.connectors.gpu.deepep_m2n.deepgemm import uses_ue8m0_scales
     from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import dequantize_fp8_rows
 
     if payload_format == "bf16" or x.shape[0] == 0:
         return x.float()
-    x_q, x_s = per_token_group_quant_fp8(x, 128, use_ue8m0=False)
+    # The connector's quantization: power-of-two scales on SM100+.
+    x_q, x_s = per_token_group_quant_fp8(x, 128, use_ue8m0=uses_ue8m0_scales())
     return dequantize_fp8_rows(x_q, x_s)
 
 
@@ -592,12 +611,20 @@ class Checker:
     """Per-rank verification state: references and worst observed errors."""
 
     def __init__(self, connector: Any) -> None:
+        from afd_plugin.connectors.gpu.deepep_m2n.deepgemm import uses_ue8m0_scales
         from afd_plugin.connectors.gpu.deepep_m2n.experts import DeepEPM2NExperts
+        from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
+            dequantize_fp8_block128,
+        )
 
         self.connector = connector
         self.payload_format = connector.config.payload_format
         self.tolerances = (
-            BF16_TOLERANCES if self.payload_format == "bf16" else FP8_TOLERANCES
+            BF16_TOLERANCES
+            if self.payload_format == "bf16"
+            else FP8_UE8M0_TOLERANCES
+            if uses_ue8m0_scales()
+            else FP8_TOLERANCES
         )
         self.worst: dict[str, float] = {}
         if connector.is_ffn:
@@ -605,6 +632,17 @@ class Checker:
             self.weights, self.w13_ref, self.w2_ref = local_weights(
                 self.experts, self.payload_format
             )
+            if connector.experts is not None and self.weights.is_fp8:
+                # SM100+ DeepGEMM requantizes FP8 weights in place to
+                # power-of-two scales; the references follow them, so the
+                # kernel checks still isolate the kernels' own error.
+                connector.experts.prepare_weights(self.weights)
+                self.w13_ref = dequantize_fp8_block128(
+                    self.weights.w13, self.weights.w13_scale
+                )
+                self.w2_ref = dequantize_fp8_block128(
+                    self.weights.w2, self.weights.w2_scale
+                )
             self.reference_executor = DeepEPM2NExperts(
                 "fused_experts", connector.expert_alignment
             )
@@ -1344,10 +1382,7 @@ def peer_exit_scenario(
         os._exit(PEER_EXIT_CODE)
     start = time.monotonic()
     if connector.is_ffn:
-        weights, _, _ = local_weights(
-            connector.layout.expert_range(connector.role_rank),
-            connector.config.payload_format,
-        )
+        weights = prepared_local_weights(connector)
         run_ffn_step(connector, weights, 1)
     else:
         x, ids, w = make_inputs(0, connector.role_rank, args["tokens"])
@@ -1436,8 +1471,7 @@ def benchmark_scenario(
     """Eager per-layer time. One lane: dispatch/experts/combine breakdown."""
     num_stages = connector.num_lanes
     if connector.is_ffn:
-        experts = connector.layout.expert_range(connector.role_rank)
-        weights, _, _ = local_weights(experts, connector.config.payload_format)
+        weights = prepared_local_weights(connector)
     timings: dict[str, Any] = {}
     for tokens in args["tokens_per_attn_rank"]:
         stages = [(tokens,) * topology.attn_size] * num_stages
@@ -1512,8 +1546,7 @@ def graph_benchmark_scenario(
     """
     weights = None
     if connector.is_ffn:
-        experts = connector.layout.expert_range(connector.role_rank)
-        weights, _, _ = local_weights(experts, connector.config.payload_format)
+        weights = prepared_local_weights(connector)
     timings: dict[str, Any] = {}
     for tokens in args["tokens_per_attn_rank"]:
         captured = capture_step(connector, topology, tokens, weights)

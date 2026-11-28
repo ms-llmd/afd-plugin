@@ -21,7 +21,9 @@ ATTN_PORT=18000 FFN_PORT=18001 AFD_PORT=6239 ATTN_DP_RPC_PORT=13345 FFN_DP_RPC_P
 # role_dp TP DP_HOST DP_RPC_PORT <ranks per pod>... -> TOTAL and this pod's DP
 # flags in DP. A role spread over pods is led by its first pod; the others run
 # headless from their start rank (the leader must omit it, or vLLM selects
-# hybrid load balancing and rejects the headless peers).
+# hybrid load balancing and rejects the headless peers). Headless pods serve no
+# API, and vLLM rejects --api-server-count > 0 with --headless, so they get 0
+# (after SERVE_ARGS, so it overrides a recipe's --api-server-count 1).
 role_dp() {
     local tp=$1 host=$2 port=$3 i pods=0 start=0 lead=-1
     shift 3
@@ -37,7 +39,8 @@ role_dp() {
     DP=(--tensor-parallel-size "$tp" --data-parallel-size $((TOTAL / tp)))
     ((pods > 1)) && DP+=(--data-parallel-size-local $((n[K] / tp))
         --data-parallel-address "$host" --data-parallel-rpc-port "$port")
-    ((pods > 1 && K != lead)) && DP+=(--headless --data-parallel-start-rank $((start / tp)))
+    ((pods > 1 && K != lead)) && DP+=(--headless --data-parallel-start-rank $((start / tp))
+        --api-server-count 0)
     return 0
 }
 
