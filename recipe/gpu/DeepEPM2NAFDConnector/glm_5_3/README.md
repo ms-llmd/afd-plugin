@@ -12,7 +12,8 @@ prefill_decode_colocation/
 ├── 4a4f_graph_mtp_dp4tp1.sh         # MXFP4xFP8, graph, MTP on Attention
 ├── 4a4f_dbo_dp4tp1.sh               # MXFP4xFP8, DBO, MODE=graph (default) or eager
 ├── 4a4f_mtp_dbo_dp4tp1.sh           # MXFP4xFP8, MTP + DBO, MODE=graph (default) or eager
-└── multipod_4a4f_4a4f_fp8_graph.sh  # block-128 FP8, graph, two 8-GPU pods
+├── multipod_4a4f_4a4f_fp8_graph.sh  # block-128 FP8, graph, two 8-GPU pods
+└── multipod_4a4f_4a4f_fp8_dbo.sh    # block-128 FP8, DBO, two 8-GPU pods
 ```
 
 The native vLLM control on the same node is
@@ -23,13 +24,13 @@ The native vLLM control on the same node is
 | Checkpoint | Size | Routed experts on the FFN | Recipe |
 | --- | --- | --- | --- |
 | `RedHatAI/GLM-5.3-MXFP4xFP8` | 415 GB | MXFP4, `expert_backend: "marlin"` (W4A16 Marlin), BF16 payload; about 96 GB per FFN rank at 4 ranks | `4a4f_*` |
-| `zai-org/GLM-5.3` | 756 GB | block-128 FP8, DeepGEMM, FP8 payload; about 91 GB per FFN rank at 8 ranks | `multipod_4a4f_4a4f_fp8_graph.sh` |
+| `zai-org/GLM-5.3` | 756 GB | block-128 FP8, DeepGEMM, FP8 payload; about 91 GB per FFN rank at 8 ranks | `multipod_4a4f_4a4f_fp8_graph.sh`, `multipod_4a4f_4a4f_fp8_dbo.sh` |
 
 ## Defaults
 
 | Setting | All recipes |
 | --- | --- |
-| `--max-num-seqs` | 64 per Attention DP rank (128 in `4a4f_dbo_dp4tp1.sh`) |
+| `--max-num-seqs` | 64 per Attention DP rank (128 in the DBO recipes) |
 | `--max-num-batched-tokens` | 4096 |
 | `--max-model-len` | 8192 |
 | `--kv-cache-dtype` | `fp8` (vLLM's `fp8_ds_mla` sparse MLA cache on Hopper) |
@@ -63,7 +64,8 @@ The native vLLM control on the same node is
   next layer's RMSNorm, so Attention TP > 1 is rejected.
 - MTP (`4a4f_graph_mtp_dp4tp1.sh`) runs the native draft model on the
   Attention ranks; only the Attention role takes the speculative config.
-- DBO (`4a4f_dbo_dp4tp1.sh`, `4a4f_mtp_dbo_dp4tp1.sh`) micro-batches decode
+- DBO (`4a4f_dbo_dp4tp1.sh`, `4a4f_mtp_dbo_dp4tp1.sh`,
+  `multipod_4a4f_4a4f_fp8_dbo.sh`) micro-batches decode
   steps only, eager or with CUDA graphs: `--dbo-prefill-token-threshold` must
   stay above `--max-num-batched-tokens`, because micro-batched GLM prefill is
   not yet correct. With MTP, verification steps split on request boundaries,
